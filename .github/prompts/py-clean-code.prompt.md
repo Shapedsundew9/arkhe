@@ -1,1 +1,0 @@
-../../.shared/ai/core/prompts/py-clean-code.prompt.md

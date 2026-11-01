@@ -1,1 +1,0 @@
-../../.shared/ai/core/prompts/clean-vision.prompt.md

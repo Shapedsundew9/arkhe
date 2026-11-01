@@ -1,1 +1,0 @@
-../../.shared/ai/gemini/prompts/agy-vision-debate.prompt.md
