@@ -1,0 +1,1 @@
+../../.shared/ai/core/prompts/standardize-docs.prompt.md

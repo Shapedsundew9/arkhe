@@ -1,0 +1,56 @@
+services:
+  app:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+      pull: true
+    volumes:
+      - ..:/workspace:cached
+    command: sleep infinity
+
+  neo4j:
+    image: neo4j:community
+    pull_policy: always
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+
+  postgres:
+    image: postgres:18
+    pull_policy: always
+    shm_size: 128mb
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  postgres_data:
+
+networks:
+  default:
+    name: devcontainer_default
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.254.100.0/24
+          gateway: 10.254.100.1
