@@ -1,0 +1,11 @@
+# Environment Variables for Services Available
+
+- Postgres `$DATABASE_URL`
+- Neo4j `$NEO4J_URI`, `$NEO4J_USER`, `$NEO4J_PASSWORD`
+- Pypi `$PYPI_USERNAME`, `$PYPI_PASSWORD`
+- GitHub `$GITHUB_TOKEN`
+- Arc AGI `$ARC_AGI_API`
+- Hugging Face `$HF_READ_TOKEN`
+- Emergent Mind `$EMERGENT_MIND_BASE_URL`, `$EMERGENT_MIND_OPENAPI_SPEC_URL`, `$EMERGENT_MIND_TOKEN`
+- Cargo Registry `$CARGO_REGISTRY_URL`, `$CARGO_REGISTRY_TOKEN`
+- Docker Hub `$DOCKER_HUB_USERNAME`, `$DOCKER_HUB_TOKEN`
