@@ -366,6 +366,19 @@ impl Circuit {
             delay_latches.push((reg_idx, in_wire));
         }
 
+        let node_input_wires: Vec<Vec<usize>> = nodes
+            .iter()
+            .enumerate()
+            .map(|(idx, prim)| {
+                let node = NodeId(u32::try_from(idx).expect("node index fits in u32"));
+                (0..prim.input_arity())
+                    .map(|port| {
+                        sink_wire(SignalSink::NodeIn { node, port }).expect("validated connected")
+                    })
+                    .collect()
+            })
+            .collect();
+
         // 9. Wire boundary output drivers.
         let mut output_drivers: Vec<Option<usize>> =
             Vec::with_capacity(usize::from(self.num_outputs()));
@@ -385,6 +398,7 @@ impl Circuit {
             reg_inits,
             delay_reads,
             comb_ops,
+            node_input_wires,
             delay_latches,
             shift_chains,
             output_drivers,

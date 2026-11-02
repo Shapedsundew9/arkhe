@@ -2,7 +2,9 @@
 //! (Charter §3.4 & §8).
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
+use crate::metrics::{NullModel, NullModelKind};
 use crate::structural::{GridShape, WiringTopology};
 use crate::substrate::{Circuit, Primitive, Width};
 
@@ -18,6 +20,26 @@ pub struct MdlBreakdown {
     /// Total description length $L = \text{palette\_bits} + \text{circuit\_bits} + \text{facts\_bits}$.
     pub total_bits: f64,
 }
+
+/// Invalid input to null-calibrated MDL accounting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NullCalibratedMdlError {
+    /// Observed facts and predictions have different lengths.
+    LengthMismatch { facts: usize, predictions: usize },
+}
+
+impl fmt::Display for NullCalibratedMdlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LengthMismatch { facts, predictions } => write!(
+                f,
+                "facts and predictions length mismatch: {facts} != {predictions}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NullCalibratedMdlError {}
 
 /// Elias-$\gamma$ universal code length $\ell_\gamma(n) = 2 \lfloor \log_2(n + 1) \rfloor + 1$ bits.
 #[must_use]
@@ -169,5 +191,95 @@ pub fn compute_mdl(
         circuit_bits,
         facts_bits,
         total_bits,
+    }
+}
+
+/// Computes circuit description length relative to a prequential null model.
+///
+/// The centered exact-match reward is the reduction in prequential residual code length relative
+/// to the null stream; the circuit description is then added once, as required by the MDL balance.
+#[allow(clippy::too_many_arguments)]
+pub fn null_calibrated_mdl_delta(
+    circuit: &Circuit,
+    topology: WiringTopology,
+    grid_shape: Option<GridShape>,
+    palette_bits: f64,
+    extra_palette_entries: usize,
+    facts: &[u64],
+    predictions: &[u64],
+    null_model_kind: NullModelKind,
+) -> Result<f64, NullCalibratedMdlError> {
+    if facts.len() != predictions.len() {
+        return Err(NullCalibratedMdlError::LengthMismatch {
+            facts: facts.len(),
+            predictions: predictions.len(),
+        });
+    }
+    let width = circuit.width();
+    let mut null_model = NullModel::new(width, null_model_kind);
+    let mut net_reward = 0.0;
+    for (&fact, &prediction) in facts.iter().zip(predictions) {
+        let prediction = width.normalize(prediction);
+        let probability = null_model.probability(prediction);
+        let match_value = if width.normalize(fact) == prediction {
+            1.0
+        } else {
+            0.0
+        };
+        net_reward += (match_value - probability) * -probability.log2();
+        null_model.observe_and_surprisal(fact);
+    }
+    Ok(
+        palette_bits + circuit_code_bits(circuit, topology, grid_shape, extra_palette_entries)
+            - net_reward,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::NullModelKind;
+    use crate::substrate::{SignalSink, SignalSource, WireDelayMode};
+
+    #[test]
+    fn null_calibrated_mdl_rewards_an_exact_predictor_over_the_null_model() {
+        let mut circuit = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+        circuit.connect(SignalSource::BoundaryIn(0), SignalSink::BoundaryOut(0));
+        let facts: Vec<u64> = (0..64).map(|tick| tick % 2).collect();
+        let delta = null_calibrated_mdl_delta(
+            &circuit,
+            WiringTopology::WellMixed,
+            None,
+            0.0,
+            0,
+            &facts,
+            &facts,
+            NullModelKind::LaplaceFrequency,
+        )
+        .unwrap();
+        assert!(delta < 0.0, "exact predictor should beat null, got {delta}");
+    }
+
+    #[test]
+    fn null_calibrated_mdl_rejects_mismatched_traces() {
+        let circuit = Circuit::new(Width::BITS_1, 0, 1, WireDelayMode::Combinational);
+        let error = null_calibrated_mdl_delta(
+            &circuit,
+            WiringTopology::WellMixed,
+            None,
+            0.0,
+            0,
+            &[0, 1],
+            &[0],
+            NullModelKind::LaplaceFrequency,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            NullCalibratedMdlError::LengthMismatch {
+                facts: 2,
+                predictions: 1
+            }
+        );
     }
 }

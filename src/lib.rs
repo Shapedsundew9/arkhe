@@ -18,6 +18,7 @@ pub mod rng;
 pub mod structural;
 pub mod substrate;
 pub mod verify;
+pub mod verify_m1;
 
 use std::fs;
 use std::path::PathBuf;
@@ -28,6 +29,7 @@ use crate::config::{ExperimentConfig, compute_ground_truth_yardstick, execute_ex
 use crate::env::{FiniteStateGenerator, GeneratorConfig, NoiseModel};
 use crate::substrate::{Width, WireDelayMode};
 use crate::verify::run_m0_verification_suite_with_offset;
+use crate::verify_m1::run_m1a_verification_suite;
 
 /// Command-line interface for the Arkhe Milestone 0 simulator and yardstick.
 #[derive(Debug, Parser)]
@@ -75,6 +77,15 @@ pub enum Commands {
         #[arg(long, default_value_t = 20)]
         seeds: u32,
     },
+    /// Run the fixed-structure Milestone 1a metabolic-economy gates.
+    VerifyM1a {
+        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
+        #[arg(long, default_value_t = 0)]
+        seed_offset: u32,
+        /// Number of master seeds evaluated on noisy conditions.
+        #[arg(long, default_value_t = 20)]
+        seeds: u32,
+    },
 }
 
 /// Returns the crate banner string.
@@ -87,7 +98,7 @@ pub fn greeting() -> &'static str {
 ///
 /// # Errors
 ///
-/// Returns an error if file I/O, configuration parsing, or `verify-m0` gates fail.
+/// Returns an error if file I/O, configuration parsing, or verification gates fail.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_with_args(std::env::args_os())
 }
@@ -96,7 +107,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// # Errors
 ///
-/// Returns an error if CLI parsing, configuration execution, or `verify-m0` gates fail.
+/// Returns an error if CLI parsing, configuration execution, or verification gates fail.
 pub fn run_with_args<I, T>(args: I) -> Result<(), Box<dyn std::error::Error>>
 where
     I: IntoIterator<Item = T>,
@@ -159,6 +170,15 @@ where
                 Ok(())
             } else {
                 Err("Milestone 0 verification failed one or more acceptance gates".into())
+            }
+        }
+        Some(Commands::VerifyM1a { seed_offset, seeds }) => {
+            let summary = run_m1a_verification_suite(seed_offset, seeds);
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if summary.all_passed {
+                Ok(())
+            } else {
+                Err("Milestone 1a verification failed one or more acceptance gates".into())
             }
         }
     }

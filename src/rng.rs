@@ -22,6 +22,10 @@ pub enum StreamDomain {
     BaselineSearch { trial: u32 },
     /// Initial register perturbation sampling for autonomous basin estimation.
     BasinPerturbation { probe: u32 },
+    /// Counterfactual values sampled by structural sensitivity analysis.
+    SensitivityProbe { tick_block: u64 },
+    /// Deterministic tie-breaking during structural growth.
+    StructuralGrowth { epoch: u32 },
 }
 
 impl StreamDomain {
@@ -31,6 +35,9 @@ impl StreamDomain {
             Self::ChannelNoise { channel } => (2, channel as u64),
             Self::BaselineSearch { trial } => (3, trial as u64),
             Self::BasinPerturbation { probe } => (4, probe as u64),
+            // Tags 1..=4 are part of the Milestone 0 stream protocol.
+            Self::SensitivityProbe { tick_block } => (5, tick_block),
+            Self::StructuralGrowth { epoch } => (6, epoch as u64),
         }
     }
 }

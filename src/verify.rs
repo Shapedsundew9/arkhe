@@ -483,6 +483,17 @@ fn verify_gate_g2_yardsticks(failures: &mut Vec<String>) -> bool {
                     em_noisy.h_mu_bits_per_symbol
                 ));
             }
+            if matches!(
+                em_noisy.msp_sync_status,
+                crate::env::MspSyncStatus::BoundedQuantizedEstimate { .. }
+                    | crate::env::MspSyncStatus::ExactZeroComplexity
+            ) && (em_noisy.c_mu_bits - exp_c_mu).abs() >= 1e-8
+            {
+                failures.push(format!(
+                    "G2(noisy k={k}): {gen_cfg:?} expected analytical C_mu={exp_c_mu}, got {}",
+                    em_noisy.c_mu_bits
+                ));
+            }
         }
 
         // Certified synthesis check across all 4 T1 tasks.

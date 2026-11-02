@@ -6,7 +6,7 @@
 
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fnv1a_128_hex(bytes: &[u8]) -> String {
@@ -20,11 +20,53 @@ fn fnv1a_128_hex(bytes: &[u8]) -> String {
     format!("{hash:032x}")
 }
 
+fn collect_rust_sources(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir)
+        .expect("read source directory")
+        .map(|entry| entry.expect("read source directory entry").path())
+    {
+        if entry.is_dir() {
+            collect_rust_sources(root, &entry, files);
+        } else if entry.extension().is_some_and(|ext| ext == "rs") {
+            files.push(
+                entry
+                    .strip_prefix(root)
+                    .expect("source is under root")
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn source_tree_fnv1a128(root: &Path) -> String {
+    let mut paths = vec![
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("Cargo.lock"),
+        PathBuf::from("scripts/build.rs"),
+    ];
+    collect_rust_sources(root, &root.join("src"), &mut paths);
+    paths.sort();
+
+    let mut bytes = Vec::new();
+    for relative_path in paths {
+        let path = relative_path.to_string_lossy().replace('\\', "/");
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&fs::read(root.join(&relative_path)).expect("read source file"));
+        bytes.push(0);
+    }
+    fnv1a_128_hex(&bytes)
+}
+
 fn main() {
     println!("cargo::rerun-if-changed=scripts/build.rs");
+    println!("cargo::rerun-if-changed=Cargo.toml");
+    println!("cargo::rerun-if-changed=src");
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_owned());
     let root = Path::new(&manifest_dir);
+    let source_digest = source_tree_fnv1a128(root);
+    println!("cargo::rustc-env=ARKHE_SOURCE_TREE_FNV1A128={source_digest}");
 
     let lock_path = root.join("Cargo.lock");
     let lock_digest = if lock_path.is_file() {

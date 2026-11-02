@@ -1,8 +1,8 @@
 //! Cross-run determinism, golden RNG vectors, and stream-isolation integration tests (Gate G4).
 
 use arkhe::config::{
-    BaselineConfig, BudgetConfig, CONFIG_SCHEMA_VERSION, EnvironmentConfig, ExperimentConfig,
-    SubstrateConfig, execute_experiment,
+    BaselineConfig, BudgetConfig, BuildProvenance, CONFIG_SCHEMA_VERSION, EnvironmentConfig,
+    ExperimentConfig, SubstrateConfig, execute_experiment,
 };
 use arkhe::env::{GeneratorConfig, NoiseModel};
 use arkhe::rng::{SeedBank, StreamDomain, fnv1a_128_hex};
@@ -58,6 +58,27 @@ fn seed_bank_golden_vectors_are_portable_and_stable() {
     assert_eq!(s1_repeat.next_u64(), v1);
     assert_eq!(v0, 10_570_056_588_342_067_228);
     assert_eq!(v1, 10_419_271_532_414_833_232);
+}
+
+#[test]
+fn m1_rng_domains_are_distinct_and_build_provenance_has_source_digest() {
+    let bank = SeedBank::new(0);
+    let sensitivity = bank
+        .stream(StreamDomain::SensitivityProbe { tick_block: 11 })
+        .next_u64();
+    let growth = bank
+        .stream(StreamDomain::StructuralGrowth { epoch: 11 })
+        .next_u64();
+    assert_ne!(sensitivity, growth);
+
+    let provenance = BuildProvenance::current();
+    assert_eq!(provenance.source_tree_fnv1a128.len(), 32);
+    assert!(
+        provenance
+            .source_tree_fnv1a128
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
 }
 
 #[test]

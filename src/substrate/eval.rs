@@ -103,6 +103,7 @@ pub struct CompiledCircuit {
     explicit_delay_count: usize,
     delay_reads: Vec<(usize, usize)>,
     comb_ops: Vec<CombOp>,
+    node_input_wires: Vec<Vec<usize>>,
     delay_latches: Vec<(usize, usize)>,
     shift_chains: Vec<ShiftChain>,
     output_drivers: Vec<Option<usize>>,
@@ -119,6 +120,7 @@ impl CompiledCircuit {
         reg_inits: Vec<RegInit>,
         delay_reads: Vec<(usize, usize)>,
         comb_ops: Vec<CombOp>,
+        node_input_wires: Vec<Vec<usize>>,
         delay_latches: Vec<(usize, usize)>,
         shift_chains: Vec<ShiftChain>,
         output_drivers: Vec<Option<usize>>,
@@ -134,6 +136,7 @@ impl CompiledCircuit {
             explicit_delay_count,
             delay_reads,
             comb_ops,
+            node_input_wires,
             delay_latches,
             shift_chains,
             output_drivers,
@@ -187,6 +190,30 @@ impl CompiledCircuit {
     pub fn comb_op_count(&self) -> usize {
         self.comb_ops.len()
     }
+
+    pub(crate) fn comb_ops(&self) -> &[CombOp] {
+        &self.comb_ops
+    }
+
+    pub(crate) fn node_input_wires(&self) -> &[Vec<usize>] {
+        &self.node_input_wires
+    }
+
+    pub(crate) fn output_drivers(&self) -> &[Option<usize>] {
+        &self.output_drivers
+    }
+
+    pub(crate) fn delay_latches(&self) -> &[(usize, usize)] {
+        &self.delay_latches
+    }
+
+    pub(crate) fn shift_chains(&self) -> &[ShiftChain] {
+        &self.shift_chains
+    }
+
+    pub(crate) fn delay_reads(&self) -> &[(usize, usize)] {
+        &self.delay_reads
+    }
 }
 
 /// Scalar execution state supporting any uniform width $1 \le k \le 64$.
@@ -218,6 +245,12 @@ impl ScalarState {
     #[must_use]
     pub fn registers(&self) -> &[u64] {
         &self.regs
+    }
+
+    /// Read-only snapshot of current input, register, and combinational wire values.
+    #[must_use]
+    pub fn wire_values(&self) -> &[u64] {
+        &self.wires
     }
 
     /// Overwrites all synchronous state registers, masking each value to `compiled.width()`.

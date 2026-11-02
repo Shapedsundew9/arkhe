@@ -1,17 +1,17 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, and compute-matched baseline harness implementing **Milestone 0 (`M0 — Simulator and yardstick`)** of the [Foundational Research Charter v2](doc/foundational_research_charter_v2.md) (see [doc/milestone_0_plan.md](doc/milestone_0_plan.md) and [doc/milestone_0_lessons_learned.md](doc/milestone_0_lessons_learned.md)).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, and compute-matched baseline harness implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and the fixed-structure **M1a economy gates** from the [Foundational Research Charter v2](doc/foundational_research_charter_v2.md). The M1b work is in progress; the authoritative scope and gates are in [doc/milestone_1_plan.md](doc/milestone_1_plan.md).
 
 ## Overview
 
 Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k}$ ($1 \le k \le 64$) with:
 
 - **`substrate`**: Exact $\mathbb{Z}_{2^k}$ ring arithmetic, Level-0 primitives (`ADD`, `SUB`, `MUL`, `EQZ`, `SPLIT`, `DELAY`), Charter §2.5 structural invariant checks, scalar evaluator (`ScalarState`), and 64-lane bit-parallel evaluator (`BitParallel64State` at $k = 1$).
-- **`structural`**: 2D spatial lattice placement (`GridShape`, `Coord`, `BoundaryAnchor`), local vs. well-mixed wiring topology checks (`WiringTopology`), and hop-delay lowering (`LatticeCircuit`).
+- **`structural`**: 2D spatial lattice placement and deterministic local relay routing, metabolic reserves and retrograde sensitivity, state-preserving graph surgery, and finite-ring residual diagnostics.
 - **`env`**: Finite-state benchmark generators (`T1`, `T3b`, `T3c`), declared channel substitution noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
 - **`metrics`**: Surprisal null models, Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
 - **`baselines`**: Compute-matched prequential baseline harness (`RandomSearch`, `(1+λ) CGP`, `CTW`, `ReedsSloane`, and certified small-circuit `Exhaustive` synthesis) over phase-exact sliding observation windows.
-- **`rng`, `config`, & `verify`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, and the pre-registered Gates G1–G4 verification battery.
+- **`rng`, `config`, & `verify`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, and the M0 plus fixed-structure M1a verification batteries.
 
 ## Project Structure
 
@@ -41,6 +41,8 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 ├── tests/
 │   ├── cli.rs
 │   ├── determinism.rs
+│   ├── m1a_economy.rs
+│   ├── m1b_neurogenesis.rs
 │   ├── m0_acceptance.rs
 │   └── post-create.sh
 ├── Cargo.toml
@@ -64,6 +66,12 @@ cargo build --locked --release
 ```bash
 cargo run --locked --release -- verify-m0 --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m0 --seed-offset 10000 --seeds 20
+```
+
+1. Run the M1a fixed-structure economy gate before enabling any M1b growth experiments:
+
+```bash
+cargo run --locked -- verify-m1a --seed-offset 0 --seeds 20
 ```
 
 1. Inspect analytical $\varepsilon$-machine and Reeds–Sloane ground-truth yardsticks for a generator:

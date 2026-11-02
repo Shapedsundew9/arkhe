@@ -4,6 +4,7 @@
 //! separated from `substrate` execution and from future M1a+ metabolic/growth logic.
 
 use std::collections::BTreeMap;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -185,8 +186,21 @@ pub enum LatticeError {
         distance: u16,
         topology: WiringTopology,
     },
+    /// No path with enough unoccupied relay cells existed within the configured limit.
+    RouteUnavailable {
+        src: SignalSource,
+        dst: SignalSink,
+        max_relay_hops: usize,
+    },
     /// Underlying substrate structural invariant failed during compilation.
     Substrate(InvariantError),
+}
+
+#[derive(Clone, Copy)]
+struct RouteRequest {
+    src: SignalSource,
+    dst: SignalSink,
+    max_relay_hops: usize,
 }
 
 impl fmt::Display for LatticeError {
@@ -219,6 +233,14 @@ impl fmt::Display for LatticeError {
             } => write!(
                 f,
                 "non-local edge {src:?} -> {dst:?} has distance {distance} under {topology:?}"
+            ),
+            Self::RouteUnavailable {
+                src,
+                dst,
+                max_relay_hops,
+            } => write!(
+                f,
+                "no local route for {src:?} -> {dst:?} within {max_relay_hops} relay nodes"
             ),
             Self::Substrate(err) => write!(f, "substrate invariant error: {err}"),
         }
@@ -286,16 +308,87 @@ impl LatticeCircuit {
         self.shape
     }
 
+    /// Circuit wire width.
+    #[must_use]
+    pub const fn width(&self) -> Width {
+        self.width
+    }
+
+    /// Circuit propagation mode.
+    #[must_use]
+    pub const fn wire_delay(&self) -> WireDelayMode {
+        self.wire_delay
+    }
+
     /// Active spatial wiring rule.
     #[must_use]
     pub const fn topology(&self) -> WiringTopology {
         self.topology
     }
 
+    /// Perimeter input anchors in channel order.
+    #[must_use]
+    pub fn input_anchors(&self) -> &[BoundaryAnchor] {
+        &self.input_anchors
+    }
+
+    /// Perimeter output anchors in port order.
+    #[must_use]
+    pub fn output_anchors(&self) -> &[BoundaryAnchor] {
+        &self.output_anchors
+    }
+
+    /// Placed nodes in stable creation order.
+    #[must_use]
+    pub fn nodes(&self) -> &[(Coord, Primitive)] {
+        &self.nodes
+    }
+
+    /// Directed lattice edges.
+    #[must_use]
+    pub fn edges(&self) -> &[(SignalSource, SignalSink)] {
+        &self.edges
+    }
+
+    /// Primitive at `node`, if it is currently placed.
+    #[must_use]
+    pub fn node_primitive(&self, node: NodeId) -> Option<Primitive> {
+        self.nodes
+            .get(node.index())
+            .map(|(_, primitive)| *primitive)
+    }
+
     /// Looks up the [`NodeId`] occupying `coord`, if any.
     #[must_use]
     pub fn cell_node(&self, coord: Coord) -> Option<NodeId> {
         self.cell_map.get(&coord).copied()
+    }
+
+    /// Returns per-node wire-hop totals used by metabolic maintenance pricing.
+    ///
+    /// Incoming node edges and outgoing boundary-output edges are charged to the node. In
+    /// `WellMixed` mode each edge costs one hop, independent of coordinates.
+    pub fn wire_steps_per_node(&self) -> Result<Vec<u32>, LatticeError> {
+        let mut steps = vec![0u32; self.nodes.len()];
+        for &(src, dst) in &self.edges {
+            let charged_node = match (src, dst) {
+                (_, SignalSink::NodeIn { node, .. }) => Some(node),
+                (SignalSource::NodeOut { node, .. }, SignalSink::BoundaryOut(_)) => Some(node),
+                _ => None,
+            };
+            if let Some(node) = charged_node {
+                let distance = if self.topology == WiringTopology::WellMixed {
+                    1
+                } else {
+                    u32::from(self.step_distance(src, dst)?)
+                };
+                let Some(total) = steps.get_mut(node.index()) else {
+                    return Err(LatticeError::UnknownEndpoint);
+                };
+                *total = total.saturating_add(distance);
+            }
+        }
+        Ok(steps)
     }
 
     /// Looks up the [`Coord`] of `node`, if valid.
@@ -351,6 +444,285 @@ impl LatticeCircuit {
         }
         self.edges.push((src, dst));
         Ok(())
+    }
+
+    /// Connects endpoints through the shortest deterministic local route.
+    ///
+    /// Empty intermediate cells are filled with `SPLIT` relay nodes whose second output remains
+    /// available for future fan-out. The returned list is ordered from source to destination.
+    pub fn route_connect(
+        &mut self,
+        src: SignalSource,
+        dst: SignalSink,
+        max_relay_hops: usize,
+    ) -> Result<Vec<NodeId>, LatticeError> {
+        let mut staged = self.clone();
+        let relays = staged.route_connect_in_place(src, dst, max_relay_hops)?;
+        *self = staged;
+        Ok(relays)
+    }
+
+    fn route_connect_in_place(
+        &mut self,
+        src: SignalSource,
+        dst: SignalSink,
+        max_relay_hops: usize,
+    ) -> Result<Vec<NodeId>, LatticeError> {
+        if self.topology == WiringTopology::WellMixed {
+            self.connect(src, dst)?;
+            return Ok(Vec::new());
+        }
+        let (start, source_is_boundary) = self.source_route_cell(src)?;
+        let (goal, sink_is_boundary) = self.sink_route_cell(dst)?;
+        let request = RouteRequest {
+            src,
+            dst,
+            max_relay_hops,
+        };
+        let path = self.shortest_empty_cell_path(
+            start,
+            goal,
+            max_relay_hops.saturating_add(1),
+            !source_is_boundary,
+            !sink_is_boundary,
+            request,
+        )?;
+        let relay_coords: Vec<Coord> = path
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &coord)| {
+                let is_source_node = index == 0 && !source_is_boundary;
+                let is_sink_node = index + 1 == path.len() && !sink_is_boundary;
+                (!is_source_node && !is_sink_node).then_some(coord)
+            })
+            .collect();
+        if relay_coords.len() > max_relay_hops {
+            return Err(LatticeError::RouteUnavailable {
+                src,
+                dst,
+                max_relay_hops,
+            });
+        }
+
+        let mut relays = Vec::with_capacity(relay_coords.len());
+        for coord in relay_coords {
+            relays.push(self.place_node(coord, Primitive::Split)?);
+        }
+        if relays.is_empty() {
+            self.connect(src, dst)?;
+            return Ok(relays);
+        }
+        self.connect(
+            src,
+            SignalSink::NodeIn {
+                node: relays[0],
+                port: 0,
+            },
+        )?;
+        for pair in relays.windows(2) {
+            self.connect(
+                SignalSource::NodeOut {
+                    node: pair[0],
+                    port: 0,
+                },
+                SignalSink::NodeIn {
+                    node: pair[1],
+                    port: 0,
+                },
+            )?;
+        }
+        self.connect(
+            SignalSource::NodeOut {
+                node: *relays.last().expect("non-empty relay route"),
+                port: 0,
+            },
+            dst,
+        )?;
+        Ok(relays)
+    }
+
+    /// Removes edges exactly matching `(src, dst)`.
+    pub fn disconnect(&mut self, src: SignalSource, dst: SignalSink) -> bool {
+        let original_len = self.edges.len();
+        self.edges
+            .retain(|&(edge_src, edge_dst)| edge_src != src || edge_dst != dst);
+        self.edges.len() != original_len
+    }
+
+    /// Changes the source endpoint of an edge with destination `dst`.
+    pub fn replace_edge_source(
+        &mut self,
+        dst: SignalSink,
+        src: SignalSource,
+    ) -> Result<(), LatticeError> {
+        let Some((old_src, _)) = self.edges.iter_mut().find(|(_, edge_dst)| *edge_dst == dst)
+        else {
+            return Err(LatticeError::UnknownEndpoint);
+        };
+        *old_src = src;
+        Ok(())
+    }
+
+    /// Compacts nodes after deletion and returns `old_node -> Some(new_node)` for survivors.
+    pub fn remove_nodes(&mut self, removed: &BTreeSet<NodeId>) -> Vec<Option<NodeId>> {
+        let mut mapping = vec![None; self.nodes.len()];
+        let mut nodes = Vec::with_capacity(self.nodes.len().saturating_sub(removed.len()));
+        let mut cell_map = BTreeMap::new();
+        for (old_index, &(coord, primitive)) in self.nodes.iter().enumerate() {
+            let old = NodeId(u32::try_from(old_index).expect("node index fits in u32"));
+            if removed.contains(&old) {
+                continue;
+            }
+            let new = NodeId(u32::try_from(nodes.len()).expect("node count fits in u32"));
+            mapping[old_index] = Some(new);
+            nodes.push((coord, primitive));
+            cell_map.insert(coord, new);
+        }
+        let remap_source = |source: SignalSource| -> Option<SignalSource> {
+            match source {
+                SignalSource::BoundaryIn(_) => Some(source),
+                SignalSource::NodeOut { node, port } => Some(SignalSource::NodeOut {
+                    node: mapping.get(node.index()).copied().flatten()?,
+                    port,
+                }),
+            }
+        };
+        let remap_sink = |sink: SignalSink| -> Option<SignalSink> {
+            match sink {
+                SignalSink::BoundaryOut(_) => Some(sink),
+                SignalSink::NodeIn { node, port } => Some(SignalSink::NodeIn {
+                    node: mapping.get(node.index()).copied().flatten()?,
+                    port,
+                }),
+            }
+        };
+        self.edges = self
+            .edges
+            .iter()
+            .filter_map(|&(src, dst)| Some((remap_source(src)?, remap_sink(dst)?)))
+            .collect();
+        self.nodes = nodes;
+        self.cell_map = cell_map;
+        mapping
+    }
+
+    fn source_route_cell(&self, source: SignalSource) -> Result<(Coord, bool), LatticeError> {
+        match source {
+            SignalSource::BoundaryIn(port) => self
+                .input_anchors
+                .get(usize::from(port))
+                .copied()
+                .ok_or(LatticeError::UnknownEndpoint)?
+                .adjacent_border_cell(self.shape)
+                .map(|coord| (coord, true)),
+            SignalSource::NodeOut { node, .. } => self
+                .node_coord(node)
+                .map(|coord| (coord, false))
+                .ok_or(LatticeError::UnknownEndpoint),
+        }
+    }
+
+    fn sink_route_cell(&self, sink: SignalSink) -> Result<(Coord, bool), LatticeError> {
+        match sink {
+            SignalSink::BoundaryOut(port) => self
+                .output_anchors
+                .get(usize::from(port))
+                .copied()
+                .ok_or(LatticeError::UnknownEndpoint)?
+                .adjacent_border_cell(self.shape)
+                .map(|coord| (coord, true)),
+            SignalSink::NodeIn { node, .. } => self
+                .node_coord(node)
+                .map(|coord| (coord, false))
+                .ok_or(LatticeError::UnknownEndpoint),
+        }
+    }
+
+    fn shortest_empty_cell_path(
+        &self,
+        start: Coord,
+        goal: Coord,
+        max_steps: usize,
+        allow_occupied_start: bool,
+        allow_occupied_goal: bool,
+        request: RouteRequest,
+    ) -> Result<Vec<Coord>, LatticeError> {
+        let start_is_blocked = self.cell_map.contains_key(&start)
+            && !allow_occupied_start
+            && !(start == goal && allow_occupied_goal);
+        let goal_is_blocked = self.cell_map.contains_key(&goal)
+            && !allow_occupied_goal
+            && !(start == goal && allow_occupied_start);
+        if start_is_blocked || goal_is_blocked {
+            return Err(LatticeError::RouteUnavailable {
+                src: request.src,
+                dst: request.dst,
+                max_relay_hops: request.max_relay_hops,
+            });
+        }
+        let mut parents = BTreeMap::new();
+        let mut queue = VecDeque::new();
+        parents.insert(start, None);
+        queue.push_back((start, 0usize));
+        while let Some((current, depth)) = queue.pop_front() {
+            if current == goal {
+                let mut path = vec![goal];
+                let mut cursor = goal;
+                while let Some(Some(parent)) = parents.get(&cursor) {
+                    path.push(*parent);
+                    cursor = *parent;
+                }
+                path.reverse();
+                return Ok(path);
+            }
+            if depth >= max_steps {
+                continue;
+            }
+            for next in self.neighbors(current) {
+                if parents.contains_key(&next)
+                    || (self.cell_map.contains_key(&next)
+                        && !(next == goal && allow_occupied_goal)
+                        && !(next == start && allow_occupied_start))
+                {
+                    continue;
+                }
+                parents.insert(next, Some(current));
+                queue.push_back((next, depth + 1));
+            }
+        }
+        Err(LatticeError::RouteUnavailable {
+            src: request.src,
+            dst: request.dst,
+            max_relay_hops: request.max_relay_hops,
+        })
+    }
+
+    fn neighbors(&self, coord: Coord) -> Vec<Coord> {
+        let mut neighbors = Vec::with_capacity(8);
+        for dr in -1i32..=1 {
+            for dc in -1i32..=1 {
+                if dr == 0 && dc == 0 {
+                    continue;
+                }
+                if self.topology == WiringTopology::LocalVonNeumann && dr != 0 && dc != 0 {
+                    continue;
+                }
+                let row = i32::from(coord.row) + dr;
+                let col = i32::from(coord.col) + dc;
+                if row >= 0
+                    && col >= 0
+                    && row < i32::from(self.shape.rows)
+                    && col < i32::from(self.shape.cols)
+                {
+                    neighbors.push(Coord {
+                        row: u16::try_from(row).expect("row is in bounds"),
+                        col: u16::try_from(col).expect("column is in bounds"),
+                    });
+                }
+            }
+        }
+        neighbors.sort_unstable();
+        neighbors
     }
 
     fn step_distance(&self, src: SignalSource, dst: SignalSink) -> Result<u16, LatticeError> {
@@ -531,5 +903,176 @@ mod tests {
             trace.push(out[0]);
         }
         assert_eq!(trace, vec![0, 0, 0, 0, 3, 2]);
+    }
+
+    #[test]
+    fn route_connect_uses_deterministic_local_paths_for_both_topologies() {
+        let shape = GridShape::new(2, 2).unwrap();
+        let input = BoundaryAnchor {
+            side: PerimeterSide::West,
+            offset: 0,
+        };
+        let output = BoundaryAnchor {
+            side: PerimeterSide::East,
+            offset: 1,
+        };
+        for (topology, expected_relays) in [
+            (WiringTopology::LocalVonNeumann, 3),
+            (WiringTopology::LocalMoore, 2),
+        ] {
+            let mut lattice = LatticeCircuit::new(
+                shape,
+                Width::BITS_1,
+                WireDelayMode::Combinational,
+                topology,
+                vec![input],
+                vec![output],
+            )
+            .unwrap();
+            let src = SignalSource::BoundaryIn(0);
+            let dst = SignalSink::BoundaryOut(0);
+            let original = lattice.clone();
+            let relays = lattice.route_connect(src, dst, 4).unwrap();
+            let mut repeated = original;
+            let repeated_relays = repeated.route_connect(src, dst, 4).unwrap();
+
+            assert_eq!(relays.len(), expected_relays);
+            assert_eq!(relays, repeated_relays);
+            for &(edge_src, edge_dst) in lattice.edges() {
+                assert_eq!(lattice.step_distance(edge_src, edge_dst).unwrap(), 1);
+            }
+            assert!(lattice.lower().is_ok());
+        }
+    }
+
+    #[test]
+    fn route_connect_respects_relay_limit_and_leaves_lattice_unchanged() {
+        let mut lattice = LatticeCircuit::new(
+            GridShape::new(3, 3).unwrap(),
+            Width::BITS_1,
+            WireDelayMode::Combinational,
+            WiringTopology::LocalVonNeumann,
+            vec![BoundaryAnchor {
+                side: PerimeterSide::West,
+                offset: 0,
+            }],
+            vec![BoundaryAnchor {
+                side: PerimeterSide::East,
+                offset: 0,
+            }],
+        )
+        .unwrap();
+        let before = lattice.clone();
+
+        assert!(matches!(
+            lattice.route_connect(SignalSource::BoundaryIn(0), SignalSink::BoundaryOut(0), 0),
+            Err(LatticeError::RouteUnavailable {
+                src: SignalSource::BoundaryIn(0),
+                dst: SignalSink::BoundaryOut(0),
+                max_relay_hops: 0,
+            })
+        ));
+        assert_eq!(lattice, before);
+    }
+
+    #[test]
+    fn route_connect_reports_blocked_boundary_cells_without_partial_mutation() {
+        let mut lattice = LatticeCircuit::new(
+            GridShape::new(1, 1).unwrap(),
+            Width::BITS_1,
+            WireDelayMode::Combinational,
+            WiringTopology::LocalVonNeumann,
+            vec![BoundaryAnchor {
+                side: PerimeterSide::West,
+                offset: 0,
+            }],
+            vec![BoundaryAnchor {
+                side: PerimeterSide::East,
+                offset: 0,
+            }],
+        )
+        .unwrap();
+        let blocker = lattice
+            .place_node(Coord { row: 0, col: 0 }, Primitive::Eqz)
+            .unwrap();
+        let before = lattice.clone();
+
+        assert!(matches!(
+            lattice.route_connect(SignalSource::BoundaryIn(0), SignalSink::BoundaryOut(0), 4),
+            Err(LatticeError::RouteUnavailable {
+                src: SignalSource::BoundaryIn(0),
+                dst: SignalSink::BoundaryOut(0),
+                ..
+            })
+        ));
+        assert_eq!(lattice, before);
+        assert_eq!(lattice.cell_node(Coord { row: 0, col: 0 }), Some(blocker));
+    }
+
+    #[test]
+    fn route_connect_routes_around_occupied_cells_and_preserves_wire_hop_latency() {
+        let mut lattice = LatticeCircuit::new(
+            GridShape::new(3, 3).unwrap(),
+            Width::BITS_1,
+            WireDelayMode::TicksPerHop,
+            WiringTopology::LocalVonNeumann,
+            vec![
+                BoundaryAnchor {
+                    side: PerimeterSide::West,
+                    offset: 1,
+                },
+                BoundaryAnchor {
+                    side: PerimeterSide::North,
+                    offset: 1,
+                },
+            ],
+            vec![],
+        )
+        .unwrap();
+        let source = lattice
+            .place_node(Coord { row: 1, col: 0 }, Primitive::Split)
+            .unwrap();
+        let blocker = lattice
+            .place_node(Coord { row: 1, col: 1 }, Primitive::Eqz)
+            .unwrap();
+        let target = lattice
+            .place_node(Coord { row: 1, col: 2 }, Primitive::Eqz)
+            .unwrap();
+        lattice
+            .connect(
+                SignalSource::BoundaryIn(0),
+                SignalSink::NodeIn {
+                    node: source,
+                    port: 0,
+                },
+            )
+            .unwrap();
+        lattice
+            .connect(
+                SignalSource::BoundaryIn(1),
+                SignalSink::NodeIn {
+                    node: blocker,
+                    port: 0,
+                },
+            )
+            .unwrap();
+        let relays = lattice
+            .route_connect(
+                SignalSource::NodeOut {
+                    node: source,
+                    port: 0,
+                },
+                SignalSink::NodeIn {
+                    node: target,
+                    port: 0,
+                },
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(relays.len(), 3);
+        assert!(!relays.contains(&blocker));
+        let compiled = lattice.lower().unwrap().compile().unwrap();
+        assert_eq!(compiled.total_registers(), 7);
     }
 }

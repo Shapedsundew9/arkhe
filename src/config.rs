@@ -40,6 +40,8 @@ pub struct BuildProvenance {
     pub git_dirty: Option<bool>,
     /// 128-bit FNV-1a digest of `Cargo.lock` (`"unavailable"` if absent).
     pub cargo_lock_fnv1a128: String,
+    /// 128-bit FNV-1a digest of the canonical build inputs and Rust source tree.
+    pub source_tree_fnv1a128: String,
 }
 
 impl BuildProvenance {
@@ -60,6 +62,7 @@ impl BuildProvenance {
             git_commit_sha,
             git_dirty,
             cargo_lock_fnv1a128: env!("ARKHE_CARGO_LOCK_FNV1A128").to_owned(),
+            source_tree_fnv1a128: env!("ARKHE_SOURCE_TREE_FNV1A128").to_owned(),
         }
     }
 }

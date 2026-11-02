@@ -7,8 +7,8 @@ pub mod scorecard;
 
 pub use dynamics::{BasinReport, CycleReport, detect_autonomous_cycle, estimate_attractor_basin};
 pub use mdl::{
-    MdlBreakdown, circuit_code_bits, compute_mdl, elias_gamma_bits, facts_code_bits,
-    kt_binary_sequence_bits,
+    MdlBreakdown, NullCalibratedMdlError, circuit_code_bits, compute_mdl, elias_gamma_bits,
+    facts_code_bits, kt_binary_sequence_bits, null_calibrated_mdl_delta,
 };
 pub use null_model::{NullModel, NullModelKind};
 pub use scorecard::{BudgetAccountingMode, Scorecard};
