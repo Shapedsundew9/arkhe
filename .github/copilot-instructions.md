@@ -3,13 +3,27 @@
 Read `.shared/ai/core/service-instructions.md`.
 Read `.shared/ai/core/common-instructions.md`.
 
+## Freedoms
+
+- Backwards compatibility is **NOT** necessary.
+- Breaking changes are allowed.
+- The project prioritizes flexibility, performance and innovation over compatibility.
+- No implementation or dependency is sacred; everything can be changed if necessary.
+- Nothing depends on the contents of this repo being stable or fixed.
+- If something needs cleaning up or refactoring to reduce future effort, do it.
+
+## Requirements
+
+- If something needs to be done more than once, it shall be mechanically automated if viable.
+- If a persistent inefficiency in the development process is identified, it shall be addressed systematically rather than repeatedly worked around.
+
 ## Repository Layout
 
 - This is a pure Rust package repository.
 - The crate/package project is configured by the repository-root `Cargo.toml`.
 - Reusable package code belongs in `src/lib.rs` (and submodules under `src/`).
 - Executable entry points belong in `src/main.rs` (or `src/bin/`).
-- Integration tests belong in `tests/` and should import the package as `rust_base`.
+- Integration tests belong in `tests/` and should import the package as `arkhe`.
 - Put one-off developer utilities or scripts in `scripts/`.
 - Keep build artifacts such as `target/` out of commits unless the repository explicitly tracks them.
 - Be explicitly aware that GEMINI.md is a symbolic link to .github/copilot-instructions.md
@@ -19,8 +33,8 @@ Read `.shared/ai/core/common-instructions.md`.
 - Use the official Cargo toolchain (stable Rust) managed via `rustup`.
 - Build and verify the project from the repository root with `cargo check` and `cargo build`.
 - Declare runtime and development dependencies in `Cargo.toml`; do not add ad hoc dependency files.
-- Keep the supported Rust edition (`2024`), version (`rust-version`), and package metadata in `Cargo.toml` accurate.
-- Follow existing code style and public APIs (`cargo fmt`, `cargo clippy`). Avoid unrelated refactors.
+- Keep the supported Rust edition, version (`rust-version`), and package metadata in `Cargo.toml` accurate.
+- Follow standard code style and public APIs (`cargo fmt`, `cargo clippy`).
 - Never hard-code, print, or commit credentials, API keys, tokens, or other secrets.
 
 ## Validation
@@ -32,7 +46,7 @@ Read `.shared/ai/core/common-instructions.md`.
   `cargo package`.
 - Inspect the generated package archive in `target/package/` when packaging changes affect included files or binaries.
 - Run focused checks for the files and behavior changed before running broader validation.
-- Keep intentional Markdown exceptions narrow and document them with targeted configuration or inline suppression.
+- Keep intentional Markdown exceptions narrow.
 
 ## Dependencies
 

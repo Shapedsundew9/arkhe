@@ -1,17 +1,17 @@
-# Rust Template
+# Arkhe
 
-A lightweight Rust project template for building small CLI-based applications and package-friendly code.
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, and compute-matched baseline harness implementing **Milestone 0 (`M0 — Simulator and yardstick`)** of the [Foundational Research Charter v2](doc/foundational_research_charter_v2.md) (see [doc/milestone_0_plan.md](doc/milestone_0_plan.md) and [doc/milestone_0_lessons_learned.md](doc/milestone_0_lessons_learned.md)).
 
 ## Overview
 
-This repository provides a minimal starting point with:
+Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k}$ ($1 \le k \le 64$) with:
 
-- a Rust package layout under `src/`
-- a simple CLI entry point in `src/main.rs`
-- reusable crate library code in `src/lib.rs`
-- project configuration and dependencies in `Cargo.toml`
-- toolchain specifications in `rust-toolchain.toml`
-- a docs folder for project notes and style guidance
+- **`substrate`**: Exact $\mathbb{Z}_{2^k}$ ring arithmetic, Level-0 primitives (`ADD`, `SUB`, `MUL`, `EQZ`, `SPLIT`, `DELAY`), Charter §2.5 structural invariant checks, scalar evaluator (`ScalarState`), and 64-lane bit-parallel evaluator (`BitParallel64State` at $k = 1$).
+- **`structural`**: 2D spatial lattice placement (`GridShape`, `Coord`, `BoundaryAnchor`), local vs. well-mixed wiring topology checks (`WiringTopology`), and hop-delay lowering (`LatticeCircuit`).
+- **`env`**: Finite-state benchmark generators (`T1`, `T3b`, `T3c`), declared channel substitution noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
+- **`metrics`**: Surprisal null models, Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
+- **`baselines`**: Compute-matched prequential baseline harness (`RandomSearch`, `(1+λ) CGP`, `CTW`, `ReedsSloane`, and certified small-circuit `Exhaustive` synthesis) over phase-exact sliding observation windows.
+- **`rng`, `config`, & `verify`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, and the pre-registered Gates G1–G4 verification battery.
 
 ## Project Structure
 
@@ -19,65 +19,87 @@ This repository provides a minimal starting point with:
 .
 ├── .devcontainer/
 ├── .github/
-├── docs/
+├── doc/
+│   ├── foundational_research_charter_v2.md
+│   ├── milestone_0_closeout_plan.md
+│   ├── milestone_0_lessons_learned.md
+│   ├── milestone_0_plan.md
+│   └── milestone_0_review.md
+├── scripts/
+│   └── build.rs
 ├── src/
+│   ├── baselines/
+│   ├── env/
+│   ├── metrics/
+│   ├── structural/
+│   ├── substrate/
+│   ├── config.rs
 │   ├── lib.rs
-│   └── main.rs
+│   ├── main.rs
+│   ├── rng.rs
+│   └── verify.rs
 ├── tests/
-│   └── cli.rs
+│   ├── cli.rs
+│   ├── determinism.rs
+│   ├── m0_acceptance.rs
+│   └── post-create.sh
 ├── Cargo.toml
 ├── GEMINI.md
 ├── LICENSE
-├── .gitignore
-├── .markdownlint-cli2.jsonc
 ├── README.md
 └── rust-toolchain.toml
 ```
 
 ## Getting Started
 
-1. Ensure the Rust toolchain (via [rustup](https://rustup.rs/)) is installed and up to date.
-2. Build the project:
+1. Ensure the stable Rust toolchain (`1.99.1+`, edition `2024`) is installed via [rustup](https://rustup.rs/).
+2. Build the workspace in release mode:
 
 ```bash
-cargo build
+cargo build --locked --release
 ```
 
-1. Run the CLI:
+1. Run the Milestone 0 pre-registered acceptance suite (Gates G1–G4 across $k = 1$ and $k = 2$ on development or holdout seed banks):
 
 ```bash
-cargo run
+cargo run --locked --release -- verify-m0 --seed-offset 0 --seeds 20
+cargo run --locked --release -- verify-m0 --seed-offset 10000 --seeds 20
 ```
 
-This currently prints:
+1. Inspect analytical $\varepsilon$-machine and Reeds–Sloane ground-truth yardsticks for a generator:
 
-```text
-Hello World!
+```bash
+cargo run --release -- yardstick --generator '{"kind":"T1_Alternating","a":0,"b":3}' --width 2 --epsilon 0.05
 ```
 
-Alternatively, install the binary locally to invoke it directly:
+1. Execute a reproducible experiment from a TOML configuration file:
+
+```bash
+cargo run --release -- run --config path/to/experiment.toml --output path/to/report.json
+```
+
+Alternatively, install the binary locally to invoke `arkhe` directly:
 
 ```bash
 cargo install --path .
-protoproject
+arkhe --help
+```
+
+## Library Example
+
+```rust
+use arkhe::run;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run()
+}
 ```
 
 ## Development
 
-You can extend the template by adding modules under `src/` and updating dependencies in `Cargo.toml`.
-
 ### Dev Container
 
-The container image installs the Rust toolchain and components specified in
-`rust-toolchain.toml` during the Docker build, without self-updating rustup.
-Post-create setup checks the project but does not update Rust. This keeps
-toolchain downloads out of startup, where editor tooling could otherwise run
-rustup concurrently and interfere with temporary download files.
-
-After changing `rust-toolchain.toml`, rebuild the container to install the new
-configuration. To refresh Rust and the image-provided rustup, use **Dev Containers:
-Rebuild Container Without Cache** so the toolchain installation runs again with
-a refreshed base image.
+The container image installs the Rust toolchain and components specified in `rust-toolchain.toml` during the Docker build, without self-updating rustup. Post-create setup checks the project (`cargo check`) without downloading toolchain updates.
 
 If post-create setup previously failed, rerun it from the repository root:
 
@@ -85,32 +107,20 @@ If post-create setup previously failed, rerun it from the repository root:
 bash .devcontainer/post-create.sh
 ```
 
-To set your git identity in new containers, export `GIT_USER_NAME` and
-`GIT_USER_EMAIL` on the host where VS Code starts. Post-create setup copies each
-value into the container's global git config only when that setting is missing.
+To set your git identity in new containers, export `GIT_USER_NAME` and `GIT_USER_EMAIL` on the host where VS Code starts. Post-create setup copies each value into the container's global git config only when that setting is missing.
 
-### Example
+## Testing, Linting, and Packaging
 
-```rust
-use rust_base::run;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run()
-}
-```
-
-## Testing and Verification
-
-Run tests:
+Run unit and integration tests:
 
 ```bash
 cargo test
 ```
 
-Run the linter:
+Run Clippy across all targets and features with warnings denied:
 
 ```bash
-cargo clippy
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Check code formatting:
@@ -119,28 +129,18 @@ Check code formatting:
 cargo fmt --check
 ```
 
-Check the container setup script with isolated mock commands (no downloads):
+Check the container setup script with isolated mock commands:
 
 ```bash
 bash tests/post-create.sh
 ```
 
-## Scripts and Tools
-
-The project is configured with a binary entry point:
-
-- `protoproject` -> `src/main.rs`
-
-This makes it easy to run the CLI directly via Cargo:
+Verify crate packaging metadata and archive contents:
 
 ```bash
-cargo run --bin protoproject
+cargo package --allow-dirty
 ```
 
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
-## Notes
-
-This is intentionally a simple starter repository. It is designed to be easy to customize for your own Rust tools, scripts, or command-line apps.

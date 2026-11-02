@@ -575,20 +575,39 @@ Each phase is scoped as a self-contained, reviewable increment passing `cargo te
 
 ---
 
-## 13. Validation Checklist
+## 13. Prospective Gate Amendment Record (`G3` $\to$ `G3-rev1`)
+
+> **Amendment Metadata:** Pre-registered during Milestone 0 closeout ([milestone_0_review.md](milestone_0_review.md), [milestone_0_closeout_plan.md](milestone_0_closeout_plan.md)) prior to executing reserved holdout seeds (`--seed-offset 10000 --seeds 20`). Original Section 10 is preserved verbatim above for auditability.
+
+Implementing and auditing Milestone 0 uncovered four places where the shorthand phrasing of Gate **G3** in Section 10 conflated distinct mathematical quantities:
+
+1. **Causal-State Lower Bound vs. Node-Minimal vs. State-Minimal Circuits:** Under causal prequential evaluation, `BoundaryIn` supplies $k$ bits of lag-1 observation memory ($y_{t-1}$). Total accessible state is therefore `effective_state_registers = delay_count + wire_hop_register_count + boundary_lag_register_count`, which universally satisfies $\text{effective\_state\_registers} \cdot k \ge C_\mu$ (`effective_excess_state_bits_over_c_mu >= 0.0`) on every valid noiseless predictor. Moreover, node minimality and state minimality diverge at $k = 2$: on `T1_PeriodicMotif([0, 1, 3])` over $\mathbb{Z}_4$ ($C_\mu = \log_2 3 \approx 1.585\text{ bits}$, $\lceil C_\mu / 2 \rceil = 1$ register), any 1-register transition $0 \mapsto 1 \mapsto 3 \mapsto 0$ violates parity preservation modulo $2$ and requires nonlinear `Eqz` + `Split` synthesis (`build_z4_motif_013_reactive_one_reg_witness`: `11` nodes, `0` `Delay` + `1` `BoundaryIn` = `1` effective register), whereas the node-minimal circuit is the **2-node** shift chain `BoundaryIn -> Delay -> Delay -> BoundaryOut` (`2` nodes, `3` effective registers). Gate **G2** certifies both witnesses; **G3-rev1** enforces `excess_nodes_over_exact_synthesis == Some(0)` and `effective_excess_state_bits_over_c_mu >= 0.0` across all tasks (plus `== 0.0` tightness on $k = 1$ `T1_Alternating` and `T1_AffineLag1`).
+2. **Sequential Log-Loss vs. Point-Prediction KT Residual:** Distributional predictors (`CTW`) emit normalized symbol probabilities scored by sequential log-loss (`native_prob_log_loss_bits_per_symbol`), whereas deterministic substrate circuits emit point predictions scored by uniform Krichevsky–Trofimov error-indicator coding (`prequential_kt_residual_bits_per_symbol`), which carries $O(\frac{\log T}{T})$ universal coding redundancy even at `0` post-transient errors. `Scorecard` separates both metrics instead of overloading one field.
+3. **Finite-Sample Channel Variance vs. Paired Noise-Oracle Regret:** At $k = 2, \varepsilon = 0.05$ over $T = 4{,}000$ ticks, the realized clean-phase Bayes oracle loss fluctuates around population $h_\mu$ with standard deviation $\sigma \approx 0.0201\text{ bits/symbol}$ solely from binomial noise draws. `Scorecard` retains population `excess_*_over_h_mu` and adds `paired_*_regret_bits_per_symbol` against the exact clean-phase Bayes oracle evaluated on the identical realized noise trajectory.
+4. **Enforced Noisy Baselines vs. Multi-Register Search Characterization:**
+   - **Noiseless ($\varepsilon = 0$, all 4 `T1` generators at $k \in \lbrace 1, 2 \rbrace$):** `Exhaustive` and `CTW` achieve `0` post-transient mismatches on `100%` of cases; `Exhaustive` matches `CertifiedExact` minimum node count; `(1+lambda) CGP` achieves `0` post-transient mismatches on $\ge 19/20$ seeds per task.
+   - **Noisy ($\varepsilon = 0.05$, all 4 `T1` generators at $k \in \lbrace 1, 2 \rbrace$):** Universal probabilistic `CTW` (`context_depth = 9`, $T = 20{,}000$ post-warmup ticks) achieves `paired_prob_regret_bits_per_symbol <= 0.030` on $\ge 19/20$ seeds, mean paired regret $\le 0.028\text{ bits/symbol}$, and population `mean_excess_over_h_mu <= 0.030` across **all 4 `T1` generators**. Discrete `(1+lambda) CGP` achieves `paired_residual_regret_bits_per_symbol <= 0.020` on $\ge 18/20$ seeds (and `mean_excess_over_h_mu <= 0.020`) on `T1_Constant` and `T1_Alternating` at $k \in \lbrace 1, 2 \rbrace$, while its per-seed outcomes on multi-register noisy `T1_PeriodicMotif` and `T1_AffineLag1` are reported transparently in `case_reports` (`gate_enforced: false`) as baseline reference data for Milestones `M1b`–`M2`.
+
+---
+
+## 14. Validation Checklist
 
 Every M0 PR and final milestone sign-off must pass:
 
 ```bash
 # 1. Format, lint, unit & integration tests
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
 
-# 2. Pre-registered M0 benchmark & reproducibility gate
-cargo run --release -- verify-m0 --seeds 20
+# 2. Pre-registered M0 benchmark & reproducibility gate (development + holdout seeds)
+cargo run --locked --release -- verify-m0 --seed-offset 0 --seeds 20
+cargo run --locked --release -- verify-m0 --seed-offset 10000 --seeds 20
 
-# 3. Markdown lint check on documentation
+# 3. Package verification
+cargo package --allow-dirty
+
+# 4. Markdown lint check on documentation
 files=$( { git diff HEAD --name-only --diff-filter=AM -- '*.md'; git ls-files -o --exclude-standard -- '*.md'; } | sort -u )
 [ -n "$files" ] && printf '%s\n' "$files" | xargs -d '\n' npx markdownlint-cli2 --fix
 npx markdownlint-cli2 "doc/**/*.md" README.md

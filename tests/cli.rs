@@ -1,4 +1,4 @@
 #[test]
 fn test_greeting() {
-    assert_eq!(rust_base::greeting(), "Hello World!");
+    assert_eq!(arkhe::greeting(), "arkhe m0");
 }
