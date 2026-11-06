@@ -1,5 +1,7 @@
 //! Pre-growth Milestone 1a metabolic-economy gates.
 
+pub mod panel;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::BuildProvenance;
@@ -77,12 +79,12 @@ fn gate_report(gate: &str, cases: u64, failures: Vec<String>) -> M1aGateReport {
 fn verify_g1a1() -> M1aGateReport {
     let mut failures = Vec::new();
     let substrate_sources = [
-        include_str!("substrate/circuit.rs"),
-        include_str!("substrate/eval.rs"),
-        include_str!("substrate/invariants.rs"),
-        include_str!("substrate/mod.rs"),
-        include_str!("substrate/primitive.rs"),
-        include_str!("substrate/value.rs"),
+        include_str!("../substrate/circuit.rs"),
+        include_str!("../substrate/eval.rs"),
+        include_str!("../substrate/invariants.rs"),
+        include_str!("../substrate/mod.rs"),
+        include_str!("../substrate/primitive.rs"),
+        include_str!("../substrate/value.rs"),
     ];
     if substrate_sources
         .iter()
