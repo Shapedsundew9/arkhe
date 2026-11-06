@@ -4,6 +4,7 @@ pub mod economy;
 pub mod growth;
 pub mod lattice;
 pub mod learner;
+pub mod live;
 pub mod sensitivity;
 pub mod surgery;
 
@@ -18,6 +19,7 @@ pub use lattice::{
     BoundaryAnchor, Coord, GridShape, LatticeCircuit, LatticeError, PerimeterSide, WiringTopology,
 };
 pub use learner::ArkheLearner;
+pub use live::{LiveCircuit, LiveError, LiveTick, node_output_values, well_mixed_wire_steps};
 pub use sensitivity::{
     CausalAncestry, NodeActivity, SensitivityError, SensitivitySnapshot, assemble_causal_ancestry,
     counterfactual_sensitivity, ring_identity_input_weights, source_node_for_wire,
