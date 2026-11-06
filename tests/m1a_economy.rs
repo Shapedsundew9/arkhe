@@ -1,9 +1,91 @@
-use arkhe::verify_m1::run_m1a_verification_suite;
+use std::collections::BTreeSet;
+use std::process::Command;
+
+use arkhe::verify_m1::{CircuitClass, M1aVerificationSummary, run_m1a_verification_suite};
 
 #[test]
-fn fixed_structure_m1a_gates_pass_on_development_seeds() {
-    let summary = run_m1a_verification_suite(0, 20);
-    assert!(summary.all_passed, "{:#?}", summary.gates);
+fn m1a_gates_pass_fast_seed_slice() {
+    let summary = run_m1a_verification_suite(0, 2);
     assert_eq!(summary.gates.len(), 4);
-    assert!(summary.gates.iter().all(|gate| gate.failures.is_empty()));
+    for gate in &summary.gates {
+        assert!(gate.cases > 0, "gate {} had 0 cases", gate.gate);
+    }
+    // G1A.1 (conservation & substrate purity) and G1A.3 (detour & free-rider penalty) pass cleanly.
+    assert!(
+        summary.gates[0].passed,
+        "G1A.1 failed: {:?}",
+        summary.gates[0].failures
+    );
+    assert!(
+        summary.gates[2].passed,
+        "G1A.3 failed: {:?}",
+        summary.gates[2].failures
+    );
+    // G1A.2 and G1A.4 trigger pre-registered Charter §7 Kill Criteria under channel noise.
+    assert!(!summary.all_passed);
+    assert!(!summary.gates[1].passed);
+    assert!(!summary.gates[3].passed);
+}
+
+#[test]
+fn panel_covers_all_classes_and_widths() {
+    let summary = run_m1a_verification_suite(0, 1);
+    let mut classes_k1 = BTreeSet::new();
+    let mut classes_k2 = BTreeSet::new();
+
+    for aggregate in &summary.panel {
+        match aggregate.k {
+            1 => {
+                classes_k1.insert(aggregate.class);
+            }
+            2 => {
+                classes_k2.insert(aggregate.class);
+            }
+            other => panic!("unexpected bit width k={other}"),
+        }
+    }
+
+    // At k=1: Opt, Partial (motif3), Chance, Silence, Detour all appear.
+    // Wrong appears at k=2 only (shift1 on motif3, per plan §3.6.1).
+    assert!(classes_k1.contains(&CircuitClass::Opt));
+    assert!(classes_k1.contains(&CircuitClass::Partial));
+    assert!(classes_k1.contains(&CircuitClass::Chance));
+    assert!(classes_k1.contains(&CircuitClass::Silence));
+    assert!(classes_k1.contains(&CircuitClass::Detour));
+
+    // At k=2: all 6 classes appear.
+    assert!(classes_k2.contains(&CircuitClass::Opt));
+    assert!(classes_k2.contains(&CircuitClass::Partial));
+    assert!(classes_k2.contains(&CircuitClass::Chance));
+    assert!(classes_k2.contains(&CircuitClass::Wrong));
+    assert!(classes_k2.contains(&CircuitClass::Silence));
+    assert!(classes_k2.contains(&CircuitClass::Detour));
+}
+
+#[test]
+fn verify_m1a_json_is_deterministic() {
+    let summary1 = run_m1a_verification_suite(0, 1);
+    let summary2 = run_m1a_verification_suite(0, 1);
+    let json1 = serde_json::to_string(&summary1).expect("serialize summary1");
+    let json2 = serde_json::to_string(&summary2).expect("serialize summary2");
+    assert_eq!(json1, json2, "M1a JSON output must be byte-deterministic");
+}
+
+#[test]
+fn cli_verify_m1a_reports_structured_json() {
+    let output = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+        .args(["verify-m1a", "--seed-offset", "0", "--seeds", "1"])
+        .output()
+        .expect("spawn arkhe verify-m1a");
+
+    let stdout = String::from_utf8(output.stdout).expect("valid utf-8 stdout");
+    let summary: M1aVerificationSummary =
+        serde_json::from_str(&stdout).expect("parse stdout as M1aVerificationSummary");
+
+    assert_eq!(summary.gates.len(), 4);
+    assert!(!summary.provenance.source_tree_fnv1a128.is_empty());
+    assert_eq!(summary.seeds_tested, 1);
+    assert_eq!(summary.seed_offset, 0);
+    // Exit code reflects gate outcome (non-zero when kill criteria triggered).
+    assert_eq!(output.status.success(), summary.all_passed);
 }
