@@ -2,7 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::env::GeneratorConfig;
+use crate::env::{FiniteStateGenerator, GeneratorConfig, NoiseModel, NoisyEnvironment};
+use crate::metrics::{NullModelKind, null_calibrated_mdl_delta};
+use crate::rng::SeedBank;
+use crate::structural::WiringTopology;
+use crate::structural::economy::EconomyConfig;
+use crate::structural::live::{LiveCircuit, well_mixed_wire_steps};
 use crate::substrate::{
     Circuit, NodeId, Primitive, SignalSink, SignalSource, Width, WireDelayMode,
 };
@@ -63,6 +68,39 @@ pub struct PanelCircuit {
     pub reference: Option<&'static str>,
     /// Expected accuracy on uncorrupted streams.
     pub expected_accuracy: AccuracyCheck,
+}
+
+/// Outcome of one live circuit evaluation across the benchmark horizon.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelRun {
+    /// Benchmark task identifier.
+    pub task: &'static str,
+    /// Bit width.
+    pub k: u8,
+    /// Circuit identifier.
+    pub circuit: &'static str,
+    /// Diagnostic classification.
+    pub class: CircuitClass,
+    /// Substitution noise rate.
+    pub epsilon: f64,
+    /// Random seed.
+    pub seed: u64,
+    /// Total nodes in the circuit.
+    pub node_count: usize,
+    /// Empirical accuracy over post-transient ticks 16..1024 against observed facts.
+    pub accuracy: f64,
+    /// Empirical accuracy over post-transient ticks 16..1024 against clean ground truth.
+    pub clean_accuracy: f64,
+    /// Net energy delta Σ_i (E_i(T) - E_init) over all ticks.
+    pub delta_e: f64,
+    /// Minimum node energy min_i E_i(T) at horizon end.
+    pub min_node_energy: f64,
+    /// Null-calibrated description length change ΔL_null over all ticks.
+    pub delta_l_null: f64,
+    /// Cumulative credit paid to detour nodes after tick 0.
+    pub detour_credit_after_tick0: f64,
+    /// Maximum conservation discrepancy |Σ node_delta - (flux - maint)| across all ticks.
+    pub max_conservation_error: f64,
 }
 
 /// Helper building circuits from canonical Level-0 motifs.
@@ -712,6 +750,173 @@ pub fn panel_circuits(task: &PanelTask) -> Vec<PanelCircuit> {
     circuits
 }
 
+/// Runs one panel circuit through the 1024-tick live economy harness.
+pub fn run_panel_case(
+    task: &PanelTask,
+    pc: &PanelCircuit,
+    epsilon: f64,
+    seed: u64,
+) -> Result<PanelRun, String> {
+    let generator = task
+        .generator
+        .build(task.width)
+        .map_err(|e| format!("failed to build generator for {}: {e}", task.id))?;
+    let channels = usize::from(generator.channels());
+    let noise = if epsilon == 0.0 {
+        NoiseModel::None
+    } else {
+        NoiseModel::IndependentSubstitution {
+            epsilon,
+            channels: vec![0],
+        }
+    };
+    let mut env = NoisyEnvironment::new(generator, noise, SeedBank::new(seed))
+        .map_err(|e| format!("failed to create environment: {e}"))?;
+
+    let wire_steps = well_mixed_wire_steps(&pc.circuit);
+    let config = EconomyConfig {
+        juvenile_ticks: 0,
+        max_energy_reserve: None,
+        ..EconomyConfig::default()
+    };
+    let mut live = LiveCircuit::new(
+        pc.circuit.clone(),
+        &wire_steps,
+        config,
+        SeedBank::new(seed),
+        8,
+    )
+    .map_err(|e| format!("failed to init LiveCircuit: {e}"))?;
+
+    let mut clean = vec![0u64; channels];
+    let mut observed = vec![0u64; channels];
+    let mut prev = vec![0u64; 1];
+
+    let mut predictions = Vec::with_capacity(1024);
+    let mut observed_facts = Vec::with_capacity(1024);
+    let mut clean_facts = Vec::with_capacity(1024);
+
+    let mut matches_observed = 0usize;
+    let mut matches_clean = 0usize;
+    let mut max_conservation_error = 0.0f64;
+    let mut detour_credit_after_tick0 = 0.0f64;
+
+    for t in 0..1024u64 {
+        env.step_frame(&mut clean, &mut observed);
+        let pred = live
+            .predict(&prev)
+            .map_err(|e| format!("predict failed at tick {t}: {e}"))?;
+        let tick = live
+            .settle(&observed)
+            .map_err(|e| format!("settle failed at tick {t}: {e}"))?;
+
+        let p0 = pred[0];
+        let obs0 = observed[0];
+        let cl0 = clean[0];
+
+        predictions.push(p0);
+        observed_facts.push(obs0);
+        clean_facts.push(cl0);
+
+        if t >= 16 {
+            if p0 == obs0 {
+                matches_observed += 1;
+            }
+            if p0 == cl0 {
+                matches_clean += 1;
+            }
+        }
+
+        let sum_delta: f64 = tick.economy.node_delta.iter().sum();
+        let expected_change = tick.economy.net_flux - tick.economy.maintenance;
+        let conservation_error = (sum_delta - expected_change).abs();
+        if conservation_error > max_conservation_error {
+            max_conservation_error = conservation_error;
+        }
+
+        if t >= 1 {
+            for &node in &pc.detour_nodes {
+                detour_credit_after_tick0 += tick.economy.node_credit[node.index()];
+            }
+        }
+
+        prev[0] = obs0;
+    }
+
+    let window_len = (1024 - 16) as f64;
+    let accuracy = (matches_observed as f64) / window_len;
+    let clean_accuracy = (matches_clean as f64) / window_len;
+
+    let delta_e = live
+        .economy()
+        .nodes()
+        .iter()
+        .map(|n| n.energy - config.initial_energy)
+        .sum();
+    let min_node_energy = live
+        .economy()
+        .nodes()
+        .iter()
+        .map(|n| n.energy)
+        .fold(f64::INFINITY, f64::min);
+
+    let delta_l_null = null_calibrated_mdl_delta(
+        &pc.circuit,
+        WiringTopology::WellMixed,
+        None,
+        0.0,
+        0,
+        &observed_facts,
+        &predictions,
+        NullModelKind::LaplaceFrequency,
+    )
+    .map_err(|e| format!("MDL delta failed: {e}"))?;
+
+    Ok(PanelRun {
+        task: task.id,
+        k: task.width.bits(),
+        circuit: pc.id,
+        class: pc.class,
+        epsilon,
+        seed,
+        node_count: pc.circuit.node_count(),
+        accuracy,
+        clean_accuracy,
+        delta_e,
+        min_node_energy,
+        delta_l_null,
+        detour_credit_after_tick0,
+        max_conservation_error,
+    })
+}
+
+/// Runs the panel matrix across tasks × circuits × ε.
+pub fn run_panel_matrix(seed_offset: u32, seeds: u32) -> Vec<PanelRun> {
+    let mut runs = Vec::new();
+    let epsilons = [0.0, 0.05];
+    let seeds_tested = seeds.max(1);
+    for task in &panel_tasks() {
+        for pc in &panel_circuits(task) {
+            for &epsilon in &epsilons {
+                if epsilon == 0.0 {
+                    let seed = u64::from(seed_offset);
+                    let run = run_panel_case(task, pc, epsilon, seed)
+                        .unwrap_or_else(|err| panic!("panel case failed: {err}"));
+                    runs.push(run);
+                } else {
+                    for s in 0..seeds_tested {
+                        let seed = u64::from(seed_offset + s);
+                        let run = run_panel_case(task, pc, epsilon, seed)
+                            .unwrap_or_else(|err| panic!("panel case failed: {err}"));
+                        runs.push(run);
+                    }
+                }
+            }
+        }
+    }
+    runs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +935,41 @@ mod tests {
                     task.width.bits(),
                     pc.circuit.compile().err()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn panel_construction_self_checks_pass_at_epsilon_zero() {
+        for task in panel_tasks() {
+            for pc in panel_circuits(&task) {
+                let run = run_panel_case(&task, &pc, 0.0, 0).unwrap();
+                match pc.expected_accuracy {
+                    AccuracyCheck::Exact(expected) => {
+                        assert!(
+                            (run.accuracy - expected).abs() < 1e-12,
+                            "panel-construction: task {} (k={}) circuit {} accuracy {} != expected {}",
+                            task.id,
+                            task.width.bits(),
+                            pc.id,
+                            run.accuracy,
+                            expected
+                        );
+                    }
+                    AccuracyCheck::Range(min, max) => {
+                        assert!(
+                            run.accuracy >= min && run.accuracy <= max,
+                            "panel-construction: task {} (k={}) circuit {} accuracy {} not in [{}, {}]",
+                            task.id,
+                            task.width.bits(),
+                            pc.id,
+                            run.accuracy,
+                            min,
+                            max
+                        );
+                    }
+                    AccuracyCheck::None => {}
+                }
             }
         }
     }
