@@ -305,6 +305,20 @@ Each detour's **reference** is the `C_opt` it wraps (`Base`). For `serial_not` t
 > [!NOTE]
 > `C_partial` cases are **report-only** for G1A.2: the plan does not pre-register an energy condition for them. They do take part in G1A.4 ranking.
 
+### 3.6.2 M1a Development-Seed Result
+
+The closed-loop metabolic economy was evaluated across the 6-class M1a panel on development seeds (`--seed-offset 0 --seeds 20`), producing `target/verify-m1a-dev.json`.
+
+- **Source tree digest:** `57b6dd875dbc57ec8a0a2751195688c7` (`BuildProvenance.source_tree_fnv1a128`)
+- **Gate case counts and outcomes:**
+  - `G1A.1` (Conservation & Substrate Purity): **Passed** (1,770 cases, 0 failures). Macro-micro energy conservation holds to $< 10^{-12}$ on every mature tick. Zero float leaks in `src/substrate/`. Sampled $k=8$ sensitivity matches exact within $\pm 0.05$.
+  - `G1A.2` (Correct vs. Incorrect Separation): **Kill criterion triggered** (1,060 cases, 30 failures). Noiseless ($\varepsilon = 0.0$) circuits pass 100% of accuracy self-checks and energy separation criteria. Under $\varepsilon = 0.05$ channel substitution noise, feedforward combinational nodes in `addc1` ($k = 1$) and `counter3` ($k = 2$) suffer credit dilution against self-looping `Delay` motifs, with node energies dropping below $E_{\text{init}} = 4.0$.
+  - `G1A.3` (Detour & Free-Rider Penalty): **Passed** (1,201 cases, 0 failures). Zero detour credit after tick 0 on non-empty detour sets across all seeds and tasks; detour circuits strictly lose to reference $\Delta E$.
+  - `G1A.4` ($\Delta E$ tracks $-\Delta L_{\text{null}}$): **Kill criterion triggered** (1,467 cases, 1 failure). Sign check passed cleanly (0 sign inversions across all 1,467 runs). Rank check achieved $\rho \ge 0.90$ across 17 of 18 non-constant $(k, \text{task}, \varepsilon)$ groups; `counter3` at $k = 2, \varepsilon = 0.05$ achieved Spearman $\rho = 0.8929 < 0.90$ due to 1024-tick continuous maintenance accumulation penalizing the 14-node `cancelsub` detour below the 3-node partial predictor `inc1`.
+- **Minimum $C_{\text{opt}}$ $\Delta E$:** `149.60087048049846` bits (all optimal circuits achieved positive net surplus).
+- **Maximum detour credit after tick 0:** `0.0` bits (exact detour insulation).
+- **Minimum Spearman rank correlation:** `0.8929` (on `counter3`, $k = 2, \varepsilon = 0.05$).
+
 ---
 
 ## 4. Stage M1b Specification: First-to-Second Neuron Residual Neurogenesis
