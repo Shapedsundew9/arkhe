@@ -1,6 +1,6 @@
 # Milestone 1 Implementation Plan: Metabolic Economy and Residual Neurogenesis
 
-> **Status:** Proposed implementation plan for Stages **M1a (`Economy on fixed structure`)** and **M1b (`First to second neuron`)** of [foundational_research_charter_v2.md](foundational_research_charter_v2.md), incorporating closeout findings from [milestone_0_review.md](milestone_0_review.md).
+> **Status:** In progress: M1a strengthened panel pre-registered; M1b pending.
 >
 > **Charter scope:** §3.1.1–§3.1.7 (Spatial lattice, metabolic reserves, retrograde sensitivity-gated credit, surprisal-weighted exact-match reward, residual-driven corrector sprouting, starvation pruning, free-rider defences), §3.3 (First and second neuron as boosting over $\mathbb{Z}_{2^k}$ with causal $z^{-1}$), §3.4 (Calibration to total description length $L$), §4.1 (Online wake loop), §6 (Hypotheses **H1** & **H2**), §7 (M1a & M1b success and kill criteria at $k = 1$ and $k = 2$), §8 (Ablations, equal compute, pre-registration, reproducibility), and §9 (Rust layer separation).
 
@@ -81,9 +81,9 @@ tests/
 
 ### 2.3 `SeedBank` Isolation and `BuildProvenance` Hardening
 
-1. **Backwards-compatible `StreamDomain` extension (`src/rng.rs`):** Append two orthogonal domain tags without altering tags `0..=3` (keeping every Milestone 0 golden ChaCha8 vector in `tests/determinism.rs` byte-identical):
-   - `StreamDomain::SensitivityProbe { tick_block: u64 }` (tag `4`): draws counterfactual perturbation values for widths $k > 4$.
-   - `StreamDomain::StructuralGrowth { epoch: u32 }` (tag `5`): breaks ties deterministically during exploratory first-neuron placement or equal-score candidate selection.
+1. **Backwards-compatible `StreamDomain` extension (`src/rng.rs`):** Append two orthogonal domain tags without altering tags `1..=4` (keeping every Milestone 0 golden ChaCha8 vector in `tests/determinism.rs` byte-identical):
+   - `StreamDomain::SensitivityProbe { tick_block: u64 }` (tag `5`): draws counterfactual perturbation values for widths $k > 4$.
+   - `StreamDomain::StructuralGrowth { epoch: u32 }` (tag `6`): breaks ties deterministically during exploratory first-neuron placement or equal-score candidate selection.
 2. **Source-tree fingerprint (`scripts/build.rs`, `src/config.rs`):** Compute a canonical 128-bit FNV-1a digest (`source_tree_fnv1a128: String`) over sorted relative paths and raw bytes of `Cargo.toml`, `Cargo.lock`, `scripts/build.rs`, and every `*.rs` file under `src/`. Emit `cargo:rerun-if-changed` for `src` and `Cargo.toml` so `RunReport` JSON manifests uniquely identify the exact compiled Rust source even when `git_dirty == Some(true)` or inside `.git`-free `cargo package` tarballs.
 
 ---
@@ -223,6 +223,87 @@ Before any growth code runs, Stage M1a evaluates six circuit classes per benchma
    - `Detour_CancelSub`: `Sub(Add(y_opt, Split.0(b)), Split.1(b))` with oscillating `b`
    - `Detour_MulZero`: `Add(y_opt, Mul(b, Delay(0)))`
    - `Detour_SerialDoubleNot`: `Eqz(Eqz(y_opt))` ($k = 1$) and redundant shift-loop detours.
+
+### 3.6.1 Pre-Registered M1a Panel Protocol
+
+#### 1.1 Run protocol (frozen)
+
+| Parameter | Value |
+| :--- | :--- |
+| Horizon per run | `T = 1024` ticks; energy and ΔL are measured over all ticks |
+| Accuracy self-check window | ticks `16..1024` (transient excluded) |
+| Widths | `k ∈ {1, 2}` |
+| Noise | `ε ∈ {0.0, 0.05}` (`IndependentSubstitution` on channel 0) |
+| Seeds | `ε = 0.0`: one run per case (fully deterministic at `k ≤ 4`). `ε = 0.05`: seeds `seed_offset .. seed_offset + seeds` |
+| Economy | `EconomyConfig { juvenile_ticks: 0, max_energy_reserve: None, ..Default::default() }` |
+| Wiring | abstract `Circuit`, `WiringTopology::WellMixed`, `WireDelayMode::Combinational`; one spatial case in G1A.2/G1A.3 (Step 6) |
+| Maintenance | `economy.maintenance_cost(primitive, wire_steps)`; under `WellMixed` each incoming `NodeIn` edge and each `BoundaryOut` edge driven by the node costs 1 step (same rule as [`wire_steps_per_node`](file:///workspaces/arkhe/src/structural/lattice.rs#L371)) |
+| Sensitivity | `SeedBank::new(seed)`, `tick_block = tick`, `sample_count = 8` (unused at `k ≤ 4`) |
+| Ports | every panel circuit has exactly 1 input (possibly unused) and 1 output |
+
+#### 1.2 Motif notation
+
+`x` = `BoundaryIn(0)` = observed `s(t-1)`. `Out` = `BoundaryOut(0)`. All `Delay` nodes are `Primitive::Delay { init }`.
+
+| Motif | Construction | Nodes | Emits |
+| :--- | :--- | :---: | :--- |
+| `ConstLoop(c)` | `D = Delay(c)`, `S = Split`; `D.out → S.in`, `S.out0 → D.in`, `S.out1 →` consumer | 2 | `c` every tick |
+| `Osc2(a, b)` | `D1 = Delay(b)`, `D2 = Delay(a)`, `S = Split`; `D1 → D2 → S.in`, `S.out0 → D1.in`, `S.out1 →` consumer | 3 | `a, b, a, b, …` |
+| `Osc3(a, b, a)` | `D1 = Delay(a)`, `D2 = Delay(b)`, `D3 = Delay(a)`, `S`; `D1 → D2 → D3 → S`, `S.out0 → D1`, `S.out1 →` consumer | 4 | `a, b, a, a, b, a, …` (period 3) |
+| `Loop4(a, b)` | `D1..D4` with inits `(b, a, b, a)`, chain `D1 → D2 → D3 → D4 → S`, `S.out0 → D1`, `S.out1 →` consumer | 5 | `a, b, a, b, …` (bloated period-2) |
+| `Shift(n)` | `x → D(0) → … → D(0) → Out` (`n` delays) | n | `s(t-1-n)` |
+| `AddConst1` | `Add(x, ConstLoop(1)) → Out` | 3 | `s(t-1) + 1` |
+| `Counter3Opt` | see 1.3 | 8 | `(x + 1) + Eqz(x + 2)` |
+
+If the self-check in Step 5.3 shows a phase is off by one, fix the `Delay` inits. Do not touch the economy.
+
+#### 1.3 `Counter3Opt` wiring (`k = 2`, exact for `CounterModN(3)`)
+
+`Dc = Delay(1)`, `Sc = Split`, `Sc2 = Split`, `A1 = Add`, `Sy = Split`, `A2 = Add`, `E = Eqz`, `AF = Add`.
+
+`Dc → Sc.in`; `Sc.out0 → Dc.in`; `Sc.out1 → Sc2.in`; `x → A1.0`; `Sc2.out0 → A1.1`; `A1 → Sy.in`; `Sy.out0 → AF.0`; `Sy.out1 → A2.0`; `Sc2.out1 → A2.1`; `A2 → E`; `E → AF.1`; `AF → Out`.
+
+#### 1.4 Panel (tasks × classes)
+
+Tasks (`hi = 2^k − 1`):
+
+| Task id | Generator | Widths |
+| :--- | :--- | :--- |
+| `alt` | `T1_Alternating { a: 0, b: hi }` | 1, 2 |
+| `motif3` | `T1_PeriodicMotif { motif: [0,1,1] }` (k=1) / `[0,1,3]` (k=2) | 1, 2 |
+| `sparse6` | `T1_PeriodicMotif { motif: [0,0,0,0,0,1] }` | 1, 2 |
+| `affine` | `T1_AffineLag1 { mul_a: 1, add_b: 1, init: 0 }` | 1, 2 |
+| `counter3` | `T3b_CounterModN { modulus: 3, init: 0 }` | 2 |
+| `const0` | `T1_Constant { value: 0 }` | 1, 2 |
+| `consthi` | `T1_Constant { value: hi }` | 1, 2 |
+
+Circuits per task. `Base` is the **first** listed `C_opt` of that task. `Bosc = Osc2(1, 0)`.
+
+| Class | Circuit id | Tasks | Construction | Self-check at ε=0 |
+| :--- | :--- | :--- | :--- | :--- |
+| `C_opt` | `osc2` | alt | `Osc2(0, hi) → Out` | acc = 1.0 |
+| `C_opt` | `eqz` | alt (k=1) | `Eqz(x) → Out` | acc = 1.0 |
+| `C_opt` | `shift2` | motif3 | `Shift(2)` | acc = 1.0 |
+| `C_opt` | `shift5` | sparse6 | `Shift(5)` | acc = 1.0 |
+| `C_opt` | `addc1` | affine | `AddConst1` | acc = 1.0 |
+| `C_opt` | `counter3` | counter3 | `Counter3Opt` | acc = 1.0 |
+| `C_partial` | `eqz_lag2` | motif3 (k=1) | `x → Delay(0) → Eqz → Out` | 0.66 ≤ acc ≤ 0.67 |
+| `C_partial` | `inc1` | counter3 | `AddConst1` | 0.66 ≤ acc ≤ 0.67 |
+| `C_chance` | `const0`, `const1` | every non-constant task | `ConstLoop(0\|1) → Out` | none (report only) |
+| `C_chance` | `osc3` | alt | `Osc3(0, hi, 0) → Out` | none |
+| `C_wrong` | `osc2_anti` | alt | `Osc2(hi, 0) → Out` | acc = 0.0 |
+| `C_wrong` | `shift1` | motif3 (k=2) | `Shift(1)` | acc = 0.0 |
+| `C_silence` | `const_match` | const0, consthi | `ConstLoop(value) → Out` | acc = 1.0 |
+| `C_detour` | `addzero` | every non-constant task | `Add(Base, ConstLoop(0)) → Out`; detour set = ConstLoop nodes | acc = 1.0 |
+| `C_detour` | `mulzero` | every non-constant task | `Add(Base, Mul(Bosc, ConstLoop(0))) → Out`; detour set = `Mul` + ConstLoop + `Bosc` nodes | acc = 1.0 |
+| `C_detour` | `cancelsub` | every non-constant task | `Sb = Split(Bosc)`; `Sub(Add(Base, Sb.out0), Sb.out1) → Out`; detour set = `Bosc` nodes + `Sb` | acc = 1.0 |
+| `C_detour` | `serial_not` | alt (k=1) | `Eqz(Eqz(Eqz(x))) → Out`; compared against `eqz` | acc = 1.0 |
+| `C_detour` | `loop4` | alt | `Loop4(0, hi) → Out`; compared against `osc2` | acc = 1.0 |
+
+Each detour's **reference** is the `C_opt` it wraps (`Base`). For `serial_not` the reference is `eqz`; for `loop4` it is `osc2`.
+
+> [!NOTE]
+> `C_partial` cases are **report-only** for G1A.2: the plan does not pre-register an energy condition for them. They do take part in G1A.4 ranking.
 
 ---
 
