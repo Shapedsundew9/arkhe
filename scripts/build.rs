@@ -62,11 +62,25 @@ fn main() {
     println!("cargo::rerun-if-changed=scripts/build.rs");
     println!("cargo::rerun-if-changed=Cargo.toml");
     println!("cargo::rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=src/substrate");
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_owned());
     let root = Path::new(&manifest_dir);
     let source_digest = source_tree_fnv1a128(root);
     println!("cargo::rustc-env=ARKHE_SOURCE_TREE_FNV1A128={source_digest}");
+
+    let substrate_dir = root.join("src/substrate");
+    let mut substrate_files = Vec::new();
+    if substrate_dir.is_dir() {
+        collect_rust_sources(root, &substrate_dir, &mut substrate_files);
+        substrate_files.sort();
+    }
+    let float_free = substrate_files.iter().all(|relative| {
+        let content = fs::read_to_string(root.join(relative)).expect("read substrate file");
+        !content.contains("f32") && !content.contains("f64")
+    });
+    let float_free_val = if float_free { "1" } else { "0" };
+    println!("cargo:rustc-env=ARKHE_SUBSTRATE_FLOAT_FREE={float_free_val}");
 
     let lock_path = root.join("Cargo.lock");
     let lock_digest = if lock_path.is_file() {
