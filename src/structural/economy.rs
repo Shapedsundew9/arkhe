@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::{NullModel, NullModelKind};
-use crate::structural::sensitivity::CausalAncestry;
+use crate::structural::sensitivity::{CausalAncestry, NodeActivity};
 use crate::substrate::{Primitive, Width};
 
 /// Reward rule used to pay exact-match predictions.
@@ -88,8 +88,8 @@ pub struct NodeEconomy {
     pub energy: f64,
     /// Remaining juvenile grace ticks.
     pub juvenile_ticks: u32,
-    /// Whether this node has emitted a non-identity value.
-    pub ever_active: bool,
+    /// Monotonic ring-identity activity history for this node.
+    pub activity: NodeActivity,
 }
 
 /// Error returned by invalid economy configuration or incompatible tick data.
@@ -140,6 +140,8 @@ pub struct EconomyTick {
     pub net_flux: f64,
     /// Total maintenance actually deducted (juveniles are exempt).
     pub maintenance: f64,
+    /// Per-node payout from port rewards before maintenance and clipping.
+    pub node_credit: Vec<f64>,
     /// Per-node net energy change after reserve clipping.
     pub node_delta: Vec<f64>,
     /// Nodes whose mature reserves are now depleted.
@@ -169,7 +171,7 @@ impl EconomyState {
         let node_state = NodeEconomy {
             energy: config.initial_energy,
             juvenile_ticks: config.juvenile_ticks,
-            ever_active: false,
+            activity: NodeActivity::default(),
         };
         Ok(Self {
             config,
@@ -194,26 +196,27 @@ impl EconomyState {
         &self.nodes
     }
 
-    /// Marks nodes that have emitted a value other than their operation's identity.
-    pub fn record_activity(
-        &mut self,
-        primitives: &[Primitive],
-        outputs: &[u64],
-    ) -> Result<(), EconomyError> {
-        if primitives.len() != self.nodes.len() || outputs.len() != primitives.len() {
+    /// Marks nodes that have emitted non-identity values.
+    pub fn record_activity(&mut self, outputs: &[u64]) -> Result<(), EconomyError> {
+        if outputs.len() != self.nodes.len() {
             return Err(EconomyError::DimensionMismatch);
         }
-        for ((node, &primitive), &output) in self.nodes.iter_mut().zip(primitives).zip(outputs) {
-            let identity = if matches!(primitive, Primitive::Mul) {
-                1
-            } else {
-                0
-            };
-            if self.width.normalize(output) != identity {
-                node.ever_active = true;
+        for (node, &output) in self.nodes.iter_mut().zip(outputs) {
+            let norm = self.width.normalize(output);
+            if norm != 0 {
+                node.activity.ever_nonzero = true;
+            }
+            if norm != 1 {
+                node.activity.ever_non_one = true;
             }
         }
         Ok(())
+    }
+
+    /// Monotonic emission activity history across all nodes.
+    #[must_use]
+    pub fn activity(&self) -> Vec<NodeActivity> {
+        self.nodes.iter().map(|node| node.activity).collect()
     }
 
     /// Eligibility ancestry for a synchronous register.
@@ -364,6 +367,7 @@ impl EconomyState {
                 }
             }
         }
+        let node_credit = delta.clone();
 
         let mut maintenance = 0.0;
         for (index, node) in self.nodes.iter().enumerate() {
@@ -403,6 +407,7 @@ impl EconomyState {
         Ok(EconomyTick {
             net_flux: port_rewards.iter().sum(),
             maintenance,
+            node_credit,
             node_delta: delta,
             starved_nodes,
         })
@@ -538,5 +543,39 @@ mod tests {
             remapped.observe_predictions(&[1], &[3]).unwrap(),
             economy.observe_predictions(&[1], &[3]).unwrap()
         );
+    }
+
+    #[test]
+    fn record_activity_tracks_nonzero_and_non_one_and_reports_node_credit() {
+        let config = EconomyConfig {
+            juvenile_ticks: 0,
+            max_energy_reserve: None,
+            ..EconomyConfig::default()
+        };
+        let mut economy = EconomyState::new(config, Width::BITS_2, 3, 1, 0).unwrap();
+        // Initially all false
+        assert_eq!(economy.activity(), vec![NodeActivity::default(); 3]);
+
+        // Emit 0, 1, 2
+        economy.record_activity(&[0, 1, 2]).unwrap();
+        let act = economy.activity();
+        // 0: ever_nonzero = false, ever_non_one = true
+        assert!(!act[0].ever_nonzero);
+        assert!(act[0].ever_non_one);
+        // 1: ever_nonzero = true, ever_non_one = false
+        assert!(act[1].ever_nonzero);
+        assert!(!act[1].ever_non_one);
+        // 2: ever_nonzero = true, ever_non_one = true
+        assert!(act[2].ever_nonzero);
+        assert!(act[2].ever_non_one);
+
+        // Check node_credit before maintenance
+        let tick = economy
+            .apply_tick(&[1.0], &[vec![0.5, 0.3, 0.2]], &[0.1, 0.1, 0.1])
+            .unwrap();
+        assert!((tick.node_credit[0] - 0.5).abs() < 1e-12);
+        assert!((tick.node_credit[1] - 0.3).abs() < 1e-12);
+        assert!((tick.node_credit[2] - 0.2).abs() < 1e-12);
+        assert!((tick.node_delta[0] - 0.4).abs() < 1e-12);
     }
 }

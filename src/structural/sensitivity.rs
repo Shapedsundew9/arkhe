@@ -29,6 +29,15 @@ pub struct CausalAncestry {
     pub next_register_eligibility: Vec<Vec<f64>>,
 }
 
+/// Monotonic per-node emission history used for ring-identity gating.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeActivity {
+    /// Node has emitted a value other than 0 (additive identity).
+    pub ever_nonzero: bool,
+    /// Node has emitted a value other than 1 (multiplicative identity).
+    pub ever_non_one: bool,
+}
+
 /// Failure while evaluating a counterfactual sensitivity snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SensitivityError {
@@ -153,13 +162,13 @@ pub fn assemble_causal_ancestry(
     compiled: &CompiledCircuit,
     state: &ScalarState,
     sensitivity: &SensitivitySnapshot,
-    ever_active: &[bool],
+    activity: &[NodeActivity],
     register_eligibility: &[Vec<f64>],
     trace_discount: f64,
 ) -> Result<CausalAncestry, SensitivityError> {
     let node_count = circuit.node_count();
     let register_count = compiled.total_registers();
-    if ever_active.len() != node_count
+    if activity.len() != node_count
         || register_eligibility.len() != register_count
         || register_eligibility
             .iter()
@@ -209,7 +218,7 @@ pub fn assemble_causal_ancestry(
             compiled,
             state,
             sensitivity,
-            ever_active,
+            activity,
             register_eligibility,
             trace_discount,
             &node_out_base,
@@ -246,7 +255,7 @@ pub fn assemble_causal_ancestry(
             compiled,
             state,
             sensitivity,
-            ever_active,
+            activity,
             register_eligibility,
             trace_discount,
             &node_out_base,
@@ -274,7 +283,7 @@ fn ancestry_for_target(
     compiled: &CompiledCircuit,
     state: &ScalarState,
     sensitivity: &SensitivitySnapshot,
-    ever_active: &[bool],
+    activity: &[NodeActivity],
     register_eligibility: &[Vec<f64>],
     trace_discount: f64,
     node_out_base: &[usize],
@@ -333,11 +342,18 @@ fn ancestry_for_target(
             .iter()
             .map(|&wire| state.wire_values()[wire])
             .collect();
+        let is_mul_consumer = matches!(circuit.nodes()[node], Primitive::Mul);
         let input_active: Vec<bool> = input_wires
             .iter()
             .map(|&wire| {
-                source_node_for_wire(circuit, wire)
-                    .is_some_and(|source| ever_active[source.index()])
+                source_node_for_wire(circuit, wire).is_some_and(|source| {
+                    let act = activity[source.index()];
+                    if is_mul_consumer {
+                        act.ever_non_one
+                    } else {
+                        act.ever_nonzero
+                    }
+                })
             })
             .collect();
         let weights = ring_identity_input_weights(
@@ -652,7 +668,7 @@ mod tests {
         let compiled = circuit.compile().unwrap();
         let mut state = ScalarState::new(&compiled);
         let mut eligibility = vec![vec![0.0; delays.len()]; compiled.total_registers()];
-        let active = vec![false; delays.len()];
+        let active = vec![NodeActivity::default(); delays.len()];
         let mut output_shares = Vec::new();
         for _ in 0..8 {
             state.step(&compiled, &[1], &mut [0]).unwrap();
@@ -678,5 +694,176 @@ mod tests {
         for (share, expected) in output_shares.iter().zip(expected) {
             assert!((share / total - expected / normalizer).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn mul_zero_detour_receives_no_additive_credit() {
+        let mut circuit = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        // ConstLoop(1) for b: db -> sb -> (db, mul.in0)
+        let db = circuit.add_node(Primitive::Delay { init: 1 });
+        let sb = circuit.add_node(Primitive::Split);
+        // ConstLoop(0) for z: dz -> sz -> (dz, mul.in1)
+        let dz = circuit.add_node(Primitive::Delay { init: 0 });
+        let sz = circuit.add_node(Primitive::Split);
+        let mul = circuit.add_node(Primitive::Mul);
+        let add = circuit.add_node(Primitive::Add);
+
+        // Wire b loop
+        circuit.connect(
+            SignalSource::NodeOut { node: db, port: 0 },
+            crate::substrate::SignalSink::NodeIn { node: sb, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: sb, port: 0 },
+            crate::substrate::SignalSink::NodeIn { node: db, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: sb, port: 1 },
+            crate::substrate::SignalSink::NodeIn { node: mul, port: 0 },
+        );
+
+        // Wire z loop
+        circuit.connect(
+            SignalSource::NodeOut { node: dz, port: 0 },
+            crate::substrate::SignalSink::NodeIn { node: sz, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: sz, port: 0 },
+            crate::substrate::SignalSink::NodeIn { node: dz, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: sz, port: 1 },
+            crate::substrate::SignalSink::NodeIn { node: mul, port: 1 },
+        );
+
+        // Wire add and output
+        circuit.connect(
+            SignalSource::BoundaryIn(0),
+            crate::substrate::SignalSink::NodeIn { node: add, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: mul, port: 0 },
+            crate::substrate::SignalSink::NodeIn { node: add, port: 1 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: add, port: 0 },
+            crate::substrate::SignalSink::BoundaryOut(0),
+        );
+
+        let compiled = circuit.compile().unwrap();
+        let mut state = ScalarState::new(&compiled);
+        let mut outputs = [0u64];
+        state.step(&compiled, &[0], &mut outputs).unwrap();
+
+        let sensitivity =
+            counterfactual_sensitivity(&circuit, &compiled, &state, SeedBank::new(1), 0, 8)
+                .unwrap();
+        let activity = vec![
+            NodeActivity {
+                ever_nonzero: true,
+                ever_non_one: false,
+            },
+            NodeActivity {
+                ever_nonzero: true,
+                ever_non_one: false,
+            },
+            NodeActivity {
+                ever_nonzero: false,
+                ever_non_one: true,
+            },
+            NodeActivity {
+                ever_nonzero: false,
+                ever_non_one: true,
+            },
+            NodeActivity {
+                ever_nonzero: false,
+                ever_non_one: true,
+            },
+            NodeActivity {
+                ever_nonzero: false,
+                ever_non_one: false,
+            },
+        ];
+        let eligibility = vec![vec![0.0; circuit.node_count()]; compiled.total_registers()];
+        let ancestry = assemble_causal_ancestry(
+            &circuit,
+            &compiled,
+            &state,
+            &sensitivity,
+            &activity,
+            &eligibility,
+            0.9,
+        )
+        .unwrap();
+
+        assert_eq!(ancestry.port_shares[0][mul.index()], 0.0);
+        assert_eq!(ancestry.port_shares[0][dz.index()], 0.0);
+        assert_eq!(ancestry.port_shares[0][sz.index()], 0.0);
+    }
+
+    #[test]
+    fn nonzero_constant_keeps_credit() {
+        let mut circuit = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let d = circuit.add_node(Primitive::Delay { init: 1 });
+        let s = circuit.add_node(Primitive::Split);
+        let add = circuit.add_node(Primitive::Add);
+
+        circuit.connect(
+            SignalSource::NodeOut { node: d, port: 0 },
+            crate::substrate::SignalSink::NodeIn { node: s, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: s, port: 0 },
+            crate::substrate::SignalSink::NodeIn { node: d, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: s, port: 1 },
+            crate::substrate::SignalSink::NodeIn { node: add, port: 1 },
+        );
+        circuit.connect(
+            SignalSource::BoundaryIn(0),
+            crate::substrate::SignalSink::NodeIn { node: add, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: add, port: 0 },
+            crate::substrate::SignalSink::BoundaryOut(0),
+        );
+
+        let compiled = circuit.compile().unwrap();
+        let mut state = ScalarState::new(&compiled);
+        let mut outputs = [0u64];
+        state.step(&compiled, &[0], &mut outputs).unwrap();
+
+        let sensitivity =
+            counterfactual_sensitivity(&circuit, &compiled, &state, SeedBank::new(1), 0, 8)
+                .unwrap();
+        let activity = vec![
+            NodeActivity {
+                ever_nonzero: true,
+                ever_non_one: false,
+            },
+            NodeActivity {
+                ever_nonzero: true,
+                ever_non_one: false,
+            },
+            NodeActivity {
+                ever_nonzero: true,
+                ever_non_one: false,
+            },
+        ];
+        let eligibility = vec![vec![0.0; circuit.node_count()]; compiled.total_registers()];
+        let ancestry = assemble_causal_ancestry(
+            &circuit,
+            &compiled,
+            &state,
+            &sensitivity,
+            &activity,
+            &eligibility,
+            0.9,
+        )
+        .unwrap();
+
+        assert!(ancestry.port_shares[0][d.index()] > 0.0);
+        assert!(ancestry.port_shares[0][s.index()] > 0.0);
     }
 }
