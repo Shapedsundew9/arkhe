@@ -632,3 +632,41 @@ Execute the seven steps below **strictly in order**. Commit after each step only
 | `min_match_gain` ($\Delta_{\min}$) | `4` symbols | Locked in [milestone_1_plan.md](milestone_1_plan.md#L475); discrete noise-floor guard |
 | `max_nodes` | `32` nodes | Locked in [milestone_1_plan.md](milestone_1_plan.md#L476) |
 | `DEFAULT_M1B_HORIZON` | `2000` ticks | Locked in [milestone_1_plan.md](milestone_1_plan.md#L450) (`warmup_ticks = 500`, `max_eval_ticks = 50_000`) |
+
+---
+
+## 9. Milestone 1b Attainment & Verification Record
+
+### 9.1 Single-Shot Holdout Sign-Off Verification
+
+In accordance with Charter §7 and §6 of this plan, holdout verification was performed with locked pre-registered constants on git commit `e29014a5c4e410f90797db079d457740c5c2d4be`:
+
+```bash
+cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdout
+```
+
+- **Execution Date:** 2026-11-07
+- **Git Commit SHA:** `e29014a5c4e410f90797db079d457740c5c2d4be`
+- **Git Dirty:** `false` (locked prior to execution)
+- **Source Tree Digest (`source_tree_fnv1a128`):** `564de6fbdb0b8cbd898b91fc6b4a408a`
+- **Cargo Lock Digest (`cargo_lock_fnv1a128`):** `8d29cd24b1fbdbb743cf5c0b3933b22d`
+- **Rustc Version:** `rustc 1.99.1 (58cf8f9c3 2026-10-13)`
+- **Target Triple:** `x86_64-unknown-linux-gnu`
+- **Seed Range:** `10000..=10019` (20 holdout seeds)
+- **Status:** **ALL GATES PASSED** (`all_passed: true`, `stage_gate_aborted: false`)
+
+### 9.2 Gate-by-Gate Results
+
+#### Stage M1a Pre-Growth Gate Audit (6,245 cases across 20 holdout seeds)
+
+- **`G1A.1` — Conservation & Substrate Purity:** **PASSED** (1,959 / 1,959 cases passed, 0 failures). $\lvert \sum \Delta E_i - (\text{flux} - \text{maint}) \rvert < 10^{-12}$, zero float arithmetic in `substrate`.
+- **`G1A.2` — Correct vs. Incorrect Separation:** **PASSED** (1,069 / 1,069 cases passed, 0 failures). 100% of optimal circuits sustain positive energy; all chance, wrong, and silent circuits starve.
+- **`G1A.3` — Detour & Free-Rider Penalty:** **PASSED** (1,579 / 1,579 cases passed, 0 failures). Zero credit to idle detours; single-fire detour leak credit strictly bounded across horizons.
+- **`G1A.4` — $\Delta E$ Tracks $-\Delta L_{\text{null}}$:** **PASSED** (1,638 / 1,638 cases passed, 0 failures). $\lvert \Delta E + \Delta L_{\text{null}} \rvert \le 10^{-9} \max(1, \lvert \Delta L_{\text{null}} \rvert)$ with zero sign inversions.
+
+#### Stage M1b Neurogenesis Gates (294 cases across 20 holdout seeds)
+
+- **`G1B.1` — Stepwise First-to-Second Neuron Reduction:** **PASSED** (80 / 80 cases passed, 0 failures across 4 tasks on 20 seeds). Monotonic prequential KT loss reduction $L_2 < L_1 < L_0$, Sprout 1 survival, and $\lvert (H(R_1) - H(R_2)) - \hat{I}(R_1; U^*) \rvert \le 0.05\text{ bits/symbol}$ on $\ge 95\%$ of seeds.
+- **`G1B.2` — T1 Suite Convergence & Noise-Floor Halting:** **PASSED** (200 / 200 cases passed, 0 failures across noiseless & noisy streams on 20 seeds). Noiseless: 0 nodes on silence, 0 mismatches on alternating/motif/affine. Noisy ($\varepsilon = 0.05$): paired regret $\le 0.025\text{ bits/symbol}$, strictly outperforms 1-lag reactive echo baseline, and growth halts at noise floor (`node_count <= 32`).
+- **`G1B.3` — Live Invariant, Phase, & Budget Integrity:** **PASSED** (4 / 4 cases passed, 0 failures). Zero runtime invariant errors across all runs; forced 500-edit live oscillator phase test across $k \in \{1, 2\}$ and `{Combinational, TicksPerHop}` recorded 0 phase slips.
+- **`G1B.4` — Charter §8 Ablations & Separate-Process Determinism:** **PASSED** (10 / 10 cases passed, 0 failures). 4-axis ablation matrix confirmed all directional hypotheses; 6-configuration independent child process spawning confirmed byte-identical JSON determinism.

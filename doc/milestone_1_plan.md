@@ -637,3 +637,40 @@ files=$( { git diff HEAD --name-only --diff-filter=AM -- '*.md'; git ls-files -o
 [ -n "$files" ] && printf '%s\n' "$files" | xargs -d '\n' npx markdownlint-cli2 --fix
 npx markdownlint-cli2 "doc/**/*.md" README.md
 ```
+
+---
+
+## 10. Milestone 1 Attainment Sign-Off
+
+### 10.1 Single-Shot Holdout Verification Record
+
+In accordance with Charter §7 and §6 of this plan, the Milestone 1 holdout sign-off was executed as a single-shot command on git commit `e29014a5c4e410f90797db079d457740c5c2d4be`:
+
+```bash
+cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdout
+```
+
+- **Execution Timestamp:** 2026-11-07
+- **Git Commit SHA:** `e29014a5c4e410f90797db079d457740c5c2d4be`
+- **Git Dirty:** `false`
+- **Source Tree Digest (`source_tree_fnv1a128`):** `564de6fbdb0b8cbd898b91fc6b4a408a`
+- **Cargo Lock Digest (`cargo_lock_fnv1a128`):** `8d29cd24b1fbdbb743cf5c0b3933b22d`
+- **Rustc Version:** `rustc 1.99.1 (58cf8f9c3 2026-10-13)`
+- **Target Triple:** `x86_64-unknown-linux-gnu`
+- **Holdout Seed Range:** `10000..=10019` (20 seeds)
+- **Status:** **ALL GATES PASSED** (`all_passed: true`, `stage_gate_aborted: false`)
+
+### 10.2 Sign-Off Summary Across Stages
+
+| Stage / Gate | Focus | Tested Cases | Result |
+| :--- | :--- | :--- | :--- |
+| **Stage M1a Stage Gate** | Fixed-Structure Economy | **6,245 panel runs** | **PASSED (0 failures)** |
+| `G1A.1` | Exact macro-micro conservation & zero-float substrate | 1,959 | Passed |
+| `G1A.2` | Correct vs. incorrect energy separation | 1,069 | Passed |
+| `G1A.3` | Detour & free-rider penalty (zero leak) | 1,579 | Passed |
+| `G1A.4` | Local $\Delta E$ tracks global $-\Delta L_{\text{null}}$ | 1,638 | Passed |
+| **Stage M1b** | Online Neurogenesis & Ablations | **294 gate runs** | **PASSED (0 failures)** |
+| `G1B.1` | Stepwise first-to-second neuron reduction | 80 | Passed |
+| `G1B.2` | T1 suite convergence & noise-floor halting | 200 | Passed |
+| `G1B.3` | Live invariant, phase, & budget integrity (500 edits) | 4 | Passed |
+| `G1B.4` | Charter §8 4-axis ablations & subprocess determinism | 10 | Passed |

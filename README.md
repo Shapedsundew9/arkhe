@@ -1,6 +1,6 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, and compute-matched baseline harness implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and the fixed-structure **M1a economy gates** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). The M1b work is in progress; the authoritative scope and gates are in [doc/milestone_1_plan.md](doc/milestone_1_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and **Milestone 1 (`M1 — First-to-second neuron`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Stage M1a (fixed-structure economy) and Stage M1b (online neurogenesis, corrector stacking, noise-floor halting, and ablations) are fully implemented and verified; see [doc/milestone_1_plan.md](doc/milestone_1_plan.md) and [doc/milestone_1b_plan.md](doc/milestone_1b_plan.md).
 
 ## Overview
 
@@ -68,10 +68,17 @@ cargo run --locked --release -- verify-m0 --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m0 --seed-offset 10000 --seeds 20
 ```
 
-1. Run the M1a fixed-structure economy gate before enabling any M1b growth experiments:
+1. Run the M1a fixed-structure economy verification suite:
 
 ```bash
-cargo run --locked -- verify-m1a --seed-offset 0 --seeds 20
+cargo run --locked --release -- verify-m1a --seed-offset 0 --seeds 20
+```
+
+1. Run the full Milestone 1 acceptance verification suite (Stage M1a hard gate audit followed by Stage M1b neurogenesis):
+
+```bash
+cargo run --locked --release -- verify-m1 --seed-offset 0 --seeds 20
+cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdout
 ```
 
 1. Inspect analytical $\varepsilon$-machine and Reeds–Sloane ground-truth yardsticks for a generator:
