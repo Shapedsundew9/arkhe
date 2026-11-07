@@ -657,7 +657,7 @@ impl PredictorBaseline for ArkheLearner {
                             &old_to_new,
                         );
                         let total_regs = self.editable.compiled().total_registers();
-                        if total_regs >= period {
+                        if total_regs == period {
                             let mut regs = self.editable.state().registers().to_vec();
                             for j in 0..period {
                                 regs[j] = template

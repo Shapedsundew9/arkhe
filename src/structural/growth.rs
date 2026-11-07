@@ -1469,13 +1469,19 @@ pub fn materialize_candidate(
     out_port: u16,
     max_relay_hops: u8,
 ) -> Result<NodeId, LatticeError> {
+    let is_driven = lattice
+        .edges()
+        .iter()
+        .any(|&(_, dst)| dst == SignalSink::BoundaryOut(out_port));
     match motif {
-        CandidateMotif::Neg(u) => {
+        CandidateMotif::Neg(u) if is_driven => {
             let out_cell = target_out_cell(lattice, out_port);
             let u_src = materialize_source(lattice, u, out_cell, out_port, max_relay_hops)?;
             lattice.stack_output_subtractor(out_port, u_src, max_relay_hops)
         }
-        CandidateMotif::ScaleEqz(u, c) if *c == (1u64 << lattice.width().bits()) - 1 => {
+        CandidateMotif::ScaleEqz(u, c)
+            if is_driven && *c == (1u64 << lattice.width().bits()) - 1 =>
+        {
             let out_cell = target_out_cell(lattice, out_port);
             let fallback_start = out_cell.unwrap_or(Coord { row: 0, col: 0 });
             let start_coord = motif_start_coord(lattice, motif, fallback_start);
@@ -1543,34 +1549,42 @@ pub fn propose_sprout(
     }
 
     let mut feature_pairs: Vec<(SourceFeature, Option<SourceFeature>)> = Vec::new();
-    if !diagnostics.candidate_features.is_empty() {
-        for feat in &diagnostics.candidate_features {
-            let u1_name = &features[feat.feature_indices[0]].name;
-            if let Some(u1) = SourceFeature::parse(u1_name) {
-                let u2 = if feat.feature_indices.len() > 1 {
-                    let u2_name = &features[feat.feature_indices[1]].name;
-                    SourceFeature::parse(u2_name)
-                } else {
-                    None
-                };
-                if !feature_pairs.contains(&(u1.clone(), u2.clone())) {
-                    feature_pairs.push((u1, u2));
-                }
-            }
-        }
-    } else if let Some(ref best) = diagnostics.best_feature {
+    if let Some(ref best) = diagnostics.best_feature {
         let u1_name = &features[best.feature_indices[0]].name;
-        let u1 = SourceFeature::parse(u1_name).unwrap_or(SourceFeature::BoundaryIn(0));
-        let u2 = diagnostics.secondary_feature.as_ref().and_then(|sec| {
-            let u2_name = &features[sec.feature_indices[0]].name;
-            SourceFeature::parse(u2_name)
-        });
-        feature_pairs.push((u1, u2));
+        if let Some(u1) = SourceFeature::parse(u1_name) {
+            let u2 = if best.feature_indices.len() > 1 {
+                let u2_name = &features[best.feature_indices[1]].name;
+                SourceFeature::parse(u2_name)
+            } else {
+                diagnostics.secondary_feature.as_ref().and_then(|sec| {
+                    let u2_name = &features[sec.feature_indices[0]].name;
+                    SourceFeature::parse(u2_name)
+                })
+            };
+            feature_pairs.push((u1, u2));
+        }
     } else if let Some((_, _)) = diagnostics.constant_offset {
         feature_pairs.push((SourceFeature::BoundaryIn(0), None));
-    } else {
+    }
+
+    for feat in &diagnostics.candidate_features {
+        let u1_name = &features[feat.feature_indices[0]].name;
+        if let Some(u1) = SourceFeature::parse(u1_name) {
+            let u2 = if feat.feature_indices.len() > 1 {
+                let u2_name = &features[feat.feature_indices[1]].name;
+                SourceFeature::parse(u2_name)
+            } else {
+                None
+            };
+            if !feature_pairs.contains(&(u1.clone(), u2.clone())) {
+                feature_pairs.push((u1, u2));
+            }
+        }
+    }
+
+    if feature_pairs.is_empty() {
         return Ok(None);
-    };
+    }
 
     let num_channels = editable.circuit().num_inputs();
     let mut candidates = Vec::new();
@@ -2028,15 +2042,16 @@ pub fn propose_autonomous_delay_ring(
         let mut state = ScalarState::new(&staged_compiled);
         let start_tick = obs_window.start_tick();
         let total_regs = staged_compiled.total_registers();
-        if total_regs >= p {
-            let mut regs = state.registers().to_vec();
-            for j in 0..p {
-                let val = mu[((start_tick as usize) + (p - 1 - j)) % p];
-                regs[j] = val;
-            }
-            if state.set_registers(&staged_compiled, &regs).is_err() {
-                continue;
-            }
+        if total_regs != p {
+            continue;
+        }
+        let mut regs = state.registers().to_vec();
+        for j in 0..p {
+            let val = mu[((start_tick as usize) + (p - 1 - j)) % p];
+            regs[j] = val;
+        }
+        if state.set_registers(&staged_compiled, &regs).is_err() {
+            continue;
         }
 
         let mut scorer = editable.economy().scorers()[out_idx].clone();
@@ -2159,6 +2174,73 @@ mod tests {
             ),
             Err(GrowthError::TraceLengthMismatch)
         );
+    }
+
+    #[test]
+    fn materialize_candidate_on_unconnected_port_correctly_negates_and_scales() {
+        use crate::structural::lattice::{BoundaryAnchor, GridShape, PerimeterSide};
+        use crate::substrate::WireDelayMode;
+
+        let shape = GridShape::new(8, 8).unwrap();
+        let lattice = LatticeCircuit::new(
+            shape,
+            Width::BITS_2,
+            WireDelayMode::Combinational,
+            WiringTopology::WellMixed,
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 3,
+            }],
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 4,
+            }],
+        )
+        .unwrap();
+
+        // 1. Neg on unconnected port: -x mod 4
+        let mut neg_lat = lattice.clone();
+        materialize_candidate(
+            &mut neg_lat,
+            &CandidateMotif::Neg(SourceFeature::BoundaryIn(0)),
+            0,
+            4,
+        )
+        .unwrap();
+        let circuit = neg_lat.lower().unwrap();
+        let compiled = circuit.compile().unwrap();
+        let mut state = ScalarState::new(&compiled);
+        let mut out = [0u64];
+        // For input = 1, -1 mod 4 = 3
+        state.step(&compiled, &[1], &mut out).unwrap();
+        assert_eq!(out[0], 3, "Neg(1) mod 4 must be 3, got {}", out[0]);
+
+        // 2. ScaleEqz on unconnected port: 3 * Eqz(x) mod 4
+        let mut scale_lat = lattice;
+        materialize_candidate(
+            &mut scale_lat,
+            &CandidateMotif::ScaleEqz(SourceFeature::BoundaryIn(0), 3),
+            0,
+            4,
+        )
+        .unwrap();
+        let circuit2 = scale_lat.lower().unwrap();
+        let compiled2 = circuit2.compile().unwrap();
+        let mut state2 = ScalarState::new(&compiled2);
+        let mut out2 = [0u64];
+        // For input = 0, Eqz(0) = 1, so 3 * 1 = 3 mod 4
+        state2.step(&compiled2, &[0], &mut out2).unwrap();
+        assert_eq!(out2[0], 3, "ScaleEqz(0, 3) must be 3, got {}", out2[0]);
+    }
+
+    #[test]
+    fn feature_pairing_includes_best_and_secondary_features() {
+        let u1 = SourceFeature::BoundaryIn(0);
+        let u2 = SourceFeature::LagIn { channel: 0, tau: 1 };
+        let cands = generate_candidate_motifs(&u1, Some(&u2), Width::BITS_2, None, false, 1);
+        assert!(cands.contains(&CandidateMotif::AddPair(u1.clone(), u2.clone())));
+        assert!(cands.contains(&CandidateMotif::SubPair(u1.clone(), u2.clone())));
+        assert!(cands.contains(&CandidateMotif::AddEqz(u1.clone(), u2.clone())));
     }
 
     #[test]
