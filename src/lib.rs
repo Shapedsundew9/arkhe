@@ -94,6 +94,39 @@ pub enum Commands {
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
     },
+    /// Run the online neurogenesis Milestone 1b gates (G1B.1–G1B.4).
+    VerifyM1b {
+        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
+        #[arg(long, default_value_t = 0)]
+        seed_offset: u32,
+        /// Number of master seeds evaluated.
+        #[arg(long, default_value_t = 20)]
+        seeds: u32,
+        /// Simulation horizon T in ticks.
+        #[arg(long, default_value_t = verify_m1::DEFAULT_M1B_HORIZON)]
+        horizon: u64,
+        /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
+        #[arg(long, alias = "allow-holdout", default_value_t = false)]
+        holdout: bool,
+    },
+    /// Run combined Milestone 1 verification (hard M1a pre-growth stage gate -> M1b neurogenesis).
+    VerifyM1 {
+        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
+        #[arg(long, default_value_t = 0)]
+        seed_offset: u32,
+        /// Number of master seeds evaluated.
+        #[arg(long, default_value_t = 20)]
+        seeds: u32,
+        /// Simulation horizon T for M1a in ticks.
+        #[arg(long, default_value_t = verify_m1::DEFAULT_HORIZON)]
+        m1a_horizon: u64,
+        /// Simulation horizon T for M1b in ticks.
+        #[arg(long, default_value_t = verify_m1::DEFAULT_M1B_HORIZON)]
+        m1b_horizon: u64,
+        /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
+        #[arg(long, alias = "allow-holdout", default_value_t = false)]
+        holdout: bool,
+    },
 }
 
 /// Returns the crate banner string.
@@ -214,6 +247,61 @@ where
                 } else {
                     Err("Milestone 1a verification failed one or more acceptance gates".into())
                 }
+            }
+        }
+        Some(Commands::VerifyM1b {
+            seed_offset,
+            seeds,
+            horizon,
+            holdout,
+        }) => {
+            verify_m1::check_seed_range_holdout(seed_offset, seeds, holdout)?;
+            let summary = verify_m1::run_m1b_verification_suite(seed_offset, seeds, horizon);
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if summary.all_passed {
+                Ok(())
+            } else {
+                Err("Milestone 1b verification failed one or more acceptance gates".into())
+            }
+        }
+        Some(Commands::VerifyM1 {
+            seed_offset,
+            seeds,
+            m1a_horizon,
+            m1b_horizon,
+            holdout,
+        }) => {
+            verify_m1::check_seed_range_holdout(seed_offset, seeds, holdout)?;
+            let m1a_summary = verify_m1::run_m1a_verification_suite_with_horizon_and_holdout(
+                seed_offset,
+                seeds,
+                m1a_horizon,
+                holdout,
+            )?;
+            if !m1a_summary.all_passed {
+                let combined = verify_m1::M1CombinedSummary {
+                    m1a: m1a_summary,
+                    m1b: None,
+                    stage_gate_aborted: true,
+                    all_passed: false,
+                };
+                println!("{}", serde_json::to_string_pretty(&combined)?);
+                return Err("Milestone 1 stage gate aborted: M1a failed one or more gates".into());
+            }
+            let m1b_summary =
+                verify_m1::run_m1b_verification_suite(seed_offset, seeds, m1b_horizon);
+            let all_passed = m1a_summary.all_passed && m1b_summary.all_passed;
+            let combined = verify_m1::M1CombinedSummary {
+                m1a: m1a_summary,
+                m1b: Some(m1b_summary),
+                stage_gate_aborted: false,
+                all_passed,
+            };
+            println!("{}", serde_json::to_string_pretty(&combined)?);
+            if all_passed {
+                Ok(())
+            } else {
+                Err("Milestone 1 combined verification failed one or more gates".into())
             }
         }
     }

@@ -1,5 +1,6 @@
 //! Pre-growth Milestone 1a metabolic-economy gates.
 
+pub mod m1b;
 pub mod panel;
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,10 @@ use crate::substrate::{
     Circuit, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
 };
 
+pub use m1b::{
+    DEFAULT_M1B_HORIZON, M1CombinedSummary, M1bGateReport, M1bVerificationSummary,
+    run_m1b_verification_suite,
+};
 pub use panel::{CircuitClass, DEFAULT_HORIZON, PanelRun, run_panel_matrix};
 
 /// Pre-registered holdout range start seed.

@@ -191,6 +191,11 @@ pub trait PredictorBaseline {
     fn split_code_tax(&self) -> bool {
         false
     }
+
+    /// Detailed online telemetry from [`crate::structural::learner::ArkheLearner`].
+    fn m1_telemetry(&self) -> Option<crate::config::ArkheM1Telemetry> {
+        None
+    }
 }
 
 fn align_autonomous_state_to_tick(

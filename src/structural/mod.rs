@@ -12,13 +12,13 @@ pub use economy::{
     EconomyConfig, EconomyError, EconomyState, EconomyTick, NodeEconomy, RewardMode,
 };
 pub use growth::{
-    FeatureScore, GrowthConfig, GrowthError, ResidualDiagnostics, ResidualFeature,
-    diagnose_residual,
+    AutonomousRingProposal, FeatureScore, GrowthConfig, GrowthError, ResidualDiagnostics,
+    ResidualFeature, diagnose_residual,
 };
 pub use lattice::{
     BoundaryAnchor, Coord, GridShape, LatticeCircuit, LatticeError, PerimeterSide, WiringTopology,
 };
-pub use learner::ArkheLearner;
+pub use learner::{ArkheLearner, GrowthEpochSnapshot};
 pub use live::{
     LiveCircuit, LiveError, LiveTick, node_output_values, well_mixed_description_debts,
     well_mixed_wire_steps,

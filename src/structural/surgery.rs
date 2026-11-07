@@ -127,6 +127,24 @@ impl EditableLattice {
         &mut self.state
     }
 
+    /// Evaluates one synchronous step on the active circuit and state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvalError`] if input or output buffer dimensions mismatch.
+    pub fn step(&mut self, inputs: &[u64], outputs: &mut [u64]) -> Result<(), EvalError> {
+        self.state.step(&self.compiled, inputs, outputs)
+    }
+
+    /// Overwrites live registers with `regs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvalError`] if register slice length mismatches.
+    pub fn set_registers(&mut self, regs: &[u64]) -> Result<(), EvalError> {
+        self.state.set_registers(&self.compiled, regs)
+    }
+
     /// Current node reserves, null models, and register ancestry.
     #[must_use]
     pub const fn economy(&self) -> &EconomyState {
@@ -722,6 +740,32 @@ impl MarginalDebtLedger {
         self.debt_paid = next_paid;
         self.last_committed_code_bits =
             circuit_code_bits_with_tax(new_circuit, topology, grid_shape, 0, split_code_tax);
+    }
+
+    /// Ensures ledger vectors match circuit node count, allocating debts for new nodes.
+    pub fn ensure_capacity(
+        &mut self,
+        circuit: &Circuit,
+        topology: WiringTopology,
+        grid_shape: Option<GridShape>,
+        split_code_tax: bool,
+    ) {
+        let n = circuit.node_count();
+        if self.node_debts.len() < n {
+            let alloc =
+                allocate_circuit_description_bits(circuit, topology, grid_shape, 0, split_code_tax);
+            while self.node_debts.len() < n {
+                let idx = self.node_debts.len();
+                let debt = alloc.node_debts.get(idx).copied().unwrap_or(0.0);
+                self.node_debts.push(debt);
+                self.debt_paid.push(false);
+            }
+            self.last_committed_code_bits =
+                circuit_code_bits_with_tax(circuit, topology, grid_shape, 0, split_code_tax);
+        } else if self.node_debts.len() > n {
+            self.node_debts.truncate(n);
+            self.debt_paid.truncate(n);
+        }
     }
 }
 

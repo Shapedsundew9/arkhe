@@ -1072,8 +1072,10 @@ impl LatticeCircuit {
     }
 
     /// Stacks a modulo additive corrector $\hat{y}_{m+1} = \hat{y}_m + \hat{r} \pmod{2^k}$ at `BoundaryOut(out_port)`.
-    pub fn stack_output_adder(
+    /// Stacks a binary operator (`Add` or `Sub`) at the output port, combining existing output and corrector.
+    pub fn stack_output_binary_op(
         &mut self,
+        op: Primitive,
         out_port: u16,
         corrector_src: SignalSource,
         max_relay_hops: u8,
@@ -1137,14 +1139,14 @@ impl LatticeCircuit {
                     let cell = staged
                         .nearest_empty_cell(Coord { row: 0, col: 0 })
                         .ok_or(LatticeError::UnknownEndpoint)?;
-                    let add = staged.place_node(cell, Primitive::Add)?;
+                    let node = staged.place_node(cell, op)?;
                     staged.disconnect(prev_src, out_sink);
-                    staged.connect(prev_src, SignalSink::NodeIn { node: add, port: 0 })?;
+                    staged.connect(prev_src, SignalSink::NodeIn { node, port: 0 })?;
                     let tapped_corr = staged.tap_source(corrector_src, max_relay_hops)?;
-                    staged.connect(tapped_corr, SignalSink::NodeIn { node: add, port: 1 })?;
-                    staged.connect(SignalSource::NodeOut { node: add, port: 0 }, out_sink)?;
+                    staged.connect(tapped_corr, SignalSink::NodeIn { node, port: 1 })?;
+                    staged.connect(SignalSource::NodeOut { node, port: 0 }, out_sink)?;
                     *self = staged;
-                    return Ok(add);
+                    return Ok(node);
                 }
 
                 let anchor = *staged
@@ -1182,7 +1184,7 @@ impl LatticeCircuit {
                             },
                         );
                         staged.disconnect(prev_src, out_sink);
-                        staged.nodes[cell_node.index()].1 = Primitive::Add;
+                        staged.nodes[cell_node.index()].1 = op;
                         staged.connect(
                             old_driver,
                             SignalSink::NodeIn {
@@ -1218,9 +1220,9 @@ impl LatticeCircuit {
                         .or_else(|| staged.nearest_empty_cell(out_cell))
                         .ok_or(LatticeError::UnknownEndpoint)?;
                     staged.relocate_node(cell_node, empty_neighbor)?;
-                    let add = staged.place_node(out_cell, Primitive::Add)?;
+                    let node = staged.place_node(out_cell, op)?;
                     let updated_prev = match prev_src {
-                        SignalSource::NodeOut { node, port } if node == cell_node => {
+                        SignalSource::NodeOut { node: p_node, port } if p_node == cell_node => {
                             SignalSource::NodeOut {
                                 node: cell_node,
                                 port,
@@ -1228,36 +1230,56 @@ impl LatticeCircuit {
                         }
                         other => other,
                     };
-                    staged.connect(updated_prev, SignalSink::NodeIn { node: add, port: 0 })?;
+                    staged.connect(updated_prev, SignalSink::NodeIn { node, port: 0 })?;
                     let tapped_corr = staged.tap_source(corrector_src, max_relay_hops)?;
                     staged.route_connect(
                         tapped_corr,
-                        SignalSink::NodeIn { node: add, port: 1 },
+                        SignalSink::NodeIn { node, port: 1 },
                         usize::from(max_relay_hops),
                     )?;
-                    staged.connect(SignalSource::NodeOut { node: add, port: 0 }, out_sink)?;
+                    staged.connect(SignalSource::NodeOut { node, port: 0 }, out_sink)?;
                     *self = staged;
-                    return Ok(add);
+                    return Ok(node);
                 }
 
-                let add = staged.place_node(out_cell, Primitive::Add)?;
+                let node = staged.place_node(out_cell, op)?;
                 staged.disconnect(prev_src, out_sink);
                 staged.route_connect(
                     prev_src,
-                    SignalSink::NodeIn { node: add, port: 0 },
+                    SignalSink::NodeIn { node, port: 0 },
                     usize::from(max_relay_hops),
                 )?;
                 let tapped_corr = staged.tap_source(corrector_src, max_relay_hops)?;
                 staged.route_connect(
                     tapped_corr,
-                    SignalSink::NodeIn { node: add, port: 1 },
+                    SignalSink::NodeIn { node, port: 1 },
                     usize::from(max_relay_hops),
                 )?;
-                staged.connect(SignalSource::NodeOut { node: add, port: 0 }, out_sink)?;
+                staged.connect(SignalSource::NodeOut { node, port: 0 }, out_sink)?;
                 *self = staged;
-                Ok(add)
+                Ok(node)
             }
         }
+    }
+
+    /// Connects a new corrector output additively into `BoundaryOut(out_port)`.
+    pub fn stack_output_adder(
+        &mut self,
+        out_port: u16,
+        corrector_src: SignalSource,
+        max_relay_hops: u8,
+    ) -> Result<NodeId, LatticeError> {
+        self.stack_output_binary_op(Primitive::Add, out_port, corrector_src, max_relay_hops)
+    }
+
+    /// Connects a new corrector output subtractively into `BoundaryOut(out_port)` ($y_{\text{out}} = y_{\text{prev}} - \text{corr}$).
+    pub fn stack_output_subtractor(
+        &mut self,
+        out_port: u16,
+        corrector_src: SignalSource,
+        max_relay_hops: u8,
+    ) -> Result<NodeId, LatticeError> {
+        self.stack_output_binary_op(Primitive::Sub, out_port, corrector_src, max_relay_hops)
     }
 
     /// Removes edges exactly matching `(src, dst)`.

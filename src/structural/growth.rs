@@ -524,7 +524,7 @@ impl DiagnosticBuffer {
         self.inputs.len() >= self.capacity
     }
 
-    /// Returns mature nodes with zero activity AND zero counterfactual sensitivity across all frames (D1b.1).
+    /// Returns mature nodes with zero counterfactual sensitivity across all frames (D1b.1).
     pub fn idle_mature_nodes(&self, economy: &EconomyState) -> BTreeSet<NodeId> {
         let mut idle = BTreeSet::new();
         if !self.is_full() {
@@ -534,16 +534,11 @@ impl DiagnosticBuffer {
             if node_econ.juvenile_ticks > 0 {
                 continue;
             }
-            let zero_activity = !node_econ.activity.ever_nonzero()
-                && self
-                    .node_outputs
-                    .iter()
-                    .all(|frame| frame.get(node_idx).copied().unwrap_or(0) == 0);
             let zero_sensitivity = self
                 .counterfactual_sensitivity
                 .iter()
                 .all(|frame| !frame.get(node_idx).copied().unwrap_or(false));
-            if zero_activity && zero_sensitivity {
+            if zero_sensitivity {
                 idle.insert(NodeId(u32::try_from(node_idx).expect("fits in u32")));
             }
         }
@@ -1474,8 +1469,38 @@ pub fn materialize_candidate(
     out_port: u16,
     max_relay_hops: u8,
 ) -> Result<NodeId, LatticeError> {
-    let motif_src = materialize_motif(lattice, motif, out_port, max_relay_hops)?;
-    lattice.stack_output_adder(out_port, motif_src, max_relay_hops)
+    match motif {
+        CandidateMotif::Neg(u) => {
+            let out_cell = target_out_cell(lattice, out_port);
+            let u_src = materialize_source(lattice, u, out_cell, out_port, max_relay_hops)?;
+            lattice.stack_output_subtractor(out_port, u_src, max_relay_hops)
+        }
+        CandidateMotif::ScaleEqz(u, c) if *c == (1u64 << lattice.width().bits()) - 1 => {
+            let out_cell = target_out_cell(lattice, out_port);
+            let fallback_start = out_cell.unwrap_or(Coord { row: 0, col: 0 });
+            let start_coord = motif_start_coord(lattice, motif, fallback_start);
+            let eqz_cell = lattice
+                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
+                .ok_or(LatticeError::UnknownEndpoint)?;
+            let eqz = lattice.place_node(eqz_cell, Primitive::Eqz)?;
+            let u_src = materialize_source(lattice, u, Some(eqz_cell), out_port, max_relay_hops)?;
+            let u_tap = lattice.tap_source(u_src, max_relay_hops)?;
+            lattice.route_connect(
+                u_tap,
+                SignalSink::NodeIn { node: eqz, port: 0 },
+                usize::from(max_relay_hops),
+            )?;
+            lattice.stack_output_subtractor(
+                out_port,
+                SignalSource::NodeOut { node: eqz, port: 0 },
+                max_relay_hops,
+            )
+        }
+        _ => {
+            let motif_src = materialize_motif(lattice, motif, out_port, max_relay_hops)?;
+            lattice.stack_output_adder(out_port, motif_src, max_relay_hops)
+        }
+    }
 }
 
 /// Evaluates candidates from $\mathcal{K}(u_1, u_2)$ on `obs_window` and returns the best staged lattice if admissible (§4.3).
@@ -1750,6 +1775,17 @@ pub fn propose_sprout(
     Ok(best_proposal.map(|(lat, _, _, _, _)| lat))
 }
 
+/// Autonomous delay ring proposal under channel noise (§4.5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutonomousRingProposal {
+    /// Staged lattice circuit containing the autonomous delay ring.
+    pub lattice: LatticeCircuit,
+    /// Period of the delay ring.
+    pub period: usize,
+    /// Learned clean symbol template for the cycle.
+    pub template: Vec<u64>,
+}
+
 fn build_autonomous_ring_lattice(
     base: &LatticeCircuit,
     period: usize,
@@ -1769,7 +1805,7 @@ fn build_autonomous_ring_lattice(
     if staged.topology() == WiringTopology::WellMixed {
         let mut delays = Vec::with_capacity(period);
         for j in 0..period {
-            let init_val = mu[j % period];
+            let init_val = mu[(period - 1 - j) % period];
             let cell = staged
                 .nearest_empty_cell(Coord { row: 0, col: 0 })
                 .ok_or(LatticeError::UnknownEndpoint)?;
@@ -1842,7 +1878,7 @@ fn build_autonomous_ring_lattice(
     let mut delays = Vec::with_capacity(period);
     let mut prev_cell = out_cell;
     for j in 0..period {
-        let init_val = mu[j % period];
+        let init_val = mu[(period - 1 - j) % period];
         let cell = staged
             .nearest_empty_cell(prev_cell)
             .ok_or(LatticeError::UnknownEndpoint)?;
@@ -1898,7 +1934,7 @@ pub fn propose_autonomous_delay_ring(
     budget: &mut TickBudget,
     out_port: u16,
     max_relay_hops: u8,
-) -> Option<LatticeCircuit> {
+) -> Option<AutonomousRingProposal> {
     if !editable.compiled().uses_boundary_inputs() {
         return None;
     }
@@ -1908,7 +1944,6 @@ pub fn propose_autonomous_delay_ring(
     }
 
     let w_replay = obs_window.len();
-    let eval_start_idx = obs_window.len().saturating_sub(w_diag);
     let out_idx = usize::from(out_port);
 
     let mut curr_state = ScalarState::new(editable.compiled());
@@ -1929,12 +1964,10 @@ pub fn propose_autonomous_delay_ring(
         {
             return None;
         }
-        if i >= eval_start_idx {
-            if curr_pred[out_idx] != frame[out_idx] {
-                e_curr += 1;
-            }
-            flux_curr += curr_scorer.observe(curr_pred[out_idx], frame[out_idx]);
+        if curr_pred[out_idx] != frame[out_idx] {
+            e_curr += 1;
         }
+        flux_curr += curr_scorer.observe(curr_pred[out_idx], frame[out_idx]);
     }
     let shape = if editable.lattice().topology() == WiringTopology::WellMixed {
         None
@@ -1951,7 +1984,7 @@ pub fn propose_autonomous_delay_ring(
     let j_curr =
         l_curr + facts_code_bits(editable.lattice().width(), w_replay as u64, e_curr as u64);
 
-    let mut best_ring: Option<(LatticeCircuit, f64)> = None;
+    let mut best_ring: Option<(AutonomousRingProposal, f64)> = None;
 
     for p in 2..=6usize {
         if p + 1 > growth_config.max_nodes {
@@ -1998,7 +2031,7 @@ pub fn propose_autonomous_delay_ring(
         if total_regs >= p {
             let mut regs = state.registers().to_vec();
             for j in 0..p {
-                let val = mu[((start_tick as usize) + j) % p];
+                let val = mu[((start_tick as usize) + (p - 1 - j)) % p];
                 regs[j] = val;
             }
             if state.set_registers(&staged_compiled, &regs).is_err() {
@@ -2014,17 +2047,15 @@ pub fn propose_autonomous_delay_ring(
         let zeros = vec![0u64; usize::from(staged_compiled.num_inputs())];
 
         let mut replay_ok = true;
-        for (i, frame) in obs_window.frames().iter().enumerate() {
+        for frame in obs_window.frames() {
             if state.step(&staged_compiled, &zeros, &mut pred).is_err() {
                 replay_ok = false;
                 break;
             }
-            if i >= eval_start_idx {
-                if pred[out_idx] != frame[out_idx] {
-                    e_ring += 1;
-                }
-                flux_ring += scorer.observe(pred[out_idx], frame[out_idx]);
+            if pred[out_idx] != frame[out_idx] {
+                e_ring += 1;
             }
+            flux_ring += scorer.observe(pred[out_idx], frame[out_idx]);
         }
         if !replay_ok {
             continue;
@@ -2057,11 +2088,18 @@ pub fn propose_autonomous_delay_ring(
             .as_ref()
             .is_none_or(|(_, best_j)| j_ring < *best_j)
         {
-            best_ring = Some((staged, j_ring));
+            best_ring = Some((
+                AutonomousRingProposal {
+                    lattice: staged,
+                    period: p,
+                    template: mu,
+                },
+                j_ring,
+            ));
         }
     }
 
-    best_ring.map(|(lat, _)| lat)
+    best_ring.map(|(prop, _)| prop)
 }
 
 #[cfg(test)]

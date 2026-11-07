@@ -170,3 +170,148 @@ fn well_mixed_direct_graph_wiring_connects_without_planar_relays() {
     let compiled = circuit.compile().unwrap();
     assert_eq!(compiled.total_registers(), 0);
 }
+
+#[test]
+fn execute_experiment_arkhe_m1_across_topologies_and_delays() {
+    use arkhe::config::{
+        BaselineConfig, BudgetConfig, CONFIG_SCHEMA_VERSION, EnvironmentConfig, ExperimentConfig,
+        SubstrateConfig, execute_experiment,
+    };
+    use arkhe::env::{GeneratorConfig, NoiseModel};
+    use arkhe::structural::EconomyConfig;
+
+    let cases = [
+        (WiringTopology::WellMixed, WireDelayMode::Combinational),
+        (
+            WiringTopology::LocalVonNeumann,
+            WireDelayMode::Combinational,
+        ),
+        (WiringTopology::LocalMoore, WireDelayMode::Combinational),
+        (WiringTopology::LocalVonNeumann, WireDelayMode::TicksPerHop),
+    ];
+
+    for (topology, wire_delay) in cases {
+        let cfg = ExperimentConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            master_seed: 42,
+            substrate: SubstrateConfig {
+                width_bits: Width::BITS_1,
+                wire_delay,
+                wiring_topology: topology,
+            },
+            environment: EnvironmentConfig {
+                horizon_ticks: 200,
+                transient_warmup_ticks: 50,
+                generator: GeneratorConfig::T1_Alternating { a: 0, b: 1 },
+                noise: NoiseModel::None,
+            },
+            budget: BudgetConfig {
+                max_eval_ticks: 10_000,
+            },
+            baseline: BaselineConfig::ArkheM1 {
+                grid_rows: 8,
+                grid_cols: 8,
+                max_relay_hops: 4,
+                economy: EconomyConfig::default(),
+                growth: GrowthConfig::default(),
+            },
+        };
+
+        let report = execute_experiment(&cfg).expect("execute_experiment succeeds for ArkheM1");
+        assert_eq!(report.baseline_name, "ArkheM1");
+        assert!(report.m1_telemetry.is_some());
+        let tel = report.m1_telemetry.unwrap();
+        assert_eq!(tel.grid_rows, 8);
+        assert_eq!(tel.grid_cols, 8);
+    }
+}
+
+#[test]
+fn cli_verify_m1b_refuses_holdout_seeds_without_flag() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_arkhe"))
+        .args(["verify-m1b", "--seed-offset", "10000", "--seeds", "20"])
+        .output()
+        .expect("spawn arkhe verify-m1b on holdout");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("overlaps pre-registered holdout range"),
+        "stderr must mention holdout refusal, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_verify_m1_refuses_holdout_seeds_without_flag() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_arkhe"))
+        .args(["verify-m1", "--seed-offset", "10000", "--seeds", "20"])
+        .output()
+        .expect("spawn arkhe verify-m1 on holdout");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("overlaps pre-registered holdout range"),
+        "stderr must mention holdout refusal, got: {stderr}"
+    );
+}
+
+#[test]
+fn fast_seed_slice_m1b_all_gates_pass() {
+    use arkhe::verify_m1::run_m1b_verification_suite;
+
+    let summary = run_m1b_verification_suite(0, 2, 2000);
+    assert_eq!(summary.gates.len(), 4);
+    assert!(
+        summary.gates[0].passed,
+        "G1B.1 failed: {:?}",
+        summary.gates[0].failures
+    );
+    assert!(
+        summary.gates[1].passed,
+        "G1B.2 failed: {:?}",
+        summary.gates[1].failures
+    );
+    assert!(
+        summary.gates[2].passed,
+        "G1B.3 failed: {:?}",
+        summary.gates[2].failures
+    );
+    assert!(
+        summary.gates[3].passed,
+        "G1B.4 failed: {:?}",
+        summary.gates[3].failures
+    );
+    assert!(summary.all_passed);
+}
+
+#[test]
+fn m1_stage_gate_aborts_m1b_when_m1a_fails() {
+    use arkhe::config::BuildProvenance;
+    use arkhe::verify_m1::{M1CombinedSummary, M1aVerificationSummary};
+
+    let fake_m1a = M1aVerificationSummary {
+        provenance: BuildProvenance::current(),
+        seed_offset: 0,
+        seeds_tested: 1,
+        horizon: 64,
+        gates: Vec::new(),
+        panel: Vec::new(),
+        all_passed: false,
+    };
+
+    let combined = M1CombinedSummary {
+        m1a: fake_m1a,
+        m1b: None,
+        stage_gate_aborted: true,
+        all_passed: false,
+    };
+
+    assert!(combined.stage_gate_aborted);
+    assert!(combined.m1b.is_none());
+    assert!(!combined.all_passed);
+
+    let json = serde_json::to_string(&combined).expect("serialize combined");
+    assert!(json.contains("\"stage_gate_aborted\":true"));
+    assert!(!json.contains("\"m1b\":"));
+}
