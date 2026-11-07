@@ -347,9 +347,11 @@ mod tests {
         let mut live = LiveCircuit::new(circuit, &wire_steps, config, SeedBank::new(7), 8).unwrap();
 
         let mut last_tick = None;
-        for _ in 0..64 {
-            let _pred = live.predict(&[1]).unwrap();
-            let tick = live.settle(&[1]).unwrap();
+        for t in 0..64 {
+            let fact = (t % 2) as u64;
+            let x = ((t + 5) % 2) as u64;
+            let _pred = live.predict(&[x]).unwrap();
+            let tick = live.settle(&[fact]).unwrap();
             last_tick = Some(tick);
         }
 

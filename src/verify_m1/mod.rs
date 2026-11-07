@@ -62,6 +62,10 @@ pub struct M1aClassStats {
     pub min_code_bits: f64,
     /// Maximum circuit code length L(C) across circuits.
     pub max_code_bits: f64,
+    /// Minimum null-calibrated MDL delta across runs.
+    pub min_delta_l_null: f64,
+    /// Maximum null-calibrated MDL delta across runs.
+    pub max_delta_l_null: f64,
     /// Minimum per-node credit margin min_i (E_i(T) - E_init) across all nodes and runs.
     pub min_per_node_margin: f64,
     /// Maximum per-node credit margin max_i (E_i(T) - E_init) across all nodes and runs.
@@ -421,6 +425,14 @@ pub fn run_m1a_bank_evaluation(
             .iter()
             .map(|r| r.code_bits)
             .fold(f64::NEG_INFINITY, f64::max);
+        let min_delta_l_null = matching
+            .iter()
+            .map(|r| r.delta_l_null)
+            .fold(f64::INFINITY, f64::min);
+        let max_delta_l_null = matching
+            .iter()
+            .map(|r| r.delta_l_null)
+            .fold(f64::NEG_INFINITY, f64::max);
         let min_per_node_margin = matching
             .iter()
             .map(|r| r.min_node_margin)
@@ -436,6 +448,8 @@ pub fn run_m1a_bank_evaluation(
             max_flux,
             min_code_bits,
             max_code_bits,
+            min_delta_l_null,
+            max_delta_l_null,
             min_per_node_margin,
             max_per_node_margin,
         });

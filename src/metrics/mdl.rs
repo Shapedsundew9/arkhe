@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use crate::metrics::{NullModel, NullModelKind};
+use crate::metrics::{NullModelKind, PointForecastScorer};
 use crate::structural::{GridShape, WiringTopology};
 use crate::substrate::{Circuit, Primitive, Width};
 
@@ -216,18 +216,10 @@ pub fn null_calibrated_mdl_delta(
         });
     }
     let width = circuit.width();
-    let mut null_model = NullModel::new(width, null_model_kind);
+    let mut scorer = PointForecastScorer::new(width, null_model_kind);
     let mut net_reward = 0.0;
     for (&fact, &prediction) in facts.iter().zip(predictions) {
-        let prediction = width.normalize(prediction);
-        let probability = null_model.probability(prediction);
-        let match_value = if width.normalize(fact) == prediction {
-            1.0
-        } else {
-            0.0
-        };
-        net_reward += (match_value - probability) * -probability.log2();
-        null_model.observe_and_surprisal(fact);
+        net_reward += scorer.observe(prediction, fact);
     }
     Ok(
         palette_bits + circuit_code_bits(circuit, topology, grid_shape, extra_palette_entries)

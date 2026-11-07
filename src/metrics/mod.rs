@@ -3,6 +3,7 @@
 pub mod dynamics;
 pub mod mdl;
 pub mod null_model;
+pub mod point_forecast;
 pub mod scorecard;
 
 pub use dynamics::{BasinReport, CycleReport, detect_autonomous_cycle, estimate_attractor_basin};
@@ -11,4 +12,5 @@ pub use mdl::{
     facts_code_bits, kt_binary_sequence_bits, null_calibrated_mdl_delta,
 };
 pub use null_model::{NullModel, NullModelKind};
+pub use point_forecast::PointForecastScorer;
 pub use scorecard::{BudgetAccountingMode, Scorecard};

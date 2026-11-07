@@ -2,15 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::metrics::{NullModel, NullModelKind};
+use crate::metrics::{NullModelKind, PointForecastScorer};
 use crate::structural::sensitivity::{CausalAncestry, NodeActivity};
 use crate::substrate::{Primitive, Width};
 
 /// Reward rule used to pay exact-match predictions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RewardMode {
-    /// Exact-match surprisal minus its pre-observation blind-luck expectation.
+    /// Calibrated sequential point-forecast reward over prequential null model (D2, default).
     #[default]
+    CalibratedPointForecast,
+    /// Exact-match surprisal minus its pre-observation blind-luck expectation.
     CenteredSurprisal,
     /// Exact-match surprisal without chance-baseline subtraction.
     UncenteredSurprisal,
@@ -53,7 +55,7 @@ impl Default for EconomyConfig {
             juvenile_ticks: 128,
             max_energy_reserve: Some(25.0),
             null_model: NullModelKind::LaplaceFrequency,
-            reward_mode: RewardMode::CenteredSurprisal,
+            reward_mode: RewardMode::CalibratedPointForecast,
         }
     }
 }
@@ -154,7 +156,7 @@ pub struct EconomyState {
     config: EconomyConfig,
     width: Width,
     nodes: Vec<NodeEconomy>,
-    null_models: Vec<NullModel>,
+    scorers: Vec<PointForecastScorer>,
     register_eligibility: Vec<Vec<f64>>,
 }
 
@@ -177,8 +179,8 @@ impl EconomyState {
             config,
             width,
             nodes: vec![node_state; nodes],
-            null_models: (0..outputs)
-                .map(|_| NullModel::new(width, config.null_model))
+            scorers: (0..outputs)
+                .map(|_| PointForecastScorer::new(width, config.null_model))
                 .collect(),
             register_eligibility: vec![vec![0.0; nodes]; registers],
         })
@@ -194,6 +196,12 @@ impl EconomyState {
     #[must_use]
     pub fn nodes(&self) -> &[NodeEconomy] {
         &self.nodes
+    }
+
+    /// Output port point-forecast scorers.
+    #[must_use]
+    pub fn scorers(&self) -> &[PointForecastScorer] {
+        &self.scorers
     }
 
     /// Marks nodes that have emitted non-identity values.
@@ -266,10 +274,10 @@ impl EconomyState {
             self.config,
             self.width,
             new_node_count,
-            self.null_models.len(),
+            self.scorers.len(),
             new_register_count,
         )?;
-        remapped.null_models.clone_from(&self.null_models);
+        remapped.scorers.clone_from(&self.scorers);
         for (old, mapped) in old_to_new_nodes.iter().enumerate() {
             if let Some(new) = mapped {
                 remapped.nodes[*new] = self.nodes[old];
@@ -295,29 +303,43 @@ impl EconomyState {
         predictions: &[u64],
         facts: &[u64],
     ) -> Result<Vec<f64>, EconomyError> {
-        if predictions.len() != self.null_models.len() || facts.len() != predictions.len() {
+        if predictions.len() != self.scorers.len() || facts.len() != predictions.len() {
             return Err(EconomyError::DimensionMismatch);
         }
         let mut rewards = Vec::with_capacity(predictions.len());
-        for ((&prediction, &fact), null) in predictions.iter().zip(facts).zip(&mut self.null_models)
-        {
-            let prediction = self.width.normalize(prediction);
-            let fact = self.width.normalize(fact);
-            let p = null.probability(prediction);
-            let surprisal = -p.log2();
-            let correct = if prediction == fact { 1.0 } else { 0.0 };
+        for ((&prediction, &fact), scorer) in predictions.iter().zip(facts).zip(&mut self.scorers) {
             let reward = match self.config.reward_mode {
-                RewardMode::CenteredSurprisal => (correct - p) * surprisal,
+                RewardMode::CalibratedPointForecast => scorer.observe(prediction, fact),
+                RewardMode::CenteredSurprisal => {
+                    let prediction = self.width.normalize(prediction);
+                    let fact = self.width.normalize(fact);
+                    let p = scorer.null_model().probability(prediction);
+                    let surprisal = -p.log2();
+                    let correct = if prediction == fact { 1.0 } else { 0.0 };
+                    let r = (correct - p) * surprisal;
+                    scorer.null_model_mut().observe_and_surprisal(fact);
+                    r
+                }
                 RewardMode::UncenteredSurprisal => {
-                    if prediction == fact {
-                        -null.probability(fact).log2()
+                    let prediction = self.width.normalize(prediction);
+                    let fact = self.width.normalize(fact);
+                    let r = if prediction == fact {
+                        -scorer.null_model().probability(fact).log2()
                     } else {
                         0.0
-                    }
+                    };
+                    scorer.null_model_mut().observe_and_surprisal(fact);
+                    r
                 }
-                RewardMode::RawAccuracy => correct - 2.0f64.powi(-i32::from(self.width.bits())),
+                RewardMode::RawAccuracy => {
+                    let prediction = self.width.normalize(prediction);
+                    let fact = self.width.normalize(fact);
+                    let correct = if prediction == fact { 1.0 } else { 0.0 };
+                    let r = correct - 2.0f64.powi(-i32::from(self.width.bits()));
+                    scorer.null_model_mut().observe_and_surprisal(fact);
+                    r
+                }
             };
-            null.observe_and_surprisal(fact);
             rewards.push(reward);
         }
         Ok(rewards)
@@ -332,7 +354,7 @@ impl EconomyState {
         port_ancestry: &[Vec<f64>],
         maintenance_costs: &[f64],
     ) -> Result<EconomyTick, EconomyError> {
-        if port_rewards.len() != self.null_models.len()
+        if port_rewards.len() != self.scorers.len()
             || port_ancestry.len() != port_rewards.len()
             || maintenance_costs.len() != self.nodes.len()
         {
@@ -476,15 +498,60 @@ mod tests {
         let config = EconomyConfig {
             juvenile_ticks: 0,
             max_energy_reserve: None,
+            reward_mode: RewardMode::CenteredSurprisal,
             ..EconomyConfig::default()
         };
         let mut state = EconomyState::new(config, Width::BITS_2, 1, 1, 0).unwrap();
-        let baseline = state.null_models[0].probability(0);
+        let baseline = state.scorers[0].null_model().probability(0);
         let reward = (1.0 - baseline) * -baseline.log2();
         assert!(reward.is_finite());
 
         let actual = state.observe_predictions(&[0], &[1]).unwrap();
         assert!(actual[0] < 0.0);
+    }
+
+    #[test]
+    fn economy_reward_and_null_calibrated_mdl_delta_agree_on_random_sequences() {
+        use crate::metrics::circuit_code_bits;
+        use crate::structural::WiringTopology;
+        use crate::substrate::{Circuit, SignalSink, SignalSource, WireDelayMode};
+        use rand_chacha::ChaCha8Rng;
+        use rand_core::{Rng, SeedableRng};
+
+        let width = Width::BITS_2;
+        let mut circuit = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
+        circuit.connect(SignalSource::BoundaryIn(0), SignalSink::BoundaryOut(0));
+        let code_bits = circuit_code_bits(&circuit, WiringTopology::WellMixed, None, 0);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(12345);
+        let mask = 3u64;
+        let facts: Vec<u64> = (0..256).map(|_| rng.next_u64() & mask).collect();
+        let preds: Vec<u64> = (0..256).map(|_| rng.next_u64() & mask).collect();
+
+        let mut economy = EconomyState::new(EconomyConfig::default(), width, 1, 1, 0).unwrap();
+        let mut total_flux = 0.0f64;
+        for (&p, &f) in preds.iter().zip(&facts) {
+            let r = economy.observe_predictions(&[p], &[f]).unwrap();
+            total_flux += r[0];
+        }
+
+        let delta_l = crate::metrics::null_calibrated_mdl_delta(
+            &circuit,
+            WiringTopology::WellMixed,
+            None,
+            0.0,
+            0,
+            &facts,
+            &preds,
+            NullModelKind::LaplaceFrequency,
+        )
+        .unwrap();
+
+        let mdl_flux = code_bits - delta_l;
+        assert!(
+            (total_flux - mdl_flux).abs() < 1e-12,
+            "economy flux {total_flux} != MDL flux {mdl_flux}"
+        );
     }
 
     #[test]
