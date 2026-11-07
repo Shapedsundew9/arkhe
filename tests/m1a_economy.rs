@@ -14,7 +14,9 @@ fn m1a_gates_pass_fast_seed_slice() {
         assert!(gate.cases > 0, "gate {} had 0 cases", gate.gate);
     }
     // G1A.1 (conservation & substrate purity), G1A.2 (separation & local credit),
-    // and G1A.3 (detour & free-rider penalty) pass cleanly under D1 recurrent cap.
+    // G1A.3 (detour & free-rider penalty), and G1A.4 (micro-macro MDL identity)
+    // pass cleanly under the M1a redesign (D1 replacing traces, D2 calibrated reward,
+    // D3 description debt, and D4 activity recency decay).
     assert!(
         summary.gates[0].passed,
         "G1A.1 failed: {:?}",
@@ -30,7 +32,6 @@ fn m1a_gates_pass_fast_seed_slice() {
         "G1A.3 failed: {:?}",
         summary.gates[2].failures
     );
-    // G1A.1, G1A.2, G1A.3, and G1A.4 pass cleanly under D1, D2, and D3.
     assert!(
         summary.gates[3].passed,
         "G1A.4 failed: {:?}",

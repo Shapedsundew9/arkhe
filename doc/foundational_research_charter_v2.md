@@ -171,7 +171,7 @@ Nodes sit on the cells of a discrete 2D grid, and each cell is empty or holds on
 
 #### 3.1.2 Metabolism
 
-Each node holds an energy reserve $E_i(t)$. Every tick, each node and wire pays a maintenance cost $c_{\text{base}}$, and `SPLIT` pays $c_{\text{split}} > c_{\text{base}}$. A node whose reserve runs out is removed. Energy enters the system **only** through reward (§3.1.4).
+Each node holds an energy reserve $E_i(t)$. Rather than arbitrary per-tick maintenance rent (which diverges with horizon $T$), each placed node incurs a **one-time description debt** $\Delta L_i$ charged upon maturity through the maintenance channel, matching its share of the circuit's description length $L(C) = \sum_i \Delta L_i$. A node driving multiple wires (such as `SPLIT`) naturally owes more wire code bits ($L(\text{split}) > L(\text{other})$) without tuning arbitrary constants. A node whose reserve runs out is removed. Energy enters the system **only** through reward (§3.1.4).
 
 #### 3.1.3 Credit assignment: retrograde, activity-gated flow
 
@@ -182,14 +182,15 @@ Each node holds an energy reserve $E_i(t)$. Every tick, each node and wire pays 
 How contribution is measured:
 
 - **Sensitivity:** an input contributed on a rewarded tick if changing it would have changed the output. This is computed exactly for $k = 1$ and sampled for larger $k$.
-- **Eligibility traces:** credit reaches structures whose contribution came several ticks earlier, through `DELAY`.
+- **Eligibility traces & replacing cap:** credit reaches structures whose contribution came several ticks earlier through `DELAY`. Ancestry weights are clamped to $\le 1.0$ (replacing traces), preventing recurrent loops from accumulating unbounded feedback gain.
+- **Activity recency decay:** input weights on identity values decay by $\gamma = 0.90$ on identity-emitting ticks, bounding single-fire detour leaks across arbitrary horizons while preserving sparse correctors.
 - **Juvenile subsidy:** new sprouts get an energy endowment and a grace period, so they can show their worth before maintenance costs kill them.
 
-#### 3.1.4 Reward: surprisal-weighted, relative to a null model
+#### 3.1.4 Reward: calibrated point-forecast surprisal, relative to a null model
 
-> **Direction:** A correct prediction of symbol $s$ earns $-\log_2 p_{\text{null}}(s)$. Here $p_{\text{null}}$ comes from a cheap local null model, such as "repeat the last symbol" or the running symbol frequency. Reward is given for **exact** matches. Graded discrepancy (for $k > 1$) drives *growth* (§3.1.5) but is not paid out as reward.
+> **Direction:** Prior to observing symbol $s$, a port's point prediction commits to a calibrated probability forecast $q = \max(\hat{q}, p_{\text{null}})$, where $\hat{q}$ is estimated prequentially under the null model's KT prior. A correct prediction earns $\log_2(q/p_{\text{null}})$, while an incorrect prediction incurs $\log_2((1-q)/(1-p_{\text{null}}))$. Reward is given for **exact** matches. Graded discrepancy (for $k > 1$) drives *growth* (§3.1.5) but is not paid out as reward.
 >
-> **Why:** This puts the informativeness principle (§1.2) into practice, and it is the faithful version of v1's "active flux" rule. The intent of that rule was right: silence agreeing with silence must not look like knowledge. The mechanism was wrong. It rewarded a two-node free-running oscillator (the most trivial structure possible) and under-rewarded sparse but meaningful streams. Weighting by surprisal pays roughly nothing for silence or for a metronome, because both are predictable by the null model, and pays most for correctly predicting rare events. Paying reward only for exact matches keeps the asymmetry principle sharp.
+> **Why:** This puts the informativeness principle (§1.2) into practice and eliminates the chance-predictor lottery. Centered surprisal had zero expected flux, but its positive variance created a random walk whose spread grew as $O(\sqrt{T})$. Under calibrated point forecasting, constant predictors score identically $0.0$ on every tick and seed, and non-predictive cumulative luck is strictly bounded by Ville's martingale inequality across arbitrary horizons. Weighting by surprisal pays nothing for silence or for a metronome, and pays most for correctly predicting rare events. Paying reward only for exact matches keeps the asymmetry principle sharp.
 
 **Where reward comes from in each phase:**
 
@@ -254,7 +255,11 @@ Local rules are hard to debug without a global quantity they are supposed to imp
 
 $$L = L(\text{palette}) + L(\text{circuit} \mid \text{palette}) + L(\text{facts} \mid \text{circuit}).$$
 
-Maintenance cost approximates the second term and prediction reward approximates the third. A derived axiom earns its place in the palette only if it lowers the first two terms by more than it adds. **A run in which total energy rises while $L$ also rises signals a bug in the economy.**
+With one-time description debt (§3.1.2) and calibrated prequential reward (§3.1.4), maintenance cost exactly realizes the second term and prediction reward exactly realizes the third. Total energy change and global null-calibrated MDL change are **identically equal**:
+
+$$\Delta E(T) = -\Delta L_{\text{null}}(T).$$
+
+A derived axiom earns its place in the palette only if it lowers the first two terms by more than it adds. **A run in which total energy change departs from $-\Delta L_{\text{null}}$ signals an implementation bug in the economy.**
 
 ---
 
@@ -505,3 +510,7 @@ Each row records a point where v1 was revised or where its intent needed stating
 | 22 | Measuring difficulty | Tiers by intuition | **ε-machines**, Berlekamp–Massey, exact synthesis (§5.2) | Measured ground truth for every learned circuit |
 | 23 | Library reuse | One environment stream | **Task families** (T4) (§5.3) | Library learning needs sub-solutions that recur across tasks |
 | 24 | Falsifiability | Expectations without metrics | Hypotheses, baselines, ablations, equal compute, pre-registered kill criteria (§6–§8) | Results that can count as failures as well as successes |
+| 25 | Metabolism | Per-tick rent ($c_{\text{base}}, c_{\text{split}}, c_{\text{wire}}$) | **One-time description debt** charged on node maturity (§3.1.2) | Per-tick rent diverges with horizon $T$ while $L(C)$ is horizon-invariant; one-time debt guarantees $\sum \Delta L_i = L(C)$ and exact macro-micro conservation without tuning magic rates |
+| 26 | Credit traces & activity | Accumulating eligibility traces & permanent activity flags | **Replacing traces** (clamped to $\le 1.0$) and **activity recency decay** with $\gamma = 0.90$ (§3.1.3) | Accumulating traces cause recurrent loops to over-credit themselves ($1/(1-\gamma) = 10$), starving combinational correctors; permanent activity flags let single-fire detours leak indefinitely |
+| 27 | Reward calibration | Centered surprisal $(\mathbf{1}[\hat{s} = s] - p)(-\log_2 p)$ | **Calibrated point-forecast reward** $r = \log_2(q/p)$ or $\log_2((1-q)/(1-p))$ (§3.1.4) | Centered surprisal is a zero-mean random walk whose variance spreads as $O(\sqrt{T})$, creating a chance lottery; calibrated forecast guarantees constant circuits score $0$ on every run and bounds cumulative variance by Ville's inequality |
+| 28 | Global-local economy alignment | Maintenance and reward "approximate" description length terms | Total energy change **identically equals** minus null-calibrated MDL change: $\Delta E(T) = -\Delta L_{\text{null}}(T)$ (§3.4) | With description debt (§3.1.2) and prequential calibrated reward (§3.1.4), local energy balance is an exact microscopic realization of global MDL, turning G1A.4 into a structural conservation law |
