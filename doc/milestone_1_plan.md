@@ -331,6 +331,25 @@ The closed-loop metabolic economy under the M1a redesign (decisions D1–D4: rep
 
 ## 4. Stage M1b Specification: First-to-Second Neuron Residual Neurogenesis
 
+### 4.0 Interface Decisions and Open Questions from the M1a Redesign
+
+Stage M1a fixed the metabolic economy on static circuits by replacing per-tick maintenance rent with one-time description debt $L(C) = \sum_i \Delta L_i$ charged upon maturity, introducing calibrated sequential point forecasts ($q = \max(\hat{q}, p)$, $r = \log_2(q/p)$), replacing ancestry traces (clamped to $\le 1.0$), and activity recency decay ($\gamma = 0.90$).
+
+Because M1b introduces online graph surgery (`EditableLattice`), sprouting, and starvation pruning, the following interface decisions arising from the debt economy must be addressed during M1b implementation:
+
+1. **Idle nodes vs. starved nodes:** Under description debt, a node that has fully repaid its share $\Delta L_i$ and subsequently stops receiving credit maintains positive energy indefinitely ($E_i(t) > 0$). Under old per-tick rent, such idle nodes passively starved. For M1b:
+   - *Structural pruning test:* A node is eligible for pruning if removing it does not increase global description length $L$ (aligning with Charter §3.2 sleep compression and Milestone 3).
+   - *Switching distribution:* Alternatively, switching codes (e.g., Herbster & Warmuth, 1998; van Erven et al., 2012) can re-charge the description cost of structure that ceases predictive contribution, using fixed switching priors rather than tuned per-tick rent.
+2. **Juvenile grace period and sprout debt:** With debt charged once upon node maturity, a newly sprouted candidate node $i$ begins with endowment $E_{\text{init}}$ (default $4.0\text{ bits}$) and juvenile grace counter $\tau_i(0) = T_{\text{juvenile}}$ (default $128\text{ ticks}$). Upon maturity ($\tau_i(t) = 0$), node $i$ is charged its description debt $\Delta L_i$. It survives if and only if accumulated juvenile earnings plus $E_{\text{init}}$ exceed $\Delta L_i$ ($E_i(t) > 0$).
+3. **Edits change existing nodes' debt shares:** Adding or removing a node changes the Elias-$\gamma$ circuit header bits and wire encoding lengths for other nodes. M1b enforces conservation $\sum_i \text{debt}_i = L(C)$ by having each sprout transaction pay the marginal change in total description length:
+   $$
+   \Delta L_{\text{sprout}} = L(C \cup \{\text{sprout}\}) - L(C).
+   $$
+4. **Port match counters ($M$) across upstream edits:** The prequential point forecast uses $M$, the cumulative count of previous exact matches. When an upstream graph edit alters a port's driver or internal cone, decide whether $M$ is preserved (treating the learner's prequential sequence as continuous) or reset (re-starting calibration for the modified predictor).
+5. **Homeostatic reserve cap ($E_{\max}$):** The M1a proportionality audit used `max_energy_reserve: None`. In M1b online runs, `max_energy_reserve: Some(25.0)` prevents long-lived first neurons from accumulating unbounded reserves that buffer against obsolete structure pruning after generator regime shifts.
+6. **Alternative null models:** The calibrated reward $r = \log_2(q/p)$ was calibrated with `LaplaceFrequency` ($KT$ estimator). If M1b evaluates `NullModelKind::RepeatLast`, a matched prequential estimator is derived so constant predictors still score identically $0.0$ on every tick.
+7. **Unowned circuit bits:** Growth can theoretically create direct `BoundaryIn(p) -> BoundaryOut(q)` connections with no intermediate nodes. Direct wire bits and minimal empty-graph headers are attributed to a circuit-level pool so $\sum_i \Delta L_i + L_{\text{unowned}} = L(C)$ remains exact.
+
 ### 4.1 Invariant- and Phase-Preserving Graph Surgery (`surgery.rs`)
 
 Online sprouting and starvation pruning mutate a live circuit at tick $t$. Naive deletion of a starved node $u$ would leave unconnected input slots on downstream consumers (violating Charter §2.5 Invariant 2) or force a fresh `ScalarState::new`, wiping live `Delay` register phases across the surviving network.
