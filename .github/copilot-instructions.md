@@ -16,6 +16,7 @@ Read `.shared/ai/core/common-instructions.md`.
 
 - If something needs to be done more than once, it shall be mechanically automated if viable.
 - If a persistent inefficiency in the development process is identified, it shall be addressed systematically rather than repeatedly worked around.
+- **NEVER, EVER** search for magic numbers. If you find yourself tuning a value to get tests or benchmarks to pass - STOP immediately & discuss it with the user.
 
 ## Repository Layout
 
