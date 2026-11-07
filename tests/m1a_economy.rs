@@ -12,20 +12,25 @@ fn m1a_gates_pass_fast_seed_slice() {
     for gate in &summary.gates {
         assert!(gate.cases > 0, "gate {} had 0 cases", gate.gate);
     }
-    // G1A.1 (conservation & substrate purity) and G1A.3 (detour & free-rider penalty) pass cleanly.
+    // G1A.1 (conservation & substrate purity), G1A.2 (separation & local credit),
+    // and G1A.3 (detour & free-rider penalty) pass cleanly under D1 recurrent cap.
     assert!(
         summary.gates[0].passed,
         "G1A.1 failed: {:?}",
         summary.gates[0].failures
     );
     assert!(
+        summary.gates[1].passed,
+        "G1A.2 failed: {:?}",
+        summary.gates[1].failures
+    );
+    assert!(
         summary.gates[2].passed,
         "G1A.3 failed: {:?}",
         summary.gates[2].failures
     );
-    // G1A.2 and G1A.4 trigger pre-registered Charter §7 Kill Criteria under channel noise.
+    // G1A.4 triggers pre-registered Kill Criterion (addressed in D2/D3).
     assert!(!summary.all_passed);
-    assert!(!summary.gates[1].passed);
     assert!(!summary.gates[3].passed);
 }
 

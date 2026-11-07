@@ -310,9 +310,9 @@ fn ancestry_for_target(
         let coefficient = target_sensitivity(sensitivity, node, target)?;
         let wire = node_out_base[node];
         for ancestor in 0..node_count {
-            wire_ancestry[wire][ancestor] = coefficient
-                * (if ancestor == node { 1.0 } else { 0.0 }
-                    + trace_discount * register_eligibility[register][ancestor]);
+            let inherited = trace_discount * register_eligibility[register][ancestor];
+            let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+            wire_ancestry[wire][ancestor] = coefficient * raw.min(1.0);
         }
     }
 
@@ -369,7 +369,8 @@ fn ancestry_for_target(
                 .zip(&weights)
                 .map(|(&wire, &weight)| weight * wire_ancestry[wire][ancestor])
                 .sum();
-            *value = coefficient * (if ancestor == node { 1.0 } else { 0.0 } + inherited);
+            let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+            *value = coefficient * raw.min(1.0);
         }
         for wire in output_wires {
             wire_ancestry[wire].copy_from_slice(&node_ancestry);
@@ -865,5 +866,79 @@ mod tests {
 
         assert!(ancestry.port_shares[0][d.index()] > 0.0);
         assert!(ancestry.port_shares[0][s.index()] > 0.0);
+    }
+
+    #[test]
+    fn recurrent_loop_ancestry_entries_are_clamped_at_most_one() {
+        let mut circuit = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+        let d = circuit.add_node(Primitive::Delay { init: 1 });
+        let s = circuit.add_node(Primitive::Split);
+        let add = circuit.add_node(Primitive::Add);
+        circuit.connect(
+            SignalSource::NodeOut { node: d, port: 0 },
+            SignalSink::NodeIn { node: s, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: s, port: 0 },
+            SignalSink::NodeIn { node: d, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: add, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: s, port: 1 },
+            SignalSink::NodeIn { node: add, port: 1 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: add, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+
+        let compiled = circuit.compile().unwrap();
+        let mut state = ScalarState::new(&compiled);
+        let mut eligibility = vec![vec![0.0; circuit.node_count()]; compiled.total_registers()];
+        let activity = vec![
+            NodeActivity {
+                ever_nonzero: true,
+                ever_non_one: false,
+            };
+            circuit.node_count()
+        ];
+        let mut outputs = [0u64];
+
+        for t in 0..100 {
+            let input = t % 2;
+            state.step(&compiled, &[input], &mut outputs).unwrap();
+            let sensitivity =
+                counterfactual_sensitivity(&circuit, &compiled, &state, SeedBank::new(1), t, 8)
+                    .unwrap();
+            let ancestry = assemble_causal_ancestry(
+                &circuit,
+                &compiled,
+                &state,
+                &sensitivity,
+                &activity,
+                &eligibility,
+                0.9,
+            )
+            .unwrap();
+
+            for &share in &ancestry.port_shares[0] {
+                assert!(
+                    share <= 1.0 + 1e-12,
+                    "tick {t}: port share {share} exceeded 1.0"
+                );
+            }
+            for trace in &ancestry.next_register_eligibility {
+                for &val in trace {
+                    assert!(
+                        val <= 1.0 + 1e-12,
+                        "tick {t}: register eligibility {val} exceeded 1.0"
+                    );
+                }
+            }
+            eligibility = ancestry.next_register_eligibility;
+        }
     }
 }
