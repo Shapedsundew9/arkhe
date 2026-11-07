@@ -296,7 +296,7 @@ Step 2 must pass before step 3 starts. Step 4's criteria are measured on top of 
    - §3.6.1: the economy and maintenance rows, and the `onefire` detour.
    - §6.1: the amended gates above.
    - WP-M1.1 to WP-M1.3, and §8 risks.
-2. Update [foundational_research_charter_v2.md](./foundational_research_charter_v2.md), adding Appendix A decision-record rows for each change:
+2. Update [foundational_research_charter_v3.md](./foundational_research_charter_v3.md), adding Appendix A decision-record rows for each change:
    - §3.1.2: metabolism as description debt.
    - §3.1.3: replacing traces and activity recency.
    - §3.1.4: the calibrated reward.

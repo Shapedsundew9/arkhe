@@ -1,6 +1,6 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, and compute-matched baseline harness implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and the fixed-structure **M1a economy gates** from the [Foundational Research Charter v2](doc/foundational_research_charter_v2.md). The M1b work is in progress; the authoritative scope and gates are in [doc/milestone_1_plan.md](doc/milestone_1_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, and compute-matched baseline harness implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and the fixed-structure **M1a economy gates** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). The M1b work is in progress; the authoritative scope and gates are in [doc/milestone_1_plan.md](doc/milestone_1_plan.md).
 
 ## Overview
 
@@ -20,7 +20,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 ├── .devcontainer/
 ├── .github/
 ├── doc/
-│   ├── foundational_research_charter_v2.md
+│   ├── foundational_research_charter_v3.md
 │   ├── milestone_0_closeout_plan.md
 │   ├── milestone_0_lessons_learned.md
 │   ├── milestone_0_plan.md

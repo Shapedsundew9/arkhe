@@ -1,8 +1,14 @@
-# Foundational Research Charter v2: Axiomatic Neurogenesis and Open-Ended Learning
+# Foundational Research Charter v3: Axiomatic Neurogenesis and Open-Ended Learning
 
-> **Status:** Current. Supersedes [foundational_research_charter.md](foundational_research_charter.md) (v1).
+> **Status:** Current authoritative research charter. Supersedes Charter v2 and v1.
 >
-> **Provenance:** This version comes out of a review cycle: [the critique](foundational_research_charter_critique.md), [the counter-critique](counter_critique.md), and [the counterpoint](counterpoint_response.md). That discussion is not repeated here. Where the review found that v1 had been misread, or that its intent was unclear, this charter states the **direction** and **why**, using callouts marked **Direction** and **Why**. [Appendix A](#appendix-a-decision-record) lists every v1 → v2 change in one table.
+> **Milestone Progress:**
+>
+> - **Milestone 0 (`M0 — Simulator and yardstick`):** Completed & verified. Exact synchronous tick semantics, variable-width arithmetic, seeded determinism, $\varepsilon$-machine and Berlekamp–Massey ground truth, and compute-matched baselines are operational.
+> - **Milestone 1a (`M1a — Metabolic economy and retrograde credit`):** Completed & verified. Closed-loop metabolic economy with replacing ancestry traces (D1), calibrated point-forecast reward (D2), one-time description debt (D3), and activity recency decay (D4) passed all acceptance gates (`G1A.1`–`G1A.4`) on 100/100 development banks across $T \in \{1024, 2048, 4096\}$ and on the untouched holdout bank (`seeds 10000..=10019`).
+> - **Milestone 1b (`M1b — First to second neuron residual neurogenesis`):** Active implementation stage. Governed by [milestone_1_plan.md](milestone_1_plan.md).
+>
+> **Provenance & Decision Record:** Version 3 incorporates the Stage M1a metabolic economy and credit redesign decisions (D1–D4). [Appendix A](#appendix-a-decision-record) details the cumulative decision record across charter revisions.
 
 ---
 
@@ -372,9 +378,9 @@ From M1a on, every milestone runs at **$k = 1$ and $k = 2$ at least**, so the ec
 
 | Stage | Goal | Success criterion | Kill / revisit criterion |
 | :--- | :--- | :--- | :--- |
-| **M0 — Simulator and yardstick** | Tick semantics and invariants (§2.5); variable-width values; seeded determinism; generator library with ε-machine and Berlekamp–Massey ground truth; baseline harness | Baselines reach known optima on T1; every run reproducible from seed and configuration | — (infrastructure) |
-| **M1a — Economy on fixed structure** | Validate credit and reward (H1) on **hand-built** correct, incorrect, and bloated circuits, before any growth | Correct circuits gain energy; incorrect ones and detours lose it; energy changes track $\Delta L$ | Energy does not separate correct from incorrect circuits: redesign credit before attempting growth |
-| **M1b — First to second neuron** | Error-driven corrector sprouting (H2) | Combined error falls as the residual's entropy predicts; no backpropagation | No consistent error reduction on T1 across seeds: revisit the sprouting criterion |
+| **M0 — Simulator and yardstick** | Tick semantics and invariants (§2.5); variable-width values; seeded determinism; generator library with ε-machine and Berlekamp–Massey ground truth; baseline harness | **Completed & verified.** Baselines reach known optima on T1; every run reproducible from seed and configuration | — (infrastructure) |
+| **M1a — Economy on fixed structure** | Validate credit and reward (H1) on **hand-built** correct, incorrect, and bloated circuits, before any growth | **Completed & verified.** Correct circuits gain energy; incorrect ones and detours lose it; exact identity $\Delta E(T) \equiv -\Delta L_{\text{null}}(T)$ holds on all runs; 100/100 banks passed | Energy does not separate correct from incorrect circuits: redesign credit before attempting growth |
+| **M1b — First to second neuron** | Error-driven corrector sprouting (H2) | **Active stage.** Combined error falls as the residual's entropy predicts; no backpropagation (see [milestone_1_plan.md](milestone_1_plan.md)) | No consistent error reduction on T1 across seeds: revisit the sprouting criterion |
 | **M2 — Redundancy and cross-channel bridges** | Redundancy sprouting; pathways from separate boundaries meet at comparators (H3) | T2 solved; comparators flag injected inconsistencies; recovery from declared noise; compared against baselines | Comparators never form spontaneously: revisit redundancy sprouting |
 | **M3 — Free-rider resistance** | Inject no-op detours and redundant branches into working circuits (H4) | Bloat is pruned; circuit size converges toward the exact-synthesis minimum | Circuit size grows without bound under stable error: revisit credit and the `SPLIT` tax |
 | **M4a — Sleep as internal falsification** | Arms S-A and S-B against compute-matched wake-only (H5, H6) | Sleep beats wake-only by a pre-registered margin; spurious cycles are rejected | Neither arm beats compute-matched wake-only: revisit sleep before attempting consolidation |
@@ -482,9 +488,9 @@ From M1a on, every milestone runs at **$k = 1$ and $k = 2$ at least**, so the ec
 
 ## Appendix A: Decision Record
 
-Each row records a point where v1 was revised or where its intent needed stating explicitly. The **Why** column is the short rationale. The full discussion is in the review documents listed at the top.
+Each row records a point where earlier designs were revised or where their intent needed stating explicitly. The **Why** column is the short rationale. Rows 1–24 record the v1 → v2 evolution; rows 25–28 record the v2 → v3 M1a metabolic economy redesign.
 
-| # | Topic | v1 | v2 direction | Why |
+| # | Topic | Earlier Baseline (v1/v2) | Direction (v2/v3) | Why |
 | :--- | :--- | :--- | :--- | :--- |
 | 1 | Meaning of truth | Survivors are "true invariants" | Truth = **unrefuted**; disagreement conclusive, agreement provisional (§1.2) | No direct access to objective truth; internal checks cannot catch errors consistent with all held structure |
 | 2 | Source of internal checks | Multiple channels emphasised | **Redundant derivations** suffice; channels are the strongest form (§1.3) | Deeper derivations over one channel can contradict shallow ones |
