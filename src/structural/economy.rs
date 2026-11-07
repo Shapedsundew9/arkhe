@@ -189,18 +189,26 @@ impl EconomyState {
         &self.scorers
     }
 
-    /// Marks nodes that have emitted non-identity values.
+    /// Updates node emission recency weights against outputs emitted on this tick (M1a redesign D4).
+    ///
+    /// If an output is non-identity, its weight is set to 1.0; otherwise it is decayed by
+    /// `trace_discount` ($\gamma$).
     pub fn record_activity(&mut self, outputs: &[u64]) -> Result<(), EconomyError> {
         if outputs.len() != self.nodes.len() {
             return Err(EconomyError::DimensionMismatch);
         }
+        let gamma = self.config.trace_discount;
         for (node, &output) in self.nodes.iter_mut().zip(outputs) {
             let norm = self.width.normalize(output);
             if norm != 0 {
-                node.activity.ever_nonzero = true;
+                node.activity.nonzero_weight = 1.0;
+            } else {
+                node.activity.nonzero_weight *= gamma;
             }
             if norm != 1 {
-                node.activity.ever_non_one = true;
+                node.activity.non_one_weight = 1.0;
+            } else {
+                node.activity.non_one_weight *= gamma;
             }
         }
         Ok(())
@@ -594,21 +602,27 @@ mod tests {
             ..EconomyConfig::default()
         };
         let mut economy = EconomyState::new(config, Width::BITS_2, 3, 1, 0).unwrap();
-        // Initially all false
+        // Initially all zero weights
         assert_eq!(economy.activity(), vec![NodeActivity::default(); 3]);
 
         // Emit 0, 1, 2
         economy.record_activity(&[0, 1, 2]).unwrap();
         let act = economy.activity();
-        // 0: ever_nonzero = false, ever_non_one = true
-        assert!(!act[0].ever_nonzero);
-        assert!(act[0].ever_non_one);
-        // 1: ever_nonzero = true, ever_non_one = false
-        assert!(act[1].ever_nonzero);
-        assert!(!act[1].ever_non_one);
-        // 2: ever_nonzero = true, ever_non_one = true
-        assert!(act[2].ever_nonzero);
-        assert!(act[2].ever_non_one);
+        // 0: nonzero_weight = 0.0, non_one_weight = 1.0
+        assert_eq!(act[0].nonzero_weight, 0.0);
+        assert_eq!(act[0].non_one_weight, 1.0);
+        assert!(!act[0].ever_nonzero());
+        assert!(act[0].ever_non_one());
+        // 1: nonzero_weight = 1.0, non_one_weight = 0.0
+        assert_eq!(act[1].nonzero_weight, 1.0);
+        assert_eq!(act[1].non_one_weight, 0.0);
+        assert!(act[1].ever_nonzero());
+        assert!(!act[1].ever_non_one());
+        // 2: nonzero_weight = 1.0, non_one_weight = 1.0
+        assert_eq!(act[2].nonzero_weight, 1.0);
+        assert_eq!(act[2].non_one_weight, 1.0);
+        assert!(act[2].ever_nonzero());
+        assert!(act[2].ever_non_one());
 
         // Check node_credit before maintenance
         let tick = economy
@@ -618,5 +632,36 @@ mod tests {
         assert!((tick.node_credit[1] - 0.3).abs() < 1e-12);
         assert!((tick.node_credit[2] - 0.2).abs() < 1e-12);
         assert!((tick.node_delta[0] - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn recency_update_and_sparse_corrector_weight_floor() {
+        let config = EconomyConfig {
+            trace_discount: 0.90,
+            juvenile_ticks: 0,
+            ..EconomyConfig::default()
+        };
+        let mut economy = EconomyState::new(config, Width::BITS_2, 1, 1, 0).unwrap();
+        let gamma = config.trace_discount;
+        assert_eq!(economy.activity()[0].nonzero_weight, 0.0);
+        assert_eq!(economy.activity()[0].non_one_weight, 0.0);
+
+        // Emit non-zero (2): nonzero_weight becomes 1.0, non_one_weight becomes 1.0
+        economy.record_activity(&[2]).unwrap();
+        assert_eq!(economy.activity()[0].nonzero_weight, 1.0);
+        assert_eq!(economy.activity()[0].non_one_weight, 1.0);
+
+        // Gap = 3: fires at t = 0, then emits 0 at t = 1 and t = 2, then fires again at t = 3.
+        // t = 1: emits 0 (identity for Add)
+        economy.record_activity(&[0]).unwrap();
+        assert!((economy.activity()[0].nonzero_weight - gamma).abs() < 1e-12);
+        // t = 2: emits 0 again
+        economy.record_activity(&[0]).unwrap();
+        let expected_floor = gamma.powi(3 - 1); // gamma^(gap - 1) = 0.90^2 = 0.81
+        assert!((economy.activity()[0].nonzero_weight - expected_floor).abs() < 1e-12);
+
+        // t = 3: fires again
+        economy.record_activity(&[2]).unwrap();
+        assert_eq!(economy.activity()[0].nonzero_weight, 1.0);
     }
 }

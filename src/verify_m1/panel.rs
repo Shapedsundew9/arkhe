@@ -102,6 +102,8 @@ pub struct PanelRun {
     pub delta_l_null: f64,
     /// Cumulative credit paid to detour nodes after tick 0.
     pub detour_credit_after_tick0: f64,
+    /// Maximum energy among detour nodes at horizon end, if any.
+    pub max_detour_energy: Option<f64>,
     /// Maximum conservation discrepancy |Σ node_delta - (flux - maint)| across all ticks.
     pub max_conservation_error: f64,
     /// Cumulative prediction reward flux Σ_t flux(t) across all ticks.
@@ -687,6 +689,38 @@ pub fn panel_circuits(task: &PanelTask) -> Vec<PanelCircuit> {
         });
     }
 
+    // onefire: Add(Base, Delay{init:1}(ConstLoop(0))) -> Out (on every non-constant task)
+    if task.id != "const0" && task.id != "const1" {
+        let mut b = Builder::new(task.width);
+        let (_, base_src) = build_base_source(task.id, &mut b, hi);
+        let mark = b.node_count();
+        let c0 = b.const_loop(0);
+        let d_one = b.circuit.add_node(Primitive::Delay { init: 1 });
+        b.circuit.connect(
+            c0,
+            SignalSink::NodeIn {
+                node: d_one,
+                port: 0,
+            },
+        );
+        let detour_nodes = b.nodes_since(mark);
+        let out = b.add(
+            base_src,
+            SignalSource::NodeOut {
+                node: d_one,
+                port: 0,
+            },
+        );
+        circuits.push(PanelCircuit {
+            id: "onefire",
+            class: CircuitClass::Detour,
+            circuit: b.finish(out),
+            detour_nodes,
+            reference: Some(base_id),
+            expected_accuracy: AccuracyCheck::Exact(1.0),
+        });
+    }
+
     // mulzero: Add(Base, Mul(Bosc, ConstLoop(0))) -> Out where Bosc = Osc2(1, 0)
     {
         let mut b = Builder::new(task.width);
@@ -887,6 +921,17 @@ pub fn run_panel_case(
         max_node_energy - config.initial_energy
     };
 
+    let max_detour_energy = if pc.detour_nodes.is_empty() {
+        None
+    } else {
+        Some(
+            pc.detour_nodes
+                .iter()
+                .map(|&n| live.economy().nodes()[n.index()].energy)
+                .fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+
     let code_bits = circuit_code_bits(&pc.circuit, WiringTopology::WellMixed, None, 0);
 
     let delta_l_null = null_calibrated_mdl_delta(
@@ -915,6 +960,7 @@ pub fn run_panel_case(
         min_node_energy,
         delta_l_null,
         detour_credit_after_tick0,
+        max_detour_energy,
         max_conservation_error,
         flux: cumulative_flux,
         code_bits,

@@ -162,3 +162,40 @@ fn cli_verify_m1a_refuses_holdout_seeds_without_flag() {
         "stderr must mention holdout refusal, got: {stderr}"
     );
 }
+
+#[test]
+fn detour_credit_after_tick0_is_bounded_and_equal_across_horizons() {
+    let runs_1024 = run_panel_matrix(20, 1, 1024);
+    let runs_4096 = run_panel_matrix(20, 1, 4096);
+
+    let mut found_onefire = false;
+    for (r1024, r4096) in runs_1024.iter().zip(&runs_4096) {
+        if r1024.circuit == "onefire" {
+            found_onefire = true;
+            let diff = (r4096.detour_credit_after_tick0 - r1024.detour_credit_after_tick0).abs();
+            assert!(
+                diff <= 1e-9,
+                "onefire leak not bounded on task {} k={}: T=1024 credit={}, T=4096 credit={}, diff={diff}",
+                r1024.task,
+                r1024.k,
+                r1024.detour_credit_after_tick0,
+                r4096.detour_credit_after_tick0
+            );
+            assert!(
+                r1024.max_detour_energy.unwrap() < 4.0,
+                "onefire detour node did not end below initial_energy at T=1024 on task {} k={}: max_de={}",
+                r1024.task,
+                r1024.k,
+                r1024.max_detour_energy.unwrap()
+            );
+            assert!(
+                r4096.max_detour_energy.unwrap() < 4.0,
+                "onefire detour node did not end below initial_energy at T=4096 on task {} k={}: max_de={}",
+                r4096.task,
+                r4096.k,
+                r4096.max_detour_energy.unwrap()
+            );
+        }
+    }
+    assert!(found_onefire, "onefire circuit must be present on panel");
+}

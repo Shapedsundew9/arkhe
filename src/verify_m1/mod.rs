@@ -770,7 +770,19 @@ fn verify_g1a3(runs: &[PanelRun], horizon: u64) -> M1aGateReport {
 
         if has_detour_nodes {
             cases += 1;
-            if run.detour_credit_after_tick0 != 0.0 {
+            if run.circuit == "onefire" {
+                let initial_energy = EconomyConfig::default().initial_energy;
+                if run
+                    .max_detour_energy
+                    .is_some_and(|max_de| max_de >= initial_energy)
+                {
+                    let max_de = run.max_detour_energy.unwrap_or(0.0);
+                    failures.push(format!(
+                        "G1A.3 / {} / {} / {} / {} / {}: onefire max_detour_energy {} >= initial_energy {}",
+                        run.task, run.k, run.circuit, run.epsilon, run.seed, max_de, initial_energy
+                    ));
+                }
+            } else if run.detour_credit_after_tick0 != 0.0 {
                 failures.push(format!(
                     "G1A.3 / {} / {} / {} / {} / {}: detour_credit_after_tick0 {} != 0.0",
                     run.task,

@@ -29,13 +29,36 @@ pub struct CausalAncestry {
     pub next_register_eligibility: Vec<Vec<f64>>,
 }
 
-/// Monotonic per-node emission history used for ring-identity gating.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Per-node emission recency history used for ring-identity gating (M1a redesign D4).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeActivity {
-    /// Node has emitted a value other than 0 (additive identity).
-    pub ever_nonzero: bool,
-    /// Node has emitted a value other than 1 (multiplicative identity).
-    pub ever_non_one: bool,
+    /// Recency weight for emitting a non-zero value (additive non-identity), in `[0.0, 1.0]`.
+    pub nonzero_weight: f64,
+    /// Recency weight for emitting a non-one value (multiplicative non-identity), in `[0.0, 1.0]`.
+    pub non_one_weight: f64,
+}
+
+impl Default for NodeActivity {
+    fn default() -> Self {
+        Self {
+            nonzero_weight: 0.0,
+            non_one_weight: 0.0,
+        }
+    }
+}
+
+impl NodeActivity {
+    /// Node has ever emitted a non-zero value.
+    #[must_use]
+    pub fn ever_nonzero(&self) -> bool {
+        self.nonzero_weight > 0.0
+    }
+
+    /// Node has ever emitted a non-one value.
+    #[must_use]
+    pub fn ever_non_one(&self) -> bool {
+        self.non_one_weight > 0.0
+    }
 }
 
 /// Failure while evaluating a counterfactual sensitivity snapshot.
@@ -343,15 +366,15 @@ fn ancestry_for_target(
             .map(|&wire| state.wire_values()[wire])
             .collect();
         let is_mul_consumer = matches!(circuit.nodes()[node], Primitive::Mul);
-        let input_active: Vec<bool> = input_wires
+        let input_active: Vec<f64> = input_wires
             .iter()
             .map(|&wire| {
-                source_node_for_wire(circuit, wire).is_some_and(|source| {
+                source_node_for_wire(circuit, wire).map_or(0.0, |source| {
                     let act = activity[source.index()];
                     if is_mul_consumer {
-                        act.ever_non_one
+                        act.non_one_weight
                     } else {
-                        act.ever_nonzero
+                        act.nonzero_weight
                     }
                 })
             })
@@ -462,12 +485,12 @@ fn evaluate_counterfactual_cone(
 
 /// Returns normalised ring-identity-aware input weights for one primitive.
 ///
-/// `input_active[j]` is the monotonic `ever_active` flag for the source of input `j`.
+/// `input_active[j]` is the recency weight in `[0.0, 1.0]` for the source of input `j` (M1a redesign D4).
 #[must_use]
 pub fn ring_identity_input_weights(
     primitive: Primitive,
     inputs: &[u64],
-    input_active: &[bool],
+    input_active: &[f64],
     width: Width,
 ) -> Vec<f64> {
     let arity = usize::from(primitive.input_arity());
@@ -486,27 +509,24 @@ pub fn ring_identity_input_weights(
             } else if values[1] == 0 && values[0] != 0 {
                 raw[1] = 0.0;
             } else if values[0] == 0 && values[1] == 0 {
-                if !input_active[0] {
-                    raw[0] = 0.0;
-                }
-                if !input_active[1] {
-                    raw[1] = 0.0;
-                }
+                raw[0] = input_active[0];
+                raw[1] = input_active[1];
             }
         }
         Primitive::Sub => {
-            if values[1] == 0 && (values[0] != 0 || !input_active[1]) {
-                raw[1] = 0.0;
+            if values[1] == 0 {
+                if values[0] != 0 {
+                    raw[1] = 0.0;
+                } else {
+                    raw[0] = input_active[0];
+                    raw[1] = input_active[1];
+                }
             }
         }
         Primitive::Mul => {
             let cardinality = 2.0f64.powi(i32::from(width.bits()));
             for input in 0..2 {
                 let other = 1 - input;
-                if values[input] == 1 && !input_active[input] {
-                    raw[input] = 0.0;
-                    continue;
-                }
                 let factor = values[other];
                 let divisor = if factor == 0 {
                     cardinality
@@ -516,7 +536,12 @@ pub fn ring_identity_input_weights(
                             .expect("trailing-zero count fits i32"),
                     )
                 };
-                raw[input] = cardinality - divisor;
+                let base_weight = cardinality - divisor;
+                if values[input] == 1 {
+                    raw[input] = base_weight * input_active[input];
+                } else {
+                    raw[input] = base_weight;
+                }
             }
         }
         _ => {}
@@ -612,15 +637,15 @@ mod tests {
     #[test]
     fn modular_identity_gates_remove_passive_inputs() {
         assert_eq!(
-            ring_identity_input_weights(Primitive::Add, &[3, 0], &[true, false], Width::BITS_2),
+            ring_identity_input_weights(Primitive::Add, &[3, 0], &[1.0, 0.0], Width::BITS_2),
             vec![1.0, 0.0]
         );
         assert_eq!(
-            ring_identity_input_weights(Primitive::Sub, &[1, 0], &[true, false], Width::BITS_2),
+            ring_identity_input_weights(Primitive::Sub, &[1, 0], &[1.0, 0.0], Width::BITS_2),
             vec![1.0, 0.0]
         );
         assert_eq!(
-            ring_identity_input_weights(Primitive::Add, &[0, 0], &[false, true], Width::BITS_2),
+            ring_identity_input_weights(Primitive::Add, &[0, 0], &[0.0, 1.0], Width::BITS_2),
             vec![0.0, 1.0]
         );
     }
@@ -628,7 +653,7 @@ mod tests {
     #[test]
     fn multiplication_weights_equal_exact_local_perturbation_counts() {
         let weights =
-            ring_identity_input_weights(Primitive::Mul, &[2, 1], &[true, true], Width::BITS_2);
+            ring_identity_input_weights(Primitive::Mul, &[2, 1], &[1.0, 1.0], Width::BITS_2);
         assert!((weights[0] - 0.6).abs() < 1e-12);
         assert!((weights[1] - 0.4).abs() < 1e-12);
     }
@@ -761,28 +786,28 @@ mod tests {
                 .unwrap();
         let activity = vec![
             NodeActivity {
-                ever_nonzero: true,
-                ever_non_one: false,
+                nonzero_weight: 1.0,
+                non_one_weight: 0.0,
             },
             NodeActivity {
-                ever_nonzero: true,
-                ever_non_one: false,
+                nonzero_weight: 1.0,
+                non_one_weight: 0.0,
             },
             NodeActivity {
-                ever_nonzero: false,
-                ever_non_one: true,
+                nonzero_weight: 0.0,
+                non_one_weight: 1.0,
             },
             NodeActivity {
-                ever_nonzero: false,
-                ever_non_one: true,
+                nonzero_weight: 0.0,
+                non_one_weight: 1.0,
             },
             NodeActivity {
-                ever_nonzero: false,
-                ever_non_one: true,
+                nonzero_weight: 0.0,
+                non_one_weight: 1.0,
             },
             NodeActivity {
-                ever_nonzero: false,
-                ever_non_one: false,
+                nonzero_weight: 0.0,
+                non_one_weight: 0.0,
             },
         ];
         let eligibility = vec![vec![0.0; circuit.node_count()]; compiled.total_registers()];
@@ -840,16 +865,16 @@ mod tests {
                 .unwrap();
         let activity = vec![
             NodeActivity {
-                ever_nonzero: true,
-                ever_non_one: false,
+                nonzero_weight: 1.0,
+                non_one_weight: 0.0,
             },
             NodeActivity {
-                ever_nonzero: true,
-                ever_non_one: false,
+                nonzero_weight: 1.0,
+                non_one_weight: 0.0,
             },
             NodeActivity {
-                ever_nonzero: true,
-                ever_non_one: false,
+                nonzero_weight: 1.0,
+                non_one_weight: 0.0,
             },
         ];
         let eligibility = vec![vec![0.0; circuit.node_count()]; compiled.total_registers()];
@@ -900,8 +925,8 @@ mod tests {
         let mut eligibility = vec![vec![0.0; circuit.node_count()]; compiled.total_registers()];
         let activity = vec![
             NodeActivity {
-                ever_nonzero: true,
-                ever_non_one: false,
+                nonzero_weight: 1.0,
+                non_one_weight: 0.0,
             };
             circuit.node_count()
         ];

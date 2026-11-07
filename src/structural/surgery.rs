@@ -253,7 +253,7 @@ impl EditableLattice {
                 matches!(
                     self.lattice.node_primitive(node),
                     Some(Primitive::Delay { init: 0 })
-                ) && !self.economy.nodes()[node.index()].activity.ever_nonzero
+                ) && !self.economy.nodes()[node.index()].activity.ever_nonzero()
             })
             .collect();
         loop {
