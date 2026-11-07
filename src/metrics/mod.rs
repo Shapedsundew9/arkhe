@@ -8,8 +8,9 @@ pub mod scorecard;
 
 pub use dynamics::{BasinReport, CycleReport, detect_autonomous_cycle, estimate_attractor_basin};
 pub use mdl::{
-    MdlBreakdown, NullCalibratedMdlError, circuit_code_bits, compute_mdl, elias_gamma_bits,
-    facts_code_bits, kt_binary_sequence_bits, null_calibrated_mdl_delta,
+    MdlBreakdown, NullCalibratedMdlError, circuit_code_bits, circuit_node_description_debts,
+    compute_mdl, elias_gamma_bits, facts_code_bits, kt_binary_sequence_bits,
+    null_calibrated_mdl_delta,
 };
 pub use null_model::{NullModel, NullModelKind};
 pub use point_forecast::PointForecastScorer;

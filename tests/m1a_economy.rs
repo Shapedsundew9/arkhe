@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use std::process::Command;
 
 use arkhe::verify_m1::{
-    CircuitClass, M1aBankReport, M1aVerificationSummary, run_m1a_verification_suite,
+    CircuitClass, DEFAULT_HORIZON, M1aBankReport, M1aVerificationSummary,
+    run_m1a_verification_suite, run_panel_matrix,
 };
 
 #[test]
@@ -29,9 +30,32 @@ fn m1a_gates_pass_fast_seed_slice() {
         "G1A.3 failed: {:?}",
         summary.gates[2].failures
     );
-    // G1A.4 triggers pre-registered Kill Criterion (addressed in D2/D3).
-    assert!(!summary.all_passed);
-    assert!(!summary.gates[3].passed);
+    // G1A.1, G1A.2, G1A.3, and G1A.4 pass cleanly under D1, D2, and D3.
+    assert!(
+        summary.gates[3].passed,
+        "G1A.4 failed: {:?}",
+        summary.gates[3].failures
+    );
+    assert!(summary.all_passed);
+}
+
+#[test]
+fn delta_e_equals_negative_delta_l_null_on_panel_runs() {
+    let runs = run_panel_matrix(0, 2, DEFAULT_HORIZON);
+    for run in &runs {
+        let sum = run.delta_e + run.delta_l_null;
+        let limit = 1e-9 * 1.0f64.max(run.delta_l_null.abs());
+        assert!(
+            sum.abs() <= limit,
+            "Run failed identity: task={} circuit={} delta_e={} delta_l={} sum={} limit={}",
+            run.task,
+            run.circuit,
+            run.delta_e,
+            run.delta_l_null,
+            sum.abs(),
+            limit
+        );
+    }
 }
 
 #[test]

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::metrics::{NullModelKind, PointForecastScorer};
 use crate::structural::sensitivity::{CausalAncestry, NodeActivity};
-use crate::substrate::{Primitive, Width};
+use crate::substrate::Width;
 
 /// Reward rule used to pay exact-match predictions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,12 +24,6 @@ pub enum RewardMode {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EconomyConfig {
-    /// Per-tick maintenance for a non-`SPLIT` node.
-    pub c_base: f64,
-    /// Per-tick maintenance for a `SPLIT` node.
-    pub c_split: f64,
-    /// Per-tick maintenance per wire hop.
-    pub c_wire: f64,
     /// Discount applied to ancestry carried through synchronous registers.
     pub trace_discount: f64,
     /// Initial reserve assigned to each placed node.
@@ -47,9 +41,6 @@ pub struct EconomyConfig {
 impl Default for EconomyConfig {
     fn default() -> Self {
         Self {
-            c_base: 0.020,
-            c_split: 0.035,
-            c_wire: 0.004,
             trace_discount: 0.90,
             initial_energy: 4.0,
             juvenile_ticks: 128,
@@ -63,13 +54,7 @@ impl Default for EconomyConfig {
 impl EconomyConfig {
     /// Checks that energy and trace settings are finite and physically meaningful.
     pub fn validate(self) -> Result<(), EconomyError> {
-        if !self.c_base.is_finite()
-            || self.c_base <= 0.0
-            || !self.c_split.is_finite()
-            || self.c_split < 0.0
-            || !self.c_wire.is_finite()
-            || self.c_wire < 0.0
-            || !self.trace_discount.is_finite()
+        if !self.trace_discount.is_finite()
             || !(0.0..1.0).contains(&self.trace_discount)
             || !self.initial_energy.is_finite()
             || self.initial_energy <= 0.0
@@ -475,17 +460,6 @@ impl EconomyState {
         };
         trace.copy_from_slice(ancestry);
         Ok(())
-    }
-
-    /// Computes a node's deterministic maintenance drain from its primitive and wire distance.
-    #[must_use]
-    pub fn maintenance_cost(&self, primitive: Primitive, wire_steps: u32) -> f64 {
-        let node_cost = if matches!(primitive, Primitive::Split) {
-            self.config.c_split
-        } else {
-            self.config.c_base
-        };
-        node_cost + self.config.c_wire * f64::from(wire_steps)
     }
 }
 

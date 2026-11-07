@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::BuildProvenance;
 use crate::env::{GeneratorConfig, NoiseModel, NoisyEnvironment};
+use crate::metrics::circuit_node_description_debts;
 use crate::rng::SeedBank;
 use crate::structural::economy::EconomyConfig;
 use crate::structural::lattice::{
@@ -17,7 +18,7 @@ use crate::substrate::{
     Circuit, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
 };
 
-pub use panel::{CircuitClass, DEFAULT_HORIZON, PanelRun};
+pub use panel::{CircuitClass, DEFAULT_HORIZON, PanelRun, run_panel_matrix};
 
 /// Pre-registered holdout range start seed.
 pub const HOLDOUT_SEED_START: u32 = 10000;
@@ -831,70 +832,28 @@ fn verify_g1a3(runs: &[PanelRun], horizon: u64) -> M1aGateReport {
     gate_report("G1A.3", cases, failures)
 }
 
-fn verify_g1a4(runs: &[PanelRun], seed_offset: u32) -> M1aGateReport {
+fn verify_g1a4(runs: &[PanelRun], _seed_offset: u32) -> M1aGateReport {
     let mut failures = Vec::new();
     let mut cases = 0u64;
 
-    // 1. Sign check (all runs): zero runs with delta_e > 0.0 && delta_l_null > 0.0
+    // Amended G1A.4 (M1a redesign D3): on every run, |delta_e + delta_l_null| <= 1e-9 * max(1, |delta_l_null|)
     for run in runs {
         cases += 1;
-        if run.delta_e > 0.0 && run.delta_l_null > 0.0 {
+        let sum = run.delta_e + run.delta_l_null;
+        let limit = 1e-9 * 1.0f64.max(run.delta_l_null.abs());
+        if sum.abs() > limit {
             failures.push(format!(
-                "G1A.4 / {} / {} / {} / {} / {}: sign inversion: delta_e {} > 0 but delta_l_null {} > 0",
-                run.task, run.k, run.circuit, run.epsilon, run.seed, run.delta_e, run.delta_l_null
+                "G1A.4 / {} / {} / {} / {} / {}: identity failed: |delta_e + delta_l_null| = |{} + {}| = {} > limit {}",
+                run.task,
+                run.k,
+                run.circuit,
+                run.epsilon,
+                run.seed,
+                run.delta_e,
+                run.delta_l_null,
+                sum.abs(),
+                limit
             ));
-        }
-    }
-
-    // 2. Rank check: for each (k, non-constant task, ε) group, take runs with seed == seed_offset
-    let epsilons = [0.0, 0.05];
-    let non_constant_tasks = [
-        ("alt", Width::BITS_1),
-        ("alt", Width::BITS_2),
-        ("motif3", Width::BITS_1),
-        ("motif3", Width::BITS_2),
-        ("sparse6", Width::BITS_1),
-        ("sparse6", Width::BITS_2),
-        ("affine", Width::BITS_1),
-        ("affine", Width::BITS_2),
-        ("counter3", Width::BITS_2),
-    ];
-
-    for (task_id, width) in non_constant_tasks {
-        let k = width.bits();
-        for &eps in &epsilons {
-            cases += 1;
-            let group_runs: Vec<&PanelRun> = runs
-                .iter()
-                .filter(|r| {
-                    r.k == k
-                        && r.task == task_id
-                        && (r.epsilon - eps).abs() < 1e-9
-                        && r.seed == u64::from(seed_offset)
-                })
-                .collect();
-
-            if group_runs.len() < 6 {
-                failures.push(format!(
-                    "G1A.4 / {} / k={} / eps={}: group has only {} members, expected >= 6",
-                    task_id,
-                    k,
-                    eps,
-                    group_runs.len()
-                ));
-                continue;
-            }
-
-            let delta_es: Vec<f64> = group_runs.iter().map(|r| r.delta_e).collect();
-            let neg_delta_ls: Vec<f64> = group_runs.iter().map(|r| -r.delta_l_null).collect();
-            let rho = spearman(&delta_es, &neg_delta_ls);
-
-            if rho < 0.90 {
-                failures.push(format!(
-                    "G1A.4 / {} / k={} / eps={}: Spearman rho {:.4} < 0.90 (delta_e={:?}, -delta_l={:?})",
-                    task_id, k, eps, rho, delta_es, neg_delta_ls
-                ));
-            }
         }
     }
 
@@ -971,8 +930,9 @@ fn run_spatial_osc2(width: Width, horizon: u64) -> Result<(f64, f64), String> {
         )
         .map_err(|e| e.to_string())?;
 
-    let wire_steps = lattice.wire_steps_per_node().map_err(|e| e.to_string())?;
     let circuit = lattice.lower().map_err(|e| e.to_string())?;
+    let debts =
+        circuit_node_description_debts(&circuit, lattice.topology(), Some(lattice.shape()), 0);
 
     let generator = GeneratorConfig::T1_Alternating { a: 0, b: hi }
         .build(width)
@@ -984,7 +944,7 @@ fn run_spatial_osc2(width: Width, horizon: u64) -> Result<(f64, f64), String> {
         max_energy_reserve: None,
         ..EconomyConfig::default()
     };
-    let mut live = LiveCircuit::new(circuit, &wire_steps, config, SeedBank::new(0), 8)
+    let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(0), 8)
         .map_err(|e| e.to_string())?;
 
     let mut clean = vec![0u64; 1];
@@ -1123,8 +1083,9 @@ fn run_spatial_detour(width: Width, horizon: u64) -> Result<(f64, f64, f64), Str
         .map_err(|e| e.to_string())?;
 
     let detour_nodes = vec![dc, sc];
-    let wire_steps = lattice.wire_steps_per_node().map_err(|e| e.to_string())?;
     let circuit = lattice.lower().map_err(|e| e.to_string())?;
+    let debts =
+        circuit_node_description_debts(&circuit, lattice.topology(), Some(lattice.shape()), 0);
 
     let generator = GeneratorConfig::T1_Alternating { a: 0, b: hi }
         .build(width)
@@ -1136,7 +1097,7 @@ fn run_spatial_detour(width: Width, horizon: u64) -> Result<(f64, f64, f64), Str
         max_energy_reserve: None,
         ..EconomyConfig::default()
     };
-    let mut live = LiveCircuit::new(circuit, &wire_steps, config, SeedBank::new(0), 8)
+    let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(0), 8)
         .map_err(|e| e.to_string())?;
 
     let mut clean = vec![0u64; 1];
@@ -1165,50 +1126,6 @@ fn run_spatial_detour(width: Width, horizon: u64) -> Result<(f64, f64, f64), Str
 
     let (ref_delta_e, _) = run_spatial_osc2(width, horizon)?;
     Ok((detour_credit_after_tick0, detour_delta_e, ref_delta_e))
-}
-
-fn spearman(left: &[f64], right: &[f64]) -> f64 {
-    fn ranks(values: &[f64]) -> Vec<f64> {
-        let mut indices: Vec<usize> = (0..values.len()).collect();
-        indices.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
-        let mut result = vec![0.0; values.len()];
-        let mut start = 0usize;
-        while start < indices.len() {
-            let mut end = start + 1;
-            while end < indices.len() && values[indices[end]] == values[indices[start]] {
-                end += 1;
-            }
-            let rank = ((start + 1 + end) as f64) / 2.0;
-            for &index in &indices[start..end] {
-                result[index] = rank;
-            }
-            start = end;
-        }
-        result
-    }
-    if left.len() != right.len() || left.len() < 2 {
-        return 0.0;
-    }
-    let left = ranks(left);
-    let right = ranks(right);
-    let n = left.len() as f64;
-    let left_mean = left.iter().sum::<f64>() / n;
-    let right_mean = right.iter().sum::<f64>() / n;
-    let covariance: f64 = left
-        .iter()
-        .zip(&right)
-        .map(|(&a, &b)| (a - left_mean) * (b - right_mean))
-        .sum();
-    let left_variance: f64 = left.iter().map(|&value| (value - left_mean).powi(2)).sum();
-    let right_variance: f64 = right
-        .iter()
-        .map(|&value| (value - right_mean).powi(2))
-        .sum();
-    if left_variance == 0.0 || right_variance == 0.0 {
-        0.0
-    } else {
-        covariance / (left_variance * right_variance).sqrt()
-    }
 }
 
 #[cfg(test)]

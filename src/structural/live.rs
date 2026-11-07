@@ -75,7 +75,8 @@ pub struct LiveCircuit {
     compiled: CompiledCircuit,
     state: ScalarState,
     economy: EconomyState,
-    maintenance: Vec<f64>,
+    description_debts: Vec<f64>,
+    debt_paid: Vec<bool>,
     seed_bank: SeedBank,
     sample_count: usize,
     tick: u64,
@@ -83,15 +84,15 @@ pub struct LiveCircuit {
 }
 
 impl LiveCircuit {
-    /// Initializes a live execution harness for `circuit` with wire-step maintenance.
+    /// Initializes a live execution harness for `circuit` with description debts.
     pub fn new(
         circuit: Circuit,
-        wire_steps: &[u32],
+        description_debts: &[f64],
         config: EconomyConfig,
         seed_bank: SeedBank,
         sample_count: usize,
     ) -> Result<Self, LiveError> {
-        if wire_steps.len() != circuit.node_count() {
+        if description_debts.len() != circuit.node_count() {
             return Err(LiveError::Economy(EconomyError::DimensionMismatch));
         }
         let compiled = circuit.compile().map_err(LiveError::Invariant)?;
@@ -104,19 +105,14 @@ impl LiveCircuit {
             compiled.total_registers(),
         )
         .map_err(LiveError::Economy)?;
-        let maintenance: Vec<f64> = circuit
-            .nodes()
-            .iter()
-            .zip(wire_steps)
-            .map(|(&primitive, &steps)| economy.maintenance_cost(primitive, steps))
-            .collect();
 
         Ok(Self {
             circuit,
             compiled,
             state,
             economy,
-            maintenance,
+            description_debts: description_debts.to_vec(),
+            debt_paid: vec![false; description_debts.len()],
             seed_bank,
             sample_count,
             tick: 0,
@@ -180,9 +176,18 @@ impl LiveCircuit {
             .economy
             .observe_predictions(&pending.predictions, facts)
             .map_err(LiveError::Economy)?;
+
+        let mut maintenance = vec![0.0; self.circuit.node_count()];
+        for (index, node) in self.economy.nodes().iter().enumerate() {
+            if !self.debt_paid[index] && node.juvenile_ticks == 0 {
+                maintenance[index] = self.description_debts[index];
+                self.debt_paid[index] = true;
+            }
+        }
+
         let economy_tick = self
             .economy
-            .apply_causal_tick(&port_rewards, &pending.ancestry, &self.maintenance)
+            .apply_causal_tick(&port_rewards, &pending.ancestry, &maintenance)
             .map_err(LiveError::Economy)?;
         let live_tick = LiveTick {
             tick: self.tick,
@@ -217,6 +222,17 @@ impl LiveCircuit {
     pub const fn tick(&self) -> u64 {
         self.tick
     }
+}
+
+/// Description debts for a well-mixed circuit (Level-0 palette).
+#[must_use]
+pub fn well_mixed_description_debts(circuit: &Circuit) -> Vec<f64> {
+    crate::metrics::circuit_node_description_debts(
+        circuit,
+        crate::structural::WiringTopology::WellMixed,
+        None,
+        0,
+    )
 }
 
 /// WellMixed wire steps: 1 per incoming NodeIn edge + 1 per BoundaryOut edge driven by the node.
@@ -282,14 +298,13 @@ mod tests {
             SignalSink::BoundaryOut(0),
         );
 
-        let wire_steps = well_mixed_wire_steps(&circuit);
+        let debts = well_mixed_description_debts(&circuit);
         let config = EconomyConfig {
             juvenile_ticks: 0,
             max_energy_reserve: None,
             ..EconomyConfig::default()
         };
-        let mut live =
-            LiveCircuit::new(circuit, &wire_steps, config, SeedBank::new(42), 8).unwrap();
+        let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(42), 8).unwrap();
 
         for t in 0..500 {
             let fact = [t % 2];
@@ -338,13 +353,13 @@ mod tests {
             SignalSink::BoundaryOut(0),
         );
 
-        let wire_steps = well_mixed_wire_steps(&circuit);
+        let debts = well_mixed_description_debts(&circuit);
         let config = EconomyConfig {
             juvenile_ticks: 0,
             max_energy_reserve: None,
             ..EconomyConfig::default()
         };
-        let mut live = LiveCircuit::new(circuit, &wire_steps, config, SeedBank::new(7), 8).unwrap();
+        let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(7), 8).unwrap();
 
         let mut last_tick = None;
         for t in 0..64 {
@@ -390,13 +405,13 @@ mod tests {
             SignalSink::BoundaryOut(0),
         );
 
-        let wire_steps = well_mixed_wire_steps(&circuit);
+        let debts = well_mixed_description_debts(&circuit);
         let config = EconomyConfig {
             juvenile_ticks: 8,
             max_energy_reserve: None,
             ..EconomyConfig::default()
         };
-        let mut live = LiveCircuit::new(circuit, &wire_steps, config, SeedBank::new(1), 8).unwrap();
+        let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(1), 8).unwrap();
 
         for t in 0..8 {
             let _pred = live.predict(&[0]).unwrap();
@@ -438,9 +453,9 @@ mod tests {
             SignalSink::BoundaryOut(0),
         );
 
-        let wire_steps = well_mixed_wire_steps(&circuit);
+        let debts = well_mixed_description_debts(&circuit);
         let config = EconomyConfig::default();
-        let mut live = LiveCircuit::new(circuit, &wire_steps, config, SeedBank::new(1), 8).unwrap();
+        let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(1), 8).unwrap();
 
         // Calling settle first is a protocol error
         assert!(matches!(live.settle(&[0]), Err(LiveError::Protocol(_))));
@@ -489,12 +504,12 @@ mod tests {
                 SignalSink::BoundaryOut(0),
             );
 
-            let wire_steps = well_mixed_wire_steps(&circuit);
+            let debts = well_mixed_description_debts(&circuit);
             let config = EconomyConfig {
                 juvenile_ticks: 4,
                 ..EconomyConfig::default()
             };
-            LiveCircuit::new(circuit, &wire_steps, config, SeedBank::new(99), 8).unwrap()
+            LiveCircuit::new(circuit, &debts, config, SeedBank::new(99), 8).unwrap()
         };
 
         let mut live1 = build();
