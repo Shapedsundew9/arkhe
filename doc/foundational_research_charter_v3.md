@@ -144,9 +144,9 @@ These are hard invariants, enforced whenever structure changes:
 
 1. **Synchronous update.** All `DELAY` registers update simultaneously at each tick. All other primitives are combinational within a tick.
 2. **Every cycle contains at least one `DELAY`.** Combinational loops are forbidden, because they have no well-defined value. Sprouting that would create one is rejected. Evaluation is then a topological pass, costing $O(1)$ per node and $O(N)$ per tick.
-3. **Wire delay is an explicit configuration parameter.** The default: hops between neighbours are combinational and only `DELAY` holds state. The alternative (every hop costs a tick, so distance equals delay) is a planned ablation, not an accident of implementation.
-4. **Each output port has one driver.** Competing hypotheses live *inside* the grid and meet at comparators. Only one structure drives each boundary prediction port at a time. Replacing the driver is a structural event decided by the economy.
-5. **Fan-out happens only through `SPLIT`.** Unconnected outputs are allowed (discarding is free). Their node still pays maintenance, so leaving outputs dangling has no advantage.
+3. **Wire delay and topology are explicit configuration parameters.** Circuits support arbitrary direct graph wiring (`WellMixed`) allowing any number of edges directly between endpoints without planar relay blockage; combinational wires propagate without tick delay and only `DELAY` holds state. Planar nearest-neighbour routing (`LocalVonNeumann` / `LocalMoore`) and per-hop wire delays (`TicksPerHop`) remain supported as controlled ablations (§8).
+4. **Each output port has one driver.** Competing hypotheses meet at comparators and output adders. Only one structure drives each boundary prediction port at a time. Replacing or augmenting the driver with a stacked corrector is a structural event decided by the economy.
+5. **Fan-out happens only through `SPLIT`.** Unconnected outputs are allowed (discarding is free). When an output signal feeds multiple destinations, explicit `SPLIT` primitives distribute it. Description length ($L(C)$) prices non-local wiring and branching, preventing bloat without planar congestion.
 
 ### 2.6 Dynamical vocabulary
 
@@ -171,9 +171,11 @@ The measurable quantities are cycle length, transient length, **basin size** (th
 
 ### 3.1 The structural layer
 
-#### 3.1.1 Spatial lattice
+#### 3.1.1 Spatial lattice and graph connectivity
 
-Nodes sit on the cells of a discrete 2D grid, and each cell is empty or holds one primitive. Wiring is **local** (to neighbouring cells only). The $K$ environment channels enter along distinct boundaries. Locality gives the system a geometry: structures form as spatially separate "droplets", cross-referencing happens where their wavefronts meet, and the distance a signal must travel is a real cost.
+Nodes sit on coordinates of a graph representation (defaulting to well-mixed direct graph wiring, with optional 2D discrete grid layouts). Wiring connects primitive ports directly without requiring intermediate single-cell relay paths.
+
+> **Architectural Decision (M1b):** The early metaphor of a physical 2D planar lattice with strict nearest-neighbour wiring (`LocalVonNeumann` with single-cell `SPLIT` relays and `max_relay_hops`) treated empty cells as routing relays. In practice, during multi-neuron neurogenesis, routing wires through empty cells rapidly saturated border cells around input/output ports and produced severe spatial congestion and routing deadlock, forcing fragile coordinate-relocation heuristics. The metaphor of a 2D spatial droplet or breadboard had gotten baked into the architecture as an accidental bottleneck. The restriction is removed: circuits support arbitrary direct graph wiring (`WellMixed` direct connections between any endpoints without planar relay blockage), allowing any number of edges directly between nodes. The true resource cost of non-local wiring is already principledly tracked by MDL circuit description length ($L(C)$ wire code bits and split pricing), preventing bloat without artificial gridlock. `LocalVonNeumann` and `LocalMoore` remain available as controlled ablations (§8).
 
 #### 3.1.2 Metabolism
 
@@ -520,3 +522,4 @@ Each row records a point where earlier designs were revised or where their inten
 | 26 | Credit traces & activity | Accumulating eligibility traces & permanent activity flags | **Replacing traces** (clamped to $\le 1.0$) and **activity recency decay** with $\gamma = 0.90$ (§3.1.3) | Accumulating traces cause recurrent loops to over-credit themselves ($1/(1-\gamma) = 10$), starving combinational correctors; permanent activity flags let single-fire detours leak indefinitely |
 | 27 | Reward calibration | Centered surprisal $(\mathbf{1}[\hat{s} = s] - p)(-\log_2 p)$ | **Calibrated point-forecast reward** $r = \log_2(q/p)$ or $\log_2((1-q)/(1-p))$ (§3.1.4) | Centered surprisal is a zero-mean random walk whose variance spreads as $O(\sqrt{T})$, creating a chance lottery; calibrated forecast guarantees constant circuits score $0$ on every run and bounds cumulative variance by Ville's inequality |
 | 28 | Global-local economy alignment | Maintenance and reward "approximate" description length terms | Total energy change **identically equals** minus null-calibrated MDL change: $\Delta E(T) = -\Delta L_{\text{null}}(T)$ (§3.4) | With description debt (§3.1.2) and prequential calibrated reward (§3.1.4), local energy balance is an exact microscopic realization of global MDL, turning G1A.4 into a structural conservation law |
+| 29 | Connectivity & graph topology | 2D planar grid nearest-neighbour routing (`LocalVonNeumann` with single-cell `SPLIT` relays and `max_relay_hops`) | **Arbitrary direct graph wiring / well-mixed connectivity** without planar relay blockage (§3.1.1) | Treating empty cells as relays rapidly created spatial congestion and blocked output ports during multi-neuron neurogenesis, forcing brittle coordinate heuristics; the physical 2D breadboard/spatial droplet metaphor had become an accidental constraint, whereas MDL description length already penalises non-local edges without artificial planar gridlock |

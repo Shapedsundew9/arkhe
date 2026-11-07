@@ -126,16 +126,45 @@ pub fn circuit_code_bits(
     grid_shape: Option<GridShape>,
     extra_palette_entries: usize,
 ) -> f64 {
+    circuit_code_bits_with_tax(circuit, topology, grid_shape, extra_palette_entries, true)
+}
+
+/// Encodes $L(\text{circuit} \mid \text{palette})$ for a Level-0 [`Circuit`] with an optional
+/// fan-out tax toggle (`split_code_tax`).
+#[must_use]
+pub fn circuit_code_bits_with_tax(
+    circuit: &Circuit,
+    topology: WiringTopology,
+    grid_shape: Option<GridShape>,
+    extra_palette_entries: usize,
+    split_code_tax: bool,
+) -> f64 {
     let n = circuit.node_count();
     let m = circuit.edges().len();
+    if n == 0 && m == 0 {
+        return 0.0;
+    }
     let header_bits = elias_gamma_bits(n) + elias_gamma_bits(m);
 
     let palette_card = (Primitive::PALETTE_SIZE + extra_palette_entries) as f64;
-    let mut node_bits = (n as f64) * palette_card.log2();
+    let base_node_bits = palette_card.log2();
     let k_bits = f64::from(circuit.width().bits());
+
+    let placement_bits_per_node = match (topology, grid_shape) {
+        (WiringTopology::LocalVonNeumann | WiringTopology::LocalMoore, Some(shape)) => {
+            let cells = (usize::from(shape.rows) * usize::from(shape.cols)).max(1) as f64;
+            cells.log2()
+        }
+        _ => 0.0,
+    };
+
+    let mut node_bits = 0.0;
     for &prim in circuit.nodes() {
+        if !split_code_tax && prim == Primitive::Split {
+            continue;
+        }
+        node_bits += base_node_bits + placement_bits_per_node;
         if let Primitive::Delay { init } = prim {
-            // 1-bit flag for default zero vs. explicit k-bit seed register.
             node_bits += if init == 0 { 1.0 } else { 1.0 + k_bits };
         }
     }
@@ -153,56 +182,63 @@ pub fn circuit_code_bits(
             .map(|p| usize::from(p.input_arity()))
             .sum::<usize>();
 
-    let wiring_bits = match (topology, grid_shape) {
-        (WiringTopology::LocalVonNeumann, Some(shape)) => {
-            let cells = (usize::from(shape.rows) * usize::from(shape.cols)).max(1) as f64;
-            // Cell placement + 2-bit cardinal step + port slot bit.
-            (n as f64) * cells.log2() + (m as f64) * 3.0
-        }
-        (WiringTopology::LocalMoore, Some(shape)) => {
-            let cells = (usize::from(shape.rows) * usize::from(shape.cols)).max(1) as f64;
-            (n as f64) * cells.log2() + (m as f64) * 4.0
-        }
+    let bit_per_wire = match (topology, grid_shape) {
+        (WiringTopology::LocalVonNeumann, Some(_)) => 3.0,
+        (WiringTopology::LocalMoore, Some(_)) => 4.0,
         _ => {
             let pairs = (src_ports.max(1) * dst_ports.max(1)) as f64;
-            (m as f64) * pairs.log2()
+            pairs.log2()
         }
     };
+
+    let mut wiring_bits = 0.0;
+    for edge in circuit.edges() {
+        let is_split_port1 = !split_code_tax
+            && matches!(edge.src, SignalSource::NodeOut { node, port: 1 } if circuit.nodes()[node.index()] == Primitive::Split);
+        if !is_split_port1 {
+            wiring_bits += bit_per_wire;
+        }
+    }
 
     header_bits + node_bits + wiring_bits
 }
 
-/// Allocates the circuit's description length $L(C)$ among its nodes as description debt $\Delta L_i$
-/// (M1a redesign D3).
+/// Decomposed allocation of circuit description length among nodes and unowned wires.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CircuitDescriptionAllocation {
+    /// Description debt assigned to each node index.
+    pub node_debts: Vec<f64>,
+    /// Bits attributable to wires or headers unowned by any node.
+    pub unowned_bits: f64,
+}
+
+/// Allocates the circuit's description length among its nodes as description debt $\Delta L_i$
+/// (M1a redesign D3, M1b extension D1b.7).
 ///
-/// Each node owes:
-/// - Its share of the header bits: $(\ell_\gamma(n) + \ell_\gamma(m)) / n$
-/// - Its node bits: palette index $\log_2(\text{palette})$, `Delay` init bits, and lattice placement bits $\log_2(\text{cells})$
-/// - The bits for each wire it drives, or incoming from `BoundaryIn` for the node it feeds
-///
-/// Fails loudly (panics) if there are unowned bits (e.g. $n = 0$ or direct `BoundaryIn` -> `BoundaryOut` wire).
+/// Returns per-node debts and unowned bits without panicking on $N = 0$ or direct boundary wires.
 #[must_use]
-pub fn circuit_node_description_debts(
+pub fn allocate_circuit_description_bits(
     circuit: &Circuit,
     topology: WiringTopology,
     grid_shape: Option<GridShape>,
     extra_palette_entries: usize,
-) -> Vec<f64> {
+    split_code_tax: bool,
+) -> CircuitDescriptionAllocation {
     let n = circuit.node_count();
     let m = circuit.edges().len();
-    assert!(
-        n > 0,
-        "circuit has no nodes to own description length (unallocated header/wire bits)"
-    );
+    if n == 0 && m == 0 {
+        return CircuitDescriptionAllocation {
+            node_debts: Vec::new(),
+            unowned_bits: 0.0,
+        };
+    }
 
     let header_bits = elias_gamma_bits(n) + elias_gamma_bits(m);
-    let header_share = header_bits / (n as f64);
-
     let palette_card = (Primitive::PALETTE_SIZE + extra_palette_entries) as f64;
     let base_node_bits = palette_card.log2();
     let k_bits = f64::from(circuit.width().bits());
 
-    let placement_bits = match (topology, grid_shape) {
+    let placement_bits_per_node = match (topology, grid_shape) {
         (WiringTopology::LocalVonNeumann | WiringTopology::LocalMoore, Some(shape)) => {
             let cells = (usize::from(shape.rows) * usize::from(shape.cols)).max(1) as f64;
             cells.log2()
@@ -232,38 +268,100 @@ pub fn circuit_node_description_debts(
         }
     };
 
+    if n == 0 {
+        let mut unowned_bits = header_bits;
+        for _ in circuit.edges() {
+            unowned_bits += bit_per_wire;
+        }
+        return CircuitDescriptionAllocation {
+            node_debts: Vec::new(),
+            unowned_bits,
+        };
+    }
+
+    let header_share = header_bits / (n as f64);
     let mut debts = Vec::with_capacity(n);
     for prim in circuit.nodes() {
-        let mut node_debt = header_share + base_node_bits + placement_bits;
+        let mut node_debt = header_share;
+        if split_code_tax || *prim != Primitive::Split {
+            node_debt += base_node_bits + placement_bits_per_node;
+        }
         if let Primitive::Delay { init } = *prim {
             node_debt += if init == 0 { 1.0 } else { 1.0 + k_bits };
         }
         debts.push(node_debt);
     }
 
+    let mut unowned_bits = 0.0;
     for edge in circuit.edges() {
+        let is_split_port1 = !split_code_tax
+            && matches!(edge.src, SignalSource::NodeOut { node, port: 1 } if circuit.nodes()[node.index()] == Primitive::Split);
+        let wire_cost = if is_split_port1 { 0.0 } else { bit_per_wire };
+
         match (edge.src, edge.dst) {
             (SignalSource::NodeOut { node, .. }, _) => {
-                debts[node.index()] += bit_per_wire;
+                debts[node.index()] += wire_cost;
             }
             (SignalSource::BoundaryIn(_), SignalSink::NodeIn { node, .. }) => {
-                debts[node.index()] += bit_per_wire;
+                debts[node.index()] += wire_cost;
             }
             (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(_)) => {
-                panic!("circuit has direct BoundaryIn -> BoundaryOut wire with no node owner");
+                unowned_bits += wire_cost;
             }
         }
     }
 
-    let total_debt: f64 = debts.iter().sum();
-    let total_circuit_bits =
-        circuit_code_bits(circuit, topology, grid_shape, extra_palette_entries);
+    let total_debt: f64 = debts.iter().sum::<f64>() + unowned_bits;
+    let total_circuit_bits = circuit_code_bits_with_tax(
+        circuit,
+        topology,
+        grid_shape,
+        extra_palette_entries,
+        split_code_tax,
+    );
     debug_assert!(
         (total_debt - total_circuit_bits).abs() < 1e-12,
-        "sum of node description debts {total_debt} does not match circuit_code_bits {total_circuit_bits}"
+        "sum of debts and unowned {total_debt} does not match circuit_code_bits_with_tax {total_circuit_bits}"
     );
 
-    debts
+    CircuitDescriptionAllocation {
+        node_debts: debts,
+        unowned_bits,
+    }
+}
+
+/// Allocates the circuit's description length $L(C)$ among its nodes as description debt $\Delta L_i$
+/// (M1a redesign D3).
+///
+/// Each node owes:
+/// - Its share of the header bits: $(\ell_\gamma(n) + \ell_\gamma(m)) / n$
+/// - Its node bits: palette index $\log_2(\text{palette})$, `Delay` init bits, and lattice placement bits $\log_2(\text{cells})$
+/// - The bits for each wire it drives, or incoming from `BoundaryIn` for the node it feeds
+///
+/// Fails loudly (panics) if there are unowned bits (e.g. $n = 0$ or direct `BoundaryIn` -> `BoundaryOut` wire).
+#[must_use]
+pub fn circuit_node_description_debts(
+    circuit: &Circuit,
+    topology: WiringTopology,
+    grid_shape: Option<GridShape>,
+    extra_palette_entries: usize,
+) -> Vec<f64> {
+    assert!(
+        circuit.node_count() > 0,
+        "circuit has no nodes to own description length (unallocated header/wire bits)"
+    );
+    let alloc = allocate_circuit_description_bits(
+        circuit,
+        topology,
+        grid_shape,
+        extra_palette_entries,
+        true,
+    );
+    assert!(
+        alloc.unowned_bits == 0.0,
+        "circuit has direct BoundaryIn -> BoundaryOut wire with no node owner"
+    );
+    alloc.node_debts
 }
 
 /// Computes the full [`MdlBreakdown`] for a candidate circuit and its observed prediction counts.
@@ -277,7 +375,39 @@ pub fn compute_mdl(
     total_symbols: u64,
     mismatches: u64,
 ) -> MdlBreakdown {
-    let circuit_bits = circuit_code_bits(circuit, topology, grid_shape, extra_palette_entries);
+    compute_mdl_with_tax(
+        circuit,
+        topology,
+        grid_shape,
+        palette_bits,
+        extra_palette_entries,
+        total_symbols,
+        mismatches,
+        true,
+    )
+}
+
+/// Computes the full [`MdlBreakdown`] for a candidate circuit and its observed prediction counts
+/// with an explicit `split_code_tax` setting.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_mdl_with_tax(
+    circuit: &Circuit,
+    topology: WiringTopology,
+    grid_shape: Option<GridShape>,
+    palette_bits: f64,
+    extra_palette_entries: usize,
+    total_symbols: u64,
+    mismatches: u64,
+    split_code_tax: bool,
+) -> MdlBreakdown {
+    let circuit_bits = circuit_code_bits_with_tax(
+        circuit,
+        topology,
+        grid_shape,
+        extra_palette_entries,
+        split_code_tax,
+    );
     let facts_bits = facts_code_bits(circuit.width(), total_symbols, mismatches);
     let total_bits = palette_bits + circuit_bits + facts_bits;
     MdlBreakdown {
@@ -468,5 +598,110 @@ mod tests {
             debts_b[s.index()],
             debts_a[d.index()]
         );
+    }
+
+    #[test]
+    fn allocate_circuit_description_bits_empty_and_unowned_boundary() {
+        let shape = GridShape::new(4, 4).unwrap();
+        // 1. Empty circuit
+        let empty = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+        let alloc_empty =
+            allocate_circuit_description_bits(&empty, WiringTopology::WellMixed, None, 0, true);
+        assert_eq!(alloc_empty.node_debts.len(), 0);
+        assert_eq!(alloc_empty.unowned_bits, 0.0);
+        assert_eq!(
+            circuit_code_bits_with_tax(&empty, WiringTopology::WellMixed, None, 0, true),
+            0.0
+        );
+
+        // 2. Direct BoundaryIn -> BoundaryOut with no nodes
+        let mut direct = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+        direct.connect(SignalSource::BoundaryIn(0), SignalSink::BoundaryOut(0));
+        let alloc_direct =
+            allocate_circuit_description_bits(&direct, WiringTopology::WellMixed, None, 0, true);
+        assert_eq!(alloc_direct.node_debts.len(), 0);
+        let expected_direct =
+            circuit_code_bits_with_tax(&direct, WiringTopology::WellMixed, None, 0, true);
+        assert!((alloc_direct.unowned_bits - expected_direct).abs() < 1e-12);
+
+        // 3. Node-containing circuit with direct unowned wire alongside a node
+        let mut hybrid = Circuit::new(Width::BITS_1, 2, 2, WireDelayMode::Combinational);
+        let d = hybrid.add_node(Primitive::Delay { init: 0 });
+        hybrid.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: d, port: 0 },
+        );
+        hybrid.connect(
+            SignalSource::NodeOut { node: d, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+        hybrid.connect(SignalSource::BoundaryIn(1), SignalSink::BoundaryOut(1));
+        let alloc_hybrid = allocate_circuit_description_bits(
+            &hybrid,
+            WiringTopology::LocalVonNeumann,
+            Some(shape),
+            0,
+            true,
+        );
+        let sum_hybrid = alloc_hybrid.node_debts.iter().sum::<f64>() + alloc_hybrid.unowned_bits;
+        let expected_hybrid = circuit_code_bits_with_tax(
+            &hybrid,
+            WiringTopology::LocalVonNeumann,
+            Some(shape),
+            0,
+            true,
+        );
+        assert!((sum_hybrid - expected_hybrid).abs() < 1e-12);
+        assert!(alloc_hybrid.unowned_bits > 0.0);
+
+        // 4. split_code_tax toggle test
+        let mut split_circ = Circuit::new(Width::BITS_1, 1, 2, WireDelayMode::Combinational);
+        let s = split_circ.add_node(Primitive::Split);
+        split_circ.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: s, port: 0 },
+        );
+        split_circ.connect(
+            SignalSource::NodeOut { node: s, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+        split_circ.connect(
+            SignalSource::NodeOut { node: s, port: 1 },
+            SignalSink::BoundaryOut(1),
+        );
+
+        let alloc_taxed = allocate_circuit_description_bits(
+            &split_circ,
+            WiringTopology::LocalVonNeumann,
+            Some(shape),
+            0,
+            true,
+        );
+        let alloc_untaxed = allocate_circuit_description_bits(
+            &split_circ,
+            WiringTopology::LocalVonNeumann,
+            Some(shape),
+            0,
+            false,
+        );
+        assert!(alloc_taxed.node_debts[0] > alloc_untaxed.node_debts[0]);
+
+        let cost_taxed = circuit_code_bits_with_tax(
+            &split_circ,
+            WiringTopology::LocalVonNeumann,
+            Some(shape),
+            0,
+            true,
+        );
+        let cost_untaxed = circuit_code_bits_with_tax(
+            &split_circ,
+            WiringTopology::LocalVonNeumann,
+            Some(shape),
+            0,
+            false,
+        );
+        assert!(cost_taxed > cost_untaxed);
+        let sum_untaxed = alloc_untaxed.node_debts.iter().sum::<f64>() + alloc_untaxed.unowned_bits;
+        assert!((sum_untaxed - cost_untaxed).abs() < 1e-12);
     }
 }

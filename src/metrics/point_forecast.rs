@@ -19,6 +19,10 @@ pub struct PointForecastScorer {
     null_model: NullModel,
     t: u64,
     matches: u64,
+    rep_t: u64,
+    rep_matches: u64,
+    chg_t: u64,
+    chg_matches: u64,
 }
 
 impl PointForecastScorer {
@@ -30,6 +34,10 @@ impl PointForecastScorer {
             null_model: NullModel::new(width, null_model_kind),
             t: 0,
             matches: 0,
+            rep_t: 0,
+            rep_matches: 0,
+            chg_t: 0,
+            chg_matches: 0,
         }
     }
 
@@ -66,8 +74,17 @@ impl PointForecastScorer {
     /// Resets running statistics and the underlying null model.
     pub fn reset(&mut self) {
         self.null_model.reset();
+        self.reset_predictor_counts();
+    }
+
+    /// Resets running predictor accuracy statistics while preserving the underlying null model.
+    pub fn reset_predictor_counts(&mut self) {
         self.t = 0;
         self.matches = 0;
+        self.rep_t = 0;
+        self.rep_matches = 0;
+        self.chg_t = 0;
+        self.chg_matches = 0;
     }
 
     /// Prequential forecast probability $\hat{q} = \frac{M + 1/2}{t + 1/2 \cdot 2^k}$ before observing $s$.
@@ -78,6 +95,33 @@ impl PointForecastScorer {
         ((self.matches as f64) + 0.5) / ((self.t as f64) + 0.5 * card_f64)
     }
 
+    /// Prequential forecast probability $\hat{q}$ for candidate prediction `raw_prediction`.
+    #[must_use]
+    pub fn q_hat_for(&self, raw_prediction: u64) -> f64 {
+        let s_hat = self.width.normalize(raw_prediction);
+        let k = self.width.bits();
+        let card_f64 = 2.0f64.powi(i32::from(k));
+        match self.null_model.kind() {
+            NullModelKind::LaplaceFrequency => self.q_hat(),
+            NullModelKind::RepeatLast => match self.null_model.last_symbol() {
+                None => 1.0 / card_f64,
+                Some(prev) => {
+                    if s_hat == prev {
+                        ((self.rep_matches as f64) + 0.5) / ((self.rep_t as f64) + 1.0)
+                    } else {
+                        let alternatives = if k == 64 {
+                            card_f64
+                        } else {
+                            ((1u64 << k) - 1).max(1) as f64
+                        };
+                        ((self.chg_matches as f64) + 0.5 / alternatives)
+                            / ((self.chg_t as f64) + 1.0)
+                    }
+                }
+            },
+        }
+    }
+
     /// Scores prediction `raw_prediction` ($\hat{s}$) against fact `raw_fact` ($s$) in bits,
     /// advancing internal state ($t$, $M$, and the null model).
     pub fn observe(&mut self, raw_prediction: u64, raw_fact: u64) -> f64 {
@@ -85,7 +129,7 @@ impl PointForecastScorer {
         let s = self.width.normalize(raw_fact);
 
         let p = self.null_model.probability(s_hat);
-        let q_hat = self.q_hat();
+        let q_hat = self.q_hat_for(s_hat);
         let q = q_hat.max(p);
 
         let r = if q <= p {
@@ -95,6 +139,22 @@ impl PointForecastScorer {
         } else {
             ((1.0 - q) / (1.0 - p)).log2()
         };
+
+        if let NullModelKind::RepeatLast = self.null_model.kind()
+            && let Some(prev) = self.null_model.last_symbol()
+        {
+            if s_hat == prev {
+                self.rep_t += 1;
+                if s_hat == s {
+                    self.rep_matches += 1;
+                }
+            } else {
+                self.chg_t += 1;
+                if s_hat == s {
+                    self.chg_matches += 1;
+                }
+            }
+        }
 
         if s_hat == s {
             self.matches += 1;
@@ -182,5 +242,73 @@ mod tests {
             );
         }
         assert_eq!(scorer.matches(), 0);
+    }
+
+    #[test]
+    fn repeat_last_matched_estimator_scores_zero_for_repeat_and_constant_predictors() {
+        for k in [1u8, 2, 4] {
+            let width = Width::new(k).unwrap();
+            let mut rng = ChaCha8Rng::seed_from_u64(1337 + u64::from(k));
+            let mask = (1u64 << k) - 1;
+
+            // 1. Repeat-last predictor on random stream earns exactly 0.0 every tick
+            let mut repeat_scorer = PointForecastScorer::new(width, NullModelKind::RepeatLast);
+            let mut last_sym = 0u64;
+            for t in 0..500 {
+                let fact = rng.next_u64() & mask;
+                let pred = if t == 0 { 0 } else { last_sym };
+                let r = repeat_scorer.observe(pred, fact);
+                assert_eq!(
+                    r, 0.0,
+                    "k={k}, t={t}: repeat-last predictor must score 0.0, got {r}"
+                );
+                last_sym = fact;
+            }
+
+            // 2. Any constant predictor on any constant stream earns exactly 0.0 every tick
+            for stream_const in [0u64, 1, mask] {
+                for pred_const in [0u64, 1, mask] {
+                    let mut const_scorer =
+                        PointForecastScorer::new(width, NullModelKind::RepeatLast);
+                    for t in 0..200 {
+                        let r = const_scorer.observe(pred_const, stream_const);
+                        assert_eq!(
+                            r, 0.0,
+                            "k={k}, t={t}, stream={stream_const}, pred={pred_const}: const predictor must score 0.0, got {r}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn martingale_property_exact_expectation_under_null_model() {
+        for k in [1u8, 2] {
+            let width = Width::new(k).unwrap();
+            let card = 1usize << k;
+            for kind in [NullModelKind::LaplaceFrequency, NullModelKind::RepeatLast] {
+                let mut scorer = PointForecastScorer::new(width, kind);
+                // Warm up with a few observations
+                scorer.observe(0, 0);
+                scorer.observe(1, 1);
+                scorer.observe(0, (card - 1) as u64);
+
+                // For any candidate prediction, check that sum_s p(s) * 2^r(s) == 1.0
+                for pred in 0..card as u64 {
+                    let mut expected_e = 0.0;
+                    for fact in 0..card as u64 {
+                        let mut test_scorer = scorer.clone();
+                        let p = test_scorer.null_model().probability(fact);
+                        let r = test_scorer.observe(pred, fact);
+                        expected_e += p * 2.0f64.powf(r);
+                    }
+                    assert!(
+                        (expected_e - 1.0).abs() < 1e-12,
+                        "k={k}, kind={kind:?}, pred={pred}: expected 1.0, got {expected_e}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -49,6 +49,18 @@ impl NullModel {
         self.repeat_matches = 0;
     }
 
+    /// Model kind used by this estimator.
+    #[must_use]
+    pub const fn kind(&self) -> NullModelKind {
+        self.kind
+    }
+
+    /// Last observed symbol, if any.
+    #[must_use]
+    pub const fn last_symbol(&self) -> Option<u64> {
+        self.last_symbol
+    }
+
     /// Predictive null probability $p_{\text{null}}(s)$ prior to observing `raw_symbol`.
     #[must_use]
     pub fn probability(&self, raw_symbol: u64) -> f64 {

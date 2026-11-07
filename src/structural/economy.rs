@@ -20,6 +20,10 @@ pub enum RewardMode {
     RawAccuracy,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 /// Node-economy settings. The defaults are the preregistered M1 values.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,6 +40,9 @@ pub struct EconomyConfig {
     pub null_model: NullModelKind,
     /// Exact-match reward rule.
     pub reward_mode: RewardMode,
+    /// Whether Split nodes and their second outgoing wire pay description debt / code length.
+    #[serde(default = "default_true")]
+    pub split_code_tax: bool,
 }
 
 impl Default for EconomyConfig {
@@ -47,6 +54,7 @@ impl Default for EconomyConfig {
             max_energy_reserve: Some(25.0),
             null_model: NullModelKind::LaplaceFrequency,
             reward_mode: RewardMode::CalibratedPointForecast,
+            split_code_tax: true,
         }
     }
 }
@@ -189,6 +197,11 @@ impl EconomyState {
         &self.scorers
     }
 
+    /// Mutable reference to an output port point-forecast scorer.
+    pub fn port_scorer_mut(&mut self, port: usize) -> &mut PointForecastScorer {
+        &mut self.scorers[port]
+    }
+
     /// Updates node emission recency weights against outputs emitted on this tick (M1a redesign D4).
     ///
     /// If an output is non-identity, its weight is set to 1.0; otherwise it is decayed by
@@ -300,42 +313,71 @@ impl EconomyState {
             return Err(EconomyError::DimensionMismatch);
         }
         let mut rewards = Vec::with_capacity(predictions.len());
-        for ((&prediction, &fact), scorer) in predictions.iter().zip(facts).zip(&mut self.scorers) {
-            let reward = match self.config.reward_mode {
-                RewardMode::CalibratedPointForecast => scorer.observe(prediction, fact),
-                RewardMode::CenteredSurprisal => {
-                    let prediction = self.width.normalize(prediction);
-                    let fact = self.width.normalize(fact);
-                    let p = scorer.null_model().probability(prediction);
-                    let surprisal = -p.log2();
-                    let correct = if prediction == fact { 1.0 } else { 0.0 };
-                    let r = (correct - p) * surprisal;
-                    scorer.null_model_mut().observe_and_surprisal(fact);
-                    r
-                }
-                RewardMode::UncenteredSurprisal => {
-                    let prediction = self.width.normalize(prediction);
-                    let fact = self.width.normalize(fact);
-                    let r = if prediction == fact {
-                        -scorer.null_model().probability(fact).log2()
-                    } else {
-                        0.0
-                    };
-                    scorer.null_model_mut().observe_and_surprisal(fact);
-                    r
-                }
-                RewardMode::RawAccuracy => {
-                    let prediction = self.width.normalize(prediction);
-                    let fact = self.width.normalize(fact);
-                    let correct = if prediction == fact { 1.0 } else { 0.0 };
-                    let r = correct - 2.0f64.powi(-i32::from(self.width.bits()));
-                    scorer.null_model_mut().observe_and_surprisal(fact);
-                    r
-                }
-            };
-            rewards.push(reward);
+        for (i, (&prediction, &fact)) in predictions.iter().zip(facts).enumerate() {
+            rewards.push(self.score_port_single(i, prediction, fact)?);
         }
         Ok(rewards)
+    }
+
+    /// Computes reward for a single output port against its observation.
+    pub fn score_port_single(
+        &mut self,
+        port: usize,
+        prediction: u64,
+        fact: u64,
+    ) -> Result<f64, EconomyError> {
+        if port >= self.scorers.len() {
+            return Err(EconomyError::DimensionMismatch);
+        }
+        let scorer = &mut self.scorers[port];
+        let reward = match self.config.reward_mode {
+            RewardMode::CalibratedPointForecast => scorer.observe(prediction, fact),
+            RewardMode::CenteredSurprisal => {
+                let prediction = self.width.normalize(prediction);
+                let fact = self.width.normalize(fact);
+                let p = scorer.null_model().probability(prediction);
+                let surprisal = -p.log2();
+                let correct = if prediction == fact { 1.0 } else { 0.0 };
+                let r = (correct - p) * surprisal;
+                scorer.null_model_mut().observe_and_surprisal(fact);
+                r
+            }
+            RewardMode::UncenteredSurprisal => {
+                let prediction = self.width.normalize(prediction);
+                let fact = self.width.normalize(fact);
+                let r = if prediction == fact {
+                    -scorer.null_model().probability(fact).log2()
+                } else {
+                    0.0
+                };
+                scorer.null_model_mut().observe_and_surprisal(fact);
+                r
+            }
+            RewardMode::RawAccuracy => {
+                let prediction = self.width.normalize(prediction);
+                let fact = self.width.normalize(fact);
+                let correct = if prediction == fact { 1.0 } else { 0.0 };
+                let r = correct - 2.0f64.powi(-i32::from(self.width.bits()));
+                scorer.null_model_mut().observe_and_surprisal(fact);
+                r
+            }
+        };
+        Ok(reward)
+    }
+
+    /// Advances null-model statistics for an unconnected output port without scoring or requiring ancestry.
+    pub fn observe_unconnected_port(
+        &mut self,
+        port: usize,
+        raw_fact: u64,
+    ) -> Result<(), EconomyError> {
+        if port >= self.scorers.len() {
+            return Err(EconomyError::DimensionMismatch);
+        }
+        self.scorers[port]
+            .null_model_mut()
+            .observe_and_surprisal(raw_fact);
+        Ok(())
     }
 
     /// Applies conserved port rewards and per-node maintenance for one tick.
@@ -402,10 +444,13 @@ impl EconomyState {
             if !unclipped.is_finite() {
                 return Err(EconomyError::InvalidTickData);
             }
-            let next_energy = self
-                .config
-                .max_energy_reserve
-                .map_or(unclipped, |cap| unclipped.min(cap));
+            let next_energy = if node.juvenile_ticks > 0 {
+                unclipped
+            } else {
+                self.config
+                    .max_energy_reserve
+                    .map_or(unclipped, |cap| unclipped.min(cap))
+            };
             next_energies.push(next_energy);
         }
         for (index, (node, next_energy)) in self.nodes.iter_mut().zip(next_energies).enumerate() {
@@ -663,5 +708,45 @@ mod tests {
         // t = 3: fires again
         economy.record_activity(&[2]).unwrap();
         assert_eq!(economy.activity()[0].nonzero_weight, 1.0);
+    }
+
+    #[test]
+    fn juvenile_escrow_accumulates_unclipped_until_maturity_debt_settlement() {
+        let config = EconomyConfig {
+            initial_energy: 4.0,
+            juvenile_ticks: 128,
+            max_energy_reserve: Some(25.0),
+            ..EconomyConfig::default()
+        };
+        let mut economy = EconomyState::new(config, Width::BITS_1, 1, 1, 0).unwrap();
+        assert_eq!(economy.nodes()[0].energy, 4.0);
+        assert_eq!(economy.nodes()[0].juvenile_ticks, 128);
+
+        // Earn 0.30 bits/tick during juvenile grace (ticks 0..128)
+        // At tick t=0 (remaining juvenile ticks 128 -> decrements to 127):
+        // energy becomes 4.0 + 0.30 = 4.30.
+        // Over 128 juvenile ticks (ticks 0..127), energy accumulates 128 * 0.30 = 38.4 bits.
+        // Total unclipped energy at tick 127 = 4.0 + 38.4 = 42.4 bits.
+        for _ in 0..128 {
+            let tick = economy.apply_tick(&[0.30], &[vec![1.0]], &[0.0]).unwrap();
+            assert_eq!(tick.starved_nodes.len(), 0);
+        }
+        assert_eq!(economy.nodes()[0].juvenile_ticks, 0);
+        assert!((economy.nodes()[0].energy - 42.4).abs() < 1e-12);
+
+        // On tick 128 (now mature, juvenile_ticks == 0):
+        // pay one-time maturity debt of 28.0 bits.
+        // Net unclipped energy: 42.4 + 0.30 - 28.0 = 14.7.
+        // Clamped by max_energy_reserve (25.0): 14.7 <= 25.0. Survives!
+        let tick = economy.apply_tick(&[0.30], &[vec![1.0]], &[28.0]).unwrap();
+        assert_eq!(tick.starved_nodes.len(), 0);
+        assert!((economy.nodes()[0].energy - 14.7).abs() < 1e-12);
+
+        // Subsequent mature ticks: earns 0.30 bits, energy accumulates toward cap
+        // If energy would exceed 25.0, it is clamped to 25.0.
+        for _ in 0..100 {
+            economy.apply_tick(&[0.30], &[vec![1.0]], &[0.0]).unwrap();
+        }
+        assert!((economy.nodes()[0].energy - 25.0).abs() < 1e-12);
     }
 }

@@ -3,8 +3,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::metrics::{allocate_circuit_description_bits, circuit_code_bits_with_tax};
 use crate::structural::economy::{EconomyConfig, EconomyError, EconomyState};
-use crate::structural::lattice::{LatticeCircuit, LatticeError};
+use crate::structural::lattice::{Coord, GridShape, LatticeCircuit, LatticeError, WiringTopology};
 use crate::substrate::{
     Circuit, CompiledCircuit, EvalError, NodeId, Primitive, ScalarState, SignalSink, SignalSource,
 };
@@ -101,6 +102,12 @@ impl EditableLattice {
     #[must_use]
     pub const fn lattice(&self) -> &LatticeCircuit {
         &self.lattice
+    }
+
+    /// Lowered substrate circuit.
+    #[must_use]
+    pub const fn circuit(&self) -> &Circuit {
+        &self.circuit
     }
 
     /// Compiled execution plan for the current graph.
@@ -225,7 +232,7 @@ impl EditableLattice {
     /// Excises mature depleted nodes, collapses single-use `Split` nodes, and bypasses inactive
     /// zero-valued correctors. Returns the old-to-new mapping for the pre-prune nodes.
     pub fn prune_starved_nodes(&mut self) -> Result<Vec<Option<NodeId>>, SurgeryError> {
-        let mut removed: BTreeSet<NodeId> = self
+        let removed: BTreeSet<NodeId> = self
             .economy
             .nodes()
             .iter()
@@ -242,11 +249,156 @@ impl EditableLattice {
                 })
                 .collect());
         }
+        let (staged, old_to_new) = self.build_pruned_lattice(&removed)?;
+        self.recompile_preserving_state(staged, &old_to_new)?;
+        Ok(old_to_new)
+    }
 
+    /// Excises causally idle mature nodes (zero counterfactual sensitivity over `W_diag`),
+    /// validating that outputs on `past_inputs` match `past_predictions` and code length does not increase (D1b.1).
+    pub fn prune_zero_sensitivity_mature_nodes(
+        &mut self,
+        idle_nodes: &BTreeSet<NodeId>,
+        past_inputs: &[Vec<u64>],
+        past_predictions: &[Vec<u64>],
+        split_code_tax: bool,
+    ) -> Result<Vec<Option<NodeId>>, SurgeryError> {
+        if idle_nodes.is_empty() {
+            return Ok((0..self.circuit.node_count())
+                .map(|index| {
+                    Some(NodeId(
+                        u32::try_from(index).expect("node count fits in u32"),
+                    ))
+                })
+                .collect());
+        }
+
+        let Ok((staged, old_to_new)) = self.build_pruned_lattice(idle_nodes) else {
+            return Ok((0..self.circuit.node_count())
+                .map(|index| {
+                    Some(NodeId(
+                        u32::try_from(index).expect("node count fits in u32"),
+                    ))
+                })
+                .collect());
+        };
+
+        let Ok(staged_circuit) = staged.lower() else {
+            return Ok((0..self.circuit.node_count())
+                .map(|index| {
+                    Some(NodeId(
+                        u32::try_from(index).expect("node count fits in u32"),
+                    ))
+                })
+                .collect());
+        };
+
+        let Ok(staged_compiled) = staged_circuit.compile() else {
+            return Ok((0..self.circuit.node_count())
+                .map(|index| {
+                    Some(NodeId(
+                        u32::try_from(index).expect("node count fits in u32"),
+                    ))
+                })
+                .collect());
+        };
+
+        let reg_map = register_mapping(
+            &self.circuit,
+            &staged_circuit,
+            &self.compiled,
+            &staged_compiled,
+            &old_to_new,
+        );
+        let mut staged_state = ScalarState::new(&staged_compiled);
+        let mut staged_regs = staged_state.registers().to_vec();
+        for (old_r, new_r) in reg_map.iter().enumerate() {
+            if let Some(nr) = new_r
+                && old_r < self.state.registers().len()
+            {
+                staged_regs[*nr] = self.state.registers()[old_r];
+            }
+        }
+        if staged_state
+            .set_registers(&staged_compiled, &staged_regs)
+            .is_err()
+        {
+            return Ok((0..self.circuit.node_count())
+                .map(|index| {
+                    Some(NodeId(
+                        u32::try_from(index).expect("node count fits in u32"),
+                    ))
+                })
+                .collect());
+        }
+
+        let mut staged_pred = vec![0u64; usize::from(staged_circuit.num_outputs())];
+        for (frame_idx, input_frame) in past_inputs.iter().enumerate() {
+            if staged_state
+                .step(&staged_compiled, input_frame, &mut staged_pred)
+                .is_err()
+            {
+                return Ok((0..self.circuit.node_count())
+                    .map(|index| {
+                        Some(NodeId(
+                            u32::try_from(index).expect("node count fits in u32"),
+                        ))
+                    })
+                    .collect());
+            }
+            if frame_idx < past_predictions.len() && staged_pred != past_predictions[frame_idx] {
+                return Ok((0..self.circuit.node_count())
+                    .map(|index| {
+                        Some(NodeId(
+                            u32::try_from(index).expect("node count fits in u32"),
+                        ))
+                    })
+                    .collect());
+            }
+        }
+
+        let shape = if self.lattice.topology() == WiringTopology::WellMixed {
+            None
+        } else {
+            Some(self.lattice.shape())
+        };
+        let l_old = circuit_code_bits_with_tax(
+            &self.circuit,
+            self.lattice.topology(),
+            shape,
+            0,
+            split_code_tax,
+        );
+        let l_new = circuit_code_bits_with_tax(
+            &staged_circuit,
+            self.lattice.topology(),
+            shape,
+            0,
+            split_code_tax,
+        );
+        if l_new > l_old {
+            return Ok((0..self.circuit.node_count())
+                .map(|index| {
+                    Some(NodeId(
+                        u32::try_from(index).expect("node count fits in u32"),
+                    ))
+                })
+                .collect());
+        }
+
+        self.recompile_preserving_state(staged, &old_to_new)?;
+        Ok(old_to_new)
+    }
+
+    fn build_pruned_lattice(
+        &self,
+        initially_removed: &BTreeSet<NodeId>,
+    ) -> Result<(LatticeCircuit, Vec<Option<NodeId>>), SurgeryError> {
+        let mut removed = initially_removed.clone();
         let mut logical_edges = self.lattice.edges().to_vec();
         let mut bypasses = Vec::new();
-        let initially_starved: Vec<NodeId> = removed.iter().copied().collect();
-        let mut inactive_zero_nodes: BTreeSet<NodeId> = initially_starved
+
+        let mut inactive_zero_nodes: BTreeSet<NodeId> = initially_removed
             .iter()
             .copied()
             .filter(|&node| {
@@ -256,6 +408,7 @@ impl EditableLattice {
                 ) && !self.economy.nodes()[node.index()].activity.ever_nonzero()
             })
             .collect();
+
         loop {
             let mut propagated = false;
             for (index, &(_, primitive)) in self.lattice.nodes().iter().enumerate() {
@@ -272,6 +425,7 @@ impl EditableLattice {
                 break;
             }
         }
+
         for zero_node in inactive_zero_nodes.iter().copied() {
             let consumers: Vec<(NodeId, u8)> = logical_edges
                 .iter()
@@ -319,11 +473,25 @@ impl EditableLattice {
                     continue;
                 }
                 let output = outputs[0];
-                removed.insert(consumer);
-                logical_edges
-                    .retain(|(source, sink)| !edge_touches_nodes(*source, *sink, &removed));
-                logical_edges.push((other_source, output));
-                bypasses.push((other_source, output));
+
+                if matches!(
+                    (other_source, output),
+                    (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(_))
+                ) {
+                    if initially_removed.contains(&consumer) {
+                        removed.insert(consumer);
+                        logical_edges
+                            .retain(|(source, sink)| !edge_touches_nodes(*source, *sink, &removed));
+                    } else {
+                        continue;
+                    }
+                } else {
+                    removed.insert(consumer);
+                    logical_edges
+                        .retain(|(source, sink)| !edge_touches_nodes(*source, *sink, &removed));
+                    logical_edges.push((other_source, output));
+                    bypasses.push((other_source, output));
+                }
             }
         }
 
@@ -358,6 +526,22 @@ impl EditableLattice {
                     && let Some(input) = input_source(&logical_edges, node, 0)
                     && !source_node(input).is_some_and(|source| removed.contains(&source))
                 {
+                    if matches!(
+                        (input, output),
+                        (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(_))
+                    ) {
+                        if initially_removed.contains(&node) {
+                            logical_edges.retain(|(source, sink)| {
+                                !matches!(source, SignalSource::NodeOut { node: current, .. } if *current == node)
+                                    && !matches!(sink, SignalSink::NodeIn { node: current, .. } if *current == node)
+                            });
+                            removed.insert(node);
+                            changed = true;
+                            break;
+                        } else {
+                            continue;
+                        }
+                    }
                     logical_edges.retain(|(source, sink)| {
                         !matches!(source, SignalSource::NodeOut { node: current, .. } if *current == node)
                             && !matches!(sink, SignalSink::NodeIn { node: current, .. } if *current == node)
@@ -385,8 +569,159 @@ impl EditableLattice {
             };
             staged.route_connect(source, sink, 4)?;
         }
-        self.recompile_preserving_state(staged, &old_to_new)?;
-        Ok(old_to_new)
+
+        let mut direct_wires = Vec::new();
+        for &(src, dst) in staged.edges() {
+            if matches!(
+                (src, dst),
+                (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(_))
+            ) {
+                direct_wires.push((src, dst));
+            }
+        }
+        for (src, dst) in direct_wires {
+            staged.disconnect(src, dst);
+            if !staged.nodes().is_empty() {
+                let cell = staged
+                    .nearest_empty_cell(Coord { row: 0, col: 0 })
+                    .ok_or(LatticeError::UnknownEndpoint)?;
+                let split = staged.place_node(cell, Primitive::Split)?;
+                staged.route_connect(
+                    src,
+                    SignalSink::NodeIn {
+                        node: split,
+                        port: 0,
+                    },
+                    4,
+                )?;
+                staged.route_connect(
+                    SignalSource::NodeOut {
+                        node: split,
+                        port: 0,
+                    },
+                    dst,
+                    4,
+                )?;
+            }
+        }
+
+        Ok((staged, old_to_new))
+    }
+}
+
+/// Tracks marginal description debt allocated to newly sprouted nodes across structural edits (D1b.3).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MarginalDebtLedger {
+    /// Owed maturity debt in bits for each node index.
+    pub node_debts: Vec<f64>,
+    /// Whether each node index has already paid its lump-sum maturity debt.
+    pub debt_paid: Vec<bool>,
+    /// Last committed total circuit code length $L_{\text{eff}}(C)$.
+    pub last_committed_code_bits: f64,
+}
+
+impl MarginalDebtLedger {
+    /// Creates a fresh [`MarginalDebtLedger`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a sprout transaction $C_{\text{old}} \to C_{\text{new}}$ and assigns marginal debt to new nodes.
+    pub fn on_sprout(
+        &mut self,
+        new_circuit: &Circuit,
+        topology: WiringTopology,
+        grid_shape: Option<GridShape>,
+        split_code_tax: bool,
+        old_to_new: &[Option<NodeId>],
+    ) {
+        let l_old = self.last_committed_code_bits;
+        let l_new =
+            circuit_code_bits_with_tax(new_circuit, topology, grid_shape, 0, split_code_tax);
+        let delta_l_sprout = (l_new - l_old).max(0.0);
+        let n_new = new_circuit.node_count();
+
+        let mut next_debts = vec![0.0; n_new];
+        let mut next_paid = vec![false; n_new];
+
+        let mut mapped_survivors = vec![false; n_new];
+        for (old_idx, &new_node) in old_to_new.iter().enumerate() {
+            if let Some(new_id) = new_node {
+                let idx = new_id.index();
+                if idx < n_new {
+                    mapped_survivors[idx] = true;
+                    if old_idx < self.node_debts.len() {
+                        next_debts[idx] = self.node_debts[old_idx];
+                        next_paid[idx] = self.debt_paid[old_idx];
+                    }
+                }
+            }
+        }
+
+        let mut new_node_indices = Vec::new();
+        for (idx, &is_survivor) in mapped_survivors.iter().enumerate().take(n_new) {
+            if !is_survivor {
+                new_node_indices.push(idx);
+            }
+        }
+
+        if !new_node_indices.is_empty() {
+            let alloc = allocate_circuit_description_bits(
+                new_circuit,
+                topology,
+                grid_shape,
+                0,
+                split_code_tax,
+            );
+            let d_new: f64 = new_node_indices
+                .iter()
+                .map(|&i| alloc.node_debts.get(i).copied().unwrap_or(0.0))
+                .sum();
+            for &idx in &new_node_indices {
+                let raw_d = alloc.node_debts.get(idx).copied().unwrap_or(0.0);
+                let debt = if d_new > 0.0 {
+                    delta_l_sprout * (raw_d / d_new)
+                } else {
+                    delta_l_sprout / (new_node_indices.len() as f64)
+                };
+                next_debts[idx] = debt;
+                next_paid[idx] = false;
+            }
+        }
+
+        self.node_debts = next_debts;
+        self.debt_paid = next_paid;
+        self.last_committed_code_bits = l_new;
+    }
+
+    /// Remaps survivor debts and paid status across a pruning transaction.
+    pub fn on_prune(
+        &mut self,
+        new_circuit: &Circuit,
+        topology: WiringTopology,
+        grid_shape: Option<GridShape>,
+        split_code_tax: bool,
+        old_to_new: &[Option<NodeId>],
+    ) {
+        let n_new = new_circuit.node_count();
+        let mut next_debts = vec![0.0; n_new];
+        let mut next_paid = vec![false; n_new];
+
+        for (old_idx, &new_node) in old_to_new.iter().enumerate() {
+            if let Some(new_id) = new_node {
+                let idx = new_id.index();
+                if idx < n_new && old_idx < self.node_debts.len() {
+                    next_debts[idx] = self.node_debts[old_idx];
+                    next_paid[idx] = self.debt_paid[old_idx];
+                }
+            }
+        }
+
+        self.node_debts = next_debts;
+        self.debt_paid = next_paid;
+        self.last_committed_code_bits =
+            circuit_code_bits_with_tax(new_circuit, topology, grid_shape, 0, split_code_tax);
     }
 }
 
@@ -790,5 +1125,285 @@ mod tests {
             .step(&compiled, &[], &mut output)
             .unwrap();
         assert_eq!(output, [1], "edges: {:?}", editable.lattice().edges());
+    }
+
+    #[test]
+    fn local_von_neumann_border_stacking_eqz_and_addself() {
+        use crate::structural::lattice::{BoundaryAnchor, PerimeterSide};
+        let shape = GridShape::new(8, 8).unwrap();
+        let mut lattice = LatticeCircuit::new(
+            shape,
+            Width::BITS_2,
+            WireDelayMode::Combinational,
+            WiringTopology::LocalVonNeumann,
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 3,
+            }],
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 4,
+            }],
+        )
+        .unwrap();
+
+        // 1. First neuron: Eqz(x) at (0, 3) connected to BoundaryOut(0) at (0, 4)
+        let eqz = lattice
+            .place_node(Coord { row: 0, col: 3 }, Primitive::Eqz)
+            .unwrap();
+        lattice
+            .connect(
+                SignalSource::BoundaryIn(0),
+                SignalSink::NodeIn { node: eqz, port: 0 },
+            )
+            .unwrap();
+        lattice
+            .stack_output_adder(0, SignalSource::NodeOut { node: eqz, port: 0 }, 4)
+            .unwrap();
+
+        let lower1 = lattice.lower().unwrap();
+        assert!(lower1.compile().is_ok());
+
+        // 2. Stack corrector: AddSelf(x) = x + x (mod 4)
+        let tapped = lattice.tap_source(SignalSource::BoundaryIn(0), 8).unwrap();
+        let split_self = lattice
+            .place_node(Coord { row: 0, col: 2 }, Primitive::Split)
+            .unwrap();
+        let add_self = lattice
+            .place_node(Coord { row: 1, col: 2 }, Primitive::Add)
+            .unwrap();
+        lattice
+            .route_connect(
+                tapped,
+                SignalSink::NodeIn {
+                    node: split_self,
+                    port: 0,
+                },
+                8,
+            )
+            .unwrap();
+        lattice
+            .route_connect(
+                SignalSource::NodeOut {
+                    node: split_self,
+                    port: 0,
+                },
+                SignalSink::NodeIn {
+                    node: add_self,
+                    port: 0,
+                },
+                8,
+            )
+            .unwrap();
+        let tapped_self = lattice
+            .tap_source(
+                SignalSource::NodeOut {
+                    node: split_self,
+                    port: 1,
+                },
+                8,
+            )
+            .unwrap();
+        lattice
+            .route_connect(
+                tapped_self,
+                SignalSink::NodeIn {
+                    node: add_self,
+                    port: 1,
+                },
+                8,
+            )
+            .unwrap();
+
+        lattice
+            .stack_output_adder(
+                0,
+                SignalSource::NodeOut {
+                    node: add_self,
+                    port: 0,
+                },
+                8,
+            )
+            .unwrap();
+
+        let circuit = lattice.lower().unwrap();
+        let compiled = circuit.compile().unwrap();
+        let mut state = ScalarState::new(&compiled);
+        let mut out = [0u64];
+
+        // Verify truth table: EQZ(x) + 2x (mod 4)
+        // x = 0: 1 + 0 = 1
+        // x = 1: 0 + 2 = 2
+        // x = 2: 0 + 4 = 0
+        // x = 3: 0 + 6 = 2
+        let expected = [1, 2, 0, 2];
+        for (x, &exp) in expected.iter().enumerate() {
+            state.step(&compiled, &[x as u64], &mut out).unwrap();
+            assert_eq!(out[0], exp, "x={x}: expected {exp}, got {}", out[0]);
+        }
+    }
+
+    #[test]
+    fn marginal_debt_ledger_telescoping_exact_conservation() {
+        let mut ledger = MarginalDebtLedger::new();
+        let mut circuit = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+
+        // Step 1: Add node 0
+        let n0 = circuit.add_node(Primitive::Eqz);
+        circuit.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: n0, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: n0, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+        ledger.on_sprout(&circuit, WiringTopology::WellMixed, None, true, &[None]);
+        let l1 = circuit_code_bits_with_tax(&circuit, WiringTopology::WellMixed, None, 0, true);
+        assert!((ledger.node_debts.iter().sum::<f64>() - l1).abs() < 1e-12);
+
+        // Step 2: Add node 1 (Delay)
+        let _ = circuit.add_node(Primitive::Delay { init: 0 });
+        ledger.on_sprout(
+            &circuit,
+            WiringTopology::WellMixed,
+            None,
+            true,
+            &[Some(NodeId(0)), None],
+        );
+        let l2 = circuit_code_bits_with_tax(&circuit, WiringTopology::WellMixed, None, 0, true);
+        assert!((ledger.node_debts.iter().sum::<f64>() - l2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn prune_zero_sensitivity_mature_nodes_excises_idle_const_loop() {
+        use crate::structural::lattice::{BoundaryAnchor, PerimeterSide};
+        let shape = GridShape::new(4, 4).unwrap();
+        let mut lattice = LatticeCircuit::new(
+            shape,
+            Width::BITS_2,
+            WireDelayMode::Combinational,
+            WiringTopology::WellMixed,
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 0,
+            }],
+            vec![BoundaryAnchor {
+                side: PerimeterSide::South,
+                offset: 0,
+            }],
+        )
+        .unwrap();
+
+        let eqz = lattice
+            .place_node(Coord { row: 0, col: 0 }, Primitive::Eqz)
+            .unwrap();
+        let zero_delay = lattice
+            .place_node(Coord { row: 0, col: 1 }, Primitive::Delay { init: 0 })
+            .unwrap();
+        let zero_split = lattice
+            .place_node(Coord { row: 0, col: 2 }, Primitive::Split)
+            .unwrap();
+        let add = lattice
+            .place_node(Coord { row: 0, col: 3 }, Primitive::Add)
+            .unwrap();
+
+        lattice
+            .connect(
+                SignalSource::BoundaryIn(0),
+                SignalSink::NodeIn { node: eqz, port: 0 },
+            )
+            .unwrap();
+        lattice
+            .connect(
+                SignalSource::NodeOut { node: eqz, port: 0 },
+                SignalSink::NodeIn { node: add, port: 0 },
+            )
+            .unwrap();
+        lattice
+            .connect(
+                SignalSource::NodeOut {
+                    node: zero_delay,
+                    port: 0,
+                },
+                SignalSink::NodeIn {
+                    node: zero_split,
+                    port: 0,
+                },
+            )
+            .unwrap();
+        lattice
+            .connect(
+                SignalSource::NodeOut {
+                    node: zero_split,
+                    port: 0,
+                },
+                SignalSink::NodeIn {
+                    node: zero_delay,
+                    port: 0,
+                },
+            )
+            .unwrap();
+        lattice
+            .connect(
+                SignalSource::NodeOut {
+                    node: zero_split,
+                    port: 1,
+                },
+                SignalSink::NodeIn { node: add, port: 1 },
+            )
+            .unwrap();
+        lattice
+            .connect(
+                SignalSource::NodeOut { node: add, port: 0 },
+                SignalSink::BoundaryOut(0),
+            )
+            .unwrap();
+
+        let economy_config = EconomyConfig {
+            initial_energy: 10.0,
+            juvenile_ticks: 10,
+            ..EconomyConfig::default()
+        };
+        let mut editable = EditableLattice::new(lattice, economy_config).unwrap();
+
+        let mut past_inputs = Vec::new();
+        let mut past_preds = Vec::new();
+        for t in 0..64 {
+            let x = (t % 4) as u64;
+            let mut out = [0u64];
+            let compiled = editable.compiled().clone();
+            editable
+                .state_mut()
+                .step(&compiled, &[x], &mut out)
+                .unwrap();
+            past_inputs.push(vec![x]);
+            past_preds.push(out.to_vec());
+        }
+
+        let mut idle_nodes = BTreeSet::new();
+        idle_nodes.insert(zero_delay);
+        idle_nodes.insert(zero_split);
+
+        let mapping = editable
+            .prune_zero_sensitivity_mature_nodes(&idle_nodes, &past_inputs, &past_preds, true)
+            .unwrap();
+
+        assert_eq!(mapping[zero_delay.index()], None);
+        assert_eq!(mapping[zero_split.index()], None);
+        assert_eq!(mapping[add.index()], None);
+        assert!(mapping[eqz.index()].is_some());
+
+        // Verify output is bit-exact to original truth table
+        let compiled = editable.compiled().clone();
+        for x in 0..4u64 {
+            let mut out = [0u64];
+            editable
+                .state_mut()
+                .step(&compiled, &[x], &mut out)
+                .unwrap();
+            let exp = if x == 0 { 1 } else { 0 };
+            assert_eq!(out[0], exp);
+        }
     }
 }

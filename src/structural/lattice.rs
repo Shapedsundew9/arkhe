@@ -97,7 +97,7 @@ impl BoundaryAnchor {
     ///
     /// A boundary port sits one step outside this border cell, so connecting a boundary port
     /// to its adjacent border cell has step distance `1`.
-    fn adjacent_border_cell(self, shape: GridShape) -> Result<Coord, LatticeError> {
+    pub fn adjacent_border_cell(self, shape: GridShape) -> Result<Coord, LatticeError> {
         match self.side {
             PerimeterSide::North => {
                 if self.offset >= shape.cols {
@@ -541,6 +541,725 @@ impl LatticeCircuit {
         Ok(relays)
     }
 
+    /// Finds the nearest unoccupied [`Coord`] from `start` via BFS expansion.
+    #[must_use]
+    pub fn nearest_empty_cell(&self, start: Coord) -> Option<Coord> {
+        let input_anchors_border: BTreeSet<Coord> = self
+            .input_anchors
+            .iter()
+            .filter_map(|a| a.adjacent_border_cell(self.shape).ok())
+            .collect();
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(start);
+        queue.push_back(start);
+        while let Some(current) = queue.pop_front() {
+            if !self.cell_map.contains_key(&current)
+                && (!input_anchors_border.contains(&current) || start == current)
+            {
+                return Some(current);
+            }
+            for next in self.neighbors(current) {
+                if visited.insert(next) {
+                    queue.push_back(next);
+                }
+            }
+        }
+        for r in 0..self.shape.rows {
+            for c in 0..self.shape.cols {
+                let coord = Coord { row: r, col: c };
+                if !self.cell_map.contains_key(&coord)
+                    && (!input_anchors_border.contains(&coord) || start == coord)
+                {
+                    return Some(coord);
+                }
+            }
+        }
+        for r in 0..self.shape.rows {
+            for c in 0..self.shape.cols {
+                let coord = Coord { row: r, col: c };
+                if !self.cell_map.contains_key(&coord) {
+                    return Some(coord);
+                }
+            }
+        }
+        None
+    }
+
+    /// Checks whether an empty-cell route exists between `start` and `goal` within `max_relay_hops`.
+    #[must_use]
+    pub fn has_route_between(&self, start: Coord, goal: Coord, max_relay_hops: usize) -> bool {
+        if self.topology == WiringTopology::WellMixed {
+            return true;
+        }
+        if start == goal {
+            return true;
+        }
+        let input_anchors_border: BTreeSet<Coord> = self
+            .input_anchors
+            .iter()
+            .filter_map(|a| a.adjacent_border_cell(self.shape).ok())
+            .collect();
+        let output_anchors_border: BTreeSet<Coord> = self
+            .output_anchors
+            .iter()
+            .filter_map(|a| a.adjacent_border_cell(self.shape).ok())
+            .collect();
+        let max_steps = max_relay_hops.saturating_add(1);
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(start);
+        queue.push_back((start, 0usize));
+        while let Some((current, depth)) = queue.pop_front() {
+            if current == goal {
+                return true;
+            }
+            if depth >= max_steps {
+                continue;
+            }
+            for next in self.neighbors(current) {
+                if visited.contains(&next) {
+                    continue;
+                }
+                if self.cell_map.contains_key(&next) && next != goal {
+                    continue;
+                }
+                if next != goal
+                    && next != start
+                    && (input_anchors_border.contains(&next)
+                        || output_anchors_border.contains(&next))
+                {
+                    continue;
+                }
+                visited.insert(next);
+                queue.push_back((next, depth + 1));
+            }
+        }
+        false
+    }
+
+    /// Finds the best empty cell for an intermediate operator connecting between `start` and `goal`.
+    #[must_use]
+    pub fn best_empty_cell_between(
+        &self,
+        start: Coord,
+        goal: Option<Coord>,
+        max_relay_hops: u8,
+    ) -> Option<Coord> {
+        let Some(goal_coord) = goal else {
+            return self.nearest_empty_cell(start);
+        };
+        if self.topology == WiringTopology::WellMixed {
+            return self.nearest_empty_cell(start);
+        }
+        let input_anchors_border: BTreeSet<Coord> = self
+            .input_anchors
+            .iter()
+            .filter_map(|a| a.adjacent_border_cell(self.shape).ok())
+            .collect();
+        let output_anchors_border: BTreeSet<Coord> = self
+            .output_anchors
+            .iter()
+            .filter_map(|a| a.adjacent_border_cell(self.shape).ok())
+            .collect();
+        let max_hops = usize::from(max_relay_hops);
+        let mut candidates = Vec::new();
+        for r in 0..self.shape.rows {
+            for c in 0..self.shape.cols {
+                let coord = Coord { row: r, col: c };
+                if !self.cell_map.contains_key(&coord) {
+                    if input_anchors_border.contains(&coord) && start != coord {
+                        continue;
+                    }
+                    if output_anchors_border.contains(&coord) && goal_coord != coord {
+                        continue;
+                    }
+                    let d_start = usize::from(coord.manhattan_distance(start));
+                    let d_goal = usize::from(coord.manhattan_distance(goal_coord));
+                    let is_adj_goal = usize::from(d_goal == 1);
+                    candidates.push((is_adj_goal, d_start + d_goal, d_start, coord));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+
+        for (_, _, _, cand) in candidates {
+            if self.has_route_between(start, cand, max_hops)
+                && self.has_route_between(cand, goal_coord, max_hops)
+            {
+                return Some(cand);
+            }
+        }
+
+        self.nearest_empty_cell(start)
+    }
+
+    /// Moves `node` to unoccupied `new_coord`, reconnecting incident edges.
+    pub fn relocate_node(&mut self, node: NodeId, new_coord: Coord) -> Result<(), LatticeError> {
+        if node.index() >= self.nodes.len() {
+            return Err(LatticeError::UnknownEndpoint);
+        }
+        if !self.shape.contains(new_coord) {
+            return Err(LatticeError::CoordOutOfBounds {
+                coord: new_coord,
+                shape: self.shape,
+            });
+        }
+        let old_coord = self.nodes[node.index()].0;
+        if old_coord == new_coord {
+            return Ok(());
+        }
+        if let Some(&existing) = self.cell_map.get(&new_coord) {
+            return Err(LatticeError::CellOccupied {
+                coord: new_coord,
+                existing,
+            });
+        }
+
+        let mut staged = self.clone();
+        let mut incoming = Vec::new();
+        let mut outgoing = Vec::new();
+        staged.edges.retain(|&(src, dst)| match (src, dst) {
+            (SignalSource::NodeOut { node: n, port }, target) if n == node => {
+                outgoing.push((port, target));
+                false
+            }
+            (source, SignalSink::NodeIn { node: n, port }) if n == node => {
+                incoming.push((source, port));
+                false
+            }
+            _ => true,
+        });
+
+        staged.cell_map.remove(&old_coord);
+        staged.cell_map.insert(new_coord, node);
+        staged.nodes[node.index()].0 = new_coord;
+
+        for (source, port) in incoming {
+            let dst = SignalSink::NodeIn { node, port };
+            if staged.topology == WiringTopology::WellMixed
+                || staged.wire_delay == WireDelayMode::TicksPerHop
+            {
+                staged.connect(source, dst)?;
+            } else {
+                staged.route_connect_in_place(source, dst, 4)?;
+            }
+        }
+        for (port, target) in outgoing {
+            let src = SignalSource::NodeOut { node, port };
+            if staged.topology == WiringTopology::WellMixed
+                || staged.wire_delay == WireDelayMode::TicksPerHop
+            {
+                staged.connect(src, target)?;
+            } else {
+                staged.route_connect_in_place(src, target, 4)?;
+            }
+        }
+
+        *self = staged;
+        Ok(())
+    }
+
+    /// Returns a usable fan-out [`SignalSource`] carrying the same signal as `source`.
+    pub fn tap_source(
+        &mut self,
+        source: SignalSource,
+        max_relay_hops: u8,
+    ) -> Result<SignalSource, LatticeError> {
+        let existing_edges: Vec<(SignalSource, SignalSink)> = self
+            .edges
+            .iter()
+            .copied()
+            .filter(|&(s, _)| s == source)
+            .collect();
+
+        if existing_edges.is_empty() {
+            return Ok(source);
+        }
+
+        if let SignalSource::NodeOut { node, .. } = source
+            && self.node_primitive(node) == Some(Primitive::Split)
+        {
+            let port0_used = self
+                .edges
+                .iter()
+                .any(|&(s, _)| s == SignalSource::NodeOut { node, port: 0 });
+            let port1_used = self
+                .edges
+                .iter()
+                .any(|&(s, _)| s == SignalSource::NodeOut { node, port: 1 });
+            if !port0_used {
+                return Ok(SignalSource::NodeOut { node, port: 0 });
+            }
+            if !port1_used {
+                return Ok(SignalSource::NodeOut { node, port: 1 });
+            }
+        }
+
+        for &(_, sink) in &existing_edges {
+            if let SignalSink::NodeIn {
+                node: sink_node,
+                port: 0,
+            } = sink
+                && self.node_primitive(sink_node) == Some(Primitive::Split)
+            {
+                let is_output_border = if let Some(coord) = self.node_coord(sink_node) {
+                    self.output_anchors.iter().any(|a| {
+                        a.adjacent_border_cell(self.shape)
+                            .map(|c| c == coord)
+                            .unwrap_or(false)
+                    })
+                } else {
+                    false
+                };
+                if !is_output_border {
+                    let port1_used = self.edges.iter().any(|&(s, _)| {
+                        s == SignalSource::NodeOut {
+                            node: sink_node,
+                            port: 1,
+                        }
+                    });
+                    if !port1_used {
+                        return Ok(SignalSource::NodeOut {
+                            node: sink_node,
+                            port: 1,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut staged = self.clone();
+        match source {
+            SignalSource::BoundaryIn(channel) => {
+                let anchor = *staged
+                    .input_anchors
+                    .get(usize::from(channel))
+                    .ok_or(LatticeError::UnknownEndpoint)?;
+                let adj = anchor.adjacent_border_cell(staged.shape)?;
+
+                let existing_sinks: Vec<SignalSink> = staged
+                    .edges
+                    .iter()
+                    .filter_map(|&(s, dst)| (s == source).then_some(dst))
+                    .collect();
+                for &sink in &existing_sinks {
+                    staged.disconnect(source, sink);
+                }
+
+                let split_node = if staged.topology == WiringTopology::WellMixed {
+                    let cell = staged
+                        .nearest_empty_cell(adj)
+                        .ok_or(LatticeError::UnknownEndpoint)?;
+                    staged.place_node(cell, Primitive::Split)?
+                } else if let Some(occ_node) = staged.cell_node(adj) {
+                    let interior_coord = match anchor.side {
+                        PerimeterSide::North => Coord {
+                            row: adj.row.saturating_add(1),
+                            col: adj.col,
+                        },
+                        PerimeterSide::South => Coord {
+                            row: adj.row.saturating_sub(1),
+                            col: adj.col,
+                        },
+                        PerimeterSide::West => Coord {
+                            row: adj.row,
+                            col: adj.col.saturating_add(1),
+                        },
+                        PerimeterSide::East => Coord {
+                            row: adj.row,
+                            col: adj.col.saturating_sub(1),
+                        },
+                    };
+                    let empty = if staged.shape.contains(interior_coord)
+                        && !staged.cell_map.contains_key(&interior_coord)
+                    {
+                        interior_coord
+                    } else {
+                        staged
+                            .neighbors(adj)
+                            .into_iter()
+                            .find(|&n| !staged.cell_map.contains_key(&n))
+                            .or_else(|| staged.nearest_empty_cell(adj))
+                            .ok_or(LatticeError::UnknownEndpoint)?
+                    };
+
+                    // Re-route outgoing edges of occ_node first
+                    let mut occ_outgoing = Vec::new();
+                    staged.edges.retain(|&(src, dst)| {
+                        if matches!(src, SignalSource::NodeOut { node, .. } if node == occ_node) {
+                            occ_outgoing.push((src, dst));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
+                    staged.cell_map.remove(&adj);
+                    staged.cell_map.insert(empty, occ_node);
+                    staged.nodes[occ_node.index()].0 = empty;
+                    let split = staged.place_node(adj, Primitive::Split)?;
+
+                    for (src, dst) in occ_outgoing {
+                        let updated_src = match src {
+                            SignalSource::NodeOut { port, .. } => SignalSource::NodeOut {
+                                node: occ_node,
+                                port,
+                            },
+                            other => other,
+                        };
+                        staged.route_connect(updated_src, dst, usize::from(max_relay_hops))?;
+                    }
+                    split
+                } else {
+                    staged.place_node(adj, Primitive::Split)?
+                };
+
+                for sink in existing_sinks {
+                    staged.route_connect(
+                        SignalSource::NodeOut {
+                            node: split_node,
+                            port: 0,
+                        },
+                        sink,
+                        usize::from(max_relay_hops),
+                    )?;
+                }
+                staged.route_connect(
+                    source,
+                    SignalSink::NodeIn {
+                        node: split_node,
+                        port: 0,
+                    },
+                    usize::from(max_relay_hops),
+                )?;
+                *self = staged;
+                Ok(SignalSource::NodeOut {
+                    node: split_node,
+                    port: 1,
+                })
+            }
+            SignalSource::NodeOut { node, .. } => {
+                let coord = staged
+                    .node_coord(node)
+                    .ok_or(LatticeError::UnknownEndpoint)?;
+
+                let existing_sinks: Vec<SignalSink> = staged
+                    .edges
+                    .iter()
+                    .filter_map(|&(s, dst)| (s == source).then_some(dst))
+                    .collect();
+
+                if staged.topology == WiringTopology::WellMixed {
+                    let cell = staged
+                        .nearest_empty_cell(coord)
+                        .ok_or(LatticeError::UnknownEndpoint)?;
+                    let split_node = staged.place_node(cell, Primitive::Split)?;
+                    for &sink in &existing_sinks {
+                        staged.disconnect(source, sink);
+                        staged.connect(
+                            SignalSource::NodeOut {
+                                node: split_node,
+                                port: 0,
+                            },
+                            sink,
+                        )?;
+                    }
+                    staged.connect(
+                        source,
+                        SignalSink::NodeIn {
+                            node: split_node,
+                            port: 0,
+                        },
+                    )?;
+                    *self = staged;
+                    return Ok(SignalSource::NodeOut {
+                        node: split_node,
+                        port: 1,
+                    });
+                }
+
+                let mut candidates = Vec::new();
+                let mut visited = BTreeSet::new();
+                let mut queue = VecDeque::new();
+                visited.insert(coord);
+                queue.push_back(coord);
+                while let Some(current) = queue.pop_front() {
+                    if !staged.cell_map.contains_key(&current) {
+                        candidates.push(current);
+                        if candidates.len() >= 8 {
+                            break;
+                        }
+                    }
+                    for next in staged.neighbors(current) {
+                        if visited.insert(next) {
+                            queue.push_back(next);
+                        }
+                    }
+                }
+                if candidates.is_empty()
+                    && let Some(empty) = staged.nearest_empty_cell(coord)
+                {
+                    candidates.push(empty);
+                }
+
+                let mut best_trial: Option<(LatticeCircuit, NodeId, usize, Coord)> = None;
+                for cand in candidates {
+                    let mut trial = staged.clone();
+                    let Ok(split_node) = trial.place_node(cand, Primitive::Split) else {
+                        continue;
+                    };
+                    let mut ok = true;
+                    for &sink in &existing_sinks {
+                        trial.disconnect(source, sink);
+                        if trial
+                            .route_connect(
+                                SignalSource::NodeOut {
+                                    node: split_node,
+                                    port: 0,
+                                },
+                                sink,
+                                usize::from(max_relay_hops),
+                            )
+                            .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    if trial
+                        .route_connect(
+                            source,
+                            SignalSink::NodeIn {
+                                node: split_node,
+                                port: 0,
+                            },
+                            usize::from(max_relay_hops),
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let cost = trial.nodes.len();
+                    let is_better = match &best_trial {
+                        None => true,
+                        Some((_, _, best_cost, best_cand)) => {
+                            cost < *best_cost || (cost == *best_cost && cand < *best_cand)
+                        }
+                    };
+                    if is_better {
+                        best_trial = Some((trial, split_node, cost, cand));
+                    }
+                }
+
+                let (winning_trial, split_node, _, _) =
+                    best_trial.ok_or(LatticeError::UnknownEndpoint)?;
+                *self = winning_trial;
+                Ok(SignalSource::NodeOut {
+                    node: split_node,
+                    port: 1,
+                })
+            }
+        }
+    }
+
+    /// Stacks a modulo additive corrector $\hat{y}_{m+1} = \hat{y}_m + \hat{r} \pmod{2^k}$ at `BoundaryOut(out_port)`.
+    pub fn stack_output_adder(
+        &mut self,
+        out_port: u16,
+        corrector_src: SignalSource,
+        max_relay_hops: u8,
+    ) -> Result<NodeId, LatticeError> {
+        let mut staged = self.clone();
+        let out_sink = SignalSink::BoundaryOut(out_port);
+        let existing_driver = staged
+            .edges
+            .iter()
+            .find_map(|&(src, dst)| (dst == out_sink).then_some(src));
+
+        match existing_driver {
+            None => {
+                let node_id = match corrector_src {
+                    SignalSource::BoundaryIn(_) => {
+                        let tapped = staged.tap_source(corrector_src, max_relay_hops)?;
+                        let cell = if staged.topology == WiringTopology::WellMixed {
+                            staged
+                                .nearest_empty_cell(Coord { row: 0, col: 0 })
+                                .ok_or(LatticeError::UnknownEndpoint)?
+                        } else {
+                            let anchor = *staged
+                                .output_anchors
+                                .get(usize::from(out_port))
+                                .ok_or(LatticeError::UnknownEndpoint)?;
+                            anchor.adjacent_border_cell(staged.shape)?
+                        };
+                        let split = staged.place_node(cell, Primitive::Split)?;
+                        staged.route_connect(
+                            tapped,
+                            SignalSink::NodeIn {
+                                node: split,
+                                port: 0,
+                            },
+                            usize::from(max_relay_hops),
+                        )?;
+                        staged.route_connect(
+                            SignalSource::NodeOut {
+                                node: split,
+                                port: 0,
+                            },
+                            out_sink,
+                            usize::from(max_relay_hops),
+                        )?;
+                        split
+                    }
+                    SignalSource::NodeOut { .. } => {
+                        let tapped = staged.tap_source(corrector_src, max_relay_hops)?;
+                        staged.route_connect(tapped, out_sink, usize::from(max_relay_hops))?;
+                        match tapped {
+                            SignalSource::NodeOut { node, .. } => node,
+                            _ => unreachable!(),
+                        }
+                    }
+                };
+                *self = staged;
+                Ok(node_id)
+            }
+            Some(prev_src) => {
+                if staged.topology == WiringTopology::WellMixed {
+                    let cell = staged
+                        .nearest_empty_cell(Coord { row: 0, col: 0 })
+                        .ok_or(LatticeError::UnknownEndpoint)?;
+                    let add = staged.place_node(cell, Primitive::Add)?;
+                    staged.disconnect(prev_src, out_sink);
+                    staged.connect(prev_src, SignalSink::NodeIn { node: add, port: 0 })?;
+                    let tapped_corr = staged.tap_source(corrector_src, max_relay_hops)?;
+                    staged.connect(tapped_corr, SignalSink::NodeIn { node: add, port: 1 })?;
+                    staged.connect(SignalSource::NodeOut { node: add, port: 0 }, out_sink)?;
+                    *self = staged;
+                    return Ok(add);
+                }
+
+                let anchor = *staged
+                    .output_anchors
+                    .get(usize::from(out_port))
+                    .ok_or(LatticeError::UnknownEndpoint)?;
+                let out_cell = anchor.adjacent_border_cell(staged.shape)?;
+
+                if let Some(cell_node) = staged.cell_node(out_cell) {
+                    let is_relay_split = staged.node_primitive(cell_node) == Some(Primitive::Split);
+                    let consumers = staged
+                        .edges
+                        .iter()
+                        .filter(|&(src, _)| {
+                            matches!(src, SignalSource::NodeOut { node, .. } if *node == cell_node)
+                        })
+                        .count();
+                    if is_relay_split && consumers == 1 {
+                        let old_driver = staged
+                            .edges
+                            .iter()
+                            .find_map(|&(src, dst)| {
+                                (dst == SignalSink::NodeIn {
+                                    node: cell_node,
+                                    port: 0,
+                                })
+                                .then_some(src)
+                            })
+                            .ok_or(LatticeError::UnknownEndpoint)?;
+                        staged.disconnect(
+                            old_driver,
+                            SignalSink::NodeIn {
+                                node: cell_node,
+                                port: 0,
+                            },
+                        );
+                        staged.disconnect(prev_src, out_sink);
+                        staged.nodes[cell_node.index()].1 = Primitive::Add;
+                        staged.connect(
+                            old_driver,
+                            SignalSink::NodeIn {
+                                node: cell_node,
+                                port: 0,
+                            },
+                        )?;
+                        let tapped_corr = staged.tap_source(corrector_src, max_relay_hops)?;
+                        staged.route_connect(
+                            tapped_corr,
+                            SignalSink::NodeIn {
+                                node: cell_node,
+                                port: 1,
+                            },
+                            usize::from(max_relay_hops),
+                        )?;
+                        staged.connect(
+                            SignalSource::NodeOut {
+                                node: cell_node,
+                                port: 0,
+                            },
+                            out_sink,
+                        )?;
+                        *self = staged;
+                        return Ok(cell_node);
+                    }
+
+                    staged.disconnect(prev_src, out_sink);
+                    let empty_neighbor = staged
+                        .neighbors(out_cell)
+                        .into_iter()
+                        .find(|&n| !staged.cell_map.contains_key(&n))
+                        .or_else(|| staged.nearest_empty_cell(out_cell))
+                        .ok_or(LatticeError::UnknownEndpoint)?;
+                    staged.relocate_node(cell_node, empty_neighbor)?;
+                    let add = staged.place_node(out_cell, Primitive::Add)?;
+                    let updated_prev = match prev_src {
+                        SignalSource::NodeOut { node, port } if node == cell_node => {
+                            SignalSource::NodeOut {
+                                node: cell_node,
+                                port,
+                            }
+                        }
+                        other => other,
+                    };
+                    staged.connect(updated_prev, SignalSink::NodeIn { node: add, port: 0 })?;
+                    let tapped_corr = staged.tap_source(corrector_src, max_relay_hops)?;
+                    staged.route_connect(
+                        tapped_corr,
+                        SignalSink::NodeIn { node: add, port: 1 },
+                        usize::from(max_relay_hops),
+                    )?;
+                    staged.connect(SignalSource::NodeOut { node: add, port: 0 }, out_sink)?;
+                    *self = staged;
+                    return Ok(add);
+                }
+
+                let add = staged.place_node(out_cell, Primitive::Add)?;
+                staged.disconnect(prev_src, out_sink);
+                staged.route_connect(
+                    prev_src,
+                    SignalSink::NodeIn { node: add, port: 0 },
+                    usize::from(max_relay_hops),
+                )?;
+                let tapped_corr = staged.tap_source(corrector_src, max_relay_hops)?;
+                staged.route_connect(
+                    tapped_corr,
+                    SignalSink::NodeIn { node: add, port: 1 },
+                    usize::from(max_relay_hops),
+                )?;
+                staged.connect(SignalSource::NodeOut { node: add, port: 0 }, out_sink)?;
+                *self = staged;
+                Ok(add)
+            }
+        }
+    }
+
     /// Removes edges exactly matching `(src, dst)`.
     pub fn disconnect(&mut self, src: SignalSource, dst: SignalSink) -> bool {
         let original_len = self.edges.len();
@@ -660,6 +1379,16 @@ impl LatticeCircuit {
                 max_relay_hops: request.max_relay_hops,
             });
         }
+        let input_anchors_border: BTreeSet<Coord> = self
+            .input_anchors
+            .iter()
+            .filter_map(|a| a.adjacent_border_cell(self.shape).ok())
+            .collect();
+        let output_anchors_border: BTreeSet<Coord> = self
+            .output_anchors
+            .iter()
+            .filter_map(|a| a.adjacent_border_cell(self.shape).ok())
+            .collect();
         let mut parents = BTreeMap::new();
         let mut queue = VecDeque::new();
         parents.insert(start, None);
@@ -686,6 +1415,13 @@ impl LatticeCircuit {
                 {
                     continue;
                 }
+                if next != goal
+                    && next != start
+                    && (input_anchors_border.contains(&next)
+                        || output_anchors_border.contains(&next))
+                {
+                    continue;
+                }
                 parents.insert(next, Some(current));
                 queue.push_back((next, depth + 1));
             }
@@ -697,7 +1433,9 @@ impl LatticeCircuit {
         })
     }
 
-    fn neighbors(&self, coord: Coord) -> Vec<Coord> {
+    /// Returns all valid adjacent lattice coordinates for `coord`.
+    #[must_use]
+    pub fn neighbors(&self, coord: Coord) -> Vec<Coord> {
         let mut neighbors = Vec::with_capacity(8);
         for dr in -1i32..=1 {
             for dc in -1i32..=1 {
@@ -1074,5 +1812,123 @@ mod tests {
         assert!(!relays.contains(&blocker));
         let compiled = lattice.lower().unwrap().compile().unwrap();
         assert_eq!(compiled.total_registers(), 7);
+    }
+
+    #[test]
+    fn well_mixed_stack_output_adder_taps_existing_node_and_boundary_without_illegal_fanout() {
+        let shape = GridShape::new(4, 4).unwrap();
+        let mut lat = LatticeCircuit::new(
+            shape,
+            Width::BITS_1,
+            WireDelayMode::Combinational,
+            WiringTopology::WellMixed,
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 0,
+            }],
+            vec![
+                BoundaryAnchor {
+                    side: PerimeterSide::North,
+                    offset: 1,
+                },
+                BoundaryAnchor {
+                    side: PerimeterSide::North,
+                    offset: 2,
+                },
+                BoundaryAnchor {
+                    side: PerimeterSide::North,
+                    offset: 3,
+                },
+            ],
+        )
+        .unwrap();
+
+        let n0 = lat
+            .place_node(Coord { row: 0, col: 0 }, Primitive::Eqz)
+            .unwrap();
+        lat.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: n0, port: 0 },
+        )
+        .unwrap();
+
+        // 1. Stack n0 onto BoundaryOut(0) (existing_driver == None)
+        lat.stack_output_adder(0, SignalSource::NodeOut { node: n0, port: 0 }, 4)
+            .unwrap();
+        assert!(lat.lower().unwrap().compile().is_ok());
+
+        // 2. Stack same n0 onto BoundaryOut(1) (existing_driver == None, n0 already drives BoundaryOut(0))
+        // Must tap n0 via Split rather than creating IllegalFanOut
+        lat.stack_output_adder(1, SignalSource::NodeOut { node: n0, port: 0 }, 4)
+            .unwrap();
+        let circ = lat.lower().unwrap();
+        assert!(circ.compile().is_ok());
+
+        // 3. Add an additive corrector stacking onto BoundaryOut(1)
+        let n1 = lat
+            .place_node(Coord { row: 1, col: 0 }, Primitive::Delay { init: 0 })
+            .unwrap();
+        let tapped_in = lat.tap_source(SignalSource::BoundaryIn(0), 4).unwrap();
+        lat.connect(tapped_in, SignalSink::NodeIn { node: n1, port: 0 })
+            .unwrap();
+        lat.stack_output_adder(1, SignalSource::NodeOut { node: n1, port: 0 }, 4)
+            .unwrap();
+        // 4. Stack BoundaryIn(0) directly onto BoundaryOut(2) (existing_driver == None, BoundaryIn(0) already has taps)
+        lat.stack_output_adder(2, SignalSource::BoundaryIn(0), 4)
+            .unwrap();
+        let circ3 = lat.lower().unwrap();
+        assert!(circ3.compile().is_ok());
+    }
+
+    #[test]
+    fn well_mixed_tap_source_on_node_out_rewires_existing_consumers_cleanly() {
+        let shape = GridShape::new(4, 4).unwrap();
+        let mut lat = LatticeCircuit::new(
+            shape,
+            Width::BITS_1,
+            WireDelayMode::Combinational,
+            WiringTopology::WellMixed,
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 0,
+            }],
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 1,
+            }],
+        )
+        .unwrap();
+
+        let n0 = lat
+            .place_node(Coord { row: 0, col: 0 }, Primitive::Eqz)
+            .unwrap();
+        let n1 = lat
+            .place_node(Coord { row: 0, col: 1 }, Primitive::Add)
+            .unwrap();
+        lat.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: n0, port: 0 },
+        )
+        .unwrap();
+        lat.connect(
+            SignalSource::NodeOut { node: n0, port: 0 },
+            SignalSink::NodeIn { node: n1, port: 0 },
+        )
+        .unwrap();
+
+        let tapped = lat
+            .tap_source(SignalSource::NodeOut { node: n0, port: 0 }, 4)
+            .unwrap();
+        lat.connect(tapped, SignalSink::NodeIn { node: n1, port: 1 })
+            .unwrap();
+        lat.connect(
+            SignalSource::NodeOut { node: n1, port: 0 },
+            SignalSink::BoundaryOut(0),
+        )
+        .unwrap();
+
+        let circ = lat.lower().unwrap();
+        let compiled = circ.compile().unwrap();
+        assert_eq!(compiled.total_registers(), 0);
     }
 }

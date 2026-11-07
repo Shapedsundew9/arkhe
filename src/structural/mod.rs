@@ -27,4 +27,4 @@ pub use sensitivity::{
     CausalAncestry, NodeActivity, SensitivityError, SensitivitySnapshot, assemble_causal_ancestry,
     counterfactual_sensitivity, ring_identity_input_weights, source_node_for_wire,
 };
-pub use surgery::{EditableLattice, SurgeryError};
+pub use surgery::{EditableLattice, MarginalDebtLedger, SurgeryError};
