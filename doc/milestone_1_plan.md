@@ -1,6 +1,6 @@
 # Milestone 1 Implementation Plan: Metabolic Economy and Residual Neurogenesis
 
-> **Status:** In progress: M1a strengthened panel pre-registered; M1b pending.
+> **Status:** In progress: Stage M1a implemented and verified across 100 development banks (`20..2019`, $T \in \{1024, 2048, 4096\}$); Stage M1b pre-registered in [milestone_1b_plan.md](milestone_1b_plan.md).
 >
 > **Charter scope:** §3.1.1–§3.1.7 (Spatial lattice, metabolic reserves, retrograde sensitivity-gated credit, surprisal-weighted exact-match reward, residual-driven corrector sprouting, starvation pruning, free-rider defences), §3.3 (First and second neuron as boosting over $\mathbb{Z}_{2^k}$ with causal $z^{-1}$), §3.4 (Calibration to total description length $L$), §4.1 (Online wake loop), §6 (Hypotheses **H1** & **H2**), §7 (M1a & M1b success and kill criteria at $k = 1$ and $k = 2$), §8 (Ablations, equal compute, pre-registration, reproducibility), and §9 (Rust layer separation).
 
@@ -335,7 +335,7 @@ The closed-loop metabolic economy under the M1a redesign (decisions D1–D4: rep
 
 Stage M1a fixed the metabolic economy on static circuits by replacing per-tick maintenance rent with one-time description debt $L(C) = \sum_i \Delta L_i$ charged upon maturity, introducing calibrated sequential point forecasts ($q = \max(\hat{q}, p)$, $r = \log_2(q/p)$), replacing ancestry traces (clamped to $\le 1.0$), and activity recency decay ($\gamma = 0.90$).
 
-Because M1b introduces online graph surgery (`EditableLattice`), sprouting, and starvation pruning, the following interface decisions arising from the debt economy must be addressed during M1b implementation:
+Because M1b introduces online graph surgery (`EditableLattice`), sprouting, and starvation pruning, the following interface decisions arising from the debt economy are resolved as `D1b.1`–`D1b.7` in [milestone_1b_plan.md](milestone_1b_plan.md#2-resolved-post-m1a-economy-and-debt-interfaces-d1b1d1b7):
 
 1. **Idle nodes vs. starved nodes:** Under description debt, a node that has fully repaid its share $\Delta L_i$ and subsequently stops receiving credit maintains positive energy indefinitely ($E_i(t) > 0$). Under old per-tick rent, such idle nodes passively starved. For M1b:
    - *Structural pruning test:* A node is eligible for pruning if removing it does not increase global description length $L$ (aligning with Charter §3.2 sleep compression and Milestone 3).
@@ -504,8 +504,8 @@ In accordance with Charter §7 and §8, all thresholds, seed counts, and kill cr
 
 | Ablation Axis | Default Setting | Ablated Setting | Measured Hypothesis Check |
 | :--- | :--- | :--- | :--- |
-| **1. Reward weighting** | `RewardMode::CenteredSurprisal` | `UncenteredSurprisal` & `RawAccuracy` | `RawAccuracy` sustains useless nodes on `T1_Constant(0)` and lazy always-`0` circuits on sparse `[0, 0, 0, 0, 0, 1]`, whereas `CenteredSurprisal` starves both and sustains the rare-event predictor |
-| **2. `SPLIT` fan-out tax** | $c_{\text{split}} = 0.035 > c_{\text{base}}$ | $c_{\text{split}} = 0.0$ | $c_{\text{split}} > c_{\text{base}}$ yields lower mean `split_count` and lower `circuit_bits` at equal post-transient accuracy |
+| **1. Reward weighting** | `RewardMode::CalibratedPointForecast` | `CenteredSurprisal`, `UncenteredSurprisal`, & `RawAccuracy` | `RawAccuracy` and `UncenteredSurprisal` sustain useless nodes on `T1_Constant(0)` and lazy always-`0` circuits on sparse `[0, 0, 0, 0, 0, 1]`, whereas `CalibratedPointForecast` scores blind/constant predictors at `0.0`, starves both, and sustains the rare-event predictor |
+| **2. `SPLIT` fan-out tax** | `split_code_tax = true` (full `Split` node + dual-wire MDL debt) | `split_code_tax = false` (`0` `Split` operator & extra-wire debt bits) | `split_code_tax = true` yields lower or equal mean `split_count` and lower unweighted `circuit_bits` at equal post-transient accuracy |
 | **3. Spatial locality** | `WiringTopology::LocalVonNeumann` | `WiringTopology::WellMixed` | Quantifies spatial routing relay overhead (`circuit_bits`, `node_count`, `ticks_to_solution`) while verifying both solve `T1` |
 | **4. Wire propagation delay** | `WireDelayMode::Combinational` | `WireDelayMode::TicksPerHop` | Verifies that hop latency is compensated by causal lag alignment and `TicksPerHop` eligibility traces on `T1` |
 
@@ -623,7 +623,7 @@ cargo run --locked --release -- verify-m0 --seed-offset 0 --seeds 20
 # 3. Pre-registered Milestone 1 gates (M1a kill gate -> M1b neurogenesis + §8 ablations)
 #    Run on development seeds (0..20) and untouched holdout seeds (10000..10020)
 cargo run --locked --release -- verify-m1 --seed-offset 0 --seeds 20
-cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20
+cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdout
 
 # 4. Crate packaging verification
 cargo package --allow-dirty
