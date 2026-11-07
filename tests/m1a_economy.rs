@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::process::Command;
 
-use arkhe::verify_m1::{CircuitClass, M1aVerificationSummary, run_m1a_verification_suite};
+use arkhe::verify_m1::{
+    CircuitClass, M1aBankReport, M1aVerificationSummary, run_m1a_verification_suite,
+};
 
 #[test]
 fn m1a_gates_pass_fast_seed_slice() {
@@ -88,4 +90,46 @@ fn cli_verify_m1a_reports_structured_json() {
     assert_eq!(summary.seed_offset, 0);
     // Exit code reflects gate outcome (non-zero when kill criteria triggered).
     assert_eq!(output.status.success(), summary.all_passed);
+}
+
+#[test]
+fn cli_verify_m1a_bank_mode_reports_structured_json() {
+    let output = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+        .args([
+            "verify-m1a",
+            "--seed-offset",
+            "20",
+            "--banks",
+            "1",
+            "--seeds",
+            "1",
+            "--horizon",
+            "64",
+        ])
+        .output()
+        .expect("spawn arkhe verify-m1a in bank mode");
+
+    let stdout = String::from_utf8(output.stdout).expect("valid utf-8 stdout");
+    let report: M1aBankReport =
+        serde_json::from_str(&stdout).expect("parse stdout as M1aBankReport");
+
+    assert_eq!(report.gate_passes.len(), 4);
+    assert_eq!(report.banks_evaluated, 1);
+    assert_eq!(report.horizon, 64);
+    assert!(!report.class_stats.is_empty());
+}
+
+#[test]
+fn cli_verify_m1a_refuses_holdout_seeds_without_flag() {
+    let output = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+        .args(["verify-m1a", "--seed-offset", "10000", "--seeds", "20"])
+        .output()
+        .expect("spawn arkhe verify-m1a on holdout");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("overlaps pre-registered holdout range"),
+        "stderr must mention holdout refusal, got: {stderr}"
+    );
 }

@@ -17,7 +17,96 @@ use crate::substrate::{
     Circuit, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
 };
 
-pub use panel::{CircuitClass, PanelRun};
+pub use panel::{CircuitClass, DEFAULT_HORIZON, PanelRun};
+
+/// Pre-registered holdout range start seed.
+pub const HOLDOUT_SEED_START: u32 = 10000;
+/// Pre-registered holdout range end seed (inclusive).
+pub const HOLDOUT_SEED_END: u32 = 10019;
+
+/// Checks whether a seed range overlaps the pre-registered holdout seeds 10000..=10019.
+///
+/// # Errors
+///
+/// Returns an error string if `[seed_offset, seed_offset + seeds)` overlaps 10000..=10019 and `allow_holdout` is false.
+pub fn check_seed_range_holdout(
+    seed_offset: u32,
+    seeds: u32,
+    allow_holdout: bool,
+) -> Result<(), String> {
+    let start = seed_offset;
+    let end = seed_offset.saturating_add(seeds.max(1));
+    let overlaps = start <= HOLDOUT_SEED_END && end > HOLDOUT_SEED_START;
+    if overlaps && !allow_holdout {
+        return Err(format!(
+            "refusing seed range {start}..{end} which overlaps pre-registered holdout range {HOLDOUT_SEED_START}..={HOLDOUT_SEED_END} without --holdout flag"
+        ));
+    }
+    Ok(())
+}
+
+const fn default_horizon() -> u64 {
+    DEFAULT_HORIZON
+}
+
+/// Min and max statistics for one circuit class across evaluated runs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct M1aClassStats {
+    /// Diagnostic classification.
+    pub class: CircuitClass,
+    /// Minimum prediction reward flux across runs.
+    pub min_flux: f64,
+    /// Maximum prediction reward flux across runs.
+    pub max_flux: f64,
+    /// Minimum circuit code length L(C) across circuits.
+    pub min_code_bits: f64,
+    /// Maximum circuit code length L(C) across circuits.
+    pub max_code_bits: f64,
+    /// Minimum per-node credit margin min_i (E_i(T) - E_init) across all nodes and runs.
+    pub min_per_node_margin: f64,
+    /// Maximum per-node credit margin max_i (E_i(T) - E_init) across all nodes and runs.
+    pub max_per_node_margin: f64,
+}
+
+/// Gate pass count across scored banks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct M1aGatePassCount {
+    /// Gate identifier.
+    pub gate: String,
+    /// Number of banks in which all gate checks passed.
+    pub passed_banks: u32,
+    /// Total number of banks evaluated.
+    pub total_banks: u32,
+}
+
+/// Structured report emitted by `verify-m1a` in bank mode.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct M1aBankReport {
+    /// Build and source-tree provenance.
+    pub provenance: BuildProvenance,
+    /// Starting master seed offset.
+    pub seed_offset: u32,
+    /// Master seeds per bank.
+    pub seeds_per_bank: u32,
+    /// Number of consecutive banks evaluated.
+    pub banks_evaluated: u32,
+    /// Evaluation horizon in ticks.
+    pub horizon: u64,
+    /// Gate pass rates across all evaluated banks.
+    pub gate_passes: Vec<M1aGatePassCount>,
+    /// Number of banks in which all four gates passed.
+    pub all_passed_banks: u32,
+    /// Aggregated flux, code length, and per-node margin statistics by circuit class.
+    pub class_stats: Vec<M1aClassStats>,
+}
+
+impl M1aBankReport {
+    /// Returns true if all evaluated banks passed all gates.
+    #[must_use]
+    pub fn all_passed(&self) -> bool {
+        self.banks_evaluated > 0 && self.all_passed_banks == self.banks_evaluated
+    }
+}
 
 /// One pre-registered M1a gate outcome.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -74,6 +163,9 @@ pub struct M1aVerificationSummary {
     pub seed_offset: u32,
     /// Number of seeds used for stochastic conditions.
     pub seeds_tested: u32,
+    /// Evaluation horizon in ticks.
+    #[serde(default = "default_horizon")]
+    pub horizon: u64,
     /// Results for G1A.1 through G1A.4.
     pub gates: Vec<M1aGateReport>,
     /// Pre-registered circuit panel aggregates.
@@ -82,17 +174,58 @@ pub struct M1aVerificationSummary {
     pub all_passed: bool,
 }
 
-/// Runs the fixed-structure M1a gates against the live circuit panel.
+/// Runs the fixed-structure M1a gates against the live circuit panel at the default horizon (1024 ticks).
 #[must_use]
 pub fn run_m1a_verification_suite(seed_offset: u32, seeds: u32) -> M1aVerificationSummary {
-    let seeds_tested = seeds.max(1);
-    let runs = panel::run_panel_matrix(seed_offset, seeds_tested);
+    run_m1a_verification_suite_with_horizon(seed_offset, seeds, DEFAULT_HORIZON)
+}
 
+/// Runs the fixed-structure M1a gates against the live circuit panel for an explicit `horizon`.
+#[must_use]
+pub fn run_m1a_verification_suite_with_horizon(
+    seed_offset: u32,
+    seeds: u32,
+    horizon: u64,
+) -> M1aVerificationSummary {
+    run_m1a_verification_suite_with_horizon_and_holdout(seed_offset, seeds, horizon, false)
+        .expect("holdout check failed")
+}
+
+/// Runs the fixed-structure M1a gates against the live circuit panel with explicit horizon and holdout permission.
+///
+/// # Errors
+///
+/// Returns an error if the seed range overlaps 10000..=10019 and `allow_holdout` is false.
+pub fn run_m1a_verification_suite_with_horizon_and_holdout(
+    seed_offset: u32,
+    seeds: u32,
+    horizon: u64,
+    allow_holdout: bool,
+) -> Result<M1aVerificationSummary, String> {
+    check_seed_range_holdout(seed_offset, seeds, allow_holdout)?;
+    let seeds_tested = seeds.max(1);
+    let runs = panel::run_panel_matrix(seed_offset, seeds_tested, horizon);
+    Ok(evaluate_panel_runs(
+        seed_offset,
+        seeds_tested,
+        horizon,
+        &runs,
+    ))
+}
+
+/// Evaluates gates and aggregates panel metrics from existing panel runs.
+#[must_use]
+pub fn evaluate_panel_runs(
+    seed_offset: u32,
+    seeds_tested: u32,
+    horizon: u64,
+    runs: &[PanelRun],
+) -> M1aVerificationSummary {
     let mut gates = vec![
-        verify_g1a1(&runs),
-        verify_g1a2(&runs),
-        verify_g1a3(&runs),
-        verify_g1a4(&runs, seed_offset),
+        verify_g1a1(runs),
+        verify_g1a2(runs, horizon),
+        verify_g1a3(runs, horizon),
+        verify_g1a4(runs, seed_offset),
     ];
     for gate in &mut gates {
         gate.failures.sort();
@@ -165,10 +298,180 @@ pub fn run_m1a_verification_suite(seed_offset: u32, seeds: u32) -> M1aVerificati
         provenance: BuildProvenance::current(),
         seed_offset,
         seeds_tested,
+        horizon,
         gates,
         panel: panel_aggregates,
         all_passed,
     }
+}
+
+/// Evaluates N consecutive banks of seeds and returns an aggregated bank report.
+///
+/// # Errors
+///
+/// Returns an error if `banks == 0` or if the seed range overlaps the holdout range without authorization.
+pub fn run_m1a_bank_evaluation(
+    seed_offset: u32,
+    seeds_per_bank: u32,
+    banks: u32,
+    horizon: u64,
+    allow_holdout: bool,
+) -> Result<M1aBankReport, String> {
+    if banks == 0 {
+        return Err("banks count must be >= 1".to_string());
+    }
+    let total_seeds = seeds_per_bank.saturating_mul(banks);
+    check_seed_range_holdout(seed_offset, total_seeds, allow_holdout)?;
+
+    struct SingleBankResult {
+        gate_passed: [bool; 4],
+        all_passed: bool,
+        runs: Vec<PanelRun>,
+    }
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(banks as usize)
+        .max(1);
+
+    let mut bank_results: Vec<Option<SingleBankResult>> = (0..banks).map(|_| None).collect();
+
+    std::thread::scope(|s| {
+        let chunk_size = (banks as usize).div_ceil(num_threads);
+        let results_slices: Vec<&mut [Option<SingleBankResult>]> =
+            bank_results.chunks_mut(chunk_size).collect();
+        for (thread_idx, slice) in results_slices.into_iter().enumerate() {
+            let start_bank = thread_idx * chunk_size;
+            s.spawn(move || {
+                for (offset_in_slice, bank_slot) in slice.iter_mut().enumerate() {
+                    let b = (start_bank + offset_in_slice) as u32;
+                    let bank_seed_offset = seed_offset + b * seeds_per_bank;
+                    let runs = panel::run_panel_matrix(bank_seed_offset, seeds_per_bank, horizon);
+                    let g1 = verify_g1a1(&runs).passed;
+                    let g2 = verify_g1a2(&runs, horizon).passed;
+                    let g3 = verify_g1a3(&runs, horizon).passed;
+                    let g4 = verify_g1a4(&runs, bank_seed_offset).passed;
+                    let all = g1 && g2 && g3 && g4;
+                    *bank_slot = Some(SingleBankResult {
+                        gate_passed: [g1, g2, g3, g4],
+                        all_passed: all,
+                        runs,
+                    });
+                }
+            });
+        }
+    });
+
+    let mut g1_passes = 0u32;
+    let mut g2_passes = 0u32;
+    let mut g3_passes = 0u32;
+    let mut g4_passes = 0u32;
+    let mut all_passed_banks = 0u32;
+    let mut all_runs = Vec::new();
+
+    for res in bank_results {
+        let res = res.expect("bank was computed");
+        if res.gate_passed[0] {
+            g1_passes += 1;
+        }
+        if res.gate_passed[1] {
+            g2_passes += 1;
+        }
+        if res.gate_passed[2] {
+            g3_passes += 1;
+        }
+        if res.gate_passed[3] {
+            g4_passes += 1;
+        }
+        if res.all_passed {
+            all_passed_banks += 1;
+        }
+        all_runs.extend(res.runs);
+    }
+
+    let classes = [
+        CircuitClass::Opt,
+        CircuitClass::Partial,
+        CircuitClass::Chance,
+        CircuitClass::Wrong,
+        CircuitClass::Silence,
+        CircuitClass::Detour,
+    ];
+
+    let mut class_stats = Vec::new();
+    for &cls in &classes {
+        let matching: Vec<&PanelRun> = all_runs.iter().filter(|r| r.class == cls).collect();
+        if matching.is_empty() {
+            continue;
+        }
+        let min_flux = matching
+            .iter()
+            .map(|r| r.flux)
+            .fold(f64::INFINITY, f64::min);
+        let max_flux = matching
+            .iter()
+            .map(|r| r.flux)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_code_bits = matching
+            .iter()
+            .map(|r| r.code_bits)
+            .fold(f64::INFINITY, f64::min);
+        let max_code_bits = matching
+            .iter()
+            .map(|r| r.code_bits)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_per_node_margin = matching
+            .iter()
+            .map(|r| r.min_node_margin)
+            .fold(f64::INFINITY, f64::min);
+        let max_per_node_margin = matching
+            .iter()
+            .map(|r| r.max_node_margin)
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        class_stats.push(M1aClassStats {
+            class: cls,
+            min_flux,
+            max_flux,
+            min_code_bits,
+            max_code_bits,
+            min_per_node_margin,
+            max_per_node_margin,
+        });
+    }
+
+    Ok(M1aBankReport {
+        provenance: BuildProvenance::current(),
+        seed_offset,
+        seeds_per_bank,
+        banks_evaluated: banks,
+        horizon,
+        gate_passes: vec![
+            M1aGatePassCount {
+                gate: "G1A.1".to_string(),
+                passed_banks: g1_passes,
+                total_banks: banks,
+            },
+            M1aGatePassCount {
+                gate: "G1A.2".to_string(),
+                passed_banks: g2_passes,
+                total_banks: banks,
+            },
+            M1aGatePassCount {
+                gate: "G1A.3".to_string(),
+                passed_banks: g3_passes,
+                total_banks: banks,
+            },
+            M1aGatePassCount {
+                gate: "G1A.4".to_string(),
+                passed_banks: g4_passes,
+                total_banks: banks,
+            },
+        ],
+        all_passed_banks,
+        class_stats,
+    })
 }
 
 fn gate_report(gate: &str, cases: u64, failures: Vec<String>) -> M1aGateReport {
@@ -308,7 +611,7 @@ fn verify_g1a1(runs: &[PanelRun]) -> M1aGateReport {
     gate_report("G1A.1", cases, failures)
 }
 
-fn verify_g1a2(runs: &[PanelRun]) -> M1aGateReport {
+fn verify_g1a2(runs: &[PanelRun], horizon: u64) -> M1aGateReport {
     let mut failures = Vec::new();
     let mut cases = 0u64;
     let initial_energy = EconomyConfig::default().initial_energy;
@@ -389,7 +692,7 @@ fn verify_g1a2(runs: &[PanelRun]) -> M1aGateReport {
     // Spatial case: build Osc2(0, hi) for alt at k ∈ {1, 2}
     for width in [Width::BITS_1, Width::BITS_2] {
         cases += 2;
-        match run_spatial_osc2(width) {
+        match run_spatial_osc2(width, horizon) {
             Ok((delta_e, min_node_energy)) => {
                 if delta_e <= 0.0 {
                     failures.push(format!(
@@ -414,7 +717,7 @@ fn verify_g1a2(runs: &[PanelRun]) -> M1aGateReport {
     gate_report("G1A.2", cases, failures)
 }
 
-fn verify_g1a3(runs: &[PanelRun]) -> M1aGateReport {
+fn verify_g1a3(runs: &[PanelRun], horizon: u64) -> M1aGateReport {
     let mut failures = Vec::new();
     let mut cases = 0u64;
 
@@ -489,7 +792,7 @@ fn verify_g1a3(runs: &[PanelRun]) -> M1aGateReport {
     // Spatial case: Add(Osc2, ConstLoop(0)) as a LocalVonNeumann lattice
     for width in [Width::BITS_1, Width::BITS_2] {
         cases += 2;
-        match run_spatial_detour(width) {
+        match run_spatial_detour(width, horizon) {
             Ok((detour_credit, detour_delta_e, ref_delta_e)) => {
                 if detour_credit != 0.0 {
                     failures.push(format!(
@@ -584,7 +887,7 @@ fn verify_g1a4(runs: &[PanelRun], seed_offset: u32) -> M1aGateReport {
     gate_report("G1A.4", cases, failures)
 }
 
-fn run_spatial_osc2(width: Width) -> Result<(f64, f64), String> {
+fn run_spatial_osc2(width: Width, horizon: u64) -> Result<(f64, f64), String> {
     let k = width.bits();
     let hi = (1u64 << k) - 1;
     let shape = GridShape::new(2, 2).map_err(|e| e.to_string())?;
@@ -674,7 +977,7 @@ fn run_spatial_osc2(width: Width) -> Result<(f64, f64), String> {
     let mut observed = vec![0u64; 1];
     let mut prev = vec![0u64; 1];
 
-    for _ in 0..1024 {
+    for _ in 0..horizon {
         env.step_frame(&mut clean, &mut observed);
         let _ = live.predict(&prev).map_err(|e| e.to_string())?;
         live.settle(&observed).map_err(|e| e.to_string())?;
@@ -696,7 +999,7 @@ fn run_spatial_osc2(width: Width) -> Result<(f64, f64), String> {
     Ok((delta_e, min_node_energy))
 }
 
-fn run_spatial_detour(width: Width) -> Result<(f64, f64, f64), String> {
+fn run_spatial_detour(width: Width, horizon: u64) -> Result<(f64, f64, f64), String> {
     let k = width.bits();
     let hi = (1u64 << k) - 1;
     let shape = GridShape::new(3, 3).map_err(|e| e.to_string())?;
@@ -827,7 +1130,7 @@ fn run_spatial_detour(width: Width) -> Result<(f64, f64, f64), String> {
     let mut prev = vec![0u64; 1];
     let mut detour_credit_after_tick0 = 0.0f64;
 
-    for t in 0..1024u64 {
+    for t in 0..horizon {
         env.step_frame(&mut clean, &mut observed);
         let _ = live.predict(&prev).map_err(|e| e.to_string())?;
         let tick = live.settle(&observed).map_err(|e| e.to_string())?;
@@ -846,7 +1149,7 @@ fn run_spatial_detour(width: Width) -> Result<(f64, f64, f64), String> {
         .map(|n| n.energy - config.initial_energy)
         .sum();
 
-    let (ref_delta_e, _) = run_spatial_osc2(width)?;
+    let (ref_delta_e, _) = run_spatial_osc2(width, horizon)?;
     Ok((detour_credit_after_tick0, detour_delta_e, ref_delta_e))
 }
 
@@ -891,5 +1194,24 @@ fn spearman(left: &[f64], right: &[f64]) -> f64 {
         0.0
     } else {
         covariance / (left_variance * right_variance).sqrt()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holdout_seed_range_guard_rejects_overlaps_without_flag() {
+        assert!(check_seed_range_holdout(0, 20, false).is_ok());
+        assert!(check_seed_range_holdout(20, 2000, false).is_ok());
+        assert!(check_seed_range_holdout(10020, 20, false).is_ok());
+
+        assert!(check_seed_range_holdout(10000, 20, false).is_err());
+        assert!(check_seed_range_holdout(9990, 20, false).is_err());
+        assert!(check_seed_range_holdout(10019, 2, false).is_err());
+
+        assert!(check_seed_range_holdout(10000, 20, true).is_ok());
+        assert!(check_seed_range_holdout(9990, 20, true).is_ok());
     }
 }

@@ -29,7 +29,6 @@ use crate::config::{ExperimentConfig, compute_ground_truth_yardstick, execute_ex
 use crate::env::{FiniteStateGenerator, GeneratorConfig, NoiseModel};
 use crate::substrate::{Width, WireDelayMode};
 use crate::verify::run_m0_verification_suite_with_offset;
-use crate::verify_m1::run_m1a_verification_suite;
 
 /// Command-line interface for the Arkhe Milestone 0 simulator and yardstick.
 #[derive(Debug, Parser)]
@@ -82,9 +81,18 @@ pub enum Commands {
         /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
         #[arg(long, default_value_t = 0)]
         seed_offset: u32,
-        /// Number of master seeds evaluated on noisy conditions.
+        /// Number of master seeds evaluated on noisy conditions (per bank in bank mode).
         #[arg(long, default_value_t = 20)]
         seeds: u32,
+        /// Simulation horizon T in ticks.
+        #[arg(long, default_value_t = verify_m1::DEFAULT_HORIZON)]
+        horizon: u64,
+        /// Number of consecutive seed banks to score (when set, activates bank mode).
+        #[arg(long)]
+        banks: Option<u32>,
+        /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
+        #[arg(long, alias = "allow-holdout", default_value_t = false)]
+        holdout: bool,
     },
 }
 
@@ -172,13 +180,40 @@ where
                 Err("Milestone 0 verification failed one or more acceptance gates".into())
             }
         }
-        Some(Commands::VerifyM1a { seed_offset, seeds }) => {
-            let summary = run_m1a_verification_suite(seed_offset, seeds);
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            if summary.all_passed {
-                Ok(())
+        Some(Commands::VerifyM1a {
+            seed_offset,
+            seeds,
+            horizon,
+            banks,
+            holdout,
+        }) => {
+            if let Some(num_banks) = banks {
+                let report = verify_m1::run_m1a_bank_evaluation(
+                    seed_offset,
+                    seeds,
+                    num_banks,
+                    horizon,
+                    holdout,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.all_passed() {
+                    Ok(())
+                } else {
+                    Err("Milestone 1a bank evaluation failed one or more gates".into())
+                }
             } else {
-                Err("Milestone 1a verification failed one or more acceptance gates".into())
+                let summary = verify_m1::run_m1a_verification_suite_with_horizon_and_holdout(
+                    seed_offset,
+                    seeds,
+                    horizon,
+                    holdout,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+                if summary.all_passed {
+                    Ok(())
+                } else {
+                    Err("Milestone 1a verification failed one or more acceptance gates".into())
+                }
             }
         }
     }

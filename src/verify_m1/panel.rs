@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::env::{FiniteStateGenerator, GeneratorConfig, NoiseModel, NoisyEnvironment};
-use crate::metrics::{NullModelKind, null_calibrated_mdl_delta};
+use crate::metrics::{NullModelKind, circuit_code_bits, null_calibrated_mdl_delta};
 use crate::rng::SeedBank;
 use crate::structural::WiringTopology;
 use crate::structural::economy::EconomyConfig;
@@ -70,6 +70,9 @@ pub struct PanelCircuit {
     pub expected_accuracy: AccuracyCheck,
 }
 
+/// Pre-registered benchmark evaluation horizon in ticks.
+pub const DEFAULT_HORIZON: u64 = 1024;
+
 /// Outcome of one live circuit evaluation across the benchmark horizon.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelRun {
@@ -87,9 +90,9 @@ pub struct PanelRun {
     pub seed: u64,
     /// Total nodes in the circuit.
     pub node_count: usize,
-    /// Empirical accuracy over post-transient ticks 16..1024 against observed facts.
+    /// Empirical accuracy over post-transient ticks 16..horizon against observed facts.
     pub accuracy: f64,
-    /// Empirical accuracy over post-transient ticks 16..1024 against clean ground truth.
+    /// Empirical accuracy over post-transient ticks 16..horizon against clean ground truth.
     pub clean_accuracy: f64,
     /// Net energy delta Σ_i (E_i(T) - E_init) over all ticks.
     pub delta_e: f64,
@@ -101,6 +104,14 @@ pub struct PanelRun {
     pub detour_credit_after_tick0: f64,
     /// Maximum conservation discrepancy |Σ node_delta - (flux - maint)| across all ticks.
     pub max_conservation_error: f64,
+    /// Cumulative prediction reward flux Σ_t flux(t) across all ticks.
+    pub flux: f64,
+    /// Circuit description length L(C).
+    pub code_bits: f64,
+    /// Minimum node credit margin min_i (E_i(T) - E_init) at horizon end.
+    pub min_node_margin: f64,
+    /// Maximum node credit margin max_i (E_i(T) - E_init) at horizon end.
+    pub max_node_margin: f64,
 }
 
 /// Helper building circuits from canonical Level-0 motifs.
@@ -750,12 +761,13 @@ pub fn panel_circuits(task: &PanelTask) -> Vec<PanelCircuit> {
     circuits
 }
 
-/// Runs one panel circuit through the 1024-tick live economy harness.
+/// Runs one panel circuit through the live economy harness across `horizon` ticks.
 pub fn run_panel_case(
     task: &PanelTask,
     pc: &PanelCircuit,
     epsilon: f64,
     seed: u64,
+    horizon: u64,
 ) -> Result<PanelRun, String> {
     let generator = task
         .generator
@@ -792,16 +804,18 @@ pub fn run_panel_case(
     let mut observed = vec![0u64; channels];
     let mut prev = vec![0u64; 1];
 
-    let mut predictions = Vec::with_capacity(1024);
-    let mut observed_facts = Vec::with_capacity(1024);
-    let mut clean_facts = Vec::with_capacity(1024);
+    let h_usize = usize::try_from(horizon).unwrap_or(usize::MAX);
+    let mut predictions = Vec::with_capacity(h_usize);
+    let mut observed_facts = Vec::with_capacity(h_usize);
+    let mut clean_facts = Vec::with_capacity(h_usize);
 
     let mut matches_observed = 0usize;
     let mut matches_clean = 0usize;
     let mut max_conservation_error = 0.0f64;
     let mut detour_credit_after_tick0 = 0.0f64;
+    let mut cumulative_flux = 0.0f64;
 
-    for t in 0..1024u64 {
+    for t in 0..horizon {
         env.step_frame(&mut clean, &mut observed);
         let pred = live
             .predict(&prev)
@@ -834,6 +848,8 @@ pub fn run_panel_case(
             max_conservation_error = conservation_error;
         }
 
+        cumulative_flux += tick.economy.net_flux;
+
         if t >= 1 {
             for &node in &pc.detour_nodes {
                 detour_credit_after_tick0 += tick.economy.node_credit[node.index()];
@@ -843,7 +859,7 @@ pub fn run_panel_case(
         prev[0] = obs0;
     }
 
-    let window_len = (1024 - 16) as f64;
+    let window_len = (horizon.saturating_sub(16)).max(1) as f64;
     let accuracy = (matches_observed as f64) / window_len;
     let clean_accuracy = (matches_clean as f64) / window_len;
 
@@ -859,6 +875,25 @@ pub fn run_panel_case(
         .iter()
         .map(|n| n.energy)
         .fold(f64::INFINITY, f64::min);
+    let max_node_energy = live
+        .economy()
+        .nodes()
+        .iter()
+        .map(|n| n.energy)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let min_node_margin = if live.economy().nodes().is_empty() {
+        0.0
+    } else {
+        min_node_energy - config.initial_energy
+    };
+    let max_node_margin = if live.economy().nodes().is_empty() {
+        0.0
+    } else {
+        max_node_energy - config.initial_energy
+    };
+
+    let code_bits = circuit_code_bits(&pc.circuit, WiringTopology::WellMixed, None, 0);
 
     let delta_l_null = null_calibrated_mdl_delta(
         &pc.circuit,
@@ -887,11 +922,15 @@ pub fn run_panel_case(
         delta_l_null,
         detour_credit_after_tick0,
         max_conservation_error,
+        flux: cumulative_flux,
+        code_bits,
+        min_node_margin,
+        max_node_margin,
     })
 }
 
-/// Runs the panel matrix across tasks × circuits × ε.
-pub fn run_panel_matrix(seed_offset: u32, seeds: u32) -> Vec<PanelRun> {
+/// Runs the panel matrix across tasks × circuits × ε for the specified `horizon`.
+pub fn run_panel_matrix(seed_offset: u32, seeds: u32, horizon: u64) -> Vec<PanelRun> {
     let mut runs = Vec::new();
     let epsilons = [0.0, 0.05];
     let seeds_tested = seeds.max(1);
@@ -900,13 +939,13 @@ pub fn run_panel_matrix(seed_offset: u32, seeds: u32) -> Vec<PanelRun> {
             for &epsilon in &epsilons {
                 if epsilon == 0.0 {
                     let seed = u64::from(seed_offset);
-                    let run = run_panel_case(task, pc, epsilon, seed)
+                    let run = run_panel_case(task, pc, epsilon, seed, horizon)
                         .unwrap_or_else(|err| panic!("panel case failed: {err}"));
                     runs.push(run);
                 } else {
                     for s in 0..seeds_tested {
                         let seed = u64::from(seed_offset + s);
-                        let run = run_panel_case(task, pc, epsilon, seed)
+                        let run = run_panel_case(task, pc, epsilon, seed, horizon)
                             .unwrap_or_else(|err| panic!("panel case failed: {err}"));
                         runs.push(run);
                     }
@@ -943,7 +982,7 @@ mod tests {
     fn panel_construction_self_checks_pass_at_epsilon_zero() {
         for task in panel_tasks() {
             for pc in panel_circuits(&task) {
-                let run = run_panel_case(&task, &pc, 0.0, 0).unwrap();
+                let run = run_panel_case(&task, &pc, 0.0, 0, DEFAULT_HORIZON).unwrap();
                 match pc.expected_accuracy {
                     AccuracyCheck::Exact(expected) => {
                         assert!(
