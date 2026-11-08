@@ -92,6 +92,7 @@ pub struct ObservationWindow {
     start_tick: u64,
     prior_frame: Vec<u64>,
     frames: Vec<Vec<u64>>,
+    state_snapshots: Vec<Option<(u64, Vec<u64>)>>,
     capacity: usize,
 }
 
@@ -104,6 +105,7 @@ impl ObservationWindow {
             start_tick: 0,
             prior_frame: vec![0u64; usize::from(channels)],
             frames: Vec::with_capacity(cap + WINDOW_EVICT_CHUNK),
+            state_snapshots: Vec::with_capacity(cap + WINDOW_EVICT_CHUNK),
             capacity: cap,
         }
     }
@@ -115,6 +117,7 @@ impl ObservationWindow {
             start_tick: 0,
             prior_frame: vec![0u64; usize::from(channels)],
             frames: prefix_frames.to_vec(),
+            state_snapshots: vec![None; prefix_frames.len()],
             capacity: prefix_frames.len().max(16),
         }
     }
@@ -122,13 +125,39 @@ impl ObservationWindow {
     /// Appends a newly observed frame and evicts oldest frames in chunks once capacity is exceeded,
     /// updating `start_tick` and `prior_frame` identically.
     pub fn push_frame(&mut self, frame: &[u64]) {
+        self.push_frame_inner(frame, None);
+    }
+
+    /// Appends a newly observed frame paired with the pre-step register state and structural epoch
+    /// that produced the causal prediction at this tick.
+    pub fn push_frame_with_state(
+        &mut self,
+        frame: &[u64],
+        structure_epoch: u64,
+        pre_step_registers: &[u64],
+    ) {
+        self.push_frame_inner(frame, Some((structure_epoch, pre_step_registers.to_vec())));
+    }
+
+    fn push_frame_inner(&mut self, frame: &[u64], snapshot: Option<(u64, Vec<u64>)>) {
         self.frames.push(frame.to_vec());
+        self.state_snapshots.push(snapshot);
         if self.frames.len() >= self.capacity + WINDOW_EVICT_CHUNK {
             let evict = WINDOW_EVICT_CHUNK;
             self.prior_frame.copy_from_slice(&self.frames[evict - 1]);
             self.frames.drain(0..evict);
+            self.state_snapshots.drain(0..evict);
             self.start_tick += evict as u64;
         }
+    }
+
+    /// Pre-step `(structure_epoch, registers)` snapshot recorded at `frame_idx`, if present.
+    #[must_use]
+    pub fn state_snapshot_at(&self, frame_idx: usize) -> Option<(u64, &[u64])> {
+        self.state_snapshots
+            .get(frame_idx)?
+            .as_ref()
+            .map(|(epoch, regs)| (*epoch, regs.as_slice()))
     }
 
     /// Global 0-based tick index corresponding to `self.frames()[0]`.

@@ -71,6 +71,7 @@ pub struct EditableLattice {
     compiled: CompiledCircuit,
     state: ScalarState,
     economy: EconomyState,
+    structure_epoch: u64,
 }
 
 impl EditableLattice {
@@ -95,7 +96,14 @@ impl EditableLattice {
             compiled,
             state,
             economy,
+            structure_epoch: 0,
         })
+    }
+
+    /// Monotonic structural edit / explicit register-overwrite epoch counter.
+    #[must_use]
+    pub const fn structure_epoch(&self) -> u64 {
+        self.structure_epoch
     }
 
     /// Current spatial graph.
@@ -142,7 +150,9 @@ impl EditableLattice {
     ///
     /// Returns [`EvalError`] if register slice length mismatches.
     pub fn set_registers(&mut self, regs: &[u64]) -> Result<(), EvalError> {
-        self.state.set_registers(&self.compiled, regs)
+        self.state.set_registers(&self.compiled, regs)?;
+        self.structure_epoch = self.structure_epoch.wrapping_add(1);
+        Ok(())
     }
 
     /// Current node reserves, null models, and register ancestry.
@@ -222,6 +232,7 @@ impl EditableLattice {
         self.compiled = compiled;
         self.state = state;
         self.economy = economy;
+        self.structure_epoch = self.structure_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -821,7 +832,97 @@ fn remap_sink(sink: SignalSink, mapping: &[Option<NodeId>]) -> Option<SignalSink
     }
 }
 
-fn register_mapping(
+pub(crate) fn explicit_delay_register_index(circuit: &Circuit, target: NodeId) -> Option<usize> {
+    let mut reg_idx = 0usize;
+    for (idx, primitive) in circuit.nodes().iter().enumerate() {
+        if primitive.is_stateful() {
+            if idx == target.index() {
+                return Some(reg_idx);
+            }
+            reg_idx += 1;
+        }
+    }
+    None
+}
+
+pub(crate) fn port_upstream_cone_and_edges(
+    lattice: &LatticeCircuit,
+    out_port: u16,
+) -> (BTreeSet<NodeId>, BTreeSet<(SignalSource, SignalSink)>) {
+    let mut cone_nodes = BTreeSet::new();
+    let mut cone_edges = BTreeSet::new();
+    let mut stack = Vec::new();
+    let target = SignalSink::BoundaryOut(out_port);
+    for &(src, dst) in lattice.edges() {
+        if dst == target {
+            cone_edges.insert((src, dst));
+            if let SignalSource::NodeOut { node, .. } = src
+                && cone_nodes.insert(node)
+            {
+                stack.push(node);
+            }
+        }
+    }
+    while let Some(node) = stack.pop() {
+        for &(src, dst) in lattice.edges() {
+            if let SignalSink::NodeIn { node: dst_node, .. } = dst
+                && dst_node == node
+            {
+                cone_edges.insert((src, dst));
+                if let SignalSource::NodeOut { node: src_node, .. } = src
+                    && cone_nodes.insert(src_node)
+                {
+                    stack.push(src_node);
+                }
+            }
+        }
+    }
+    (cone_nodes, cone_edges)
+}
+
+pub(crate) fn port_uses_boundary_in(lattice: &LatticeCircuit, out_port: u16) -> bool {
+    let (_, cone_edges) = port_upstream_cone_and_edges(lattice, out_port);
+    cone_edges
+        .iter()
+        .any(|&(src, _)| matches!(src, SignalSource::BoundaryIn(_)))
+}
+
+pub(crate) fn port_cone_changed(
+    old_lattice: &LatticeCircuit,
+    new_lattice: &LatticeCircuit,
+    old_to_new: &[Option<NodeId>],
+    out_port: u16,
+) -> bool {
+    let (old_nodes, old_edges) = port_upstream_cone_and_edges(old_lattice, out_port);
+    let (new_nodes, new_edges) = port_upstream_cone_and_edges(new_lattice, out_port);
+    if old_nodes.len() != new_nodes.len() || old_edges.len() != new_edges.len() {
+        return true;
+    }
+    for &old_node in &old_nodes {
+        let Some(new_node) = old_to_new.get(old_node.index()).copied().flatten() else {
+            return true;
+        };
+        if !new_nodes.contains(&new_node)
+            || old_lattice.node_primitive(old_node) != new_lattice.node_primitive(new_node)
+        {
+            return true;
+        }
+    }
+    for &(src, dst) in &old_edges {
+        let Some(mapped_src) = remap_source(src, old_to_new) else {
+            return true;
+        };
+        let Some(mapped_dst) = remap_sink(dst, old_to_new) else {
+            return true;
+        };
+        if !new_edges.contains(&(mapped_src, mapped_dst)) {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn register_mapping(
     old: &Circuit,
     new: &Circuit,
     old_compiled: &CompiledCircuit,

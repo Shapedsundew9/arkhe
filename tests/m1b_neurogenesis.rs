@@ -257,6 +257,34 @@ fn cli_verify_m1_refuses_holdout_seeds_without_flag() {
 }
 
 #[test]
+fn cli_verify_m1b_and_m1_banks_refuse_holdout_overlap_without_flag() {
+    for subcmd in ["verify-m1b", "verify-m1"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_arkhe"))
+            .args([
+                subcmd,
+                "--banks",
+                "10",
+                "--seed-offset",
+                "9900",
+                "--seeds",
+                "20",
+            ])
+            .output()
+            .expect("spawn arkhe bank mode overlapping holdout");
+
+        assert!(
+            !output.status.success(),
+            "{subcmd} --banks must refuse 9900..10100 holdout overlap"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("overlaps pre-registered holdout range"),
+            "{subcmd} stderr must mention holdout refusal, got: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn fast_seed_slice_m1b_all_gates_pass() {
     use arkhe::verify_m1::run_m1b_verification_suite;
 
@@ -288,9 +316,9 @@ fn fast_seed_slice_m1b_all_gates_pass() {
 #[test]
 fn m1_stage_gate_aborts_m1b_when_m1a_fails() {
     use arkhe::config::BuildProvenance;
-    use arkhe::verify_m1::{M1CombinedSummary, M1aVerificationSummary};
+    use arkhe::verify_m1::{M1aVerificationSummary, evaluate_m1_stage_gate};
 
-    let fake_m1a = M1aVerificationSummary {
+    let failing_m1a = M1aVerificationSummary {
         provenance: BuildProvenance::current(),
         seed_offset: 0,
         seeds_tested: 1,
@@ -300,12 +328,9 @@ fn m1_stage_gate_aborts_m1b_when_m1a_fails() {
         all_passed: false,
     };
 
-    let combined = M1CombinedSummary {
-        m1a: fake_m1a,
-        m1b: None,
-        stage_gate_aborted: true,
-        all_passed: false,
-    };
+    let combined = evaluate_m1_stage_gate(failing_m1a, || {
+        panic!("M1b must never execute when M1a stage gate fails")
+    });
 
     assert!(combined.stage_gate_aborted);
     assert!(combined.m1b.is_none());

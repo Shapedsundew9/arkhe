@@ -3,11 +3,19 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::baselines::{ObservationWindow, TickBudget};
-use crate::metrics::{circuit_code_bits_with_tax, facts_code_bits};
-use crate::structural::economy::{EconomyConfig, EconomyState};
+use crate::metrics::{PointForecastScorer, circuit_code_bits_with_tax, facts_code_bits};
+use crate::rng::SeedBank;
+use crate::structural::economy::{EconomyConfig, EconomyState, score_with_reward_mode};
 use crate::structural::lattice::{Coord, LatticeCircuit, LatticeError, WiringTopology};
-use crate::structural::surgery::EditableLattice;
-use crate::substrate::{NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width};
+use crate::structural::live::node_output_values;
+use crate::structural::sensitivity::{assemble_causal_ancestry, counterfactual_sensitivity};
+use crate::structural::surgery::{
+    EditableLattice, MarginalDebtLedger, explicit_delay_register_index,
+    port_upstream_cone_and_edges, port_uses_boundary_in, register_mapping,
+};
+use crate::substrate::{
+    NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
+};
 
 /// Growth thresholds and resource bounds used by an online M1 learner.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -262,8 +270,9 @@ fn score_feature_group(
         .collect();
     let mutual_information_bits = mutual_information(residuals, &feature_values);
     let alphabet_size = joint_frequencies(&feature_values).len();
-    let residual_alphabet_size = 2.0f64.powi(i32::from(width.bits()));
-    let correction = (alphabet_size.saturating_sub(1) as f64) * (residual_alphabet_size - 1.0)
+    let residual_alphabet_size = frequencies(residuals.iter().copied()).len();
+    let correction = (alphabet_size.saturating_sub(1) as f64)
+        * (residual_alphabet_size.saturating_sub(1) as f64)
         / (2.0 * std::f64::consts::LN_2 * residuals.len() as f64);
     let corrected_mutual_information_bits = mutual_information_bits - correction;
     let match_gain = match_gain(residuals, &feature_values);
@@ -747,7 +756,7 @@ pub fn generate_candidate_motifs(
     }
 
     // 3. Constant-Loop & Shifted/Scaled Motifs
-    let max_c = (1u64 << width.bits()).saturating_sub(1).min(3);
+    let max_c = width.mask().min(3);
     let mut constants = Vec::new();
     for c in 1..=max_c {
         constants.push(c);
@@ -1479,9 +1488,7 @@ pub fn materialize_candidate(
             let u_src = materialize_source(lattice, u, out_cell, out_port, max_relay_hops)?;
             lattice.stack_output_subtractor(out_port, u_src, max_relay_hops)
         }
-        CandidateMotif::ScaleEqz(u, c)
-            if is_driven && *c == (1u64 << lattice.width().bits()) - 1 =>
-        {
+        CandidateMotif::ScaleEqz(u, c) if is_driven && *c == lattice.width().mask() => {
             let out_cell = target_out_cell(lattice, out_port);
             let fallback_start = out_cell.unwrap_or(Coord { row: 0, col: 0 });
             let start_coord = motif_start_coord(lattice, motif, fallback_start);
@@ -1549,11 +1556,11 @@ pub fn propose_sprout(
     }
 
     let mut feature_pairs: Vec<(SourceFeature, Option<SourceFeature>)> = Vec::new();
-    if let Some(ref best) = diagnostics.best_feature {
-        let u1_name = &features[best.feature_indices[0]].name;
+    if let Some(first) = diagnostics.candidate_features.first() {
+        let u1_name = &features[first.feature_indices[0]].name;
         if let Some(u1) = SourceFeature::parse(u1_name) {
-            let u2 = if best.feature_indices.len() > 1 {
-                let u2_name = &features[best.feature_indices[1]].name;
+            let u2 = if first.feature_indices.len() > 1 {
+                let u2_name = &features[first.feature_indices[1]].name;
                 SourceFeature::parse(u2_name)
             } else {
                 diagnostics.secondary_feature.as_ref().and_then(|sec| {
@@ -1563,8 +1570,6 @@ pub fn propose_sprout(
             };
             feature_pairs.push((u1, u2));
         }
-    } else if let Some((_, _)) = diagnostics.constant_offset {
-        feature_pairs.push((SourceFeature::BoundaryIn(0), None));
     }
 
     for feat in &diagnostics.candidate_features {
@@ -1582,26 +1587,35 @@ pub fn propose_sprout(
         }
     }
 
-    if feature_pairs.is_empty() {
-        return Ok(None);
-    }
-
     let num_channels = editable.circuit().num_inputs();
     let mut candidates = Vec::new();
-    for (u1_feat, u2_feat) in &feature_pairs {
-        let cands = generate_candidate_motifs(
-            u1_feat,
-            u2_feat.as_ref(),
-            editable.lattice().width(),
-            diagnostics.constant_offset,
-            is_epoch_1,
-            num_channels,
-        );
-        for c in cands {
-            if !candidates.contains(&c) {
-                candidates.push(c);
+    if feature_pairs.is_empty() {
+        if let Some((c_off, _)) = diagnostics.constant_offset {
+            let norm_c = editable.lattice().width().normalize(c_off);
+            if norm_c != 0 {
+                candidates.push(CandidateMotif::ConstLoop(norm_c));
             }
         }
+    } else {
+        for (u1_feat, u2_feat) in &feature_pairs {
+            let cands = generate_candidate_motifs(
+                u1_feat,
+                u2_feat.as_ref(),
+                editable.lattice().width(),
+                diagnostics.constant_offset,
+                is_epoch_1,
+                num_channels,
+            );
+            for c in cands {
+                if !candidates.contains(&c) {
+                    candidates.push(c);
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(None);
     }
 
     let w_diag = growth_config.diagnostic_window;
@@ -1609,10 +1623,27 @@ pub fn propose_sprout(
     let start_idx = obs_window.len() - w_replay;
     let eval_start_idx = obs_window.len() - w_diag;
 
+    let max_sym_count = frequencies(obs_window.frames()[eval_start_idx..].iter().map(|f| {
+        editable
+            .lattice()
+            .width()
+            .normalize(f[usize::from(out_port)])
+    }))
+    .values()
+    .copied()
+    .max()
+    .unwrap_or(0);
+    let e_const_mode = w_diag.saturating_sub(max_sym_count);
+
     let mut curr_state = ScalarState::new(editable.compiled());
+    if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(start_idx)
+        && snap_epoch == editable.structure_epoch()
+    {
+        let _ = curr_state.set_registers(editable.compiled(), snap_regs);
+    }
     let mut curr_pred = vec![0u64; usize::from(editable.compiled().num_outputs())];
-    let mut curr_scorer = editable.economy().scorers()[usize::from(out_port)].clone();
-    curr_scorer.reset_predictor_counts();
+    let mut curr_scorer =
+        PointForecastScorer::new(editable.lattice().width(), economy_config.null_model);
 
     let mut e_curr = 0usize;
     let mut flux_curr = 0.0;
@@ -1625,21 +1656,29 @@ pub fn propose_sprout(
         };
         let truth = &obs_window.frames()[idx];
         let _ = curr_state.step(editable.compiled(), input, &mut curr_pred);
+        let p_curr = if is_epoch_1 {
+            0
+        } else {
+            curr_pred[usize::from(out_port)]
+        };
+        let p_truth = truth[usize::from(out_port)];
+        let reward_curr = if is_epoch_1 {
+            curr_scorer.null_model_mut().observe_and_surprisal(p_truth);
+            0.0
+        } else {
+            score_with_reward_mode(
+                &mut curr_scorer,
+                economy_config.reward_mode,
+                editable.lattice().width(),
+                p_curr,
+                p_truth,
+            )
+        };
         if idx >= eval_start_idx {
-            let p_curr = if is_epoch_1 {
-                0
-            } else {
-                curr_pred[usize::from(out_port)]
-            };
-            let p_truth = truth[usize::from(out_port)];
             if p_curr != p_truth {
                 e_curr += 1;
             }
-            if !is_epoch_1 {
-                flux_curr += curr_scorer.observe(p_curr, p_truth);
-            } else {
-                curr_scorer.null_model_mut().observe_and_surprisal(p_truth);
-            }
+            flux_curr += reward_curr;
         }
     }
 
@@ -1656,14 +1695,11 @@ pub fn propose_sprout(
         economy_config.split_code_tax,
     );
     let j_curr = l_curr + facts_code_bits(editable.lattice().width(), w_diag as u64, e_curr as u64);
+    let survivor_map: Vec<Option<NodeId>> = (0..editable.circuit().node_count())
+        .map(|i| Some(NodeId(i as u32)))
+        .collect();
 
     let mut best_proposal: Option<(LatticeCircuit, usize, f64, f64, bool)> = None;
-
-    let is_constant_stream = !obs_window.frames().is_empty()
-        && obs_window
-            .frames()
-            .iter()
-            .all(|f| f[usize::from(out_port)] == obs_window.frames()[0][usize::from(out_port)]);
 
     for motif in &candidates {
         if !budget.try_consume(w_replay as u64) {
@@ -1687,12 +1723,32 @@ pub fn propose_sprout(
         };
 
         let mut state = ScalarState::new(&staged_compiled);
+        if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(start_idx)
+            && snap_epoch == editable.structure_epoch()
+        {
+            let reg_map = register_mapping(
+                editable.circuit(),
+                &staged_circuit,
+                editable.compiled(),
+                &staged_compiled,
+                &survivor_map,
+            );
+            let mut staged_regs = state.registers().to_vec();
+            for (old_r, new_r) in reg_map.iter().enumerate() {
+                if let Some(nr) = new_r
+                    && old_r < snap_regs.len()
+                {
+                    staged_regs[*nr] = snap_regs[old_r];
+                }
+            }
+            let _ = state.set_registers(&staged_compiled, &staged_regs);
+        }
         let mut pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
-        let mut scorer = editable.economy().scorers()[usize::from(out_port)].clone();
-        scorer.reset_predictor_counts();
+        let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
 
         let mut e_cand = 0usize;
         let mut flux_cand = 0.0;
+        let mut pos_flux_cand = 0.0;
         let mut replay_ok = true;
 
         for i in 0..w_replay {
@@ -1709,12 +1765,19 @@ pub fn propose_sprout(
             }
             let p_cand = pred[usize::from(out_port)];
             let p_truth = truth[usize::from(out_port)];
-            let reward = scorer.observe(p_cand, p_truth);
+            let reward = score_with_reward_mode(
+                &mut scorer,
+                economy_config.reward_mode,
+                staged.width(),
+                p_cand,
+                p_truth,
+            );
             if idx >= eval_start_idx {
                 if p_cand != p_truth {
                     e_cand += 1;
                 }
                 flux_cand += reward;
+                pos_flux_cand += reward.max(0.0);
             }
         }
         if !replay_ok {
@@ -1724,6 +1787,18 @@ pub fn propose_sprout(
         if e_cand + growth_config.min_match_gain > e_curr {
             continue;
         }
+        if is_epoch_1 && !matches!(motif, CandidateMotif::ConstLoop(_)) {
+            let is_binary_eqz_scaffold = staged.width() == Width::BITS_1
+                && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(_)));
+            if is_binary_eqz_scaffold {
+                if e_cand > e_const_mode.saturating_add(1) {
+                    continue;
+                }
+            } else if e_cand + growth_config.min_match_gain > e_const_mode {
+                continue;
+            }
+        }
+
         let delta_flux = flux_cand - flux_curr;
         let staged_shape = if staged.topology() == WiringTopology::WellMixed {
             None
@@ -1745,16 +1820,20 @@ pub fn propose_sprout(
                     | CandidateMotif::Eqz(SourceFeature::BoundaryIn(_))
             );
 
-        if delta_flux <= 0.0 && !(is_1_op && !is_constant_stream) {
-            continue;
-        }
-
-        if !is_1_op && economy_config.juvenile_ticks > 0 && delta_l_sprout > 0.0 {
+        if economy_config.juvenile_ticks > 0 && delta_l_sprout > 0.0 {
             let projected_survival = economy_config.initial_energy
-                + (economy_config.juvenile_ticks as f64 / w_diag as f64) * flux_cand;
+                + (economy_config.juvenile_ticks as f64 / w_diag as f64) * pos_flux_cand;
             if projected_survival <= delta_l_sprout {
                 continue;
             }
+        }
+
+        let allow_eqz_scaffold_zero_flux = is_1_op
+            && staged.width() == Width::BITS_1
+            && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(_)))
+            && pos_flux_cand > delta_l_sprout;
+        if delta_flux <= 0.0 && !allow_eqz_scaffold_zero_flux {
+            continue;
         }
 
         let j_cand = l_cand + facts_code_bits(staged.width(), w_diag as u64, e_cand as u64);
@@ -1794,11 +1873,17 @@ pub fn propose_sprout(
 pub struct AutonomousRingProposal {
     /// Staged lattice circuit containing the autonomous delay ring.
     pub lattice: LatticeCircuit,
+    /// Node survival map from pre-edit circuit nodes (`None` for replaced `out_port` cone nodes).
+    pub old_to_new: Vec<Option<NodeId>>,
+    /// Explicit `Delay` node IDs in `lattice` forming the period-`p` ring (`0..period`).
+    pub ring_delay_nodes: Vec<NodeId>,
     /// Period of the delay ring.
     pub period: usize,
     /// Learned clean symbol template for the cycle.
     pub template: Vec<u64>,
 }
+
+type BuiltRingLattice = (LatticeCircuit, Vec<Option<NodeId>>, Vec<NodeId>);
 
 fn build_autonomous_ring_lattice(
     base: &LatticeCircuit,
@@ -1806,15 +1891,31 @@ fn build_autonomous_ring_lattice(
     mu: &[u64],
     out_port: u16,
     max_relay_hops: u8,
-) -> Result<LatticeCircuit, LatticeError> {
-    let mut staged = LatticeCircuit::new(
-        base.shape(),
-        base.width(),
-        base.wire_delay(),
-        base.topology(),
-        base.input_anchors().to_vec(),
-        base.output_anchors().to_vec(),
-    )?;
+) -> Result<BuiltRingLattice, LatticeError> {
+    let (target_cone, _) = port_upstream_cone_and_edges(base, out_port);
+    let mut protected_nodes = BTreeSet::new();
+    for q in 0..(base.output_anchors().len() as u16) {
+        if q != out_port {
+            let (other_cone, _) = port_upstream_cone_and_edges(base, q);
+            protected_nodes.extend(other_cone);
+        }
+    }
+    let removed: BTreeSet<NodeId> = target_cone
+        .into_iter()
+        .filter(|node| !protected_nodes.contains(node))
+        .collect();
+
+    let mut staged = base.clone();
+    let old_out_edges: Vec<(SignalSource, SignalSink)> = staged
+        .edges()
+        .iter()
+        .copied()
+        .filter(|&(_, dst)| dst == SignalSink::BoundaryOut(out_port))
+        .collect();
+    for (src, dst) in old_out_edges {
+        staged.disconnect(src, dst);
+    }
+    let old_to_new = staged.remove_nodes(&removed);
 
     if staged.topology() == WiringTopology::WellMixed {
         let mut delays = Vec::with_capacity(period);
@@ -1870,7 +1971,7 @@ fn build_autonomous_ring_lattice(
             },
             SignalSink::BoundaryOut(out_port),
         )?;
-        return Ok(staged);
+        return Ok((staged, old_to_new, delays));
     }
 
     let anchor = *staged
@@ -1878,8 +1979,11 @@ fn build_autonomous_ring_lattice(
         .get(usize::from(out_port))
         .ok_or(LatticeError::UnknownEndpoint)?;
     let out_cell = anchor.adjacent_border_cell(staged.shape())?;
+    let split_cell = staged
+        .nearest_empty_cell(out_cell)
+        .ok_or(LatticeError::UnknownEndpoint)?;
 
-    let split = staged.place_node(out_cell, Primitive::Split)?;
+    let split = staged.place_node(split_cell, Primitive::Split)?;
     staged.route_connect(
         SignalSource::NodeOut {
             node: split,
@@ -1889,16 +1993,110 @@ fn build_autonomous_ring_lattice(
         usize::from(max_relay_hops),
     )?;
 
+    let border_cells: BTreeSet<Coord> = staged
+        .input_anchors()
+        .iter()
+        .chain(staged.output_anchors().iter())
+        .filter_map(|a| a.adjacent_border_cell(staged.shape()).ok())
+        .collect();
+    let half_span = (period + 2) / 2;
+    let mut cycle_cells: Option<Vec<Coord>> = None;
+    for &(horizontal_first, step_a, step_b) in &[
+        (true, 1i32, 1i32),
+        (true, 1, -1),
+        (true, -1, 1),
+        (true, -1, -1),
+        (false, 1, 1),
+        (false, 1, -1),
+        (false, -1, 1),
+        (false, -1, -1),
+    ] {
+        let mut loop_coords = Vec::with_capacity(2 * half_span - 1);
+        let mut ok = true;
+        for s in 1..half_span {
+            let (r, c) = if horizontal_first {
+                (
+                    i32::from(split_cell.row),
+                    i32::from(split_cell.col) + (s as i32) * step_a,
+                )
+            } else {
+                (
+                    i32::from(split_cell.row) + (s as i32) * step_a,
+                    i32::from(split_cell.col),
+                )
+            };
+            if r < 0
+                || c < 0
+                || r >= i32::from(staged.shape().rows)
+                || c >= i32::from(staged.shape().cols)
+            {
+                ok = false;
+                break;
+            }
+            loop_coords.push(Coord {
+                row: r as u16,
+                col: c as u16,
+            });
+        }
+        if !ok {
+            continue;
+        }
+        for s in (0..half_span).rev() {
+            let (r, c) = if horizontal_first {
+                (
+                    i32::from(split_cell.row) + step_b,
+                    i32::from(split_cell.col) + (s as i32) * step_a,
+                )
+            } else {
+                (
+                    i32::from(split_cell.row) + (s as i32) * step_a,
+                    i32::from(split_cell.col) + step_b,
+                )
+            };
+            if r < 0
+                || c < 0
+                || r >= i32::from(staged.shape().rows)
+                || c >= i32::from(staged.shape().cols)
+            {
+                ok = false;
+                break;
+            }
+            loop_coords.push(Coord {
+                row: r as u16,
+                col: c as u16,
+            });
+        }
+        if !ok || loop_coords.len() < period {
+            continue;
+        }
+        if loop_coords
+            .iter()
+            .any(|cell| staged.cell_node(*cell).is_some() || border_cells.contains(cell))
+        {
+            continue;
+        }
+        cycle_cells = Some(loop_coords);
+        break;
+    }
+
     let mut delays = Vec::with_capacity(period);
-    let mut prev_cell = out_cell;
-    for j in 0..period {
-        let init_val = mu[(period - 1 - j) % period];
-        let cell = staged
-            .nearest_empty_cell(prev_cell)
-            .ok_or(LatticeError::UnknownEndpoint)?;
-        let d = staged.place_node(cell, Primitive::Delay { init: init_val })?;
-        delays.push(d);
-        prev_cell = cell;
+    if let Some(loop_coords) = cycle_cells {
+        for (j, &cell) in loop_coords.iter().take(period).enumerate() {
+            let init_val = mu[(period - 1 - j) % period];
+            let d = staged.place_node(cell, Primitive::Delay { init: init_val })?;
+            delays.push(d);
+        }
+    } else {
+        let mut prev_cell = split_cell;
+        for j in 0..period {
+            let init_val = mu[(period - 1 - j) % period];
+            let cell = staged
+                .nearest_empty_cell(prev_cell)
+                .ok_or(LatticeError::UnknownEndpoint)?;
+            let d = staged.place_node(cell, Primitive::Delay { init: init_val })?;
+            delays.push(d);
+            prev_cell = cell;
+        }
     }
     for i in 0..(period - 1) {
         staged.route_connect(
@@ -1936,7 +2134,159 @@ fn build_autonomous_ring_lattice(
         usize::from(max_relay_hops),
     )?;
 
-    Ok(staged)
+    Ok((staged, old_to_new, delays))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simulate_ring_juvenile_survival(
+    editable: &EditableLattice,
+    obs_window: &ObservationWindow,
+    staged: &LatticeCircuit,
+    old_to_new: &[Option<NodeId>],
+    ring_delay_nodes: &[NodeId],
+    period: usize,
+    mu: &[u64],
+    out_port: u16,
+    l_curr: f64,
+    economy_config: &EconomyConfig,
+) -> bool {
+    let j_ticks = economy_config.juvenile_ticks as usize;
+    let ring_shape = if staged.topology() == WiringTopology::WellMixed {
+        None
+    } else {
+        Some(staged.shape())
+    };
+    let mut sim = editable.clone();
+    if sim
+        .recompile_preserving_state(staged.clone(), old_to_new)
+        .is_err()
+    {
+        return false;
+    }
+    let mut sim_ledger = MarginalDebtLedger {
+        last_committed_code_bits: l_curr,
+        ..MarginalDebtLedger::default()
+    };
+    sim_ledger.on_sprout(
+        sim.circuit(),
+        sim.lattice().topology(),
+        ring_shape,
+        economy_config.split_code_tax,
+        old_to_new,
+    );
+
+    let mut is_survivor = vec![false; sim.circuit().node_count()];
+    for &mapped in old_to_new.iter().flatten() {
+        if mapped.index() < is_survivor.len() {
+            is_survivor[mapped.index()] = true;
+        }
+    }
+
+    if j_ticks == 0 {
+        return is_survivor
+            .iter()
+            .enumerate()
+            .filter(|(_, surv)| !**surv)
+            .all(|(idx, _)| economy_config.initial_energy > sim_ledger.node_debts[idx]);
+    }
+
+    let w_replay = obs_window.len();
+    let start_offset = w_replay.saturating_sub(j_ticks);
+    let align_tick = obs_window.start_tick() + (start_offset as u64);
+
+    let mut regs = sim.state().registers().to_vec();
+    for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
+        let Some(reg_idx) = explicit_delay_register_index(sim.circuit(), delay_node) else {
+            return false;
+        };
+        regs[reg_idx] = mu[((align_tick as usize) + (period - 1 - j)) % period];
+    }
+    if sim.set_registers(&regs).is_err() {
+        return false;
+    }
+
+    let out_idx = usize::from(out_port);
+    sim.economy_mut()
+        .port_scorer_mut(out_idx)
+        .reset_predictor_counts();
+
+    let cycle_len = (w_replay - (w_replay % period)).max(period).min(w_replay);
+    let num_ports = sim.economy().scorers().len();
+    let mut predictions = vec![0u64; usize::from(sim.compiled().num_outputs())];
+    let zeros_maint = vec![0.0; sim.circuit().node_count()];
+    let seed_bank = SeedBank::new(0);
+
+    for step_idx in 0..j_ticks {
+        let frame_idx = if start_offset + step_idx < w_replay {
+            start_offset + step_idx
+        } else {
+            (start_offset + step_idx) % cycle_len
+        };
+        let input = if frame_idx == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[frame_idx - 1]
+        };
+        let truth = &obs_window.frames()[frame_idx];
+        if sim.step(input, &mut predictions).is_err() {
+            return false;
+        }
+        let node_outputs = node_output_values(sim.circuit(), sim.state());
+        if sim.economy_mut().record_activity(&node_outputs).is_err() {
+            return false;
+        }
+        let Ok(snapshot) = counterfactual_sensitivity(
+            sim.circuit(),
+            sim.compiled(),
+            sim.state(),
+            seed_bank,
+            step_idx as u64,
+            4,
+        ) else {
+            return false;
+        };
+        let Ok(ancestry) = assemble_causal_ancestry(
+            sim.circuit(),
+            sim.compiled(),
+            sim.state(),
+            &snapshot,
+            &sim.economy().activity(),
+            sim.economy().register_eligibility(),
+            economy_config.trace_discount,
+        ) else {
+            return false;
+        };
+
+        let mut port_rewards = vec![0.0; num_ports];
+        if ancestry.port_shares[out_idx].iter().sum::<f64>() > 0.0 {
+            let Ok(r) =
+                sim.economy_mut()
+                    .score_port_single(out_idx, predictions[out_idx], truth[out_idx])
+            else {
+                return false;
+            };
+            port_rewards[out_idx] = r;
+        } else {
+            let _ = sim
+                .economy_mut()
+                .observe_unconnected_port(out_idx, truth[out_idx]);
+        }
+
+        if sim
+            .economy_mut()
+            .apply_causal_tick(&port_rewards, &ancestry, &zeros_maint)
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    for (idx, &surv) in is_survivor.iter().enumerate() {
+        if !surv && sim.economy().nodes()[idx].energy <= sim_ledger.node_debts[idx] {
+            return false;
+        }
+    }
+    true
 }
 
 /// Evaluates autonomous delay-ring candidates of period $p \in 2..=6$ under channel noise (§4.5).
@@ -1949,7 +2299,15 @@ pub fn propose_autonomous_delay_ring(
     out_port: u16,
     max_relay_hops: u8,
 ) -> Option<AutonomousRingProposal> {
-    if !editable.compiled().uses_boundary_inputs() {
+    if editable.lattice().wire_delay() != WireDelayMode::Combinational {
+        return None;
+    }
+    let has_port_driver = editable
+        .lattice()
+        .edges()
+        .iter()
+        .any(|&(_, dst)| dst == SignalSink::BoundaryOut(out_port));
+    if has_port_driver && !port_uses_boundary_in(editable.lattice(), out_port) {
         return None;
     }
     let w_diag = growth_config.diagnostic_window;
@@ -1958,13 +2316,20 @@ pub fn propose_autonomous_delay_ring(
     }
 
     let w_replay = obs_window.len();
+    let diag_start = w_replay.saturating_sub(w_diag);
     let out_idx = usize::from(out_port);
 
     let mut curr_state = ScalarState::new(editable.compiled());
+    if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(0)
+        && snap_epoch == editable.structure_epoch()
+    {
+        let _ = curr_state.set_registers(editable.compiled(), snap_regs);
+    }
     let mut curr_pred = vec![0u64; usize::from(editable.compiled().num_outputs())];
-    let mut curr_scorer = editable.economy().scorers()[out_idx].clone();
-    curr_scorer.reset_predictor_counts();
+    let mut curr_scorer =
+        PointForecastScorer::new(editable.lattice().width(), economy_config.null_model);
     let mut e_curr = 0usize;
+    let mut e_curr_diag = 0usize;
     let mut flux_curr = 0.0;
     for (i, frame) in obs_window.frames().iter().enumerate() {
         let input = if i == 0 {
@@ -1978,11 +2343,34 @@ pub fn propose_autonomous_delay_ring(
         {
             return None;
         }
-        if curr_pred[out_idx] != frame[out_idx] {
+        let p_curr = if has_port_driver {
+            curr_pred[out_idx]
+        } else {
+            0
+        };
+        let p_truth = frame[out_idx];
+        if p_curr != p_truth {
             e_curr += 1;
+            if i >= diag_start {
+                e_curr_diag += 1;
+            }
         }
-        flux_curr += curr_scorer.observe(curr_pred[out_idx], frame[out_idx]);
+        if has_port_driver {
+            flux_curr += score_with_reward_mode(
+                &mut curr_scorer,
+                economy_config.reward_mode,
+                editable.lattice().width(),
+                p_curr,
+                p_truth,
+            );
+        } else {
+            curr_scorer.null_model_mut().observe_and_surprisal(p_truth);
+        }
     }
+    if e_curr_diag == 0 {
+        return None;
+    }
+
     let shape = if editable.lattice().topology() == WiringTopology::WellMixed {
         None
     } else {
@@ -2027,11 +2415,14 @@ pub fn propose_autonomous_delay_ring(
             break;
         }
 
-        let Ok(staged) =
+        let Ok((staged, old_to_new, ring_delay_nodes)) =
             build_autonomous_ring_lattice(editable.lattice(), p, &mu, out_port, max_relay_hops)
         else {
             continue;
         };
+        if staged.nodes().len() > growth_config.max_nodes {
+            continue;
+        }
         let Ok(staged_circuit) = staged.lower() else {
             continue;
         };
@@ -2040,37 +2431,64 @@ pub fn propose_autonomous_delay_ring(
         };
 
         let mut state = ScalarState::new(&staged_compiled);
-        let start_tick = obs_window.start_tick();
-        let total_regs = staged_compiled.total_registers();
-        if total_regs != p {
-            continue;
-        }
         let mut regs = state.registers().to_vec();
-        for j in 0..p {
-            let val = mu[((start_tick as usize) + (p - 1 - j)) % p];
-            regs[j] = val;
+        if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(0)
+            && snap_epoch == editable.structure_epoch()
+        {
+            let reg_map = register_mapping(
+                editable.circuit(),
+                &staged_circuit,
+                editable.compiled(),
+                &staged_compiled,
+                &old_to_new,
+            );
+            for (old_r, new_r) in reg_map.iter().enumerate() {
+                if let Some(nr) = new_r
+                    && old_r < snap_regs.len()
+                {
+                    regs[*nr] = snap_regs[old_r];
+                }
+            }
         }
-        if state.set_registers(&staged_compiled, &regs).is_err() {
+        let start_tick = obs_window.start_tick();
+        let mut reg_map_ok = true;
+        for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
+            let Some(reg_idx) = explicit_delay_register_index(&staged_circuit, delay_node) else {
+                reg_map_ok = false;
+                break;
+            };
+            regs[reg_idx] = mu[((start_tick as usize) + (p - 1 - j)) % p];
+        }
+        if !reg_map_ok || state.set_registers(&staged_compiled, &regs).is_err() {
             continue;
         }
 
-        let mut scorer = editable.economy().scorers()[out_idx].clone();
-        scorer.reset_predictor_counts();
+        let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
         let mut e_ring = 0usize;
         let mut flux_ring = 0.0;
         let mut pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
-        let zeros = vec![0u64; usize::from(staged_compiled.num_inputs())];
 
         let mut replay_ok = true;
-        for frame in obs_window.frames() {
-            if state.step(&staged_compiled, &zeros, &mut pred).is_err() {
+        for (i, frame) in obs_window.frames().iter().enumerate() {
+            let input = if i == 0 {
+                obs_window.prior_frame()
+            } else {
+                &obs_window.frames()[i - 1]
+            };
+            if state.step(&staged_compiled, input, &mut pred).is_err() {
                 replay_ok = false;
                 break;
             }
             if pred[out_idx] != frame[out_idx] {
                 e_ring += 1;
             }
-            flux_ring += scorer.observe(pred[out_idx], frame[out_idx]);
+            flux_ring += score_with_reward_mode(
+                &mut scorer,
+                economy_config.reward_mode,
+                staged.width(),
+                pred[out_idx],
+                frame[out_idx],
+            );
         }
         if !replay_ok {
             continue;
@@ -2099,6 +2517,21 @@ pub fn propose_autonomous_delay_ring(
             continue;
         }
 
+        if !simulate_ring_juvenile_survival(
+            editable,
+            obs_window,
+            &staged,
+            &old_to_new,
+            &ring_delay_nodes,
+            p,
+            &mu,
+            out_port,
+            l_curr,
+            economy_config,
+        ) {
+            continue;
+        }
+
         if best_ring
             .as_ref()
             .is_none_or(|(_, best_j)| j_ring < *best_j)
@@ -2106,6 +2539,8 @@ pub fn propose_autonomous_delay_ring(
             best_ring = Some((
                 AutonomousRingProposal {
                     lattice: staged,
+                    old_to_new,
+                    ring_delay_nodes,
                     period: p,
                     template: mu,
                 },
@@ -2420,5 +2855,72 @@ mod tests {
             }
             assert_eq!(e2, 0, "Task {name}: expected 0 errors in Stage 2, got {e2}");
         }
+    }
+
+    #[test]
+    fn k64_width_safety_diagnose_and_materialize_without_overflow() {
+        use crate::structural::lattice::{BoundaryAnchor, GridShape, PerimeterSide};
+
+        let w64 = Width::new(64).unwrap();
+        let config = GrowthConfig {
+            min_match_gain: 2,
+            mi_threshold_bits: 0.01,
+            ..GrowthConfig::default()
+        };
+        let residuals = vec![0, u64::MAX, 0, u64::MAX, 0, u64::MAX, 0, u64::MAX];
+        let features = vec![ResidualFeature {
+            name: "in:0".to_owned(),
+            values: vec![1, 0, 1, 0, 1, 0, 1, 0],
+        }];
+        let diag = diagnose_residual(w64, &residuals, &features, config).unwrap();
+        assert!(diag.growth_criterion_met);
+        let best = diag.best_feature.unwrap();
+        assert!(best.corrected_mutual_information_bits.is_finite());
+        assert!(best.corrected_mutual_information_bits > 0.0);
+
+        let cands = generate_candidate_motifs(
+            &SourceFeature::BoundaryIn(0),
+            None,
+            w64,
+            Some((u64::MAX, 4)),
+            false,
+            1,
+        );
+        assert!(cands.contains(&CandidateMotif::ScaleEqz(
+            SourceFeature::BoundaryIn(0),
+            u64::MAX
+        )));
+
+        let shape = GridShape::new(8, 8).unwrap();
+        let mut lattice = LatticeCircuit::new(
+            shape,
+            w64,
+            WireDelayMode::Combinational,
+            WiringTopology::WellMixed,
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 3,
+            }],
+            vec![BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 4,
+            }],
+        )
+        .unwrap();
+        materialize_candidate(
+            &mut lattice,
+            &CandidateMotif::Identity(SourceFeature::BoundaryIn(0)),
+            0,
+            4,
+        )
+        .unwrap();
+        materialize_candidate(
+            &mut lattice,
+            &CandidateMotif::ScaleEqz(SourceFeature::BoundaryIn(0), u64::MAX),
+            0,
+            4,
+        )
+        .unwrap();
+        assert!(lattice.lower().unwrap().compile().is_ok());
     }
 }

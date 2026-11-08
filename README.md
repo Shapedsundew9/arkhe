@@ -24,7 +24,10 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   ├── milestone_0_closeout_plan.md
 │   ├── milestone_0_lessons_learned.md
 │   ├── milestone_0_plan.md
-│   └── milestone_0_review.md
+│   ├── milestone_0_review.md
+│   ├── milestone_1_plan.md
+│   ├── milestone_1b_plan.md
+│   └── milestone_1b_review.md
 ├── scripts/
 │   └── build.rs
 ├── src/
@@ -68,16 +71,19 @@ cargo run --locked --release -- verify-m0 --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m0 --seed-offset 10000 --seeds 20
 ```
 
-1. Run the M1a fixed-structure economy verification suite:
+1. Run the M1a fixed-structure economy verification suite (single bank or 100-bank statistical sweep):
 
 ```bash
 cargo run --locked --release -- verify-m1a --seed-offset 0 --seeds 20
+cargo run --locked --release -- verify-m1a --banks 100 --seed-offset 20 --seeds 20
 ```
 
-1. Run the full Milestone 1 acceptance verification suite (Stage M1a hard gate audit followed by Stage M1b neurogenesis):
+1. Run the full Milestone 1 acceptance verification suite (Stage M1a hard gate audit followed by Stage M1b neurogenesis, single bank or 100-bank sweep):
 
 ```bash
 cargo run --locked --release -- verify-m1 --seed-offset 0 --seeds 20
+cargo run --locked --release -- verify-m1b --banks 100 --seed-offset 20 --seeds 20
+cargo run --locked --release -- verify-m1 --banks 100 --seed-offset 20 --seeds 20
 cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdout
 ```
 

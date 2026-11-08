@@ -181,6 +181,8 @@ Nodes sit on coordinates of a graph representation (defaulting to well-mixed dir
 
 Each node holds an energy reserve $E_i(t)$. Rather than arbitrary per-tick maintenance rent (which diverges with horizon $T$), each placed node incurs a **one-time description debt** $\Delta L_i$ charged upon maturity through the maintenance channel, matching its share of the circuit's description length $L(C) = \sum_i \Delta L_i$. A node driving multiple wires (such as `SPLIT`) naturally owes more wire code bits ($L(\text{split}) > L(\text{other})$) without tuning arbitrary constants. A node whose reserve runs out is removed. Energy enters the system **only** through reward (§3.1.4).
 
+> **Design note on post-maturity reserve bounding (scaling rule vs. hard cap):** Online runs bound mature reserves so obsolete structures cannot coast indefinitely after regime shifts (implemented in M1b as a fixed ceiling `max_energy_reserve = 25.0` bits). Because single-tick surprisal swings scale as $O(k)$ bits under noise and structural replacement cost scales with $\Delta L_i$, fixed bit caps become brittle as width $k$ (M5) and macro complexity (M4) grow; post-M1 stages should replace hard reserve caps with a dimensionless scaling rule (for example, bounding mature reserves as a multiple of $\max(\Delta L_i, k)$ or via exponential reserve forgetting) rather than a fixed bit constant.
+
 #### 3.1.3 Credit assignment: retrograde, activity-gated flow
 
 > **Direction:** Reward enters at the point where a prediction is checked (a boundary port in wake, a comparator in sleep). From there it flows **backward** along the edges that actually carried the rewarded signal, split according to each upstream contribution.

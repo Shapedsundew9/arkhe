@@ -435,9 +435,9 @@ When the structure diagnostic triggers on residual $r_m(t) = s(t) - \hat{y}_m(t)
 
 Preserve `arkhe run`, `arkhe yardstick`, and `arkhe verify-m0` unchanged, and add:
 
-- `arkhe verify-m1a [--seed-offset <u64>] [--seeds <usize>]` — executes Stage M1a Gates `G1A.1`–`G1A.4` at $k = 1$ and $k = 2$ and emits structured JSON.
-- `arkhe verify-m1b [--seed-offset <u64>] [--seeds <usize>]` — executes Stage M1b Gates `G1B.1`–`G1B.4` (including the §8 M1 ablation matrix) at $k = 1$ and $k = 2$.
-- `arkhe verify-m1 [--seed-offset <u64>] [--seeds <usize>]` — runs `verify-m1a` first (**aborting immediately if any M1a gate fails**, enforcing Charter §7's pre-growth kill gate), then runs `verify-m1b` and subprocess determinism checks.
+- `arkhe verify-m1a [--seed-offset <u32>] [--seeds <u32>] [--banks <u32>]` — executes Stage M1a Gates `G1A.1`–`G1A.4` at $k = 1$ and $k = 2$ (single bank or `N` parallel banks) and emits structured JSON.
+- `arkhe verify-m1b [--seed-offset <u32>] [--seeds <u32>] [--banks <u32>]` — executes Stage M1b Gates `G1B.1`–`G1B.4` (including the §8 M1 ablation matrix) at $k = 1$ and $k = 2$ (single bank or `N` parallel banks).
+- `arkhe verify-m1 [--seed-offset <u32>] [--seeds <u32>] [--banks <u32>]` — runs `verify-m1a` first (**aborting immediately if any M1a gate fails**, enforcing Charter §7's pre-growth kill gate), then runs `verify-m1b` and subprocess determinism checks.
 
 ### 5.2 Example `ExperimentConfig` TOML for `ArkheM1`
 
@@ -674,3 +674,7 @@ cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdo
 | `G1B.2` | T1 suite convergence & noise-floor halting | 200 | Passed |
 | `G1B.3` | Live invariant, phase, & budget integrity (500 edits) | 4 | Passed |
 | `G1B.4` | Charter §8 4-axis ablations & subprocess determinism | 10 | Passed |
+
+### 10.3 Post-Review Hardening & 100-Bank (`2,000`-Seed) Verification Addendum (`2026-11-08`)
+
+Following the closeout review in [milestone_1b_review.md](milestone_1b_review.md), pre-M2 hardening expanded `verify-m1b` to `2,530` gate checks per 20-seed bank (covering noisy non-zero constants, multi-stage `TicksPerHop` tasks, online sparse rare-event rings, multi-seed fan-out/locality/delay ablations, cross-run budget/invariant audits, and `320`-tick separate-process determinism) while keeping all pre-registered metabolic and growth constants unchanged and leaving holdout seeds `10000..=10019` untouched. Parallel 100-bank verification (`verify-m1 --banks 100 --seed-offset 20 --seeds 20`, `source_tree_fnv1a128 = 10806db8e8a213e338d563a904cd36df`) passed **100 / 100 banks** across both Stage M1a (`624,500` cases, `0` failures) and Stage M1b (`253,000` cases, `0` failures).

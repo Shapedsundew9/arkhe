@@ -20,8 +20,9 @@ use crate::substrate::{
 };
 
 pub use m1b::{
-    DEFAULT_M1B_HORIZON, M1CombinedSummary, M1bGateReport, M1bVerificationSummary,
-    run_m1b_verification_suite,
+    DEFAULT_M1B_HORIZON, M1CombinedBankReport, M1CombinedSummary, M1bBankReport, M1bGatePassCount,
+    M1bGateReport, M1bVerificationSummary, evaluate_m1_stage_gate, run_m1_combined_bank_evaluation,
+    run_m1_combined_verification, run_m1b_bank_evaluation, run_m1b_verification_suite,
 };
 pub use panel::{CircuitClass, DEFAULT_HORIZON, PanelRun, run_panel_matrix};
 

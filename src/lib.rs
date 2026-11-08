@@ -99,12 +99,15 @@ pub enum Commands {
         /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
         #[arg(long, default_value_t = 0)]
         seed_offset: u32,
-        /// Number of master seeds evaluated.
+        /// Number of master seeds evaluated (per bank when `--banks` is set).
         #[arg(long, default_value_t = 20)]
         seeds: u32,
         /// Simulation horizon T in ticks.
         #[arg(long, default_value_t = verify_m1::DEFAULT_M1B_HORIZON)]
         horizon: u64,
+        /// Number of consecutive seed banks to score (when set, activates bank mode).
+        #[arg(long)]
+        banks: Option<u32>,
         /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
@@ -114,7 +117,7 @@ pub enum Commands {
         /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
         #[arg(long, default_value_t = 0)]
         seed_offset: u32,
-        /// Number of master seeds evaluated.
+        /// Number of master seeds evaluated (per bank when `--banks` is set).
         #[arg(long, default_value_t = 20)]
         seeds: u32,
         /// Simulation horizon T for M1a in ticks.
@@ -123,6 +126,9 @@ pub enum Commands {
         /// Simulation horizon T for M1b in ticks.
         #[arg(long, default_value_t = verify_m1::DEFAULT_M1B_HORIZON)]
         m1b_horizon: u64,
+        /// Number of consecutive seed banks to score (when set, activates bank mode).
+        #[arg(long)]
+        banks: Option<u32>,
         /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
@@ -253,15 +259,32 @@ where
             seed_offset,
             seeds,
             horizon,
+            banks,
             holdout,
         }) => {
-            verify_m1::check_seed_range_holdout(seed_offset, seeds, holdout)?;
-            let summary = verify_m1::run_m1b_verification_suite(seed_offset, seeds, horizon);
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            if summary.all_passed {
-                Ok(())
+            if let Some(num_banks) = banks {
+                let report = verify_m1::run_m1b_bank_evaluation(
+                    seed_offset,
+                    seeds,
+                    num_banks,
+                    horizon,
+                    holdout,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.all_passed() {
+                    Ok(())
+                } else {
+                    Err("Milestone 1b bank evaluation failed one or more gates".into())
+                }
             } else {
-                Err("Milestone 1b verification failed one or more acceptance gates".into())
+                verify_m1::check_seed_range_holdout(seed_offset, seeds, holdout)?;
+                let summary = verify_m1::run_m1b_verification_suite(seed_offset, seeds, horizon);
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+                if summary.all_passed {
+                    Ok(())
+                } else {
+                    Err("Milestone 1b verification failed one or more acceptance gates".into())
+                }
             }
         }
         Some(Commands::VerifyM1 {
@@ -269,39 +292,42 @@ where
             seeds,
             m1a_horizon,
             m1b_horizon,
+            banks,
             holdout,
         }) => {
-            verify_m1::check_seed_range_holdout(seed_offset, seeds, holdout)?;
-            let m1a_summary = verify_m1::run_m1a_verification_suite_with_horizon_and_holdout(
-                seed_offset,
-                seeds,
-                m1a_horizon,
-                holdout,
-            )?;
-            if !m1a_summary.all_passed {
-                let combined = verify_m1::M1CombinedSummary {
-                    m1a: m1a_summary,
-                    m1b: None,
-                    stage_gate_aborted: true,
-                    all_passed: false,
-                };
-                println!("{}", serde_json::to_string_pretty(&combined)?);
-                return Err("Milestone 1 stage gate aborted: M1a failed one or more gates".into());
-            }
-            let m1b_summary =
-                verify_m1::run_m1b_verification_suite(seed_offset, seeds, m1b_horizon);
-            let all_passed = m1a_summary.all_passed && m1b_summary.all_passed;
-            let combined = verify_m1::M1CombinedSummary {
-                m1a: m1a_summary,
-                m1b: Some(m1b_summary),
-                stage_gate_aborted: false,
-                all_passed,
-            };
-            println!("{}", serde_json::to_string_pretty(&combined)?);
-            if all_passed {
-                Ok(())
+            if let Some(num_banks) = banks {
+                let report = verify_m1::run_m1_combined_bank_evaluation(
+                    seed_offset,
+                    seeds,
+                    num_banks,
+                    m1a_horizon,
+                    m1b_horizon,
+                    holdout,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.stage_gate_aborted {
+                    Err("Milestone 1 stage gate aborted: M1a bank evaluation failed".into())
+                } else if report.all_passed {
+                    Ok(())
+                } else {
+                    Err("Milestone 1 combined bank evaluation failed one or more gates".into())
+                }
             } else {
-                Err("Milestone 1 combined verification failed one or more gates".into())
+                let combined = verify_m1::run_m1_combined_verification(
+                    seed_offset,
+                    seeds,
+                    m1a_horizon,
+                    m1b_horizon,
+                    holdout,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&combined)?);
+                if combined.stage_gate_aborted {
+                    Err("Milestone 1 stage gate aborted: M1a failed one or more gates".into())
+                } else if combined.all_passed {
+                    Ok(())
+                } else {
+                    Err("Milestone 1 combined verification failed one or more gates".into())
+                }
             }
         }
     }

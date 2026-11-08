@@ -20,6 +20,49 @@ pub enum RewardMode {
     RawAccuracy,
 }
 
+/// Scores a single causal `(prediction, fact)` step against `scorer` under `mode`, advancing the
+/// underlying null model identically to online [`EconomyState::score_port_single`].
+pub fn score_with_reward_mode(
+    scorer: &mut PointForecastScorer,
+    mode: RewardMode,
+    width: Width,
+    prediction: u64,
+    fact: u64,
+) -> f64 {
+    match mode {
+        RewardMode::CalibratedPointForecast => scorer.observe(prediction, fact),
+        RewardMode::CenteredSurprisal => {
+            let prediction = width.normalize(prediction);
+            let fact = width.normalize(fact);
+            let p = scorer.null_model().probability(prediction);
+            let surprisal = -p.log2();
+            let correct = if prediction == fact { 1.0 } else { 0.0 };
+            let r = (correct - p) * surprisal;
+            scorer.null_model_mut().observe_and_surprisal(fact);
+            r
+        }
+        RewardMode::UncenteredSurprisal => {
+            let prediction = width.normalize(prediction);
+            let fact = width.normalize(fact);
+            let r = if prediction == fact {
+                -scorer.null_model().probability(fact).log2()
+            } else {
+                0.0
+            };
+            scorer.null_model_mut().observe_and_surprisal(fact);
+            r
+        }
+        RewardMode::RawAccuracy => {
+            let prediction = width.normalize(prediction);
+            let fact = width.normalize(fact);
+            let correct = if prediction == fact { 1.0 } else { 0.0 };
+            let r = correct - 2.0f64.powi(-i32::from(width.bits()));
+            scorer.null_model_mut().observe_and_surprisal(fact);
+            r
+        }
+    }
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -330,39 +373,13 @@ impl EconomyState {
             return Err(EconomyError::DimensionMismatch);
         }
         let scorer = &mut self.scorers[port];
-        let reward = match self.config.reward_mode {
-            RewardMode::CalibratedPointForecast => scorer.observe(prediction, fact),
-            RewardMode::CenteredSurprisal => {
-                let prediction = self.width.normalize(prediction);
-                let fact = self.width.normalize(fact);
-                let p = scorer.null_model().probability(prediction);
-                let surprisal = -p.log2();
-                let correct = if prediction == fact { 1.0 } else { 0.0 };
-                let r = (correct - p) * surprisal;
-                scorer.null_model_mut().observe_and_surprisal(fact);
-                r
-            }
-            RewardMode::UncenteredSurprisal => {
-                let prediction = self.width.normalize(prediction);
-                let fact = self.width.normalize(fact);
-                let r = if prediction == fact {
-                    -scorer.null_model().probability(fact).log2()
-                } else {
-                    0.0
-                };
-                scorer.null_model_mut().observe_and_surprisal(fact);
-                r
-            }
-            RewardMode::RawAccuracy => {
-                let prediction = self.width.normalize(prediction);
-                let fact = self.width.normalize(fact);
-                let correct = if prediction == fact { 1.0 } else { 0.0 };
-                let r = correct - 2.0f64.powi(-i32::from(self.width.bits()));
-                scorer.null_model_mut().observe_and_surprisal(fact);
-                r
-            }
-        };
-        Ok(reward)
+        Ok(score_with_reward_mode(
+            scorer,
+            self.config.reward_mode,
+            self.width,
+            prediction,
+            fact,
+        ))
     }
 
     /// Advances null-model statistics for an unconnected output port without scoring or requiring ancestry.

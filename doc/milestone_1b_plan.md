@@ -466,13 +466,13 @@ Create `src/verify_m1/m1b.rs` and re-export from `src/verify_m1/mod.rs`. Enforce
 
 Add two subcommands to `Commands` in `src/lib.rs` (preserving `arkhe::greeting() == "arkhe m0"` and all existing `Run`, `Yardstick`, `VerifyM0`, `VerifyM1a` flags):
 
-1. `VerifyM1b { seed_offset: u32, seeds: u32, horizon: u64, holdout: bool }`:
-   - Calls `check_seed_range_holdout(seed_offset, seeds, holdout)?`.
-   - Runs `run_m1b_verification_suite(seed_offset, seeds, horizon)` (`DEFAULT_M1B_HORIZON = 2000`), prints pretty JSON `M1bVerificationSummary` to `stdout`, and returns `Err` (non-zero exit status) if `!summary.all_passed`.
-2. `VerifyM1 { seed_offset: u32, seeds: u32, m1a_horizon: u64, m1b_horizon: u64, holdout: bool }`:
-   - Calls `check_seed_range_holdout(seed_offset, seeds, holdout)?`.
-   - **Hard Stage Gate (Charter §7):** Executes `run_m1a_verification_suite_with_horizon(seed_offset, seeds, m1a_horizon)` **first**. If `!m1a_summary.all_passed`, emits `M1CombinedSummary { m1a: m1a_summary, m1b: None, stage_gate_aborted: true, all_passed: false }` and exits non-zero **without running M1b**!
-   - When `m1a_summary.all_passed` is `true`, executes `run_m1b_verification_suite(seed_offset, seeds, m1b_horizon)` and emits `M1CombinedSummary` with `all_passed = m1a.all_passed && m1b.all_passed`.
+1. `VerifyM1b { seed_offset: u32, seeds: u32, horizon: u64, banks: Option<u32>, holdout: bool }`:
+   - Calls `check_seed_range_holdout(seed_offset, total_seeds, holdout)?`.
+   - In single-bank mode, runs `run_m1b_verification_suite(seed_offset, seeds, horizon)` (`DEFAULT_M1B_HORIZON = 2000`), prints pretty JSON `M1bVerificationSummary`, and exits non-zero if `!summary.all_passed`. When `--banks <N>` is set, evaluates `N` consecutive banks in parallel via `run_m1b_bank_evaluation` and emits `M1bBankReport`.
+2. `VerifyM1 { seed_offset: u32, seeds: u32, m1a_horizon: u64, m1b_horizon: u64, banks: Option<u32>, holdout: bool }`:
+   - Calls `check_seed_range_holdout(seed_offset, total_seeds, holdout)?`.
+   - **Hard Stage Gate (Charter §7):** Executes M1a verification (`run_m1a_verification_suite_with_horizon_and_holdout` or `run_m1a_bank_evaluation`) **first**. If M1a fails, emits `stage_gate_aborted: true` with `m1b: None` and exits non-zero **without running M1b**.
+   - When M1a passes, executes M1b (`run_m1b_verification_suite` or `run_m1b_bank_evaluation`) and emits `M1CombinedSummary` / `M1CombinedBankReport`.
 
 ---
 
@@ -670,3 +670,19 @@ cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdo
 - **`G1B.2` — T1 Suite Convergence & Noise-Floor Halting:** **PASSED** (200 / 200 cases passed, 0 failures across noiseless & noisy streams on 20 seeds). Noiseless: 0 nodes on silence, 0 mismatches on alternating/motif/affine. Noisy ($\varepsilon = 0.05$): paired regret $\le 0.025\text{ bits/symbol}$, strictly outperforms 1-lag reactive echo baseline, and growth halts at noise floor (`node_count <= 32`).
 - **`G1B.3` — Live Invariant, Phase, & Budget Integrity:** **PASSED** (4 / 4 cases passed, 0 failures). Zero runtime invariant errors across all runs; forced 500-edit live oscillator phase test across $k \in \{1, 2\}$ and `{Combinational, TicksPerHop}` recorded 0 phase slips.
 - **`G1B.4` — Charter §8 Ablations & Separate-Process Determinism:** **PASSED** (10 / 10 cases passed, 0 failures). 4-axis ablation matrix confirmed all directional hypotheses; 6-configuration independent child process spawning confirmed byte-identical JSON determinism.
+
+### 9.3 Post-Review Hardening & 100-Bank Statistical Sign-Off (`2026-11-08`)
+
+Following the independent closeout audit in [milestone_1b_review.md](milestone_1b_review.md), all pre-M2 structural fixes (`TicksPerHop` post-edit causal ancestry priming, Epoch-1 constant-mode parity eliminating noisy non-zero constant thrashing, empty-circuit ring discovery + 2D rectangular spatial loop placement + juvenile metabolic survival simulation, full first-cycle `ObservationWindow` capacity `juvenile_ticks + 2 * diagnostic_window = 256` ticks covering the $152.9$-tick Shannon MDL crossover on `NoisyAlternating(k=1)`, multi-channel non-wiping ring surgery, Charter §3.4 negative-for-compression `null_calibrated_mdl_delta_bits` sign, and `k = 64` width safety) and the complete pre-registered gate matrix (`2,530` M1b gate cases per 20-seed bank) were verified across **100 consecutive banks of 20 seeds (`2,000` seeds: `20..2020`, disjoint from untouched holdout `10000..=10019`)** with zero changes to pre-registered constants:
+
+```bash
+cargo run --locked --release -- verify-m1 --banks 100 --seed-offset 20 --seeds 20
+```
+
+- **Execution Date:** 2026-11-08
+- **Source Tree Digest (`source_tree_fnv1a128`):** `10806db8e8a213e338d563a904cd36df`
+- **Cargo Lock Digest (`cargo_lock_fnv1a128`):** `8d29cd24b1fbdbb743cf5c0b3933b22d`
+- **Seed Range:** `20..2020` (`100` banks $\times$ `20` master seeds/bank = `2,000` master seeds; holdout `10000..=10019` untouched)
+- **Stage M1a Result (`T = 1024`):** **100 / 100 banks passed** (`G1A.1`: `100/100`, `G1A.2`: `100/100`, `G1A.3`: `100/100`, `G1A.4`: `100/100`; `624,500` cases, `0` failures)
+- **Stage M1b Result (`T = 2000`):** **100 / 100 banks passed** (`G1B.1`: `100/100` [`8,000` cases], `G1B.2`: `100/100` [`36,000` cases], `G1B.3`: `100/100` [`126,400` cases], `G1B.4`: `100/100` [`82,600` cases]; `253,000` cases, `0` failures)
+- **Combined Status:** **`all_passed: true`, `stage_gate_aborted: false`**

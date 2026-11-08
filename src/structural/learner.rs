@@ -13,13 +13,15 @@ use crate::structural::growth::{
     propose_sprout,
 };
 use crate::structural::lattice::{
-    BoundaryAnchor, GridShape, LatticeCircuit, PerimeterSide, WiringTopology,
+    BoundaryAnchor, Coord, GridShape, LatticeCircuit, PerimeterSide, WiringTopology,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
     CausalAncestry, SensitivitySnapshot, assemble_causal_ancestry, counterfactual_sensitivity,
 };
-use crate::structural::surgery::{EditableLattice, MarginalDebtLedger};
+use crate::structural::surgery::{
+    EditableLattice, MarginalDebtLedger, explicit_delay_register_index, port_cone_changed,
+};
 use crate::substrate::{Circuit, NodeId, Primitive, SignalSink, Width, WireDelayMode};
 
 /// Telemetry record capturing residual entropy and diagnostic mutual information across growth epochs.
@@ -40,20 +42,119 @@ pub struct GrowthEpochSnapshot {
 }
 
 fn default_anchors(channels: u16, shape: GridShape) -> (Vec<BoundaryAnchor>, Vec<BoundaryAnchor>) {
-    let mut in_anchors = Vec::with_capacity(channels as usize);
-    let mut out_anchors = Vec::with_capacity(channels as usize);
-    for c in 0..channels {
-        in_anchors.push(BoundaryAnchor {
-            side: PerimeterSide::North,
-            offset: (2 * c + 3) % shape.cols,
-        });
-        out_anchors.push(BoundaryAnchor {
-            side: PerimeterSide::North,
-            offset: (2 * c + 4) % shape.cols,
-        });
+    if channels <= 1 {
+        let mut in_anchors = Vec::with_capacity(channels as usize);
+        let mut out_anchors = Vec::with_capacity(channels as usize);
+        if channels == 1 {
+            in_anchors.push(BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 3 % shape.cols,
+            });
+            out_anchors.push(BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 4 % shape.cols,
+            });
+        }
+        return (in_anchors, out_anchors);
+    }
+
+    let mut pairs: Vec<(BoundaryAnchor, BoundaryAnchor)> = Vec::new();
+    let mut used_border_cells = std::collections::BTreeSet::<Coord>::new();
+    let sides = [
+        PerimeterSide::North,
+        PerimeterSide::South,
+        PerimeterSide::West,
+        PerimeterSide::East,
+    ];
+    let max_dim = shape.rows.max(shape.cols);
+
+    // Pair adjacent interior border cells per side, starting near the side midpoint so each
+    // channel's (in_c, out_c) pair is 1 hop apart with ample surrounding lattice cells.
+    let mut base_offsets = Vec::new();
+    if max_dim >= 6 {
+        base_offsets.push(3);
+    }
+    let mut off = 1u16;
+    while off + 2 < max_dim {
+        if off != 3 && off != 4 {
+            base_offsets.push(off);
+        }
+        off += 2;
+    }
+
+    for base in base_offsets {
+        for side in sides {
+            let limit = match side {
+                PerimeterSide::North | PerimeterSide::South => shape.cols,
+                PerimeterSide::West | PerimeterSide::East => shape.rows,
+            };
+            if base + 2 < limit {
+                let a_in = BoundaryAnchor { side, offset: base };
+                let a_out = BoundaryAnchor {
+                    side,
+                    offset: base + 1,
+                };
+                if let (Ok(c_in), Ok(c_out)) = (
+                    a_in.adjacent_border_cell(shape),
+                    a_out.adjacent_border_cell(shape),
+                ) && !used_border_cells.contains(&c_in)
+                    && !used_border_cells.contains(&c_out)
+                    && c_in != c_out
+                {
+                    used_border_cells.insert(c_in);
+                    used_border_cells.insert(c_out);
+                    pairs.push((a_in, a_out));
+                }
+            }
+        }
+    }
+
+    // Fallback pass over any remaining unclaimed border cells for small grids or high channel counts.
+    let mut leftovers = Vec::new();
+    for side in sides {
+        let limit = match side {
+            PerimeterSide::North | PerimeterSide::South => shape.cols,
+            PerimeterSide::West | PerimeterSide::East => shape.rows,
+        };
+        for offset in 0..limit {
+            let anchor = BoundaryAnchor { side, offset };
+            if let Ok(cell) = anchor.adjacent_border_cell(shape)
+                && used_border_cells.insert(cell)
+            {
+                leftovers.push(anchor);
+            }
+        }
+    }
+    for chunk in leftovers.chunks(2) {
+        if chunk.len() == 2 {
+            pairs.push((chunk[0], chunk[1]));
+        }
+    }
+    if pairs.is_empty() {
+        pairs.push((
+            BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 0,
+            },
+            BoundaryAnchor {
+                side: PerimeterSide::North,
+                offset: 1 % shape.cols,
+            },
+        ));
+    }
+
+    let count = usize::from(channels);
+    let mut in_anchors = Vec::with_capacity(count);
+    let mut out_anchors = Vec::with_capacity(count);
+    for c in 0..count {
+        let (a_in, a_out) = pairs[c % pairs.len()];
+        in_anchors.push(a_in);
+        out_anchors.push(a_out);
     }
     (in_anchors, out_anchors)
 }
+
+type PendingPrediction = (Vec<u64>, CausalAncestry, SensitivitySnapshot, u64, Vec<u64>);
 
 /// Online gradient-free closed-loop learner driving spatial lattice neurogenesis and metabolic economy.
 pub struct ArkheLearner {
@@ -67,7 +168,7 @@ pub struct ArkheLearner {
     tick: u64,
     ticks_since_last_check: u64,
     prev_observed_frame: Vec<u64>,
-    pending_prediction: Option<(Vec<u64>, CausalAncestry, SensitivitySnapshot)>,
+    pending_prediction: Option<PendingPrediction>,
     obs_window: ObservationWindow,
     post_juvenile_diag: DiagnosticBuffer,
     sprout_events: u64,
@@ -136,7 +237,8 @@ impl ArkheLearner {
             .map_err(|_| GrowthError::InvalidConfig)?;
 
         let channels_usize = usize::from(channels);
-        let obs_capacity = 2 * growth_config.diagnostic_window;
+        let obs_capacity =
+            (economy_config.juvenile_ticks as usize) + 2 * growth_config.diagnostic_window;
 
         Ok(Self {
             editable,
@@ -276,7 +378,7 @@ impl ArkheLearner {
             0,
             self.economy_config.split_code_tax,
         );
-        let null_calibrated_mdl_delta_bits = self.cumulative_net_flux - code_bits;
+        let null_calibrated_mdl_delta_bits = code_bits - self.cumulative_net_flux;
 
         ArkheM1Telemetry {
             grid_rows: self.grid_shape.map_or(8, |s| s.rows),
@@ -303,6 +405,8 @@ impl PredictorBaseline for ArkheLearner {
     }
 
     fn predict(&mut self, _budget: &mut TickBudget) -> Vec<u64> {
+        let pre_epoch = self.editable.structure_epoch();
+        let pre_registers = self.editable.state().registers().to_vec();
         let num_out = usize::from(self.editable.compiled().num_outputs());
         let mut predictions = vec![0u64; num_out];
         let _ = self
@@ -330,18 +434,25 @@ impl PredictorBaseline for ArkheLearner {
         )
         .expect("valid causal ancestry");
 
-        self.pending_prediction = Some((predictions.clone(), ancestry, snapshot));
+        self.pending_prediction = Some((
+            predictions.clone(),
+            ancestry,
+            snapshot,
+            pre_epoch,
+            pre_registers,
+        ));
         predictions
     }
 
     fn observe(&mut self, truth: &[u64], budget: &mut TickBudget) -> Option<f64> {
-        let (predictions, ancestry, snapshot) = self
+        let (predictions, ancestry, snapshot, pre_epoch, pre_registers) = self
             .pending_prediction
             .take()
             .expect("observe called with pending prediction");
 
         let input_frame = self.prev_observed_frame.clone();
-        self.obs_window.push_frame(truth);
+        self.obs_window
+            .push_frame_with_state(truth, pre_epoch, &pre_registers);
         for (slot, &val) in self.prev_observed_frame.iter_mut().zip(truth) {
             *slot = self.editable.circuit().width().normalize(val);
         }
@@ -355,7 +466,11 @@ impl PredictorBaseline for ArkheLearner {
                 .edges()
                 .iter()
                 .any(|edge| edge.dst == SignalSink::BoundaryOut(p as u16));
-            if is_driven {
+            let has_causal_ancestry = ancestry
+                .port_shares
+                .get(p)
+                .is_some_and(|shares| shares.iter().sum::<f64>() > 0.0);
+            if is_driven && has_causal_ancestry {
                 port_rewards[p] = self
                     .editable
                     .economy_mut()
@@ -397,25 +512,36 @@ impl PredictorBaseline for ArkheLearner {
         self.cumulative_debt_paid += econ_tick.maintenance;
 
         // Starvation pruning
-        if !econ_tick.starved_nodes.is_empty()
-            && let Ok(old_to_new) = self.editable.prune_starved_nodes()
-        {
-            self.ledger.on_prune(
-                self.editable.circuit(),
-                self.editable.lattice().topology(),
-                self.grid_shape,
-                self.economy_config.split_code_tax,
-                &old_to_new,
-            );
-            for p in 0..num_ports {
-                self.editable
-                    .economy_mut()
-                    .port_scorer_mut(p)
-                    .reset_predictor_counts();
+        if !econ_tick.starved_nodes.is_empty() {
+            let pre_prune_lattice = self.editable.lattice().clone();
+            if let Ok(old_to_new) = self.editable.prune_starved_nodes() {
+                self.ledger.on_prune(
+                    self.editable.circuit(),
+                    self.editable.lattice().topology(),
+                    self.grid_shape,
+                    self.economy_config.split_code_tax,
+                    &old_to_new,
+                );
+                let changed_ports: Vec<usize> = (0..num_ports)
+                    .filter(|&p| {
+                        port_cone_changed(
+                            &pre_prune_lattice,
+                            self.editable.lattice(),
+                            &old_to_new,
+                            p as u16,
+                        )
+                    })
+                    .collect();
+                for p in changed_ports {
+                    self.editable
+                        .economy_mut()
+                        .port_scorer_mut(p)
+                        .reset_predictor_counts();
+                }
+                self.starvation_prune_events += 1;
+                self.post_juvenile_diag.clear();
+                self.ticks_since_last_check = 0;
             }
-            self.starvation_prune_events += 1;
-            self.post_juvenile_diag.clear();
-            self.ticks_since_last_check = 0;
         }
 
         // Post-juvenile diagnostic buffer
@@ -426,8 +552,21 @@ impl PredictorBaseline for ArkheLearner {
                 .nodes()
                 .iter()
                 .all(|node| node.juvenile_ticks == 0);
+        let all_driven_ports_primed = (0..num_ports).all(|p| {
+            let is_driven = self
+                .editable
+                .circuit()
+                .edges()
+                .iter()
+                .any(|edge| edge.dst == SignalSink::BoundaryOut(p as u16));
+            !is_driven
+                || ancestry
+                    .port_shares
+                    .get(p)
+                    .is_some_and(|shares| shares.iter().sum::<f64>() > 0.0)
+        });
 
-        if all_mature {
+        if all_mature && all_driven_ports_primed {
             let mut res = vec![0u64; num_ports];
             for p in 0..num_ports {
                 res[p] = self
@@ -456,6 +595,7 @@ impl PredictorBaseline for ArkheLearner {
 
         // Sprouting and autonomous delay-ring check
         if all_mature
+            && all_driven_ports_primed
             && self.post_juvenile_diag.len() >= self.growth_config.diagnostic_window
             && self.ticks_since_last_check >= self.growth_config.sprout_interval
         {
@@ -465,33 +605,44 @@ impl PredictorBaseline for ArkheLearner {
             let idle_nodes = self
                 .post_juvenile_diag
                 .idle_mature_nodes(self.editable.economy());
-            if !idle_nodes.is_empty()
-                && let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes(
+            if !idle_nodes.is_empty() {
+                let pre_prune_lattice = self.editable.lattice().clone();
+                if let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes(
                     &idle_nodes,
                     &self.post_juvenile_diag.inputs,
                     &self.post_juvenile_diag.predictions,
                     self.economy_config.split_code_tax,
-                )
-            {
-                let any_pruned = old_to_new.iter().any(Option::is_none);
-                if any_pruned {
-                    self.ledger.on_prune(
-                        self.editable.circuit(),
-                        self.editable.lattice().topology(),
-                        self.grid_shape,
-                        self.economy_config.split_code_tax,
-                        &old_to_new,
-                    );
-                    for p in 0..num_ports {
-                        self.editable
-                            .economy_mut()
-                            .port_scorer_mut(p)
-                            .reset_predictor_counts();
+                ) {
+                    let any_pruned = old_to_new.iter().any(Option::is_none);
+                    if any_pruned {
+                        self.ledger.on_prune(
+                            self.editable.circuit(),
+                            self.editable.lattice().topology(),
+                            self.grid_shape,
+                            self.economy_config.split_code_tax,
+                            &old_to_new,
+                        );
+                        let changed_ports: Vec<usize> = (0..num_ports)
+                            .filter(|&p| {
+                                port_cone_changed(
+                                    &pre_prune_lattice,
+                                    self.editable.lattice(),
+                                    &old_to_new,
+                                    p as u16,
+                                )
+                            })
+                            .collect();
+                        for p in changed_ports {
+                            self.editable
+                                .economy_mut()
+                                .port_scorer_mut(p)
+                                .reset_predictor_counts();
+                        }
+                        self.idle_prune_events += 1;
+                        self.post_juvenile_diag.clear();
+                        self.tick += 1;
+                        return None;
                     }
-                    self.idle_prune_events += 1;
-                    self.post_juvenile_diag.clear();
-                    self.tick += 1;
-                    return None;
                 }
             }
 
@@ -641,7 +792,8 @@ impl PredictorBaseline for ArkheLearner {
                     port_u16,
                     self.max_relay_hops,
                 ) {
-                    let old_to_new = vec![None; self.editable.circuit().node_count()];
+                    let old_to_new = ring_prop.old_to_new;
+                    let ring_delay_nodes = ring_prop.ring_delay_nodes;
                     let period = ring_prop.period;
                     let template = ring_prop.template;
                     if self
@@ -656,13 +808,20 @@ impl PredictorBaseline for ArkheLearner {
                             self.economy_config.split_code_tax,
                             &old_to_new,
                         );
-                        let total_regs = self.editable.compiled().total_registers();
-                        if total_regs == period {
-                            let mut regs = self.editable.state().registers().to_vec();
-                            for j in 0..period {
-                                regs[j] = template
+                        let mut regs = self.editable.state().registers().to_vec();
+                        let mut ok_regs = true;
+                        for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
+                            if let Some(reg_idx) =
+                                explicit_delay_register_index(self.editable.circuit(), delay_node)
+                            {
+                                regs[reg_idx] = template
                                     [(((self.tick + 1) as usize) + (period - 1 - j)) % period];
+                            } else {
+                                ok_regs = false;
+                                break;
                             }
+                        }
+                        if ok_regs {
                             let _ = self.editable.set_registers(&regs);
                         }
                         self.editable
@@ -694,6 +853,184 @@ impl PredictorBaseline for ArkheLearner {
     }
 
     fn m1_telemetry(&self) -> Option<ArkheM1Telemetry> {
-        Some(self.telemetry())
+        Some(telemetry_ref(self))
+    }
+}
+
+fn telemetry_ref(learner: &ArkheLearner) -> ArkheM1Telemetry {
+    learner.telemetry()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::{FiniteStateGenerator, GeneratorConfig, NoiseModel, NoisyEnvironment};
+
+    #[test]
+    fn default_anchors_distribute_multi_channel_without_border_collisions() {
+        let shape = GridShape::new(8, 8).unwrap();
+        let (ins, outs) = default_anchors(8, shape);
+        assert_eq!(ins.len(), 8);
+        assert_eq!(outs.len(), 8);
+        let mut cells = std::collections::BTreeSet::new();
+        for a in ins.iter().chain(outs.iter()) {
+            let cell = a.adjacent_border_cell(shape).unwrap();
+            assert!(cells.insert(cell), "duplicate border cell {cell:?}");
+        }
+    }
+
+    #[test]
+    fn ticks_per_hop_multistage_tasks_run_without_missing_ancestry_panic() {
+        let shape = GridShape::new(8, 8).unwrap();
+        for topology in [WiringTopology::WellMixed, WiringTopology::LocalVonNeumann] {
+            let mut learner = ArkheLearner::new_with_spatial(
+                Width::BITS_1,
+                1,
+                WireDelayMode::TicksPerHop,
+                topology,
+                shape,
+                4,
+                EconomyConfig::default(),
+                GrowthConfig::default(),
+                SeedBank::new(7),
+            )
+            .unwrap();
+            let mut budget = TickBudget::new(200_000);
+            let motif = [0u64, 1, 1];
+            for t in 0..800 {
+                let _ = learner.predict(&mut budget);
+                learner.observe(&[motif[t % 3]], &mut budget);
+            }
+            assert!(learner.best_circuit().unwrap().compile().is_ok());
+            assert!(learner.sprout_events() >= 1);
+        }
+    }
+
+    #[test]
+    fn noisy_nonzero_constants_halt_at_zero_nodes_without_thrashing() {
+        let cases = [(Width::BITS_1, 1u64), (Width::BITS_2, 3u64)];
+        for (width, val) in cases {
+            for seed in 0..10u64 {
+                let seeds = SeedBank::new(seed);
+                let mut learner = ArkheLearner::new(
+                    width,
+                    1,
+                    WireDelayMode::Combinational,
+                    GrowthConfig::default(),
+                    seeds,
+                )
+                .unwrap();
+                let generator = GeneratorConfig::T1_Constant { value: val }
+                    .build(width)
+                    .unwrap();
+                let mut env = NoisyEnvironment::new(
+                    generator,
+                    NoiseModel::IndependentSubstitution {
+                        epsilon: 0.05,
+                        channels: vec![0],
+                    },
+                    seeds,
+                )
+                .unwrap();
+                let mut budget = TickBudget::new(300_000);
+                let mut clean = [0u64];
+                let mut obs = [0u64];
+                for _ in 0..1024 {
+                    let _ = learner.predict(&mut budget);
+                    env.step_frame(&mut clean, &mut obs);
+                    learner.observe(&obs, &mut budget);
+                }
+                let tel = learner.telemetry();
+                assert_eq!(
+                    tel.sprout_events,
+                    0,
+                    "width={} val={val} seed={seed} sprouted on noisy constant",
+                    width.bits()
+                );
+                assert_eq!(tel.starvation_prune_events, 0);
+                assert_eq!(tel.final_node_count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_rare_event_ring_discovery_and_mdl_sign_convention() {
+        let mut learner = ArkheLearner::new(
+            Width::BITS_1,
+            1,
+            WireDelayMode::Combinational,
+            GrowthConfig::default(),
+            SeedBank::new(11),
+        )
+        .unwrap();
+        let mut generator = GeneratorConfig::T1_PeriodicMotif {
+            motif: vec![0, 0, 0, 0, 1],
+        }
+        .build(Width::BITS_1)
+        .unwrap();
+        let mut budget = TickBudget::new(300_000);
+        let mut tail_matches = 0usize;
+        let mut truth = [0u64];
+        for t in 0..800 {
+            let pred = learner.predict(&mut budget);
+            generator.next_clean_frame(&mut truth);
+            if t >= 400 && pred[0] == truth[0] {
+                tail_matches += 1;
+            }
+            learner.observe(&truth, &mut budget);
+        }
+        let tel = learner.telemetry();
+        assert!(tel.ring_closure_events >= 1);
+        assert_eq!(tel.starvation_prune_events, 0);
+        assert_eq!(tail_matches, 400);
+        assert!(
+            tel.null_calibrated_mdl_delta_bits < 0.0,
+            "compression must yield negative MDL delta, got {}",
+            tel.null_calibrated_mdl_delta_bits
+        );
+    }
+
+    #[test]
+    fn two_channel_ring_closure_preserves_other_channel_subcircuit() {
+        let shape = GridShape::new(8, 8).unwrap();
+        let mut learner = ArkheLearner::new_with_spatial(
+            Width::BITS_1,
+            2,
+            WireDelayMode::Combinational,
+            WiringTopology::LocalVonNeumann,
+            shape,
+            4,
+            EconomyConfig::default(),
+            GrowthConfig::default(),
+            SeedBank::new(23),
+        )
+        .unwrap();
+        let mut budget = TickBudget::new(500_000);
+        let motif_ch1 = [0u64, 0, 0, 0, 1];
+        let mut ch0_tail_matches = 0usize;
+        let mut ch1_tail_matches = 0usize;
+        for t in 0..900 {
+            let pred = learner.predict(&mut budget);
+            let truth = [(t % 2) as u64, motif_ch1[t % 5]];
+            if t >= 500 {
+                if pred[0] == truth[0] {
+                    ch0_tail_matches += 1;
+                }
+                if pred[1] == truth[1] {
+                    ch1_tail_matches += 1;
+                }
+            }
+            learner.observe(&truth, &mut budget);
+        }
+        assert!(learner.sprout_events() >= 1);
+        assert!(learner.ring_closure_events() >= 1);
+        assert_eq!(
+            ch0_tail_matches, 400,
+            "channel 0 subcircuit must survive channel 1 ring closure"
+        );
+        assert_eq!(
+            ch1_tail_matches, 400,
+            "channel 1 ring must lock phase cleanly"
+        );
     }
 }
