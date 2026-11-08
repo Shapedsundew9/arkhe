@@ -1,0 +1,77 @@
+{
+  "name": "affine_k2_comb_s23",
+  "seed": 23,
+  "width_bits": 2,
+  "wire_delay": "Combinational",
+  "total_ticks": 500,
+  "events": [
+    {
+      "tick": 63,
+      "kind": "Sprout",
+      "node_count": 1,
+      "details": "sprout_events=1"
+    },
+    {
+      "tick": 254,
+      "kind": "Sprout",
+      "node_count": 6,
+      "details": "sprout_events=2"
+    }
+  ],
+  "trajectory_digest_fnv1a": "5cfa85360b90bd57fe03540a5450f118",
+  "final_circuit_nodes": [
+    "Eqz",
+    "Add",
+    "Split",
+    "Eqz",
+    "Split",
+    "Add"
+  ],
+  "final_circuit_edges": [
+    {
+      "src": "NodeOut { node: NodeId(2), port: 0 }",
+      "dst": "NodeIn { node: NodeId(0), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "BoundaryIn(0)",
+      "dst": "NodeIn { node: NodeId(2), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(2), port: 1 }",
+      "dst": "NodeIn { node: NodeId(1), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(0), port: 0 }",
+      "dst": "NodeIn { node: NodeId(4), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(4), port: 1 }",
+      "dst": "NodeIn { node: NodeId(3), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(3), port: 0 }",
+      "dst": "NodeIn { node: NodeId(1), port: 1 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(4), port: 0 }",
+      "dst": "NodeIn { node: NodeId(5), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(1), port: 0 }",
+      "dst": "NodeIn { node: NodeId(5), port: 1 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(5), port: 0 }",
+      "dst": "BoundaryOut(0)",
+      "hops": 0
+    }
+  ]
+}

@@ -184,6 +184,10 @@ pub struct EconomyTick {
     pub node_delta: Vec<f64>,
     /// Nodes whose mature reserves are now depleted.
     pub starved_nodes: Vec<usize>,
+    /// Number of nodes whose reserves were clipped by max_energy_reserve on this tick.
+    pub clipped_nodes: usize,
+    /// Total energy bits clipped by max_energy_reserve on this tick.
+    pub clipped_bits: f64,
 }
 
 /// Node-local reserves, port null models, and synchronous-register eligibility traces.
@@ -456,18 +460,25 @@ impl EconomyState {
 
         let mut starved_nodes = Vec::new();
         let mut next_energies = Vec::with_capacity(self.nodes.len());
+        let mut clipped_nodes = 0usize;
+        let mut clipped_bits = 0.0f64;
         for (index, node) in self.nodes.iter().enumerate() {
             let unclipped = node.energy + delta[index];
             if !unclipped.is_finite() {
                 return Err(EconomyError::InvalidTickData);
             }
-            let next_energy = if node.juvenile_ticks > 0 {
-                unclipped
+            let (next_energy, clipped) = if node.juvenile_ticks > 0 {
+                (unclipped, 0.0)
             } else {
-                self.config
-                    .max_energy_reserve
-                    .map_or(unclipped, |cap| unclipped.min(cap))
+                match self.config.max_energy_reserve {
+                    Some(cap) if unclipped > cap => (cap, unclipped - cap),
+                    _ => (unclipped, 0.0),
+                }
             };
+            if clipped > 0.0 {
+                clipped_nodes += 1;
+                clipped_bits += clipped;
+            }
             next_energies.push(next_energy);
         }
         for (index, (node, next_energy)) in self.nodes.iter_mut().zip(next_energies).enumerate() {
@@ -487,6 +498,8 @@ impl EconomyState {
             node_credit,
             node_delta: delta,
             starved_nodes,
+            clipped_nodes,
+            clipped_bits,
         })
     }
 

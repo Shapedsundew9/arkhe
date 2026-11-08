@@ -13,7 +13,7 @@ pub use economy::{
 };
 pub use growth::{
     AutonomousRingProposal, FeatureScore, GrowthConfig, GrowthError, ResidualDiagnostics,
-    ResidualFeature, diagnose_residual,
+    ResidualFeature, SproutTelemetry, diagnose_residual,
 };
 pub use lattice::{
     BoundaryAnchor, Coord, GridShape, LatticeCircuit, LatticeError, PerimeterSide, WiringTopology,

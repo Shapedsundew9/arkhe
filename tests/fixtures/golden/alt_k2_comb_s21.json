@@ -1,0 +1,31 @@
+{
+  "name": "alt_k2_comb_s21",
+  "seed": 21,
+  "width_bits": 2,
+  "wire_delay": "Combinational",
+  "total_ticks": 400,
+  "events": [
+    {
+      "tick": 63,
+      "kind": "Sprout",
+      "node_count": 1,
+      "details": "sprout_events=1"
+    }
+  ],
+  "trajectory_digest_fnv1a": "5ef4ed2511aa09b11b3c042142fcebc8",
+  "final_circuit_nodes": [
+    "Delay { init: 0 }"
+  ],
+  "final_circuit_edges": [
+    {
+      "src": "BoundaryIn(0)",
+      "dst": "NodeIn { node: NodeId(0), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(0), port: 0 }",
+      "dst": "BoundaryOut(0)",
+      "hops": 0
+    }
+  ]
+}

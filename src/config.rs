@@ -306,6 +306,18 @@ pub struct ArkheM1Telemetry {
     pub ring_closure_events: u64,
     pub starvation_prune_events: u64,
     pub idle_prune_events: u64,
+    #[serde(default)]
+    pub reserve_clipped_count: u64,
+    #[serde(default)]
+    pub reserve_clipped_bits: f64,
+    #[serde(default)]
+    pub sprout_blocked_max_nodes: u64,
+    #[serde(default)]
+    pub candidate_undecidable: u64,
+    #[serde(default)]
+    pub candidate_list_truncated: u64,
+    #[serde(default)]
+    pub lag_horizon_exhausted: u64,
 }
 
 /// Complete, deterministic output manifest produced by [`execute_experiment`].

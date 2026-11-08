@@ -9,8 +9,8 @@ use crate::metrics::facts_code_bits;
 use crate::rng::SeedBank;
 use crate::structural::economy::EconomyConfig;
 use crate::structural::growth::{
-    DiagnosticBuffer, GrowthConfig, GrowthError, diagnose_residual, propose_autonomous_delay_ring,
-    propose_sprout,
+    DiagnosticBuffer, GrowthConfig, GrowthError, SproutTelemetry, diagnose_residual,
+    propose_autonomous_delay_ring, propose_sprout_with_telemetry,
 };
 use crate::structural::lattice::{
     BoundaryAnchor, Coord, GridShape, LatticeCircuit, PerimeterSide, WiringTopology,
@@ -178,6 +178,12 @@ pub struct ArkheLearner {
     epoch_snapshots: Vec<GrowthEpochSnapshot>,
     cumulative_net_flux: f64,
     cumulative_debt_paid: f64,
+    reserve_clipped_count: u64,
+    reserve_clipped_bits: f64,
+    sprout_blocked_max_nodes: u64,
+    candidate_undecidable: u64,
+    candidate_list_truncated: u64,
+    lag_horizon_exhausted: u64,
     grid_shape: Option<GridShape>,
 }
 
@@ -261,6 +267,12 @@ impl ArkheLearner {
             epoch_snapshots: Vec::new(),
             cumulative_net_flux: 0.0,
             cumulative_debt_paid: 0.0,
+            reserve_clipped_count: 0,
+            reserve_clipped_bits: 0.0,
+            sprout_blocked_max_nodes: 0,
+            candidate_undecidable: 0,
+            candidate_list_truncated: 0,
+            lag_horizon_exhausted: 0,
             grid_shape: if topology == WiringTopology::WellMixed {
                 None
             } else {
@@ -395,6 +407,12 @@ impl ArkheLearner {
             ring_closure_events: self.ring_closure_events,
             starvation_prune_events: self.starvation_prune_events,
             idle_prune_events: self.idle_prune_events,
+            reserve_clipped_count: self.reserve_clipped_count,
+            reserve_clipped_bits: self.reserve_clipped_bits,
+            sprout_blocked_max_nodes: self.sprout_blocked_max_nodes,
+            candidate_undecidable: self.candidate_undecidable,
+            candidate_list_truncated: self.candidate_list_truncated,
+            lag_horizon_exhausted: self.lag_horizon_exhausted,
         }
     }
 }
@@ -510,6 +528,8 @@ impl PredictorBaseline for ArkheLearner {
             .expect("valid causal tick");
         self.cumulative_net_flux += econ_tick.net_flux;
         self.cumulative_debt_paid += econ_tick.maintenance;
+        self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
+        self.reserve_clipped_bits += econ_tick.clipped_bits;
 
         // Starvation pruning
         if !econ_tick.starved_nodes.is_empty() {
@@ -693,8 +713,9 @@ impl PredictorBaseline for ArkheLearner {
 
                 // 2a. Candidate motif sprouting
                 let mut sprouted = false;
-                if self.editable.circuit().node_count() < self.growth_config.max_nodes
-                    && let Ok(Some(sprout_lat)) = propose_sprout(
+                let mut sprout_tel = SproutTelemetry::default();
+                if self.editable.circuit().node_count() < self.growth_config.max_nodes {
+                    if let Ok(Some(sprout_lat)) = propose_sprout_with_telemetry(
                         &self.editable,
                         &self.obs_window,
                         &self.post_juvenile_diag,
@@ -703,9 +724,9 @@ impl PredictorBaseline for ArkheLearner {
                         budget,
                         port_u16,
                         self.max_relay_hops,
-                    )
-                {
-                    // Diagnostic snapshot for G1B.1 before committing sprout
+                        &mut sprout_tel,
+                    ) {
+                        // Diagnostic snapshot for G1B.1 before committing sprout
                     if p == 0 && (self.sprout_events == 0 || self.sprout_events == 1) {
                         let residuals: Vec<u64> = self
                             .post_juvenile_diag
@@ -777,6 +798,13 @@ impl PredictorBaseline for ArkheLearner {
                         sprouted = true;
                     }
                 }
+            } else {
+                self.sprout_blocked_max_nodes += 1;
+            }
+                self.sprout_blocked_max_nodes += sprout_tel.sprout_blocked_max_nodes;
+                self.candidate_undecidable += sprout_tel.candidate_undecidable;
+                self.candidate_list_truncated += sprout_tel.candidate_list_truncated;
+                self.lag_horizon_exhausted += sprout_tel.lag_horizon_exhausted;
 
                 if sprouted {
                     break;

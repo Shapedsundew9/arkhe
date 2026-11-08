@@ -101,8 +101,23 @@ pub struct ResidualDiagnostics {
     pub secondary_feature: Option<FeatureScore>,
     /// Top candidate feature groups clearing the growth guards.
     pub candidate_features: Vec<FeatureScore>,
+    /// Whether candidate features were truncated by the candidate cap.
+    pub candidate_list_truncated: bool,
     /// Whether a non-zero constant offset or feature clears the growth guards.
     pub growth_criterion_met: bool,
+}
+
+/// Telemetry counters for structural growth guardrails and search horizons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SproutTelemetry {
+    /// Count of sprout attempts blocked by max_nodes.
+    pub sprout_blocked_max_nodes: u64,
+    /// Count of rejected candidates whose required observation window exceeded obs_window.
+    pub candidate_undecidable: u64,
+    /// Count of candidate feature lists truncated by the candidate cap.
+    pub candidate_list_truncated: u64,
+    /// Count of diagnostic checks where lag horizon was exhausted without finding a passing candidate.
+    pub lag_horizon_exhausted: u64,
 }
 
 /// Invalid or dimensionally inconsistent residual diagnostics input.
@@ -222,15 +237,18 @@ pub fn diagnose_residual(
             ));
         }
     }
-    let candidate_features: Vec<FeatureScore> = scores
+    let passing_candidates = scores
         .iter()
         .filter(|s| {
             s.corrected_mutual_information_bits > config.mi_threshold_bits
                 && s.match_gain >= config.min_match_gain
-        })
+        });
+    let total_passing = passing_candidates.clone().count();
+    let candidate_features: Vec<FeatureScore> = passing_candidates
         .take(6)
         .cloned()
         .collect();
+    let candidate_list_truncated = total_passing > 6;
 
     let growth_criterion_met = !zero_error
         && (constant_offset.is_some()
@@ -248,6 +266,7 @@ pub fn diagnose_residual(
         best_feature,
         secondary_feature,
         candidate_features,
+        candidate_list_truncated,
         growth_criterion_met,
     })
 }
@@ -1528,6 +1547,32 @@ pub fn propose_sprout(
     out_port: u16,
     max_relay_hops: u8,
 ) -> Result<Option<LatticeCircuit>, GrowthError> {
+    propose_sprout_with_telemetry(
+        editable,
+        obs_window,
+        diag,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        max_relay_hops,
+        &mut SproutTelemetry::default(),
+    )
+}
+
+/// Evaluates candidates from $\mathcal{K}(u_1, u_2)$ on `obs_window` with telemetry collection.
+#[allow(clippy::too_many_arguments)]
+pub fn propose_sprout_with_telemetry(
+    editable: &EditableLattice,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    max_relay_hops: u8,
+    telemetry: &mut SproutTelemetry,
+) -> Result<Option<LatticeCircuit>, GrowthError> {
     let len = diag.len();
     if len < growth_config.diagnostic_window {
         return Ok(None);
@@ -1551,6 +1596,9 @@ pub fn propose_sprout(
         &features,
         *growth_config,
     )?;
+    if diagnostics.candidate_list_truncated {
+        telemetry.candidate_list_truncated += 1;
+    }
     if diagnostics.zero_error || !diagnostics.growth_criterion_met {
         return Ok(None);
     }
@@ -1615,6 +1663,9 @@ pub fn propose_sprout(
     }
 
     if candidates.is_empty() {
+        if !feature_pairs.is_empty() {
+            telemetry.lag_horizon_exhausted += 1;
+        }
         return Ok(None);
     }
 
@@ -1707,12 +1758,14 @@ pub fn propose_sprout(
         }
         let mut staged = editable.lattice().clone();
         if staged.nodes().len() >= growth_config.max_nodes {
+            telemetry.sprout_blocked_max_nodes += 1;
             continue;
         }
         if materialize_candidate(&mut staged, motif, out_port, max_relay_hops).is_err() {
             continue;
         }
         if staged.nodes().len() > growth_config.max_nodes {
+            telemetry.sprout_blocked_max_nodes += 1;
             continue;
         }
         let Ok(staged_circuit) = staged.lower() else {
@@ -1824,6 +1877,13 @@ pub fn propose_sprout(
             let projected_survival = economy_config.initial_energy
                 + (economy_config.juvenile_ticks as f64 / w_diag as f64) * pos_flux_cand;
             if projected_survival <= delta_l_sprout {
+                let delta_i_hat = pos_flux_cand / (w_diag as f64);
+                if delta_i_hat > 0.0 {
+                    let w_star = delta_l_sprout / delta_i_hat;
+                    if w_star > (obs_window.len() as f64) {
+                        telemetry.candidate_undecidable += 1;
+                    }
+                }
                 continue;
             }
         }
