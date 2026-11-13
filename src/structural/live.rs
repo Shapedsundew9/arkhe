@@ -95,12 +95,17 @@ impl LiveCircuit {
         }
         let compiled = circuit.compile().map_err(LiveError::Invariant)?;
         let state = ScalarState::new(&compiled);
+        let obs_horizon = crate::structural::growth::observation_horizon(
+            &config,
+            &crate::structural::growth::GrowthConfig::default(),
+        );
         let mut economy = EconomyState::new(
             config,
             circuit.width(),
             circuit.node_count(),
             usize::from(circuit.num_outputs()),
             compiled.total_registers(),
+            obs_horizon,
         )
         .map_err(LiveError::Economy)?;
         economy.assign_sprout_debts(description_debts);

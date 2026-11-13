@@ -191,7 +191,7 @@ pub enum BaselineConfig {
         #[serde(default = "default_fact_window")]
         fact_window: usize,
     },
-    /// Online gradient-free structural learning from an empty spatial lattice.
+    /// Online gradient-free structural learning from an empty circuit.
     ArkheM1 {
         #[serde(default)]
         economy: EconomyConfig,
@@ -282,8 +282,60 @@ pub struct ArkheM1Telemetry {
     pub candidate_undecidable: u64,
     #[serde(default)]
     pub candidate_list_truncated: u64,
+    #[serde(default, alias = "lag_horizon_exhausted")]
+    pub lag_horizon_bound: u64,
     #[serde(default)]
-    pub lag_horizon_exhausted: u64,
+    pub ring_period_bound: u64,
+    #[serde(default)]
+    pub reserve_mismatch_floored: u64,
+}
+
+/// Aggregated cliff, bound, and guardrail telemetry across one or more learner runs (§B3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CliffCountersSummary {
+    pub reserve_clipped_count: u64,
+    pub reserve_clipped_bits: f64,
+    pub reserve_mismatch_floored: u64,
+    pub sprout_blocked_max_nodes: u64,
+    pub candidate_undecidable: u64,
+    pub candidate_list_truncated: u64,
+    pub lag_horizon_bound: u64,
+    pub ring_period_bound: u64,
+}
+
+impl From<&ArkheM1Telemetry> for CliffCountersSummary {
+    fn from(telemetry: &ArkheM1Telemetry) -> Self {
+        Self {
+            reserve_clipped_count: telemetry.reserve_clipped_count,
+            reserve_clipped_bits: telemetry.reserve_clipped_bits,
+            reserve_mismatch_floored: telemetry.reserve_mismatch_floored,
+            sprout_blocked_max_nodes: telemetry.sprout_blocked_max_nodes,
+            candidate_undecidable: telemetry.candidate_undecidable,
+            candidate_list_truncated: telemetry.candidate_list_truncated,
+            lag_horizon_bound: telemetry.lag_horizon_bound,
+            ring_period_bound: telemetry.ring_period_bound,
+        }
+    }
+}
+
+impl CliffCountersSummary {
+    /// Adds another summary's counters into `self`.
+    pub fn accumulate(&mut self, other: &Self) {
+        self.reserve_clipped_count += other.reserve_clipped_count;
+        self.reserve_clipped_bits += other.reserve_clipped_bits;
+        self.reserve_mismatch_floored += other.reserve_mismatch_floored;
+        self.sprout_blocked_max_nodes += other.sprout_blocked_max_nodes;
+        self.candidate_undecidable += other.candidate_undecidable;
+        self.candidate_list_truncated += other.candidate_list_truncated;
+        self.lag_horizon_bound += other.lag_horizon_bound;
+        self.ring_period_bound += other.ring_period_bound;
+    }
+
+    /// Returns whether the hard compute guardrail (`max_nodes`) bound during execution.
+    #[must_use]
+    pub const fn guardrail_bound(&self) -> bool {
+        self.sprout_blocked_max_nodes > 0
+    }
 }
 
 /// Complete, deterministic output manifest produced by [`execute_experiment`].

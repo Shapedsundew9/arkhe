@@ -11,6 +11,10 @@ use crate::substrate::{
     Circuit, CompiledCircuit, NodeId, Primitive, ScalarState, SignalSource, Width,
 };
 
+/// Maximum bit-width $k$ for which counterfactual sensitivity enumerates all $2^k - 1$
+/// alternative symbols exhaustively instead of drawing `sample_count` random alternatives.
+pub const EXACT_SENSITIVITY_MAX_BITS: u8 = 4;
+
 /// Sensitivity of each circuit node to output ports and synchronous-register latches.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SensitivitySnapshot {
@@ -106,7 +110,7 @@ pub fn counterfactual_sensitivity(
     if wires.is_empty() && (!nodes.is_empty() || compiled.num_outputs() > 0) {
         return Err(SensitivityError::DimensionMismatch);
     }
-    if compiled.width().bits() > 4 && sample_count == 0 {
+    if compiled.width().bits() > EXACT_SENSITIVITY_MAX_BITS && sample_count == 0 {
         return Err(SensitivityError::EmptySample);
     }
 
@@ -429,7 +433,7 @@ fn candidate_values(
     rng: &mut impl Rng,
 ) -> Result<Vec<u64>, SensitivityError> {
     let actual = width.normalize(actual);
-    if width.bits() <= 4 {
+    if width.bits() <= EXACT_SENSITIVITY_MAX_BITS {
         let cardinality = 1u64 << width.bits();
         return Ok((0..cardinality).filter(|&value| value != actual).collect());
     }

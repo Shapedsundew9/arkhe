@@ -190,7 +190,7 @@ fn fast_seed_slice_m1b_all_gates_pass() {
 
 #[test]
 fn m1_stage_gate_aborts_m1b_when_m1a_fails() {
-    use arkhe::config::BuildProvenance;
+    use arkhe::config::{BuildProvenance, CliffCountersSummary};
     use arkhe::verify_m1::{M1aVerificationSummary, evaluate_m1_stage_gate};
 
     let failing_m1a = M1aVerificationSummary {
@@ -201,6 +201,7 @@ fn m1_stage_gate_aborts_m1b_when_m1a_fails() {
         gates: Vec::new(),
         panel: Vec::new(),
         all_passed: false,
+        cliff_counters: CliffCountersSummary::default(),
     };
 
     let combined = evaluate_m1_stage_gate(failing_m1a, || {

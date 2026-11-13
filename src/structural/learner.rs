@@ -1,4 +1,4 @@
-//! Online closed-loop spatial lattice neurogenesis learner (Milestone 1b, Hypothesis H2).
+//! Online closed-loop coordinate-free neurogenesis learner (Milestone 1b, Hypothesis H2).
 
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +10,7 @@ use crate::rng::SeedBank;
 use crate::structural::economy::EconomyConfig;
 use crate::structural::growth::{
     DiagnosticBuffer, GrowthConfig, GrowthError, SproutTelemetry, diagnose_residual,
-    propose_autonomous_delay_ring, propose_sprout_with_telemetry,
+    propose_autonomous_delay_ring_with_telemetry, propose_sprout_with_telemetry,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
@@ -25,6 +25,9 @@ use crate::substrate::{Circuit, NodeId, Primitive, SignalSink, Width, WireDelayM
 /// Telemetry record capturing residual entropy and diagnostic mutual information across growth epochs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GrowthEpochSnapshot {
+    /// Output port for which this snapshot was captured.
+    #[serde(default)]
+    pub port: u16,
     /// Global evaluation tick at which this snapshot was captured.
     pub tick: u64,
     /// Sequential epoch counter (0 = pre-sprout 1, 1 = post-sprout 1 / pre-sprout 2, 2 = post-sprout 2).
@@ -44,6 +47,8 @@ pub struct GrowthEpochSnapshot {
 pub struct PortDevelopmentalState {
     pub diagnostic_buffer: DiagnosticBuffer,
     pub ticks_since_last_check: u64,
+    pub port_sprout_events: u64,
+    pub epoch_snapshots: Vec<GrowthEpochSnapshot>,
 }
 
 impl PortDevelopmentalState {
@@ -52,6 +57,8 @@ impl PortDevelopmentalState {
         Self {
             diagnostic_buffer: DiagnosticBuffer::new(diagnostic_window),
             ticks_since_last_check: 0,
+            port_sprout_events: 0,
+            epoch_snapshots: Vec::new(),
         }
     }
 }
@@ -75,15 +82,16 @@ pub struct ArkheLearner {
     starvation_prune_events: u64,
     idle_prune_events: u64,
     ring_closure_events: u64,
-    epoch_snapshots: Vec<GrowthEpochSnapshot>,
     cumulative_net_flux: f64,
     cumulative_debt_paid: f64,
     reserve_clipped_count: u64,
     reserve_clipped_bits: f64,
+    reserve_mismatch_floored: u64,
     sprout_blocked_max_nodes: u64,
     candidate_undecidable: u64,
     candidate_list_truncated: u64,
-    lag_horizon_exhausted: u64,
+    lag_horizon_bound: u64,
+    ring_period_bound: u64,
 }
 
 impl ArkheLearner {
@@ -126,12 +134,12 @@ impl ArkheLearner {
             return Err(GrowthError::InvalidConfig);
         }
         let circuit = Circuit::new(width, channels, channels, wire_delay);
-        let editable = EditableCircuit::new(circuit, economy_config)
+        let editable = EditableCircuit::new_with_growth(circuit, economy_config, &growth_config)
             .map_err(|_| GrowthError::InvalidConfig)?;
 
         let channels_usize = usize::from(channels);
         let obs_capacity =
-            (economy_config.juvenile_ticks as usize) + 2 * growth_config.diagnostic_window;
+            crate::structural::growth::observation_horizon(&economy_config, &growth_config);
 
         let port_states = (0..channels_usize)
             .map(|_| PortDevelopmentalState::new(growth_config.diagnostic_window))
@@ -143,7 +151,7 @@ impl ArkheLearner {
             economy_config,
             growth_config,
             seed_bank,
-            sample_count: 8,
+            sample_count: growth_config.sensitivity_sample_count,
             tick: 0,
             prev_observed_frame: vec![0; channels_usize],
             pending_prediction: None,
@@ -153,15 +161,16 @@ impl ArkheLearner {
             starvation_prune_events: 0,
             idle_prune_events: 0,
             ring_closure_events: 0,
-            epoch_snapshots: Vec::new(),
             cumulative_net_flux: 0.0,
             cumulative_debt_paid: 0.0,
             reserve_clipped_count: 0,
             reserve_clipped_bits: 0.0,
+            reserve_mismatch_floored: 0,
             sprout_blocked_max_nodes: 0,
             candidate_undecidable: 0,
             candidate_list_truncated: 0,
-            lag_horizon_exhausted: 0,
+            lag_horizon_bound: 0,
+            ring_period_bound: 0,
         })
     }
 
@@ -224,10 +233,86 @@ impl ArkheLearner {
         self.ring_closure_events
     }
 
-    /// Diagnostic epoch snapshots captured across developmental milestones.
+    /// Diagnostic epoch snapshots captured for port 0 across developmental milestones.
     #[must_use]
     pub fn epoch_snapshots(&self) -> &[GrowthEpochSnapshot] {
-        &self.epoch_snapshots
+        self.port_states
+            .first()
+            .map_or(&[], |state| state.epoch_snapshots.as_slice())
+    }
+
+    /// Diagnostic epoch snapshots captured for a specific output port `port`.
+    #[must_use]
+    pub fn port_epoch_snapshots(&self, port: u16) -> Option<&[GrowthEpochSnapshot]> {
+        self.port_states
+            .get(usize::from(port))
+            .map(|state| state.epoch_snapshots.as_slice())
+    }
+
+    fn reset_changed_ports(&mut self, pre_circuit: &Circuit, old_to_new: &[Option<NodeId>]) {
+        let num_ports = self.port_states.len();
+        let changed_ports: Vec<usize> = (0..num_ports)
+            .filter(|&q| {
+                port_cone_changed(pre_circuit, self.editable.circuit(), old_to_new, q as u16)
+            })
+            .collect();
+        for q in changed_ports {
+            self.editable
+                .economy_mut()
+                .port_scorer_mut(q)
+                .reset_predictor_counts();
+            self.port_states[q].diagnostic_buffer.clear();
+            self.port_states[q].ticks_since_last_check = 0;
+        }
+    }
+
+    fn record_epoch_snapshot(&mut self, port_idx: usize, epoch: usize, include_mi: bool) {
+        let diag_buf = &self.port_states[port_idx].diagnostic_buffer;
+        let residuals: Vec<u64> = diag_buf.residuals.iter().map(|f| f[port_idx]).collect();
+        let port_u16 = port_idx as u16;
+        let features = diag_buf.build_signal_pool(
+            self.editable.circuit(),
+            &self.obs_window,
+            port_u16,
+            self.growth_config.max_reactive_lag,
+            Some(self.editable.economy()),
+        );
+        let Ok(diag_res) = diagnose_residual(
+            self.editable.circuit().width(),
+            &residuals,
+            &features,
+            self.growth_config,
+        ) else {
+            return;
+        };
+        let mismatches = diag_buf
+            .truth
+            .iter()
+            .zip(&diag_buf.predictions)
+            .filter(|(t, p)| t[port_idx] != p[port_idx])
+            .count();
+        let w = diag_buf.len() as u64;
+        let loss =
+            facts_code_bits(self.editable.circuit().width(), w, mismatches as u64) / (w as f64);
+        let best_feature_mi_bits = if include_mi {
+            diag_res
+                .best_feature
+                .as_ref()
+                .map(|f| f.mutual_information_bits)
+        } else {
+            None
+        };
+        self.port_states[port_idx]
+            .epoch_snapshots
+            .push(GrowthEpochSnapshot {
+                port: port_u16,
+                tick: self.tick,
+                epoch,
+                kt_loss_bits_per_symbol: loss,
+                residual_entropy_bits: diag_res.residual_entropy_bits,
+                best_feature_mi_bits,
+                node_count: self.editable.circuit().node_count(),
+            });
     }
 
     /// Active marginal debt ledger.
@@ -299,7 +384,9 @@ impl ArkheLearner {
             sprout_blocked_max_nodes: self.sprout_blocked_max_nodes,
             candidate_undecidable: self.candidate_undecidable,
             candidate_list_truncated: self.candidate_list_truncated,
-            lag_horizon_exhausted: self.lag_horizon_exhausted,
+            lag_horizon_bound: self.lag_horizon_bound,
+            ring_period_bound: self.ring_period_bound,
+            reserve_mismatch_floored: self.reserve_mismatch_floored,
         }
     }
 }
@@ -419,6 +506,7 @@ impl PredictorBaseline for ArkheLearner {
         self.cumulative_debt_paid += econ_tick.maintenance;
         self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
         self.reserve_clipped_bits += econ_tick.clipped_bits;
+        self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
 
         // Starvation pruning
         if !econ_tick.starved_nodes.is_empty() {
@@ -429,24 +517,7 @@ impl PredictorBaseline for ArkheLearner {
                     self.economy_config.split_code_tax,
                     &old_to_new,
                 );
-                let changed_ports: Vec<usize> = (0..num_ports)
-                    .filter(|&p| {
-                        port_cone_changed(
-                            &pre_prune_circuit,
-                            self.editable.circuit(),
-                            &old_to_new,
-                            p as u16,
-                        )
-                    })
-                    .collect();
-                for p in changed_ports {
-                    self.editable
-                        .economy_mut()
-                        .port_scorer_mut(p)
-                        .reset_predictor_counts();
-                    self.port_states[p].diagnostic_buffer.clear();
-                    self.port_states[p].ticks_since_last_check = 0;
-                }
+                self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
                 self.starvation_prune_events += 1;
             }
         }
@@ -524,24 +595,7 @@ impl PredictorBaseline for ArkheLearner {
                             self.economy_config.split_code_tax,
                             &old_to_new,
                         );
-                        let changed_ports: Vec<usize> = (0..num_ports)
-                            .filter(|&q| {
-                                port_cone_changed(
-                                    &pre_prune_circuit,
-                                    self.editable.circuit(),
-                                    &old_to_new,
-                                    q as u16,
-                                )
-                            })
-                            .collect();
-                        for q in changed_ports {
-                            self.editable
-                                .economy_mut()
-                                .port_scorer_mut(q)
-                                .reset_predictor_counts();
-                            self.port_states[q].diagnostic_buffer.clear();
-                            self.port_states[q].ticks_since_last_check = 0;
-                        }
+                        self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
                         self.idle_prune_events += 1;
                         self.tick += 1;
                         return None;
@@ -549,171 +603,69 @@ impl PredictorBaseline for ArkheLearner {
                 }
             }
 
-            // Check if Snapshot 2 needs to be recorded after Sprout 2 has settled
-            if p == 0 && self.sprout_events == 2 && self.epoch_snapshots.len() == 2 {
-                let residuals: Vec<u64> = self.port_states[0]
-                    .diagnostic_buffer
-                    .residuals
-                    .iter()
-                    .map(|f| f[0])
-                    .collect();
-                let features = self.port_states[0].diagnostic_buffer.build_signal_pool(
-                    self.editable.circuit(),
-                    &self.obs_window,
-                    0,
-                    3,
-                    Some(self.editable.economy()),
-                );
-                if let Ok(diag_res) = diagnose_residual(
-                    self.editable.circuit().width(),
-                    &residuals,
-                    &features,
-                    self.growth_config,
-                ) {
-                    let mismatches = self.port_states[0]
-                        .diagnostic_buffer
-                        .truth
-                        .iter()
-                        .zip(&self.port_states[0].diagnostic_buffer.predictions)
-                        .filter(|(t, p)| t[0] != p[0])
-                        .count();
-                    let w = self.port_states[0].diagnostic_buffer.len() as u64;
-                    let l2 = facts_code_bits(self.editable.circuit().width(), w, mismatches as u64)
-                        / (w as f64);
-                    self.epoch_snapshots.push(GrowthEpochSnapshot {
-                        tick: self.tick,
-                        epoch: 2,
-                        kt_loss_bits_per_symbol: l2,
-                        residual_entropy_bits: diag_res.residual_entropy_bits,
-                        best_feature_mi_bits: None,
-                        node_count: self.editable.circuit().node_count(),
-                    });
-                }
+            // Check if Snapshot 2 needs to be recorded after this port's Sprout 2 has settled
+            if self.port_states[p].port_sprout_events == 2
+                && self.port_states[p].epoch_snapshots.len() == 2
+            {
+                self.record_epoch_snapshot(p, 2, false);
             }
 
-            // 2a. Candidate motif sprouting (tau <= 3)
+            // 2a. Candidate motif sprouting (up to GrowthConfig::max_reactive_lag)
             let mut sprouted = false;
             let mut sprout_tel = SproutTelemetry::default();
-            if self.editable.circuit().node_count() < self.growth_config.max_nodes {
-                if let Ok(Some(sprout_circ)) = propose_sprout_with_telemetry(
-                    &self.editable,
-                    &self.obs_window,
-                    &self.port_states[p].diagnostic_buffer,
-                    &self.growth_config,
-                    &self.economy_config,
-                    budget,
-                    port_u16,
-                    3,
-                    &mut sprout_tel,
-                ) {
-                    // Diagnostic snapshot for G1B.1 before committing sprout
-                    if p == 0 && (self.sprout_events == 0 || self.sprout_events == 1) {
-                        let residuals: Vec<u64> = self.port_states[0]
-                            .diagnostic_buffer
-                            .residuals
-                            .iter()
-                            .map(|f| f[0])
-                            .collect();
-                        let features = self.port_states[0].diagnostic_buffer.build_signal_pool(
-                            self.editable.circuit(),
-                            &self.obs_window,
-                            0,
-                            3,
-                            Some(self.editable.economy()),
-                        );
-                        if let Ok(diag_res) = diagnose_residual(
-                            self.editable.circuit().width(),
-                            &residuals,
-                            &features,
-                            self.growth_config,
-                        ) {
-                            let mismatches = self.port_states[0]
-                                .diagnostic_buffer
-                                .truth
-                                .iter()
-                                .zip(&self.port_states[0].diagnostic_buffer.predictions)
-                                .filter(|(t, p)| t[0] != p[0])
-                                .count();
-                            let w = self.port_states[0].diagnostic_buffer.len() as u64;
-                            let loss = facts_code_bits(
-                                self.editable.circuit().width(),
-                                w,
-                                mismatches as u64,
-                            ) / (w as f64);
-                            let mi = diag_res
-                                .best_feature
-                                .as_ref()
-                                .map(|f| f.mutual_information_bits);
-                            self.epoch_snapshots.push(GrowthEpochSnapshot {
-                                tick: self.tick,
-                                epoch: self.sprout_events as usize,
-                                kt_loss_bits_per_symbol: loss,
-                                residual_entropy_bits: diag_res.residual_entropy_bits,
-                                best_feature_mi_bits: mi,
-                                node_count: self.editable.circuit().node_count(),
-                            });
-                        }
-                    }
-
-                    let pre_sprout_circuit = self.editable.circuit().clone();
-                    let old_to_new: Vec<Option<NodeId>> = (0..self.editable.circuit().node_count())
-                        .map(|i| Some(NodeId(i as u32)))
-                        .collect();
-                    if self
-                        .editable
-                        .recompile_preserving_state(sprout_circ, &old_to_new)
-                        .is_ok()
-                    {
-                        self.ledger.on_sprout(
-                            self.editable.circuit(),
-                            self.economy_config.split_code_tax,
-                            &old_to_new,
-                        );
-                        self.editable
-                            .economy_mut()
-                            .assign_sprout_debts(&self.ledger.node_debts);
-                        let changed_ports: Vec<usize> = (0..num_ports)
-                            .filter(|&q| {
-                                port_cone_changed(
-                                    &pre_sprout_circuit,
-                                    self.editable.circuit(),
-                                    &old_to_new,
-                                    q as u16,
-                                )
-                            })
-                            .collect();
-                        for q in changed_ports {
-                            self.editable
-                                .economy_mut()
-                                .port_scorer_mut(q)
-                                .reset_predictor_counts();
-                            self.port_states[q].diagnostic_buffer.clear();
-                            self.port_states[q].ticks_since_last_check = 0;
-                        }
-                        self.sprout_events += 1;
-                        sprouted = true;
-                    }
-                }
-            } else {
-                self.sprout_blocked_max_nodes += 1;
-            }
-            self.sprout_blocked_max_nodes += sprout_tel.sprout_blocked_max_nodes;
-            self.candidate_undecidable += sprout_tel.candidate_undecidable;
-            self.candidate_list_truncated += sprout_tel.candidate_list_truncated;
-
-            if sprouted {
-                break;
-            }
-
-            // 2b. Autonomous delay ring proposal under noise
-            if let Some(ring_prop) = propose_autonomous_delay_ring(
+            if let Ok(Some(sprout_circ)) = propose_sprout_with_telemetry(
                 &self.editable,
                 &self.obs_window,
+                &self.port_states[p].diagnostic_buffer,
                 &self.growth_config,
                 &self.economy_config,
                 budget,
                 port_u16,
+                self.growth_config.max_reactive_lag,
+                &mut sprout_tel,
             ) {
+                // Diagnostic snapshot for G1B.1 before committing sprout
+                let port_sprouts = self.port_states[p].port_sprout_events;
+                if port_sprouts == 0 || port_sprouts == 1 {
+                    self.record_epoch_snapshot(p, port_sprouts as usize, true);
+                }
+
+                let pre_sprout_circuit = self.editable.circuit().clone();
+                let old_to_new: Vec<Option<NodeId>> = (0..self.editable.circuit().node_count())
+                    .map(|i| Some(NodeId(i as u32)))
+                    .collect();
+                if self
+                    .editable
+                    .recompile_preserving_state(sprout_circ, &old_to_new)
+                    .is_ok()
+                {
+                    self.ledger.on_sprout(
+                        self.editable.circuit(),
+                        self.economy_config.split_code_tax,
+                        &old_to_new,
+                    );
+                    self.editable
+                        .economy_mut()
+                        .assign_sprout_debts(&self.ledger.node_debts);
+                    self.reset_changed_ports(&pre_sprout_circuit, &old_to_new);
+                    self.port_states[p].port_sprout_events += 1;
+                    self.sprout_events += 1;
+                    sprouted = true;
+                }
+            }
+
+            // 2b. Autonomous delay ring proposal under noise
+            if !sprouted
+                && let Some(ring_prop) = propose_autonomous_delay_ring_with_telemetry(
+                    &self.editable,
+                    &self.obs_window,
+                    &self.growth_config,
+                    &self.economy_config,
+                    budget,
+                    port_u16,
+                    &mut sprout_tel,
+                )
+            {
                 let pre_ring_circuit = self.editable.circuit().clone();
                 let old_to_new = ring_prop.old_to_new;
                 let ring_delay_nodes = ring_prop.ring_delay_nodes;
@@ -748,102 +700,17 @@ impl PredictorBaseline for ArkheLearner {
                     if ok_regs {
                         let _ = self.editable.set_registers(&regs);
                     }
-                    let changed_ports: Vec<usize> = (0..num_ports)
-                        .filter(|&q| {
-                            port_cone_changed(
-                                &pre_ring_circuit,
-                                self.editable.circuit(),
-                                &old_to_new,
-                                q as u16,
-                            )
-                        })
-                        .collect();
-                    for q in changed_ports {
-                        self.editable
-                            .economy_mut()
-                            .port_scorer_mut(q)
-                            .reset_predictor_counts();
-                        self.port_states[q].diagnostic_buffer.clear();
-                        self.port_states[q].ticks_since_last_check = 0;
-                    }
+                    self.reset_changed_ports(&pre_ring_circuit, &old_to_new);
                     self.ring_closure_events += 1;
-                    break;
+                    sprouted = true;
                 }
             }
 
-            // 2c. Reactive lag deepening search (§2.7)
-            // Evaluated only after observation window reaches steady-state 2 * W_diag,
-            // preserving autonomous delay-ring discovery for periodic limit cycles.
-            if self.obs_window.len() >= 2 * self.growth_config.diagnostic_window
-                && self.editable.circuit().node_count() < self.growth_config.max_nodes
-            {
-                let max_allowed_tau = (self.growth_config.diagnostic_window / 2).clamp(3, 32) as u8;
-                let mut tau = 6u8;
-                while tau <= max_allowed_tau {
-                    if let Ok(Some(sprout_circ)) = propose_sprout_with_telemetry(
-                        &self.editable,
-                        &self.obs_window,
-                        &self.port_states[p].diagnostic_buffer,
-                        &self.growth_config,
-                        &self.economy_config,
-                        budget,
-                        port_u16,
-                        tau,
-                        &mut sprout_tel,
-                    ) {
-                        let pre_sprout_circuit = self.editable.circuit().clone();
-                        let old_to_new: Vec<Option<NodeId>> =
-                            (0..self.editable.circuit().node_count())
-                                .map(|i| Some(NodeId(i as u32)))
-                                .collect();
-                        if self
-                            .editable
-                            .recompile_preserving_state(sprout_circ, &old_to_new)
-                            .is_ok()
-                        {
-                            self.ledger.on_sprout(
-                                self.editable.circuit(),
-                                self.economy_config.split_code_tax,
-                                &old_to_new,
-                            );
-                            self.editable
-                                .economy_mut()
-                                .assign_sprout_debts(&self.ledger.node_debts);
-                            let changed_ports: Vec<usize> = (0..num_ports)
-                                .filter(|&q| {
-                                    port_cone_changed(
-                                        &pre_sprout_circuit,
-                                        self.editable.circuit(),
-                                        &old_to_new,
-                                        q as u16,
-                                    )
-                                })
-                                .collect();
-                            for q in changed_ports {
-                                self.editable
-                                    .economy_mut()
-                                    .port_scorer_mut(q)
-                                    .reset_predictor_counts();
-                                self.port_states[q].diagnostic_buffer.clear();
-                                self.port_states[q].ticks_since_last_check = 0;
-                            }
-                            self.sprout_events += 1;
-                            sprouted = true;
-                            break;
-                        }
-                    }
-                    if tau == max_allowed_tau {
-                        break;
-                    }
-                    tau = (tau * 2).min(max_allowed_tau);
-                }
-                if !sprouted && tau >= max_allowed_tau {
-                    self.lag_horizon_exhausted += 1;
-                }
-            }
             self.sprout_blocked_max_nodes += sprout_tel.sprout_blocked_max_nodes;
             self.candidate_undecidable += sprout_tel.candidate_undecidable;
             self.candidate_list_truncated += sprout_tel.candidate_list_truncated;
+            self.lag_horizon_bound += sprout_tel.lag_horizon_bound;
+            self.ring_period_bound += sprout_tel.ring_period_bound;
 
             if sprouted {
                 break;

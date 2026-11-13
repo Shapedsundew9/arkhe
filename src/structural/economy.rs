@@ -67,6 +67,9 @@ const fn default_true() -> bool {
     true
 }
 
+/// Numerical floor on `1 - q` in the HorizonDerived mismatch-loss ceiling to prevent `log2(./0)`.
+pub const RESERVE_MISMATCH_DENOM_FLOOR: f64 = 1e-12;
+
 /// Policy governing metabolic reserve ceilings on mature nodes (§3.1.2).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub enum ReserveCap {
@@ -207,6 +210,8 @@ pub struct EconomyTick {
     pub clipped_nodes: usize,
     /// Total energy bits clipped by max_energy_reserve on this tick.
     pub clipped_bits: f64,
+    /// Number of mature nodes for which `1 - q` hit `RESERVE_MISMATCH_DENOM_FLOOR` on this tick.
+    pub mismatch_floored_nodes: usize,
 }
 
 /// Node-local reserves, port null models, and synchronous-register eligibility traces.
@@ -214,21 +219,26 @@ pub struct EconomyTick {
 pub struct EconomyState {
     config: EconomyConfig,
     width: Width,
+    observation_horizon: usize,
     nodes: Vec<NodeEconomy>,
     scorers: Vec<PointForecastScorer>,
     register_eligibility: Vec<Vec<f64>>,
 }
 
 impl EconomyState {
-    /// Creates energy state for `nodes`, `outputs`, and `registers`.
+    /// Creates energy state for `nodes`, `outputs`, `registers`, and unified observation horizon `W_obs`.
     pub fn new(
         config: EconomyConfig,
         width: Width,
         nodes: usize,
         outputs: usize,
         registers: usize,
+        observation_horizon: usize,
     ) -> Result<Self, EconomyError> {
         config.validate()?;
+        if observation_horizon == 0 {
+            return Err(EconomyError::InvalidConfig);
+        }
         let node_state = NodeEconomy {
             energy: config.initial_energy,
             juvenile_ticks: config.juvenile_ticks,
@@ -239,12 +249,19 @@ impl EconomyState {
         Ok(Self {
             config,
             width,
+            observation_horizon,
             nodes: vec![node_state; nodes],
             scorers: (0..outputs)
                 .map(|_| PointForecastScorer::new(width, config.null_model))
                 .collect(),
             register_eligibility: vec![vec![0.0; nodes]; registers],
         })
+    }
+
+    /// Unified observation horizon $W_{\text{obs}}$ in ticks used by HorizonDerived reserve capping.
+    #[must_use]
+    pub const fn observation_horizon(&self) -> usize {
+        self.observation_horizon
     }
 
     /// Economy settings.
@@ -376,6 +393,7 @@ impl EconomyState {
             new_node_count,
             self.scorers.len(),
             new_register_count,
+            self.observation_horizon,
         )?;
         remapped.scorers.clone_from(&self.scorers);
         for (old, mapped) in old_to_new_nodes.iter().enumerate() {
@@ -509,11 +527,13 @@ impl EconomyState {
         let mut next_energies = Vec::with_capacity(self.nodes.len());
         let mut clipped_nodes = 0usize;
         let mut clipped_bits = 0.0f64;
+        let mut mismatch_floored_nodes = 0usize;
         for (index, node) in self.nodes.iter().enumerate() {
             let unclipped = node.energy + delta[index];
             if !unclipped.is_finite() {
                 return Err(EconomyError::InvalidTickData);
             }
+            let mut node_floored = false;
             let (next_energy, clipped) = if node.juvenile_ticks > 0 {
                 (unclipped, 0.0)
             } else {
@@ -521,7 +541,7 @@ impl EconomyState {
                     ReserveCap::Uncapped => None,
                     ReserveCap::Fixed(cap) => Some(cap),
                     ReserveCap::HorizonDerived => {
-                        let w_obs = (self.config.juvenile_ticks as f64) + 128.0;
+                        let w_obs = self.observation_horizon as f64;
                         let mut drain_rate = 0.0;
                         for (port, ancestry) in port_ancestry.iter().enumerate() {
                             let total_ancestry: f64 = ancestry.iter().sum();
@@ -532,8 +552,15 @@ impl EconomyState {
                                     let q = scorer.q_hat();
                                     let p_null = 1.0 / (2.0f64.powi(i32::from(self.width.bits())));
                                     if q > p_null {
+                                        let one_minus_q = 1.0 - q;
+                                        let denom = if one_minus_q < RESERVE_MISMATCH_DENOM_FLOOR {
+                                            node_floored = true;
+                                            RESERVE_MISMATCH_DENOM_FLOOR
+                                        } else {
+                                            one_minus_q
+                                        };
                                         let mismatch_loss =
-                                            ((1.0 - p_null) / (1.0 - q).max(1e-12)).log2().max(0.0);
+                                            ((1.0 - p_null) / denom).log2().max(0.0);
                                         drain_rate += share * mismatch_loss;
                                     }
                                 }
@@ -552,6 +579,9 @@ impl EconomyState {
                     (unclipped, 0.0)
                 }
             };
+            if node_floored {
+                mismatch_floored_nodes += 1;
+            }
             if clipped > 0.0 {
                 clipped_nodes += 1;
                 clipped_bits += clipped;
@@ -577,6 +607,7 @@ impl EconomyState {
             starved_nodes,
             clipped_nodes,
             clipped_bits,
+            mismatch_floored_nodes,
         })
     }
 
@@ -626,6 +657,11 @@ impl EconomyState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structural::growth::{GrowthConfig, observation_horizon};
+
+    fn test_obs_horizon(config: &EconomyConfig) -> usize {
+        observation_horizon(config, &GrowthConfig::default())
+    }
 
     #[test]
     fn centered_reward_is_zero_at_the_null_probability_and_negative_on_mismatch() {
@@ -635,7 +671,8 @@ mod tests {
             reward_mode: RewardMode::CenteredSurprisal,
             ..EconomyConfig::default()
         };
-        let mut state = EconomyState::new(config, Width::BITS_2, 1, 1, 0).unwrap();
+        let mut state =
+            EconomyState::new(config, Width::BITS_2, 1, 1, 0, test_obs_horizon(&config)).unwrap();
         let baseline = state.scorers[0].null_model().probability(0);
         let reward = (1.0 - baseline) * -baseline.log2();
         assert!(reward.is_finite());
@@ -661,7 +698,15 @@ mod tests {
         let facts: Vec<u64> = (0..256).map(|_| rng.next_u64() & mask).collect();
         let preds: Vec<u64> = (0..256).map(|_| rng.next_u64() & mask).collect();
 
-        let mut economy = EconomyState::new(EconomyConfig::default(), width, 1, 1, 0).unwrap();
+        let mut economy = EconomyState::new(
+            EconomyConfig::default(),
+            width,
+            1,
+            1,
+            0,
+            test_obs_horizon(&EconomyConfig::default()),
+        )
+        .unwrap();
         let mut total_flux = 0.0f64;
         for (&p, &f) in preds.iter().zip(&facts) {
             let r = economy.observe_predictions(&[p], &[f]).unwrap();
@@ -692,7 +737,8 @@ mod tests {
             reserve_cap: ReserveCap::Uncapped,
             ..EconomyConfig::default()
         };
-        let mut economy = EconomyState::new(config, Width::BITS_1, 2, 1, 0).unwrap();
+        let mut economy =
+            EconomyState::new(config, Width::BITS_1, 2, 1, 0, test_obs_horizon(&config)).unwrap();
         let before: f64 = economy.nodes().iter().map(|node| node.energy).sum();
         let tick = economy
             .apply_tick(&[0.75], &[vec![1.0, 3.0]], &[0.02, 0.03])
@@ -708,7 +754,8 @@ mod tests {
             reserve_cap: ReserveCap::Uncapped,
             ..EconomyConfig::default()
         };
-        let mut economy = EconomyState::new(config, Width::BITS_1, 1, 1, 0).unwrap();
+        let mut economy =
+            EconomyState::new(config, Width::BITS_1, 1, 1, 0, test_obs_horizon(&config)).unwrap();
         let tick = economy.apply_tick(&[-1.0], &[vec![1.0]], &[1.0]).unwrap();
         assert_eq!(tick.node_delta, vec![0.0]);
         assert_eq!(economy.nodes()[0].juvenile_ticks, 1);
@@ -721,7 +768,8 @@ mod tests {
             reserve_cap: ReserveCap::Uncapped,
             ..EconomyConfig::default()
         };
-        let mut economy = EconomyState::new(config, Width::BITS_2, 2, 1, 1).unwrap();
+        let mut economy =
+            EconomyState::new(config, Width::BITS_2, 2, 1, 1, test_obs_horizon(&config)).unwrap();
         economy.set_register_eligibility(0, &[0.25, 0.75]).unwrap();
         economy
             .observe_predictions(&[1], &[2])
@@ -750,7 +798,8 @@ mod tests {
             reserve_cap: ReserveCap::Uncapped,
             ..EconomyConfig::default()
         };
-        let mut economy = EconomyState::new(config, Width::BITS_2, 3, 1, 0).unwrap();
+        let mut economy =
+            EconomyState::new(config, Width::BITS_2, 3, 1, 0, test_obs_horizon(&config)).unwrap();
         // Initially all zero weights
         assert_eq!(economy.activity(), vec![NodeActivity::default(); 3]);
 
@@ -790,7 +839,8 @@ mod tests {
             juvenile_ticks: 0,
             ..EconomyConfig::default()
         };
-        let mut economy = EconomyState::new(config, Width::BITS_2, 1, 1, 0).unwrap();
+        let mut economy =
+            EconomyState::new(config, Width::BITS_2, 1, 1, 0, test_obs_horizon(&config)).unwrap();
         let gamma = config.trace_discount;
         assert_eq!(economy.activity()[0].nonzero_weight, 0.0);
         assert_eq!(economy.activity()[0].non_one_weight, 0.0);
@@ -822,7 +872,8 @@ mod tests {
             reserve_cap: ReserveCap::Fixed(25.0),
             ..EconomyConfig::default()
         };
-        let mut economy = EconomyState::new(config, Width::BITS_1, 1, 1, 0).unwrap();
+        let mut economy =
+            EconomyState::new(config, Width::BITS_1, 1, 1, 0, test_obs_horizon(&config)).unwrap();
         assert_eq!(economy.nodes()[0].energy, 4.0);
         assert_eq!(economy.nodes()[0].juvenile_ticks, 128);
 
@@ -862,7 +913,8 @@ mod tests {
             reserve_cap: ReserveCap::HorizonDerived,
             ..EconomyConfig::default()
         };
-        let mut economy = EconomyState::new(config, Width::BITS_1, 1, 1, 0).unwrap();
+        let horizon = test_obs_horizon(&config);
+        let mut economy = EconomyState::new(config, Width::BITS_1, 1, 1, 0, horizon).unwrap();
         // Train scorer with 10 correct matches on 1-bit port
         for _ in 0..10 {
             let _ = economy.port_scorer_mut(0).observe(1, 1);
@@ -872,12 +924,18 @@ mod tests {
         let q = economy.scorers()[0].q_hat();
         let p_null = 0.5f64;
         let drain_loss = ((1.0 - p_null) / (1.0 - q)).log2();
-        let w_obs = 128.0f64;
-        let expected_cap = (w_obs * drain_loss).max(4.0);
+        let w_obs = horizon as f64;
+        let expected_cap = (w_obs * drain_loss).max(config.initial_energy);
 
         // Apply a huge reward 1000.0 bits
         let tick = economy.apply_tick(&[1000.0], &[vec![1.0]], &[0.0]).unwrap();
         assert_eq!(tick.clipped_nodes, 1);
         assert!((economy.nodes()[0].energy - expected_cap).abs() < 1e-6);
+
+        let custom_growth = GrowthConfig {
+            diagnostic_window: 32,
+            ..GrowthConfig::default()
+        };
+        assert_eq!(observation_horizon(&config, &custom_growth), 64);
     }
 }

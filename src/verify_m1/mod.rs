@@ -6,7 +6,7 @@ pub mod stats;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::BuildProvenance;
+use crate::config::{BuildProvenance, CliffCountersSummary};
 use crate::rng::SeedBank;
 use crate::structural::economy::EconomyConfig;
 use crate::structural::sensitivity::counterfactual_sensitivity;
@@ -15,9 +15,10 @@ use crate::substrate::{
 };
 
 pub use m1b::{
-    DEFAULT_M1B_HORIZON, M1CombinedBankReport, M1CombinedSummary, M1bBankReport, M1bGatePassCount,
-    M1bGateReport, M1bVerificationSummary, evaluate_m1_stage_gate, run_m1_combined_bank_evaluation,
-    run_m1_combined_verification, run_m1b_bank_evaluation, run_m1b_verification_suite,
+    CaseOutcome, DEFAULT_M1B_HORIZON, M1CombinedBankReport, M1CombinedSummary, M1bBankReport,
+    M1bGatePassCount, M1bGateReport, M1bVerificationSummary, OnlineCaseSummary,
+    evaluate_m1_stage_gate, run_m1_combined_bank_evaluation, run_m1_combined_verification,
+    run_m1b_bank_evaluation, run_m1b_verification_suite,
 };
 pub use panel::{CircuitClass, DEFAULT_HORIZON, PanelRun, run_panel_matrix};
 pub use stats::{
@@ -108,6 +109,9 @@ pub struct M1aBankReport {
     pub all_passed_banks: u32,
     /// Aggregated flux, code length, and per-node margin statistics by circuit class.
     pub class_stats: Vec<M1aClassStats>,
+    /// Aggregated cliff, bound, and guardrail telemetry across all evaluated banks and panel runs (§B3).
+    #[serde(default)]
+    pub cliff_counters: CliffCountersSummary,
 }
 
 impl M1aBankReport {
@@ -162,6 +166,9 @@ pub struct M1aPanelAggregate {
     pub min_accuracy: f64,
     /// Maximum credit paid to detour nodes after tick 0 across runs.
     pub max_detour_credit_after_tick0: f64,
+    /// Aggregated cliff, bound, and guardrail telemetry across matching runs (§B3).
+    #[serde(default)]
+    pub cliff_counters: CliffCountersSummary,
 }
 
 /// Structured report emitted by `verify-m1a`.
@@ -182,6 +189,9 @@ pub struct M1aVerificationSummary {
     pub panel: Vec<M1aPanelAggregate>,
     /// Whether every M1a gate passed.
     pub all_passed: bool,
+    /// Aggregated cliff, bound, and guardrail telemetry across all panel runs (§B3).
+    #[serde(default)]
+    pub cliff_counters: CliffCountersSummary,
 }
 
 /// Runs the fixed-structure M1a gates against the live circuit panel at the default horizon (1024 ticks).
@@ -283,6 +293,10 @@ pub fn evaluate_panel_runs(
                     .iter()
                     .map(|r| r.detour_credit_after_tick0)
                     .fold(0.0, f64::max);
+                let mut tuple_cliff = CliffCountersSummary::default();
+                for r in &matching {
+                    tuple_cliff.accumulate(&r.cliff_counters);
+                }
 
                 panel_aggregates.push(M1aPanelAggregate {
                     task: task.id.to_owned(),
@@ -299,9 +313,15 @@ pub fn evaluate_panel_runs(
                     mean_delta_l_null,
                     min_accuracy,
                     max_detour_credit_after_tick0,
+                    cliff_counters: tuple_cliff,
                 });
             }
         }
+    }
+
+    let mut total_cliff = CliffCountersSummary::default();
+    for r in runs {
+        total_cliff.accumulate(&r.cliff_counters);
     }
 
     M1aVerificationSummary {
@@ -312,6 +332,7 @@ pub fn evaluate_panel_runs(
         gates,
         panel: panel_aggregates,
         all_passed,
+        cliff_counters: total_cliff,
     }
 }
 
@@ -461,6 +482,11 @@ pub fn run_m1a_bank_evaluation(
         });
     }
 
+    let mut bank_cliff = CliffCountersSummary::default();
+    for r in &all_runs {
+        bank_cliff.accumulate(&r.cliff_counters);
+    }
+
     Ok(M1aBankReport {
         provenance: BuildProvenance::current(),
         seed_offset,
@@ -491,6 +517,7 @@ pub fn run_m1a_bank_evaluation(
         ],
         all_passed_banks,
         class_stats,
+        cliff_counters: bank_cliff,
     })
 }
 

@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::CliffCountersSummary;
 use crate::env::{FiniteStateGenerator, GeneratorConfig, NoiseModel, NoisyEnvironment};
 use crate::metrics::{NullModelKind, circuit_code_bits, null_calibrated_mdl_delta};
 use crate::rng::SeedBank;
@@ -113,6 +114,8 @@ pub struct PanelRun {
     pub min_node_margin: f64,
     /// Maximum node credit margin max_i (E_i(T) - E_init) at horizon end.
     pub max_node_margin: f64,
+    /// Cliff, bound, and guardrail telemetry counters observed on this panel run (§B3).
+    pub cliff_counters: CliffCountersSummary,
 }
 
 /// Helper building circuits from canonical Level-0 motifs.
@@ -841,6 +844,7 @@ pub fn run_panel_case(
     let mut max_conservation_error = 0.0f64;
     let mut detour_credit_after_tick0 = 0.0f64;
     let mut cumulative_flux = 0.0f64;
+    let mut cliff_counters = CliffCountersSummary::default();
 
     for t in 0..horizon {
         env.step_frame(&mut clean, &mut observed);
@@ -876,6 +880,9 @@ pub fn run_panel_case(
         }
 
         cumulative_flux += tick.economy.net_flux;
+        cliff_counters.reserve_clipped_count += tick.economy.clipped_nodes as u64;
+        cliff_counters.reserve_clipped_bits += tick.economy.clipped_bits;
+        cliff_counters.reserve_mismatch_floored += tick.economy.mismatch_floored_nodes as u64;
 
         if t >= 1 {
             for &node in &pc.detour_nodes {
@@ -963,6 +970,7 @@ pub fn run_panel_case(
         code_bits,
         min_node_margin,
         max_node_margin,
+        cliff_counters,
     })
 }
 

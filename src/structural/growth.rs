@@ -19,6 +19,22 @@ use crate::substrate::{
     Circuit, NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
 };
 
+/// Numerical tolerance for deterministic candidate $\Delta J$ tie-breaking.
+pub const MDL_TIE_BREAK_EPS: f64 = 1e-9;
+
+/// Bounded sensitivity sample count during autonomous delay-ring juvenile simulation.
+pub const RING_SIM_SENSITIVITY_SAMPLES: usize = 4;
+
+/// Maximum small nonzero constant literal enumerated unconditionally in motif generation
+/// (supplemented dynamically by any detected dominant `constant_offset`).
+pub const SMALL_CONST_CANDIDATE_CAP: u64 = 3;
+
+/// Derived unified observation horizon $W_{\text{obs}} = t_{\text{juv}} + 2 W_{\text{diag}}$ (ticks).
+#[must_use]
+pub const fn observation_horizon(economy: &EconomyConfig, growth: &GrowthConfig) -> usize {
+    (economy.juvenile_ticks as usize).saturating_add(growth.diagnostic_window.saturating_mul(2))
+}
+
 /// Growth thresholds and resource bounds used by an online M1 learner.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -31,8 +47,18 @@ pub struct GrowthConfig {
     pub mi_threshold_bits: f64,
     /// Minimum discrete exact-match gain over predicting residual zero.
     pub min_match_gain: usize,
-    /// Maximum number of live substrate nodes.
+    /// Maximum number of live substrate nodes (compute guardrail).
     pub max_nodes: usize,
+    /// Pre-registered upper bound on reactive causal input/output lags $\tau_{\max}$.
+    pub max_reactive_lag: u8,
+    /// Pre-registered cap on ranked passing candidate feature groups evaluated per sprout.
+    pub candidate_feature_cap: usize,
+    /// Pre-registered minimum autonomous delay-ring period.
+    pub min_ring_period: usize,
+    /// Pre-registered maximum autonomous delay-ring period.
+    pub max_ring_period: usize,
+    /// Counterfactual sensitivity sample budget per tick when $k > 4$ (exact below).
+    pub sensitivity_sample_count: usize,
 }
 
 impl Default for GrowthConfig {
@@ -43,12 +69,17 @@ impl Default for GrowthConfig {
             mi_threshold_bits: 0.05,
             min_match_gain: 4,
             max_nodes: 32,
+            max_reactive_lag: 3,
+            candidate_feature_cap: 6,
+            min_ring_period: 2,
+            max_ring_period: 6,
+            sensitivity_sample_count: 8,
         }
     }
 }
 
 impl GrowthConfig {
-    /// Returns whether all growth limits are usable.
+    /// Returns whether all growth limits and search bounds are usable.
     #[must_use]
     pub fn is_valid(self) -> bool {
         self.diagnostic_window >= 2
@@ -57,6 +88,11 @@ impl GrowthConfig {
             && self.mi_threshold_bits >= 0.0
             && self.min_match_gain > 0
             && self.max_nodes > 0
+            && self.max_reactive_lag >= 1
+            && self.candidate_feature_cap >= 1
+            && self.min_ring_period >= 2
+            && self.max_ring_period >= self.min_ring_period
+            && self.sensitivity_sample_count >= 1
     }
 }
 
@@ -95,7 +131,7 @@ pub struct ResidualDiagnostics {
     pub constant_offset: Option<(u64, usize)>,
     /// Whether all residuals are zero.
     pub zero_error: bool,
-    /// Mutual information between the residual and its lags 1 through 3.
+    /// Mutual information between the residual and its lags `1..=config.max_reactive_lag`.
     pub lagged_mutual_information_bits: Vec<f64>,
     /// Best singleton or pair candidate, selected deterministically.
     pub best_feature: Option<FeatureScore>,
@@ -112,14 +148,16 @@ pub struct ResidualDiagnostics {
 /// Telemetry counters for structural growth guardrails and search horizons.
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SproutTelemetry {
-    /// Count of sprout attempts blocked by max_nodes.
+    /// Count of sprout or ring proposals blocked by `max_nodes`.
     pub sprout_blocked_max_nodes: u64,
-    /// Count of rejected candidates whose required observation window exceeded obs_window.
+    /// Count of rejected candidates whose required observation window exceeded `obs_window`.
     pub candidate_undecidable: u64,
-    /// Count of candidate feature lists truncated by the candidate cap.
+    /// Count of candidate feature lists truncated by `candidate_feature_cap`.
     pub candidate_list_truncated: u64,
-    /// Count of diagnostic checks where lag horizon was exhausted without finding a passing candidate.
-    pub lag_horizon_exhausted: u64,
+    /// Count of diagnostic checks where `max_reactive_lag` excluded a predictive longer lag or yielded no motif.
+    pub lag_horizon_bound: u64,
+    /// Count of autonomous ring checks where `max_ring_period` excluded an MDL-improving longer ring.
+    pub ring_period_bound: u64,
 }
 
 /// Invalid or dimensionally inconsistent residual diagnostics input.
@@ -227,8 +265,9 @@ pub fn diagnose_residual(
         None
     };
 
-    let mut lagged_mutual_information_bits = Vec::with_capacity(3);
-    for lag in 1..=3 {
+    let max_lag = usize::from(config.max_reactive_lag);
+    let mut lagged_mutual_information_bits = Vec::with_capacity(max_lag);
+    for lag in 1..=max_lag {
         let count = residuals.len().saturating_sub(lag);
         if count == 0 {
             lagged_mutual_information_bits.push(0.0);
@@ -244,8 +283,11 @@ pub fn diagnose_residual(
             && s.match_gain >= config.min_match_gain
     });
     let total_passing = passing_candidates.clone().count();
-    let candidate_features: Vec<FeatureScore> = passing_candidates.take(6).cloned().collect();
-    let candidate_list_truncated = total_passing > 6;
+    let candidate_features: Vec<FeatureScore> = passing_candidates
+        .take(config.candidate_feature_cap)
+        .cloned()
+        .collect();
+    let candidate_list_truncated = total_passing > config.candidate_feature_cap;
 
     let growth_criterion_met = !zero_error
         && (constant_offset.is_some()
@@ -635,19 +677,8 @@ impl DiagnosticBuffer {
 
         for tau in 1..=max_tau {
             for c in 0..num_channels {
-                let mut values = Vec::with_capacity(len);
-                for t in 0..len {
-                    let win_idx = start_in_window + t;
-                    let lag_t = (win_idx as isize) - 1 - (tau as isize);
-                    let val = if lag_t >= 0 {
-                        obs_window.frames().get(lag_t as usize).map_or(0, |f| f[c])
-                    } else if lag_t == -1 {
-                        obs_window.prior_frame().get(c).copied().unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    values.push(val);
-                }
+                let values =
+                    lagged_boundary_values(obs_window, start_in_window, len, c, usize::from(tau));
                 features.push(ResidualFeature {
                     name: SourceFeature::LagIn {
                         channel: c as u16,
@@ -706,7 +737,31 @@ impl DiagnosticBuffer {
     }
 }
 
-/// Generates candidate motifs in canonical order from primary/secondary features (§4.3).
+fn lagged_boundary_values(
+    obs_window: &ObservationWindow,
+    start_in_window: usize,
+    len: usize,
+    channel: usize,
+    tau: usize,
+) -> Vec<u64> {
+    let mut values = Vec::with_capacity(len);
+    for t in 0..len {
+        let win_idx = start_in_window + t;
+        let lag_t = (win_idx as isize) - 1 - (tau as isize);
+        let val = if lag_t >= 0 {
+            obs_window
+                .frames()
+                .get(lag_t as usize)
+                .map_or(0, |f| f[channel])
+        } else if lag_t == -1 {
+            obs_window.prior_frame().get(channel).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        values.push(val);
+    }
+    values
+}
 #[must_use]
 pub fn generate_candidate_motifs(
     u1: &SourceFeature,
@@ -758,7 +813,7 @@ pub fn generate_candidate_motifs(
     }
 
     // 3. Constant-Loop & Shifted/Scaled Motifs
-    let max_c = width.mask().min(3);
+    let max_c = width.mask().min(SMALL_CONST_CANDIDATE_CAP);
     let mut constants = Vec::new();
     for c in 1..=max_c {
         constants.push(c);
@@ -1190,127 +1245,33 @@ pub fn propose_sprout(
         economy_config,
         budget,
         out_port,
-        3,
+        growth_config.max_reactive_lag,
         &mut SproutTelemetry::default(),
     )
 }
 
-/// Evaluates candidates from $\mathcal{K}(u_1, u_2)$ on `obs_window` with telemetry collection.
+/// Baseline performance summary over the replay window prior to candidate sprouting.
+struct BaselineReplayMetrics {
+    e_curr: usize,
+    e_const_mode: usize,
+    flux_curr: f64,
+    l_curr: f64,
+    j_curr: f64,
+    start_idx: usize,
+    eval_start_idx: usize,
+    w_replay: usize,
+    survivor_map: Vec<Option<NodeId>>,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn propose_sprout_with_telemetry(
+fn replay_current_baseline(
     editable: &EditableCircuit,
     obs_window: &ObservationWindow,
-    diag: &DiagnosticBuffer,
     growth_config: &GrowthConfig,
     economy_config: &EconomyConfig,
-    budget: &mut TickBudget,
     out_port: u16,
-    max_tau: u8,
-    telemetry: &mut SproutTelemetry,
-) -> Result<Option<Circuit>, GrowthError> {
-    let len = diag.len();
-    if len < growth_config.diagnostic_window {
-        return Ok(None);
-    }
-    let residuals: Vec<u64> = diag
-        .residuals
-        .iter()
-        .map(|f| f[usize::from(out_port)])
-        .collect();
-
-    let features = diag.build_signal_pool(
-        editable.circuit(),
-        obs_window,
-        out_port,
-        max_tau,
-        Some(editable.economy()),
-    );
-
-    let is_epoch_1 = !editable
-        .circuit()
-        .edges()
-        .iter()
-        .any(|edge| edge.dst == SignalSink::BoundaryOut(out_port));
-
-    let diagnostics = diagnose_residual(
-        editable.circuit().width(),
-        &residuals,
-        &features,
-        *growth_config,
-    )?;
-    if diagnostics.candidate_list_truncated {
-        telemetry.candidate_list_truncated += 1;
-    }
-    if diagnostics.zero_error || !diagnostics.growth_criterion_met {
-        return Ok(None);
-    }
-
-    let mut feature_pairs: Vec<(SourceFeature, Option<SourceFeature>)> = Vec::new();
-    if let Some(first) = diagnostics.candidate_features.first() {
-        let u1_name = &features[first.feature_indices[0]].name;
-        if let Some(u1) = SourceFeature::parse(u1_name) {
-            let u2 = if first.feature_indices.len() > 1 {
-                let u2_name = &features[first.feature_indices[1]].name;
-                SourceFeature::parse(u2_name)
-            } else {
-                diagnostics.secondary_feature.as_ref().and_then(|sec| {
-                    let u2_name = &features[sec.feature_indices[0]].name;
-                    SourceFeature::parse(u2_name)
-                })
-            };
-            feature_pairs.push((u1, u2));
-        }
-    }
-
-    for feat in &diagnostics.candidate_features {
-        let u1_name = &features[feat.feature_indices[0]].name;
-        if let Some(u1) = SourceFeature::parse(u1_name) {
-            let u2 = if feat.feature_indices.len() > 1 {
-                let u2_name = &features[feat.feature_indices[1]].name;
-                SourceFeature::parse(u2_name)
-            } else {
-                None
-            };
-            if !feature_pairs.contains(&(u1.clone(), u2.clone())) {
-                feature_pairs.push((u1, u2));
-            }
-        }
-    }
-
-    let num_channels = editable.circuit().num_inputs();
-    let mut candidates = Vec::new();
-    if feature_pairs.is_empty() {
-        if let Some((c_off, _)) = diagnostics.constant_offset {
-            let norm_c = editable.circuit().width().normalize(c_off);
-            if norm_c != 0 {
-                candidates.push(CandidateMotif::ConstLoop(norm_c));
-            }
-        }
-    } else {
-        for (u1_feat, u2_feat) in &feature_pairs {
-            let cands = generate_candidate_motifs(
-                u1_feat,
-                u2_feat.as_ref(),
-                editable.circuit().width(),
-                diagnostics.constant_offset,
-                is_epoch_1,
-                num_channels,
-            );
-            for c in cands {
-                if !candidates.contains(&c) {
-                    candidates.push(c);
-                }
-            }
-        }
-    }
-
-    if candidates.is_empty() {
-        if !feature_pairs.is_empty() {
-            telemetry.lag_horizon_exhausted += 1;
-        }
-        return Ok(None);
-    }
-
+    is_epoch_1: bool,
+) -> BaselineReplayMetrics {
     let w_diag = growth_config.diagnostic_window;
     let w_replay = obs_window.len().min(2 * w_diag);
     let start_idx = obs_window.len() - w_replay;
@@ -1381,163 +1342,462 @@ pub fn propose_sprout_with_telemetry(
         .map(|i| Some(NodeId(i as u32)))
         .collect();
 
-    let mut best_proposal: Option<(Circuit, usize, f64, f64, bool)> = None;
+    BaselineReplayMetrics {
+        e_curr,
+        e_const_mode,
+        flux_curr,
+        l_curr,
+        j_curr,
+        start_idx,
+        eval_start_idx,
+        w_replay,
+        survivor_map,
+    }
+}
 
-    for motif in &candidates {
-        if !budget.try_consume(w_replay as u64) {
-            break;
+enum SproutMotifOutcome {
+    Accepted {
+        circuit: Circuit,
+        e_cand: usize,
+        j_cand: f64,
+        delta_flux: f64,
+        is_1_op: bool,
+    },
+    BlockedMaxNodes,
+    Rejected,
+    OutOfBudget,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_sprout_motif(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    out_port: u16,
+    motif: &CandidateMotif,
+    is_epoch_1: bool,
+    baseline: &BaselineReplayMetrics,
+    budget: Option<&mut TickBudget>,
+    mut telemetry: Option<&mut SproutTelemetry>,
+) -> SproutMotifOutcome {
+    let w_diag = growth_config.diagnostic_window;
+    let mut staged = editable.circuit().clone();
+    materialize_candidate(&mut staged, motif, out_port);
+    if staged.nodes().len() > growth_config.max_nodes {
+        if let Some(tel) = telemetry.as_deref_mut() {
+            tel.sprout_blocked_max_nodes += 1;
         }
-        let mut staged = editable.circuit().clone();
-        if staged.nodes().len() >= growth_config.max_nodes {
-            telemetry.sprout_blocked_max_nodes += 1;
-            continue;
+        return SproutMotifOutcome::BlockedMaxNodes;
+    }
+    if let Some(b) = budget
+        && !b.try_consume(baseline.w_replay as u64)
+    {
+        return SproutMotifOutcome::OutOfBudget;
+    }
+    let Ok(staged_compiled) = staged.compile() else {
+        return SproutMotifOutcome::Rejected;
+    };
+
+    let mut state = ScalarState::new(&staged_compiled);
+    if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(baseline.start_idx)
+        && snap_epoch == editable.structure_epoch()
+    {
+        let reg_map = register_mapping(
+            editable.circuit(),
+            &staged,
+            editable.compiled(),
+            &staged_compiled,
+            &baseline.survivor_map,
+        );
+        let mut staged_regs = state.registers().to_vec();
+        for (old_r, new_r) in reg_map.iter().enumerate() {
+            if let Some(nr) = new_r
+                && old_r < snap_regs.len()
+            {
+                staged_regs[*nr] = snap_regs[old_r];
+            }
         }
-        materialize_candidate(&mut staged, motif, out_port);
-        if staged.nodes().len() > growth_config.max_nodes {
-            telemetry.sprout_blocked_max_nodes += 1;
-            continue;
-        }
-        let Ok(staged_compiled) = staged.compile() else {
-            continue;
+        let _ = state.set_registers(&staged_compiled, &staged_regs);
+    }
+    let mut pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
+    let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
+
+    let mut e_cand = 0usize;
+    let mut flux_cand = 0.0;
+    let mut pos_flux_cand = 0.0;
+
+    for i in 0..baseline.w_replay {
+        let idx = baseline.start_idx + i;
+        let input = if idx == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[idx - 1]
         };
+        let truth = &obs_window.frames()[idx];
+        if state.step(&staged_compiled, input, &mut pred).is_err() {
+            return SproutMotifOutcome::Rejected;
+        }
+        let p_cand = pred[usize::from(out_port)];
+        let p_truth = truth[usize::from(out_port)];
+        let reward = score_with_reward_mode(
+            &mut scorer,
+            economy_config.reward_mode,
+            staged.width(),
+            p_cand,
+            p_truth,
+        );
+        if idx >= baseline.eval_start_idx {
+            if p_cand != p_truth {
+                e_cand += 1;
+            }
+            flux_cand += reward;
+            pos_flux_cand += reward.max(0.0);
+        }
+    }
 
-        let mut state = ScalarState::new(&staged_compiled);
-        if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(start_idx)
-            && snap_epoch == editable.structure_epoch()
-        {
-            let reg_map = register_mapping(
-                editable.circuit(),
-                &staged,
-                editable.compiled(),
-                &staged_compiled,
-                &survivor_map,
-            );
-            let mut staged_regs = state.registers().to_vec();
-            for (old_r, new_r) in reg_map.iter().enumerate() {
-                if let Some(nr) = new_r
-                    && old_r < snap_regs.len()
+    if e_cand + growth_config.min_match_gain > baseline.e_curr {
+        return SproutMotifOutcome::Rejected;
+    }
+    if is_epoch_1 && !matches!(motif, CandidateMotif::ConstLoop(_)) {
+        let is_binary_eqz_scaffold = staged.width() == Width::BITS_1
+            && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(_)));
+        if is_binary_eqz_scaffold {
+            if e_cand > baseline.e_const_mode.saturating_add(1) {
+                return SproutMotifOutcome::Rejected;
+            }
+        } else if e_cand + growth_config.min_match_gain > baseline.e_const_mode {
+            return SproutMotifOutcome::Rejected;
+        }
+    }
+
+    let delta_flux = flux_cand - baseline.flux_curr;
+    let l_cand = circuit_code_bits_with_tax(&staged, 0, economy_config.split_code_tax);
+    let delta_l_sprout = (l_cand - baseline.l_curr).max(0.0);
+    let is_1_op = is_epoch_1
+        && matches!(
+            motif,
+            CandidateMotif::Identity(SourceFeature::BoundaryIn(_))
+                | CandidateMotif::Eqz(SourceFeature::BoundaryIn(_))
+        );
+
+    if economy_config.juvenile_ticks > 0 && delta_l_sprout > 0.0 {
+        let projected_survival = economy_config.initial_energy
+            + (economy_config.juvenile_ticks as f64 / w_diag as f64) * pos_flux_cand;
+        if projected_survival <= delta_l_sprout {
+            let delta_i_hat = pos_flux_cand / (w_diag as f64);
+            if delta_i_hat > 0.0 {
+                let w_star = delta_l_sprout / delta_i_hat;
+                if w_star > (obs_window.capacity() as f64)
+                    && let Some(tel) = telemetry
                 {
-                    staged_regs[*nr] = snap_regs[old_r];
+                    tel.candidate_undecidable += 1;
                 }
             }
-            let _ = state.set_registers(&staged_compiled, &staged_regs);
+            return SproutMotifOutcome::Rejected;
         }
-        let mut pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
-        let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
+    }
 
-        let mut e_cand = 0usize;
-        let mut flux_cand = 0.0;
-        let mut pos_flux_cand = 0.0;
-        let mut replay_ok = true;
+    let allow_eqz_scaffold_zero_flux = is_1_op
+        && staged.width() == Width::BITS_1
+        && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(_)))
+        && pos_flux_cand > delta_l_sprout;
+    if delta_flux <= 0.0 && !allow_eqz_scaffold_zero_flux {
+        return SproutMotifOutcome::Rejected;
+    }
 
-        for i in 0..w_replay {
-            let idx = start_idx + i;
-            let input = if idx == 0 {
-                obs_window.prior_frame()
+    let j_cand = l_cand + facts_code_bits(staged.width(), w_diag as u64, e_cand as u64);
+
+    if !is_epoch_1 && j_cand >= baseline.j_curr && e_cand > 0 {
+        return SproutMotifOutcome::Rejected;
+    }
+
+    SproutMotifOutcome::Accepted {
+        circuit: staged,
+        e_cand,
+        j_cand,
+        delta_flux,
+        is_1_op,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn has_admissible_deeper_lag(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    residuals: &[u64],
+    max_tau: u8,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    out_port: u16,
+    is_epoch_1: bool,
+    baseline: &BaselineReplayMetrics,
+) -> bool {
+    let probe_max = (growth_config.diagnostic_window / 2)
+        .min(obs_window.len().saturating_sub(1))
+        .min(usize::from(u8::MAX));
+    let start_tau = usize::from(max_tau).saturating_add(1);
+    if start_tau > probe_max || residuals.is_empty() {
+        return false;
+    }
+    let width = editable.circuit().width();
+    let norm_residuals: Vec<u64> = residuals.iter().map(|&v| width.normalize(v)).collect();
+    let len = norm_residuals.len();
+    let start_in_window = obs_window.len().saturating_sub(len);
+    let num_channels = editable.circuit().num_inputs();
+    for tau in start_tau..=probe_max {
+        for c in 0..usize::from(num_channels) {
+            let values = lagged_boundary_values(obs_window, start_in_window, len, c, tau);
+            let feat = [ResidualFeature {
+                name: String::new(),
+                values,
+            }];
+            let score = score_feature_group(&norm_residuals, &feat, &[0], width);
+            if score.corrected_mutual_information_bits > growth_config.mi_threshold_bits
+                && score.match_gain >= growth_config.min_match_gain
+            {
+                let u1 = SourceFeature::LagIn {
+                    channel: c as u16,
+                    tau: tau as u8,
+                };
+                for motif in
+                    generate_candidate_motifs(&u1, None, width, None, is_epoch_1, num_channels)
+                {
+                    if matches!(
+                        evaluate_sprout_motif(
+                            editable,
+                            obs_window,
+                            growth_config,
+                            economy_config,
+                            out_port,
+                            &motif,
+                            is_epoch_1,
+                            baseline,
+                            None,
+                            None,
+                        ),
+                        SproutMotifOutcome::Accepted { .. }
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Evaluates candidates from $\mathcal{K}(u_1, u_2)$ on `obs_window` with telemetry collection.
+#[allow(clippy::too_many_arguments)]
+pub fn propose_sprout_with_telemetry(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    max_tau: u8,
+    telemetry: &mut SproutTelemetry,
+) -> Result<Option<Circuit>, GrowthError> {
+    let len = diag.len();
+    if len < growth_config.diagnostic_window {
+        return Ok(None);
+    }
+    let residuals: Vec<u64> = diag
+        .residuals
+        .iter()
+        .map(|f| f[usize::from(out_port)])
+        .collect();
+
+    let features = diag.build_signal_pool(
+        editable.circuit(),
+        obs_window,
+        out_port,
+        max_tau,
+        Some(editable.economy()),
+    );
+
+    let is_epoch_1 = !editable
+        .circuit()
+        .edges()
+        .iter()
+        .any(|edge| edge.dst == SignalSink::BoundaryOut(out_port));
+
+    let diagnostics = diagnose_residual(
+        editable.circuit().width(),
+        &residuals,
+        &features,
+        *growth_config,
+    )?;
+    if diagnostics.candidate_list_truncated {
+        telemetry.candidate_list_truncated += 1;
+    }
+    if diagnostics.zero_error {
+        return Ok(None);
+    }
+
+    let baseline = replay_current_baseline(
+        editable,
+        obs_window,
+        growth_config,
+        economy_config,
+        out_port,
+        is_epoch_1,
+    );
+
+    if !diagnostics.growth_criterion_met {
+        if has_admissible_deeper_lag(
+            editable,
+            obs_window,
+            &residuals,
+            max_tau,
+            growth_config,
+            economy_config,
+            out_port,
+            is_epoch_1,
+            &baseline,
+        ) {
+            telemetry.lag_horizon_bound += 1;
+        }
+        return Ok(None);
+    }
+
+    let mut feature_pairs: Vec<(SourceFeature, Option<SourceFeature>)> = Vec::new();
+    if let Some(first) = diagnostics.candidate_features.first() {
+        let u1_name = &features[first.feature_indices[0]].name;
+        if let Some(u1) = SourceFeature::parse(u1_name) {
+            let u2 = if first.feature_indices.len() > 1 {
+                let u2_name = &features[first.feature_indices[1]].name;
+                SourceFeature::parse(u2_name)
             } else {
-                &obs_window.frames()[idx - 1]
+                diagnostics.secondary_feature.as_ref().and_then(|sec| {
+                    let u2_name = &features[sec.feature_indices[0]].name;
+                    SourceFeature::parse(u2_name)
+                })
             };
-            let truth = &obs_window.frames()[idx];
-            if state.step(&staged_compiled, input, &mut pred).is_err() {
-                replay_ok = false;
-                break;
+            feature_pairs.push((u1, u2));
+        }
+    }
+
+    for feat in &diagnostics.candidate_features {
+        let u1_name = &features[feat.feature_indices[0]].name;
+        if let Some(u1) = SourceFeature::parse(u1_name) {
+            let u2 = if feat.feature_indices.len() > 1 {
+                let u2_name = &features[feat.feature_indices[1]].name;
+                SourceFeature::parse(u2_name)
+            } else {
+                None
+            };
+            if !feature_pairs.contains(&(u1.clone(), u2.clone())) {
+                feature_pairs.push((u1, u2));
             }
-            let p_cand = pred[usize::from(out_port)];
-            let p_truth = truth[usize::from(out_port)];
-            let reward = score_with_reward_mode(
-                &mut scorer,
-                economy_config.reward_mode,
-                staged.width(),
-                p_cand,
-                p_truth,
+        }
+    }
+
+    let num_channels = editable.circuit().num_inputs();
+    let mut candidates = Vec::new();
+    if feature_pairs.is_empty() {
+        if let Some((c_off, _)) = diagnostics.constant_offset {
+            let norm_c = editable.circuit().width().normalize(c_off);
+            if norm_c != 0 {
+                candidates.push(CandidateMotif::ConstLoop(norm_c));
+            }
+        }
+    } else {
+        for (u1_feat, u2_feat) in &feature_pairs {
+            let cands = generate_candidate_motifs(
+                u1_feat,
+                u2_feat.as_ref(),
+                editable.circuit().width(),
+                diagnostics.constant_offset,
+                is_epoch_1,
+                num_channels,
             );
-            if idx >= eval_start_idx {
-                if p_cand != p_truth {
-                    e_cand += 1;
+            for c in cands {
+                if !candidates.contains(&c) {
+                    candidates.push(c);
                 }
-                flux_cand += reward;
-                pos_flux_cand += reward.max(0.0);
             }
         }
-        if !replay_ok {
-            continue;
-        }
+    }
 
-        if e_cand + growth_config.min_match_gain > e_curr {
-            continue;
+    if candidates.is_empty() {
+        if !feature_pairs.is_empty() {
+            telemetry.lag_horizon_bound += 1;
         }
-        if is_epoch_1 && !matches!(motif, CandidateMotif::ConstLoop(_)) {
-            let is_binary_eqz_scaffold = staged.width() == Width::BITS_1
-                && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(_)));
-            if is_binary_eqz_scaffold {
-                if e_cand > e_const_mode.saturating_add(1) {
-                    continue;
-                }
-            } else if e_cand + growth_config.min_match_gain > e_const_mode {
-                continue;
-            }
-        }
+        return Ok(None);
+    }
 
-        let delta_flux = flux_cand - flux_curr;
-        let l_cand = circuit_code_bits_with_tax(&staged, 0, economy_config.split_code_tax);
-        let delta_l_sprout = (l_cand - l_curr).max(0.0);
-        let is_1_op = is_epoch_1
-            && matches!(
-                motif,
-                CandidateMotif::Identity(SourceFeature::BoundaryIn(_))
-                    | CandidateMotif::Eqz(SourceFeature::BoundaryIn(_))
-            );
-
-        if economy_config.juvenile_ticks > 0 && delta_l_sprout > 0.0 {
-            let projected_survival = economy_config.initial_energy
-                + (economy_config.juvenile_ticks as f64 / w_diag as f64) * pos_flux_cand;
-            if projected_survival <= delta_l_sprout {
-                let delta_i_hat = pos_flux_cand / (w_diag as f64);
-                if delta_i_hat > 0.0 {
-                    let w_star = delta_l_sprout / delta_i_hat;
-                    if w_star > (obs_window.capacity() as f64) {
-                        telemetry.candidate_undecidable += 1;
+    let mut best_proposal: Option<(Circuit, usize, f64, f64, bool)> = None;
+    let mut blocked_by_max_nodes = 0u64;
+    for motif in &candidates {
+        match evaluate_sprout_motif(
+            editable,
+            obs_window,
+            growth_config,
+            economy_config,
+            out_port,
+            motif,
+            is_epoch_1,
+            &baseline,
+            Some(budget),
+            Some(telemetry),
+        ) {
+            SproutMotifOutcome::Accepted {
+                circuit: staged,
+                e_cand,
+                j_cand,
+                delta_flux,
+                is_1_op,
+            } => {
+                let is_better = match &best_proposal {
+                    None => true,
+                    Some((_, _, prev_j, prev_flux, prev_1_op)) => {
+                        if is_epoch_1 {
+                            if is_1_op && !prev_1_op {
+                                true
+                            } else if !is_1_op && *prev_1_op {
+                                false
+                            } else {
+                                j_cand < *prev_j
+                                    || ((j_cand - *prev_j).abs() < MDL_TIE_BREAK_EPS
+                                        && delta_flux > *prev_flux)
+                            }
+                        } else {
+                            j_cand < *prev_j
+                                || ((j_cand - *prev_j).abs() < MDL_TIE_BREAK_EPS
+                                    && delta_flux > *prev_flux)
+                        }
                     }
-                }
-                continue;
-            }
-        }
-
-        let allow_eqz_scaffold_zero_flux = is_1_op
-            && staged.width() == Width::BITS_1
-            && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(_)))
-            && pos_flux_cand > delta_l_sprout;
-        if delta_flux <= 0.0 && !allow_eqz_scaffold_zero_flux {
-            continue;
-        }
-
-        let j_cand = l_cand + facts_code_bits(staged.width(), w_diag as u64, e_cand as u64);
-
-        if !is_epoch_1 && j_cand >= j_curr && e_cand > 0 {
-            continue;
-        }
-
-        let is_better = match &best_proposal {
-            None => true,
-            Some((_, _, prev_j, prev_flux, prev_1_op)) => {
-                if is_epoch_1 {
-                    if is_1_op && !prev_1_op {
-                        true
-                    } else if !is_1_op && *prev_1_op {
-                        false
-                    } else {
-                        j_cand < *prev_j
-                            || ((j_cand - *prev_j).abs() < 1e-9 && delta_flux > *prev_flux)
-                    }
-                } else {
-                    j_cand < *prev_j || ((j_cand - *prev_j).abs() < 1e-9 && delta_flux > *prev_flux)
+                };
+                if is_better {
+                    best_proposal = Some((staged, e_cand, j_cand, delta_flux, is_1_op));
                 }
             }
-        };
-
-        if is_better {
-            best_proposal = Some((staged, e_cand, j_cand, delta_flux, is_1_op));
+            SproutMotifOutcome::BlockedMaxNodes => {
+                blocked_by_max_nodes += 1;
+            }
+            SproutMotifOutcome::Rejected => {}
+            SproutMotifOutcome::OutOfBudget => break,
         }
+    }
+
+    if best_proposal.is_none()
+        && blocked_by_max_nodes == 0
+        && has_admissible_deeper_lag(
+            editable,
+            obs_window,
+            &residuals,
+            max_tau,
+            growth_config,
+            economy_config,
+            out_port,
+            is_epoch_1,
+            &baseline,
+        )
+    {
+        telemetry.lag_horizon_bound += 1;
     }
 
     Ok(best_proposal.map(|(lat, _, _, _, _)| lat))
@@ -1684,7 +1944,7 @@ fn simulate_ring_juvenile_survival(
             sim.state(),
             seed_bank,
             step_idx as u64,
-            4,
+            RING_SIM_SENSITIVITY_SAMPLES,
         ) else {
             return false;
         };
@@ -1732,7 +1992,7 @@ fn simulate_ring_juvenile_survival(
     true
 }
 
-/// Evaluates autonomous delay-ring candidates of period $p \in 2..=6$ under channel noise (§4.5).
+/// Evaluates autonomous delay-ring candidates in `min_ring_period..=max_ring_period` under channel noise (§4.5).
 pub fn propose_autonomous_delay_ring(
     editable: &EditableCircuit,
     obs_window: &ObservationWindow,
@@ -1740,6 +2000,185 @@ pub fn propose_autonomous_delay_ring(
     economy_config: &EconomyConfig,
     budget: &mut TickBudget,
     out_port: u16,
+) -> Option<AutonomousRingProposal> {
+    propose_autonomous_delay_ring_with_telemetry(
+        editable,
+        obs_window,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        &mut SproutTelemetry::default(),
+    )
+}
+
+enum RingPeriodOutcome {
+    Accepted(AutonomousRingProposal, f64),
+    Rejected,
+    OutOfBudget,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_ring_period(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    out_port: u16,
+    p: usize,
+    e_curr: usize,
+    flux_curr: f64,
+    l_curr: f64,
+    j_curr: f64,
+    budget: Option<&mut TickBudget>,
+    telemetry: Option<&mut SproutTelemetry>,
+) -> RingPeriodOutcome {
+    let w_replay = obs_window.len();
+    let out_idx = usize::from(out_port);
+    let mut residue_counts = vec![BTreeMap::<u64, usize>::new(); p];
+    for (i, frame) in obs_window.frames().iter().enumerate() {
+        let global_t = obs_window.start_tick() + (i as u64);
+        let r = (global_t as usize) % p;
+        *residue_counts[r].entry(frame[out_idx]).or_default() += 1;
+    }
+    let mut mu = vec![0u64; p];
+    for (r, counts) in residue_counts.iter().enumerate() {
+        let mode = counts
+            .iter()
+            .max_by(|(s1, c1), (s2, c2)| c1.cmp(c2).then_with(|| s2.cmp(s1)))
+            .map(|(&s, _)| s)
+            .unwrap_or(0);
+        mu[r] = mode;
+    }
+    if mu.iter().all(|&v| v == mu[0]) {
+        return RingPeriodOutcome::Rejected;
+    }
+
+    let (staged, old_to_new, ring_delay_nodes) =
+        build_autonomous_ring_circuit(editable.circuit(), p, &mu, out_port);
+    if staged.nodes().len() > growth_config.max_nodes {
+        if let Some(tel) = telemetry {
+            tel.sprout_blocked_max_nodes += 1;
+        }
+        return RingPeriodOutcome::Rejected;
+    }
+    if let Some(b) = budget
+        && !b.try_consume(w_replay as u64)
+    {
+        return RingPeriodOutcome::OutOfBudget;
+    }
+
+    let Ok(staged_compiled) = staged.compile() else {
+        return RingPeriodOutcome::Rejected;
+    };
+
+    let mut state = ScalarState::new(&staged_compiled);
+    let mut regs = state.registers().to_vec();
+    if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(0)
+        && snap_epoch == editable.structure_epoch()
+    {
+        let reg_map = register_mapping(
+            editable.circuit(),
+            &staged,
+            editable.compiled(),
+            &staged_compiled,
+            &old_to_new,
+        );
+        for (old_r, new_r) in reg_map.iter().enumerate() {
+            if let Some(nr) = new_r
+                && old_r < snap_regs.len()
+            {
+                regs[*nr] = snap_regs[old_r];
+            }
+        }
+    }
+    let start_tick = obs_window.start_tick();
+    let mut reg_map_ok = true;
+    for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
+        let Some(reg_idx) = explicit_delay_register_index(&staged, delay_node) else {
+            reg_map_ok = false;
+            break;
+        };
+        regs[reg_idx] = mu[((start_tick as usize) + (p - 1 - j)) % p];
+    }
+    if !reg_map_ok || state.set_registers(&staged_compiled, &regs).is_err() {
+        return RingPeriodOutcome::Rejected;
+    }
+
+    let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
+    let mut e_ring = 0usize;
+    let mut flux_ring = 0.0;
+    let mut pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
+
+    for (i, frame) in obs_window.frames().iter().enumerate() {
+        let input = if i == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[i - 1]
+        };
+        if state.step(&staged_compiled, input, &mut pred).is_err() {
+            return RingPeriodOutcome::Rejected;
+        }
+        if pred[out_idx] != frame[out_idx] {
+            e_ring += 1;
+        }
+        flux_ring += score_with_reward_mode(
+            &mut scorer,
+            economy_config.reward_mode,
+            staged.width(),
+            pred[out_idx],
+            frame[out_idx],
+        );
+    }
+
+    if e_ring + growth_config.min_match_gain > e_curr {
+        return RingPeriodOutcome::Rejected;
+    }
+    if flux_ring <= flux_curr {
+        return RingPeriodOutcome::Rejected;
+    }
+    let l_ring = circuit_code_bits_with_tax(&staged, 0, economy_config.split_code_tax);
+    let j_ring = l_ring + facts_code_bits(staged.width(), w_replay as u64, e_ring as u64);
+    if j_ring >= j_curr {
+        return RingPeriodOutcome::Rejected;
+    }
+
+    if !simulate_ring_juvenile_survival(
+        editable,
+        obs_window,
+        &staged,
+        &old_to_new,
+        &ring_delay_nodes,
+        p,
+        &mu,
+        out_port,
+        l_curr,
+        economy_config,
+    ) {
+        return RingPeriodOutcome::Rejected;
+    }
+
+    RingPeriodOutcome::Accepted(
+        AutonomousRingProposal {
+            candidate_circuit: staged,
+            old_to_new,
+            ring_delay_nodes,
+            period: p,
+            template: mu,
+        },
+        j_ring,
+    )
+}
+
+/// Evaluates autonomous delay-ring candidates with bound/guardrail telemetry (§4.5).
+pub fn propose_autonomous_delay_ring_with_telemetry(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    telemetry: &mut SproutTelemetry,
 ) -> Option<AutonomousRingProposal> {
     if editable.circuit().wire_delay() != WireDelayMode::Combinational {
         return None;
@@ -1819,147 +2258,56 @@ pub fn propose_autonomous_delay_ring(
 
     let mut best_ring: Option<(AutonomousRingProposal, f64)> = None;
 
-    for p in 2..=6usize {
-        if editable.circuit().node_count() + p + 1 > growth_config.max_nodes {
-            continue;
-        }
-        let mut residue_counts = vec![BTreeMap::<u64, usize>::new(); p];
-        for (i, frame) in obs_window.frames().iter().enumerate() {
-            let global_t = obs_window.start_tick() + (i as u64);
-            let r = (global_t as usize) % p;
-            *residue_counts[r].entry(frame[out_idx]).or_default() += 1;
-        }
-        let mut mu = vec![0u64; p];
-        for (r, counts) in residue_counts.iter().enumerate() {
-            let mode = counts
-                .iter()
-                .max_by(|(s1, c1), (s2, c2)| c1.cmp(c2).then_with(|| s2.cmp(s1)))
-                .map(|(&s, _)| s)
-                .unwrap_or(0);
-            mu[r] = mode;
-        }
-        if mu.iter().all(|&v| v == mu[0]) {
-            continue;
-        }
-
-        if !budget.try_consume(w_replay as u64) {
-            break;
-        }
-
-        let (staged, old_to_new, ring_delay_nodes) =
-            build_autonomous_ring_circuit(editable.circuit(), p, &mu, out_port);
-        if staged.nodes().len() > growth_config.max_nodes {
-            continue;
-        }
-        let Ok(staged_compiled) = staged.compile() else {
-            continue;
-        };
-
-        let mut state = ScalarState::new(&staged_compiled);
-        let mut regs = state.registers().to_vec();
-        if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(0)
-            && snap_epoch == editable.structure_epoch()
-        {
-            let reg_map = register_mapping(
-                editable.circuit(),
-                &staged,
-                editable.compiled(),
-                &staged_compiled,
-                &old_to_new,
-            );
-            for (old_r, new_r) in reg_map.iter().enumerate() {
-                if let Some(nr) = new_r
-                    && old_r < snap_regs.len()
-                {
-                    regs[*nr] = snap_regs[old_r];
-                }
-            }
-        }
-        let start_tick = obs_window.start_tick();
-        let mut reg_map_ok = true;
-        for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
-            let Some(reg_idx) = explicit_delay_register_index(&staged, delay_node) else {
-                reg_map_ok = false;
-                break;
-            };
-            regs[reg_idx] = mu[((start_tick as usize) + (p - 1 - j)) % p];
-        }
-        if !reg_map_ok || state.set_registers(&staged_compiled, &regs).is_err() {
-            continue;
-        }
-
-        let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
-        let mut e_ring = 0usize;
-        let mut flux_ring = 0.0;
-        let mut pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
-
-        let mut replay_ok = true;
-        for (i, frame) in obs_window.frames().iter().enumerate() {
-            let input = if i == 0 {
-                obs_window.prior_frame()
-            } else {
-                &obs_window.frames()[i - 1]
-            };
-            if state.step(&staged_compiled, input, &mut pred).is_err() {
-                replay_ok = false;
-                break;
-            }
-            if pred[out_idx] != frame[out_idx] {
-                e_ring += 1;
-            }
-            flux_ring += score_with_reward_mode(
-                &mut scorer,
-                economy_config.reward_mode,
-                staged.width(),
-                pred[out_idx],
-                frame[out_idx],
-            );
-        }
-        if !replay_ok {
-            continue;
-        }
-
-        if e_ring + growth_config.min_match_gain > e_curr {
-            continue;
-        }
-        if flux_ring <= flux_curr {
-            continue;
-        }
-        let l_ring = circuit_code_bits_with_tax(&staged, 0, economy_config.split_code_tax);
-        let j_ring = l_ring + facts_code_bits(staged.width(), w_replay as u64, e_ring as u64);
-        if j_ring >= j_curr {
-            continue;
-        }
-
-        if !simulate_ring_juvenile_survival(
+    for p in growth_config.min_ring_period..=growth_config.max_ring_period {
+        match evaluate_ring_period(
             editable,
             obs_window,
-            &staged,
-            &old_to_new,
-            &ring_delay_nodes,
-            p,
-            &mu,
-            out_port,
-            l_curr,
+            growth_config,
             economy_config,
+            out_port,
+            p,
+            e_curr,
+            flux_curr,
+            l_curr,
+            j_curr,
+            Some(budget),
+            Some(telemetry),
         ) {
-            continue;
+            RingPeriodOutcome::Accepted(prop, j_ring) => {
+                if best_ring
+                    .as_ref()
+                    .is_none_or(|(_, best_j)| j_ring < *best_j)
+                {
+                    best_ring = Some((prop, j_ring));
+                }
+            }
+            RingPeriodOutcome::Rejected => {}
+            RingPeriodOutcome::OutOfBudget => break,
         }
+    }
 
-        if best_ring
-            .as_ref()
-            .is_none_or(|(_, best_j)| j_ring < *best_j)
+    if best_ring.is_none() {
+        let probe_ceiling = (w_diag / 2).max(growth_config.max_ring_period);
+        for p in (2..growth_config.min_ring_period)
+            .chain((growth_config.max_ring_period + 1)..=probe_ceiling)
         {
-            best_ring = Some((
-                AutonomousRingProposal {
-                    candidate_circuit: staged,
-                    old_to_new,
-                    ring_delay_nodes,
-                    period: p,
-                    template: mu,
-                },
-                j_ring,
-            ));
+            if let RingPeriodOutcome::Accepted(..) = evaluate_ring_period(
+                editable,
+                obs_window,
+                growth_config,
+                economy_config,
+                out_port,
+                p,
+                e_curr,
+                flux_curr,
+                l_curr,
+                j_curr,
+                None,
+                None,
+            ) {
+                telemetry.ring_period_bound += 1;
+                break;
+            }
         }
     }
 
@@ -2098,6 +2446,7 @@ mod tests {
                 mi_threshold_bits: 0.05,
                 min_match_gain: 4,
                 max_nodes: 32,
+                ..GrowthConfig::default()
             };
 
             let mut editable = EditableCircuit::new(circuit, economy_config).unwrap();
@@ -2280,5 +2629,244 @@ mod tests {
             0,
         );
         assert!(circuit.compile().is_ok());
+    }
+
+    #[test]
+    fn search_bound_telemetry_detects_lag_horizon_candidate_cap_and_ring_period() {
+        // 1. LagHorizonBound: port 1 depends on BoundaryIn(0) at lag tau = 5 (> max_reactive_lag = 3).
+        let mut lag_obs = ObservationWindow::new(2, 192);
+        let mut diag = DiagnosticBuffer::new(64);
+        let mut hist = Vec::new();
+        let mut state_rng = 0x1234_5678_9abc_def0u64;
+        for t in 0..128usize {
+            state_rng = state_rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let x = (state_rng >> 62) % 4;
+            hist.push(x);
+            let truth1 = if t >= 6 { hist[t - 6] } else { 0 };
+            let frame = [x, truth1];
+            let prev = if t == 0 {
+                [0, 0]
+            } else {
+                [hist[t - 1], if t >= 7 { hist[t - 7] } else { 0 }]
+            };
+            lag_obs.push_frame(&frame);
+            if t >= 64 {
+                diag.push_frame(&prev, &frame, &[0, 0], &frame, &[], &[]);
+            }
+        }
+        let circuit2 = Circuit::new(Width::BITS_2, 2, 2, WireDelayMode::Combinational);
+        let circuit = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let econ = EconomyConfig::default();
+        let growth_lag = GrowthConfig {
+            diagnostic_window: 64,
+            min_match_gain: 4,
+            mi_threshold_bits: 0.05,
+            max_reactive_lag: 3,
+            ..GrowthConfig::default()
+        };
+        let editable_lag = EditableCircuit::new(circuit2.clone(), econ).unwrap();
+        let mut budget = TickBudget::new(100_000);
+        let mut tel_lag = SproutTelemetry::default();
+        let prop_lag = propose_sprout_with_telemetry(
+            &editable_lag,
+            &lag_obs,
+            &diag,
+            &growth_lag,
+            &econ,
+            &mut budget,
+            1,
+            growth_lag.max_reactive_lag,
+            &mut tel_lag,
+        )
+        .unwrap();
+        assert!(prop_lag.is_none());
+        assert_eq!(tel_lag.lag_horizon_bound, 1);
+
+        // Uncorrelated noise residual must NOT emit LagHorizonBound.
+        use crate::rng::StreamDomain;
+        use rand_core::Rng;
+        let mut rng_in = SeedBank::new(101).stream(StreamDomain::GeneratorInit);
+        let mut rng_truth = SeedBank::new(202).stream(StreamDomain::ChannelNoise { channel: 0 });
+        let mut noise_diag = DiagnosticBuffer::new(64);
+        let mut noise_obs = ObservationWindow::new(1, 192);
+        let mut prev_in = 0u64;
+        for t in 0..128u64 {
+            let in_sym = rng_in.next_u64() % 4;
+            let truth = rng_truth.next_u64() % 4;
+            noise_obs.push_frame(&[truth]);
+            if t >= 64 {
+                noise_diag.push_frame(&[prev_in], &[truth], &[0], &[truth], &[], &[]);
+            }
+            prev_in = in_sym;
+        }
+        let editable = EditableCircuit::new(circuit.clone(), econ).unwrap();
+        let mut tel_noise = SproutTelemetry::default();
+        let prop_noise = propose_sprout_with_telemetry(
+            &editable,
+            &noise_obs,
+            &noise_diag,
+            &growth_lag,
+            &econ,
+            &mut budget,
+            0,
+            growth_lag.max_reactive_lag,
+            &mut tel_noise,
+        )
+        .unwrap();
+        assert!(prop_noise.is_none());
+        assert_eq!(tel_noise.lag_horizon_bound, 0);
+
+        // CandidateListTruncated with multiple correlated inputs & small candidate_feature_cap.
+        let mut cap_obs = ObservationWindow::new(2, 64);
+        let mut cap_diag = DiagnosticBuffer::new(32);
+        for t in 0..32u64 {
+            let x = t % 4;
+            cap_obs.push_frame(&[x, x]);
+            cap_diag.push_frame(&[x, x], &[x, x], &[0, 0], &[x, x], &[], &[]);
+        }
+        let editable2 = EditableCircuit::new(circuit2, econ).unwrap();
+        let growth_cap = GrowthConfig {
+            diagnostic_window: 32,
+            min_match_gain: 4,
+            mi_threshold_bits: 0.05,
+            candidate_feature_cap: 2,
+            ..GrowthConfig::default()
+        };
+        let mut tel_cap = SproutTelemetry::default();
+        let _ = propose_sprout_with_telemetry(
+            &editable2,
+            &cap_obs,
+            &cap_diag,
+            &growth_cap,
+            &econ,
+            &mut budget,
+            0,
+            growth_cap.max_reactive_lag,
+            &mut tel_cap,
+        )
+        .unwrap();
+        assert_eq!(tel_cap.candidate_list_truncated, 1);
+
+        // RingPeriodBound: clean period-7 cycle exceeds max_ring_period = 6.
+        let seq7 = [0u64, 1, 2, 3, 1, 2, 0];
+        let econ_ring = EconomyConfig {
+            initial_energy: 10.0,
+            juvenile_ticks: 64,
+            split_code_tax: true,
+            ..EconomyConfig::default()
+        };
+        let growth_ring = GrowthConfig {
+            diagnostic_window: 64,
+            min_match_gain: 4,
+            min_ring_period: 2,
+            max_ring_period: 6,
+            ..GrowthConfig::default()
+        };
+        let mut ring_obs = ObservationWindow::new(1, observation_horizon(&econ_ring, &growth_ring));
+        for t in 0..128usize {
+            let sym = seq7[t % 7];
+            ring_obs.push_frame(&[sym]);
+        }
+        let editable_ring = EditableCircuit::new(circuit, econ_ring).unwrap();
+        let mut tel_ring = SproutTelemetry::default();
+        let prop_ring = propose_autonomous_delay_ring_with_telemetry(
+            &editable_ring,
+            &ring_obs,
+            &growth_ring,
+            &econ_ring,
+            &mut budget,
+            0,
+            &mut tel_ring,
+        );
+        assert!(prop_ring.is_none());
+        assert_eq!(tel_ring.ring_period_bound, 1);
+    }
+
+    #[test]
+    fn b4_max_nodes_guardrail_counts_once_without_wasting_budget() {
+        let mut obs = ObservationWindow::new(1, 32);
+        let mut diag = DiagnosticBuffer::new(16);
+        for t in 0..16u64 {
+            let x = t % 4;
+            let res = 1u64;
+            obs.push_frame(&[x]);
+            diag.push_frame(&[x], &[x], &[0], &[res], &[], &[]);
+        }
+        let econ = EconomyConfig::default();
+        let mut one_node = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let tap = one_node.add_node(Primitive::Delay { init: 0 });
+        one_node.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: tap, port: 0 },
+        );
+        one_node.connect(
+            SignalSource::NodeOut { node: tap, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+        let editable_one = EditableCircuit::new(one_node, econ).unwrap();
+
+        let growth = GrowthConfig {
+            diagnostic_window: 16,
+            min_match_gain: 4,
+            mi_threshold_bits: 0.01,
+            max_nodes: 1,
+            ..GrowthConfig::default()
+        };
+        let initial_budget = 500u64;
+        let mut budget = TickBudget::new(initial_budget);
+        let mut tel = SproutTelemetry::default();
+        let prop = propose_sprout_with_telemetry(
+            &editable_one,
+            &obs,
+            &diag,
+            &growth,
+            &econ,
+            &mut budget,
+            0,
+            growth.max_reactive_lag,
+            &mut tel,
+        )
+        .unwrap();
+        assert!(prop.is_none());
+        assert_eq!(tel.sprout_blocked_max_nodes, 1);
+        assert_eq!(budget.remaining(), initial_budget);
+
+        // Ring proposal blocked by max_nodes also consumes zero replay budget and counts once per admissible mu period.
+        let econ_ring = EconomyConfig {
+            initial_energy: 10.0,
+            juvenile_ticks: 32,
+            ..EconomyConfig::default()
+        };
+        let growth_ring = GrowthConfig {
+            diagnostic_window: 32,
+            min_match_gain: 4,
+            max_nodes: 2,
+            min_ring_period: 2,
+            max_ring_period: 4,
+            ..GrowthConfig::default()
+        };
+        let mut ring_obs = ObservationWindow::new(1, observation_horizon(&econ_ring, &growth_ring));
+        for t in 0..64u64 {
+            ring_obs.push_frame(&[t % 2]);
+        }
+        let empty = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let editable_empty = EditableCircuit::new(empty, econ_ring).unwrap();
+        let mut ring_budget = TickBudget::new(initial_budget);
+        let mut tel_ring = SproutTelemetry::default();
+        let ring_prop = propose_autonomous_delay_ring_with_telemetry(
+            &editable_empty,
+            &ring_obs,
+            &growth_ring,
+            &econ_ring,
+            &mut ring_budget,
+            0,
+            &mut tel_ring,
+        );
+        assert!(ring_prop.is_none());
+        // Periods 2, 3, 4 each yield a non-constant template and require p + 1 >= 3 nodes (> max_nodes = 2).
+        assert_eq!(tel_ring.sprout_blocked_max_nodes, 3);
+        assert_eq!(ring_budget.remaining(), initial_budget);
     }
 }

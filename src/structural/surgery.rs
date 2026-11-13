@@ -64,16 +64,32 @@ pub struct EditableCircuit {
 }
 
 impl EditableCircuit {
-    /// Builds an editable circuit with fresh scalar and metabolic state.
+    /// Builds an editable circuit with default growth configuration for observation horizon sizing.
     pub fn new(circuit: Circuit, economy_config: EconomyConfig) -> Result<Self, SurgeryError> {
+        Self::new_with_growth(
+            circuit,
+            economy_config,
+            &crate::structural::growth::GrowthConfig::default(),
+        )
+    }
+
+    /// Builds an editable circuit with fresh scalar and metabolic state tied to `growth_config`.
+    pub fn new_with_growth(
+        circuit: Circuit,
+        economy_config: EconomyConfig,
+        growth_config: &crate::structural::growth::GrowthConfig,
+    ) -> Result<Self, SurgeryError> {
         let compiled = circuit.compile()?;
         let state = ScalarState::new(&compiled);
+        let obs_horizon =
+            crate::structural::growth::observation_horizon(&economy_config, growth_config);
         let economy = EconomyState::new(
             economy_config,
             circuit.width(),
             circuit.node_count(),
             usize::from(circuit.num_outputs()),
             compiled.total_registers(),
+            obs_horizon,
         )?;
         Ok(Self {
             circuit,

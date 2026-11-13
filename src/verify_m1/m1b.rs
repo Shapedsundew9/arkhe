@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::baselines::run_prequential_harness;
 use crate::config::{
-    BaselineConfig, BudgetConfig, BuildProvenance, CONFIG_SCHEMA_VERSION, EnvironmentConfig,
-    ExperimentConfig, SubstrateConfig, compute_ground_truth_yardstick,
+    BaselineConfig, BudgetConfig, BuildProvenance, CONFIG_SCHEMA_VERSION, CliffCountersSummary,
+    EnvironmentConfig, ExperimentConfig, RunReport, SubstrateConfig,
+    compute_ground_truth_yardstick,
 };
 use crate::env::{GeneratorConfig, NoiseModel, NoisyEnvironment};
 use crate::metrics::Scorecard;
@@ -30,15 +31,46 @@ pub const DEFAULT_M1B_HORIZON: u64 = 2000;
 
 static TMP_NONCE: AtomicU64 = AtomicU64::new(1);
 
+/// Per-case outcome classification under pre-registered guardrail semantics (§B3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaseOutcome {
+    /// Case passed its functional check with zero compute-guardrail bindings.
+    Passed,
+    /// Case failed its functional check.
+    Failed,
+    /// Case hit a compute guardrail (`max_nodes`) and is excluded from passing (§2.0.1).
+    Excluded,
+}
+
+/// Per-case cliff, bound, and guardrail telemetry summary for M1b online runs (§B3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OnlineCaseSummary {
+    /// Unique case identifier.
+    pub label: String,
+    /// Final case classification (`Excluded` whenever a guardrail bound).
+    pub outcome: CaseOutcome,
+    /// Observed cliff, bound, and guardrail counters for this case.
+    pub cliff_counters: CliffCountersSummary,
+}
+
 /// Individual gate outcome report for M1b.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct M1bGateReport {
     /// Gate identifier (e.g. "G1B.1").
     pub gate: String,
-    /// Whether all checks for this gate passed.
+    /// Whether all checks for this gate passed and zero cases were excluded by guardrails.
     pub passed: bool,
     /// Total cases or seeds evaluated.
     pub cases: usize,
+    /// Count of cases excluded because a compute guardrail bound (§B3).
+    #[serde(default)]
+    pub excluded_cases: usize,
+    /// Aggregated cliff, bound, and guardrail counters across this gate's runs (§B3).
+    #[serde(default)]
+    pub cliff_counters: CliffCountersSummary,
+    /// Per-case outcome and telemetry breakdown (§B3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub case_summaries: Vec<OnlineCaseSummary>,
     /// Failure explanations, if any.
     pub failures: Vec<String>,
 }
@@ -56,6 +88,12 @@ pub struct M1bVerificationSummary {
     pub horizon: u64,
     /// Results for gates G1B.1 through G1B.4.
     pub gates: Vec<M1bGateReport>,
+    /// Total cases excluded by compute guardrails across all gates (§B3).
+    #[serde(default)]
+    pub excluded_cases: usize,
+    /// Aggregated cliff, bound, and guardrail counters across all online M1b runs (§B3).
+    #[serde(default)]
+    pub cliff_counters: CliffCountersSummary,
     /// Whether all M1b gates passed.
     pub all_passed: bool,
 }
@@ -88,6 +126,12 @@ pub struct M1bBankReport {
     pub gate_passes: Vec<M1bGatePassCount>,
     /// Number of banks in which all four M1b gates passed.
     pub all_passed_banks: u32,
+    /// Total cases excluded by compute guardrails across all banks (§B3).
+    #[serde(default)]
+    pub excluded_cases: usize,
+    /// Aggregated cliff, bound, and guardrail counters across all banks (§B3).
+    #[serde(default)]
+    pub cliff_counters: CliffCountersSummary,
     /// Diagnostic failure messages from any failed bank (empty when all pass).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub failures: Vec<String>,
@@ -154,6 +198,81 @@ impl OnlineRunAudit {
             budget_respected,
             max_nodes_respected,
         }
+    }
+}
+
+/// Classifies an online case outcome, enforcing §2.0.1 exclusion when a guardrail binds.
+#[must_use]
+pub const fn classify_case_outcome(
+    functional_pass: bool,
+    cliff_counters: &CliffCountersSummary,
+) -> CaseOutcome {
+    if cliff_counters.guardrail_bound() {
+        CaseOutcome::Excluded
+    } else if functional_pass {
+        CaseOutcome::Passed
+    } else {
+        CaseOutcome::Failed
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_online_case(
+    label: impl Into<String>,
+    learner: &ArkheLearner,
+    scorecard: &Scorecard,
+    max_eval_ticks: u64,
+    functional_pass: bool,
+    audits: &mut Vec<OnlineRunAudit>,
+    case_summaries: &mut Vec<OnlineCaseSummary>,
+    gate_cliff_counters: &mut CliffCountersSummary,
+    failures: &mut Vec<String>,
+) -> CaseOutcome {
+    let label = label.into();
+    let telemetry = learner.telemetry();
+    let cliff_counters = CliffCountersSummary::from(&telemetry);
+    audits.push(OnlineRunAudit::record(
+        label.clone(),
+        learner,
+        scorecard,
+        max_eval_ticks,
+    ));
+    gate_cliff_counters.accumulate(&cliff_counters);
+    let outcome = classify_case_outcome(functional_pass, &cliff_counters);
+    if outcome == CaseOutcome::Excluded {
+        failures.push(format!(
+            "{label}: compute guardrail bound (sprout_blocked_max_nodes={}); case marked Excluded",
+            cliff_counters.sprout_blocked_max_nodes
+        ));
+    }
+    case_summaries.push(OnlineCaseSummary {
+        label,
+        outcome,
+        cliff_counters,
+    });
+    outcome
+}
+
+fn finalize_m1b_gate_report(
+    gate: &str,
+    cases: usize,
+    failures: Vec<String>,
+    cliff_counters: CliffCountersSummary,
+    case_summaries: Vec<OnlineCaseSummary>,
+) -> M1bGateReport {
+    let excluded_cases = case_summaries
+        .iter()
+        .filter(|c| c.outcome == CaseOutcome::Excluded)
+        .count();
+    let passed = failures.is_empty() && excluded_cases == 0;
+    M1bGateReport {
+        gate: gate.to_owned(),
+        passed,
+        cases,
+        excluded_cases,
+        cliff_counters,
+        case_summaries,
+        failures,
     }
 }
 
@@ -283,9 +402,13 @@ pub fn run_m1b_bank_evaluation(
     let mut gate_counts = [0u32; 4];
     let mut all_passed_banks = 0u32;
     let mut failures = Vec::new();
+    let mut total_cliff = CliffCountersSummary::default();
+    let mut total_excluded = 0usize;
 
     for (b_idx, summary) in bank_summaries.into_iter().enumerate() {
         let summary = summary.expect("bank summary computed");
+        total_cliff.accumulate(&summary.cliff_counters);
+        total_excluded += summary.excluded_cases;
         for (g_idx, g) in summary.gates.iter().enumerate().take(4) {
             if g.passed {
                 gate_counts[g_idx] += 1;
@@ -322,6 +445,8 @@ pub fn run_m1b_bank_evaluation(
         horizon,
         gate_passes,
         all_passed_banks,
+        excluded_cases: total_excluded,
+        cliff_counters: total_cliff,
         failures,
     })
 }
@@ -387,64 +512,30 @@ pub fn run_m1b_verification_suite(
     let seeds = seeds.max(1);
     let mut online_audits = Vec::new();
 
-    let mut g1_failures = Vec::new();
-    let (g1_passed, g1_cases) = verify_gate_g1b1(
-        seed_offset,
-        seeds,
-        horizon,
-        &mut online_audits,
-        &mut g1_failures,
-    );
-
-    let mut g2_failures = Vec::new();
-    let (g2_passed, g2_cases) = verify_gate_g1b2(
-        seed_offset,
-        seeds,
-        horizon,
-        &mut online_audits,
-        &mut g2_failures,
-    );
-
-    let mut g4_failures = Vec::new();
-    let (g4_passed, g4_cases) = verify_gate_g1b4(
-        seed_offset,
-        seeds,
-        horizon,
-        &mut online_audits,
-        &mut g4_failures,
-    );
+    let g1_report = verify_gate_g1b1(seed_offset, seeds, horizon, &mut online_audits);
+    let g2_report = verify_gate_g1b2(seed_offset, seeds, horizon, &mut online_audits);
+    let g4_report = verify_gate_g1b4(seed_offset, seeds, horizon, &mut online_audits);
 
     let mut g3_failures = Vec::new();
     let (g3_passed, g3_cases) = verify_gate_g1b3(&online_audits, &mut g3_failures);
+    let g3_report = M1bGateReport {
+        gate: "G1B.3".to_owned(),
+        passed: g3_passed,
+        cases: g3_cases,
+        excluded_cases: 0,
+        cliff_counters: CliffCountersSummary::default(),
+        case_summaries: Vec::new(),
+        failures: g3_failures,
+    };
 
-    let gates = vec![
-        M1bGateReport {
-            gate: "G1B.1".to_owned(),
-            passed: g1_passed,
-            cases: g1_cases,
-            failures: g1_failures,
-        },
-        M1bGateReport {
-            gate: "G1B.2".to_owned(),
-            passed: g2_passed,
-            cases: g2_cases,
-            failures: g2_failures,
-        },
-        M1bGateReport {
-            gate: "G1B.3".to_owned(),
-            passed: g3_passed,
-            cases: g3_cases,
-            failures: g3_failures,
-        },
-        M1bGateReport {
-            gate: "G1B.4".to_owned(),
-            passed: g4_passed,
-            cases: g4_cases,
-            failures: g4_failures,
-        },
-    ];
-
-    let all_passed = gates.iter().all(|g| g.passed);
+    let gates = vec![g1_report, g2_report, g3_report, g4_report];
+    let mut total_cliff = CliffCountersSummary::default();
+    let mut excluded_cases = 0usize;
+    for gate in &gates {
+        total_cliff.accumulate(&gate.cliff_counters);
+        excluded_cases += gate.excluded_cases;
+    }
+    let all_passed = gates.iter().all(|g| g.passed) && excluded_cases == 0;
 
     M1bVerificationSummary {
         provenance: BuildProvenance::current(),
@@ -452,6 +543,8 @@ pub fn run_m1b_verification_suite(
         seeds_tested: seeds,
         horizon,
         gates,
+        excluded_cases,
+        cliff_counters: total_cliff,
         all_passed,
     }
 }
@@ -462,8 +555,7 @@ fn verify_gate_g1b1(
     seeds: u32,
     horizon: u64,
     audits: &mut Vec<OnlineRunAudit>,
-    failures: &mut Vec<String>,
-) -> (bool, usize) {
+) -> M1bGateReport {
     let tasks = [
         (
             Width::BITS_1,
@@ -500,6 +592,9 @@ fn verify_gate_g1b1(
 
     let min_pass = ((seeds as f64) * 0.95).ceil() as u32;
     let mut cases = 0usize;
+    let mut failures = Vec::new();
+    let mut case_summaries = Vec::new();
+    let mut gate_cliff = CliffCountersSummary::default();
 
     for (width, gen_cfg, task_name) in tasks {
         let mut seeds_passed = 0u32;
@@ -525,15 +620,9 @@ fn verify_gate_g1b1(
 
             let scorecard =
                 run_prequential_harness(&mut env, &mut learner, horizon, 500, 50_000, None, None);
-            audits.push(OnlineRunAudit::record(
-                format!("G1B.1:{task_name}:seed={master_seed}"),
-                &learner,
-                &scorecard,
-                50_000,
-            ));
 
             let snaps = learner.epoch_snapshots();
-            if snaps.len() >= 3 {
+            let functional_pass = if snaps.len() >= 3 {
                 let l0 = snaps[0].kt_loss_bits_per_symbol;
                 let l1 = snaps[1].kt_loss_bits_per_symbol;
                 let l2 = snaps[2].kt_loss_bits_per_symbol;
@@ -546,9 +635,24 @@ fn verify_gate_g1b1(
                 let c3 = learner.starvation_prune_events() == 0;
                 let c4 = ((hr1 - hr2) - mi).abs() <= 0.05;
 
-                if c1 && c2 && c3 && c4 {
-                    seeds_passed += 1;
-                }
+                c1 && c2 && c3 && c4
+            } else {
+                false
+            };
+
+            if record_online_case(
+                format!("G1B.1:{task_name}:seed={master_seed}"),
+                &learner,
+                &scorecard,
+                50_000,
+                functional_pass,
+                audits,
+                &mut case_summaries,
+                &mut gate_cliff,
+                &mut failures,
+            ) == CaseOutcome::Passed
+            {
+                seeds_passed += 1;
             }
         }
 
@@ -559,7 +663,7 @@ fn verify_gate_g1b1(
         }
     }
 
-    (failures.is_empty(), cases)
+    finalize_m1b_gate_report("G1B.1", cases, failures, gate_cliff, case_summaries)
 }
 
 struct FixedReactiveEchoBaseline {
@@ -672,10 +776,12 @@ fn verify_gate_g1b2(
     seeds: u32,
     horizon: u64,
     audits: &mut Vec<OnlineRunAudit>,
-    failures: &mut Vec<String>,
-) -> (bool, usize) {
+) -> M1bGateReport {
     let min_pass = ((seeds as f64) * 0.90).ceil() as u32;
     let mut cases = 0usize;
+    let mut failures = Vec::new();
+    let mut case_summaries = Vec::new();
+    let mut gate_cliff = CliffCountersSummary::default();
 
     // (a) Noiseless cases
     // 1. Silent/constant streams: final_node_count == 0 and 0 sprouts on 100% of runs
@@ -709,7 +815,10 @@ fn verify_gate_g1b2(
                     None,
                     None,
                 );
-                audits.push(OnlineRunAudit::record(
+                let functional_pass = learner.editable().circuit().node_count() == 0
+                    && learner.sprout_events() == 0
+                    && learner.ring_closure_events() == 0;
+                if record_online_case(
                     format!(
                         "G1B.2a:Constant({val}):k={}:seed={master_seed}",
                         width.bits()
@@ -717,10 +826,12 @@ fn verify_gate_g1b2(
                     &learner,
                     &scorecard,
                     50_000,
-                ));
-                if learner.editable().circuit().node_count() == 0
-                    && learner.sprout_events() == 0
-                    && learner.ring_closure_events() == 0
+                    functional_pass,
+                    audits,
+                    &mut case_summaries,
+                    &mut gate_cliff,
+                    &mut failures,
+                ) == CaseOutcome::Passed
                 {
                     zero_count += 1;
                 }
@@ -799,13 +910,19 @@ fn verify_gate_g1b2(
             .unwrap();
             let scorecard =
                 run_prequential_harness(&mut env, &mut learner, horizon, 500, 50_000, None, None);
-            audits.push(OnlineRunAudit::record(
+            let functional_pass = scorecard.post_transient_clean_mismatches == 0;
+            if record_online_case(
                 format!("G1B.2a:{name}:seed={master_seed}"),
                 &learner,
                 &scorecard,
                 50_000,
-            ));
-            if scorecard.post_transient_clean_mismatches == 0 {
+                functional_pass,
+                audits,
+                &mut case_summaries,
+                &mut gate_cliff,
+                &mut failures,
+            ) == CaseOutcome::Passed
+            {
                 clean_pass += 1;
             }
         }
@@ -862,7 +979,15 @@ fn verify_gate_g1b2(
                     gt.epsilon_machine.as_ref(),
                     None,
                 );
-                audits.push(OnlineRunAudit::record(
+                let halt_ok = learner.editable().circuit().node_count() == 0
+                    && learner.sprout_events() == 0
+                    && learner.starvation_prune_events() == 0
+                    && learner.ring_closure_events() == 0;
+                let regret_ok = scorecard
+                    .paired_regret_bits_per_symbol
+                    .is_some_and(|regret| regret <= 0.025);
+                let functional_pass = halt_ok && (val != 0 || regret_ok);
+                let outcome = record_online_case(
                     format!(
                         "G1B.2b:NoisyConstant({val}):k={}:seed={master_seed}",
                         width.bits()
@@ -870,21 +995,19 @@ fn verify_gate_g1b2(
                     &learner,
                     &scorecard,
                     50_000,
-                ));
-
-                if learner.editable().circuit().node_count() == 0
-                    && learner.sprout_events() == 0
-                    && learner.starvation_prune_events() == 0
-                    && learner.ring_closure_events() == 0
-                {
-                    halt_pass += 1;
-                }
-                if val == 0
-                    && scorecard
-                        .paired_regret_bits_per_symbol
-                        .is_some_and(|regret| regret <= 0.025)
-                {
-                    regret_pass += 1;
+                    functional_pass,
+                    audits,
+                    &mut case_summaries,
+                    &mut gate_cliff,
+                    &mut failures,
+                );
+                if outcome != CaseOutcome::Excluded {
+                    if halt_ok {
+                        halt_pass += 1;
+                    }
+                    if val == 0 && regret_ok {
+                        regret_pass += 1;
+                    }
                 }
             }
 
@@ -977,18 +1100,25 @@ fn verify_gate_g1b2(
                 gt.epsilon_machine.as_ref(),
                 None,
             );
-            audits.push(OnlineRunAudit::record(
+            let regret_ok = scorecard
+                .paired_regret_bits_per_symbol
+                .is_some_and(|regret| regret <= 0.025);
+            if let Some(regret) = scorecard.paired_regret_bits_per_symbol {
+                arkhe_regrets.push(regret);
+            }
+            if record_online_case(
                 format!("G1B.2b:{label}:seed={master_seed}"),
                 &learner,
                 &scorecard,
                 50_000,
-            ));
-
-            if let Some(regret) = scorecard.paired_regret_bits_per_symbol {
-                if regret <= 0.025 {
-                    regret_pass += 1;
-                }
-                arkhe_regrets.push(regret);
+                regret_ok,
+                audits,
+                &mut case_summaries,
+                &mut gate_cliff,
+                &mut failures,
+            ) == CaseOutcome::Passed
+            {
+                regret_pass += 1;
             }
 
             let echo_seed_bank = SeedBank::new(master_seed);
@@ -1027,7 +1157,7 @@ fn verify_gate_g1b2(
         }
     }
 
-    (failures.is_empty(), cases)
+    finalize_m1b_gate_report("G1B.2", cases, failures, gate_cliff, case_summaries)
 }
 
 /// Gate G1B.3: Live invariant, phase, & budget integrity across all online runs + 500-edit stress battery.
@@ -1154,10 +1284,12 @@ fn verify_gate_g1b4(
     seeds: u32,
     horizon: u64,
     audits: &mut Vec<OnlineRunAudit>,
-    failures: &mut Vec<String>,
-) -> (bool, usize) {
+) -> M1bGateReport {
     let min_pass = ((seeds as f64) * 0.90).ceil() as u32;
     let mut cases = 0usize;
+    let mut failures = Vec::new();
+    let mut case_summaries = Vec::new();
+    let mut gate_cliff = CliffCountersSummary::default();
 
     // Axis 1: All 4 RewardModes across T1_Constant(0) and sparse T1_PeriodicMotif([0,0,0,0,0,1]),
     // plus online rare-event autonomous ring discovery on T1_PeriodicMotif([0,0,0,0,1]).
@@ -1196,10 +1328,7 @@ fn verify_gate_g1b4(
                         1,
                         WireDelayMode::Combinational,
                         econ,
-                        GrowthConfig {
-                            max_nodes: 2,
-                            ..GrowthConfig::default()
-                        },
+                        GrowthConfig::default(),
                         seeds_bank,
                     )
                     .unwrap();
@@ -1215,41 +1344,47 @@ fn verify_gate_g1b4(
                         None,
                         None,
                     );
-                    audits.push(OnlineRunAudit::record(
-                        format!("G1B.4a:Axis1:{task_label}:{mode:?}:seed={master_seed}"),
+                    let n_final = learner.editable().circuit().node_count();
+                    let functional_pass = match mode {
+                        RewardMode::CalibratedPointForecast | RewardMode::CenteredSurprisal => {
+                            learner.starvation_prune_events() >= 1
+                        }
+                        RewardMode::UncenteredSurprisal => {
+                            !(task_label == "SparseMotif6"
+                                && (n_final == 0 || learner.starvation_prune_events() > 0))
+                        }
+                        RewardMode::RawAccuracy => {
+                            n_final != 0 && learner.starvation_prune_events() == 0
+                        }
+                    };
+                    if record_online_case(
+                        format!(
+                            "G1B.4a:Axis1:{task_label}:k={}:{mode:?}:seed={master_seed}",
+                            width.bits()
+                        ),
                         &learner,
                         &scorecard,
                         20_000,
-                    ));
-                    let n_final = learner.editable().circuit().node_count();
-                    match mode {
-                        RewardMode::CalibratedPointForecast => {
-                            if n_final != 0 {
-                                failures.push(format!(
-                                    "G1B.4a (Axis 1): CalibratedPointForecast failed to starve ConstLoop(0) on {task_label} width {width:?} seed {master_seed}"
-                                ));
-                            }
-                        }
-                        RewardMode::CenteredSurprisal => {
-                            if n_final != 0 {
-                                failures.push(format!(
-                                    "G1B.4a (Axis 1): CenteredSurprisal failed to starve ConstLoop(0) on {task_label} width {width:?}"
-                                ));
-                            }
-                        }
-                        RewardMode::UncenteredSurprisal => {
-                            if task_label == "SparseMotif6" && n_final == 0 {
-                                failures.push(format!(
-                                    "G1B.4a (Axis 1): UncenteredSurprisal unexpectedly starved lazy ConstLoop(0) on SparseMotif6 width {width:?}"
-                                ));
-                            }
-                        }
-                        RewardMode::RawAccuracy => {
-                            if n_final == 0 {
-                                failures.push(format!(
-                                    "G1B.4a (Axis 1): RawAccuracy unexpectedly starved ConstLoop(0) on {task_label} width {width:?}"
-                                ));
-                            }
+                        functional_pass,
+                        audits,
+                        &mut case_summaries,
+                        &mut gate_cliff,
+                        &mut failures,
+                    ) == CaseOutcome::Failed
+                    {
+                        match mode {
+                            RewardMode::CalibratedPointForecast => failures.push(format!(
+                                "G1B.4a (Axis 1): CalibratedPointForecast failed to starve ConstLoop(0) on {task_label} width {width:?} seed {master_seed}"
+                            )),
+                            RewardMode::CenteredSurprisal => failures.push(format!(
+                                "G1B.4a (Axis 1): CenteredSurprisal failed to starve ConstLoop(0) on {task_label} width {width:?}"
+                            )),
+                            RewardMode::UncenteredSurprisal => failures.push(format!(
+                                "G1B.4a (Axis 1): UncenteredSurprisal unexpectedly starved lazy ConstLoop(0) on SparseMotif6 width {width:?}"
+                            )),
+                            RewardMode::RawAccuracy => failures.push(format!(
+                                "G1B.4a (Axis 1): RawAccuracy unexpectedly starved ConstLoop(0) on {task_label} width {width:?}"
+                            )),
                         }
                     }
                 }
@@ -1291,7 +1426,9 @@ fn verify_gate_g1b4(
                 None,
                 None,
             );
-            audits.push(OnlineRunAudit::record(
+            let functional_pass = score_osc6.post_transient_clean_mismatches == 0
+                && learner_osc6.starvation_prune_events() == 0;
+            if record_online_case(
                 format!(
                     "G1B.4a:Axis1:Osc6Mature:k={}:seed={master_seed}",
                     width.bits()
@@ -1299,9 +1436,12 @@ fn verify_gate_g1b4(
                 &learner_osc6,
                 &score_osc6,
                 20_000,
-            ));
-            if score_osc6.post_transient_clean_mismatches != 0
-                || learner_osc6.starvation_prune_events() != 0
+                functional_pass,
+                audits,
+                &mut case_summaries,
+                &mut gate_cliff,
+                &mut failures,
+            ) == CaseOutcome::Failed
             {
                 failures.push(format!(
                     "G1B.4a (Axis 1): mature Osc6 failed rare-event survival on width {width:?}"
@@ -1340,7 +1480,10 @@ fn verify_gate_g1b4(
                 None,
                 None,
             );
-            audits.push(OnlineRunAudit::record(
+            let functional_pass = learner_rare.ring_closure_events() >= 1
+                && learner_rare.starvation_prune_events() == 0
+                && score_rare.post_transient_clean_mismatches == 0;
+            if record_online_case(
                 format!(
                     "G1B.4a:Axis1:OnlineRareMotif5:k={}:seed={master_seed}",
                     width.bits()
@@ -1348,10 +1491,12 @@ fn verify_gate_g1b4(
                 &learner_rare,
                 &score_rare,
                 50_000,
-            ));
-            if learner_rare.ring_closure_events() >= 1
-                && learner_rare.starvation_prune_events() == 0
-                && score_rare.post_transient_clean_mismatches == 0
+                functional_pass,
+                audits,
+                &mut case_summaries,
+                &mut gate_cliff,
+                &mut failures,
+            ) == CaseOutcome::Passed
             {
                 rare_ring_pass += 1;
             }
@@ -1432,12 +1577,17 @@ fn verify_gate_g1b4(
                 None,
                 None,
             );
-            audits.push(OnlineRunAudit::record(
+            let _ = record_online_case(
                 format!("G1B.4a:Axis2:Tax:{task_name}:seed={master_seed}"),
                 &learner_tax,
                 &score_tax,
                 50_000,
-            ));
+                true,
+                audits,
+                &mut case_summaries,
+                &mut gate_cliff,
+                &mut failures,
+            );
 
             let gen_notax = task_cfg.build(width).unwrap();
             let mut env_notax =
@@ -1463,12 +1613,17 @@ fn verify_gate_g1b4(
                 None,
                 None,
             );
-            audits.push(OnlineRunAudit::record(
+            let _ = record_online_case(
                 format!("G1B.4a:Axis2:NoTax:{task_name}:seed={master_seed}"),
                 &learner_notax,
                 &score_notax,
                 50_000,
-            ));
+                true,
+                audits,
+                &mut case_summaries,
+                &mut gate_cliff,
+                &mut failures,
+            );
 
             total_splits_tax += learner_tax
                 .editable()
@@ -1565,13 +1720,19 @@ fn verify_gate_g1b4(
                 None,
                 None,
             );
-            audits.push(OnlineRunAudit::record(
+            let functional_pass = score_tph.post_transient_clean_mismatches == 0;
+            if record_online_case(
                 format!("G1B.4a:Axis4:{label}:seed={master_seed}"),
                 &learner_tph,
                 &score_tph,
                 50_000,
-            ));
-            if score_tph.post_transient_clean_mismatches == 0 {
+                functional_pass,
+                audits,
+                &mut case_summaries,
+                &mut gate_cliff,
+                &mut failures,
+            ) == CaseOutcome::Passed
+            {
                 tph_pass += 1;
             }
         }
@@ -1586,7 +1747,7 @@ fn verify_gate_g1b4(
     let Some(arkhe_bin) = locate_arkhe_binary() else {
         failures
             .push("G1B.4b: could not locate arkhe binary for child process determinism".to_owned());
-        return (failures.is_empty(), cases);
+        return finalize_m1b_gate_report("G1B.4", cases, failures, gate_cliff, case_summaries);
     };
 
     let pid = std::process::id();
@@ -1709,10 +1870,29 @@ fn verify_gate_g1b4(
             (Ok(s1), Ok(s2)) if s1.success() && s2.success() => {
                 let bytes1 = fs::read(&out1_path).unwrap_or_default();
                 let bytes2 = fs::read(&out2_path).unwrap_or_default();
-                if bytes1.is_empty() || bytes1 != bytes2 {
+                let functional_pass = !bytes1.is_empty() && bytes1 == bytes2;
+                if !functional_pass {
                     failures.push(format!(
                         "G1B.4b (case {c_idx}): separate processes produced differing JSON"
                     ));
+                }
+                if let Ok(report) = serde_json::from_slice::<RunReport>(&bytes1)
+                    && let Some(ref tel) = report.m1_telemetry
+                {
+                    let counters = CliffCountersSummary::from(tel);
+                    gate_cliff.accumulate(&counters);
+                    let outcome = classify_case_outcome(functional_pass, &counters);
+                    if outcome == CaseOutcome::Excluded {
+                        failures.push(format!(
+                            "G1B.4b:case={c_idx}: compute guardrail bound (sprout_blocked_max_nodes={}); case marked Excluded",
+                            counters.sprout_blocked_max_nodes
+                        ));
+                    }
+                    case_summaries.push(OnlineCaseSummary {
+                        label: format!("G1B.4b:case={c_idx}"),
+                        outcome,
+                        cliff_counters: counters,
+                    });
                 }
             }
             _ => {
@@ -1727,5 +1907,46 @@ fn verify_gate_g1b4(
         let _ = fs::remove_file(out2_path);
     }
 
-    (failures.is_empty(), cases)
+    finalize_m1b_gate_report("G1B.4", cases, failures, gate_cliff, case_summaries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b3_guardrail_binding_marks_case_excluded_and_fails_gate() {
+        let guardrail_counters = CliffCountersSummary {
+            sprout_blocked_max_nodes: 1,
+            ..CliffCountersSummary::default()
+        };
+        assert_eq!(
+            classify_case_outcome(true, &guardrail_counters),
+            CaseOutcome::Excluded
+        );
+
+        let search_bound_counters = CliffCountersSummary {
+            lag_horizon_bound: 2,
+            ..CliffCountersSummary::default()
+        };
+        assert_eq!(
+            classify_case_outcome(true, &search_bound_counters),
+            CaseOutcome::Passed
+        );
+
+        let summaries = vec![OnlineCaseSummary {
+            label: "synthetic:guardrail_case".to_owned(),
+            outcome: CaseOutcome::Excluded,
+            cliff_counters: guardrail_counters,
+        }];
+        let report = finalize_m1b_gate_report(
+            "G1B.synthetic",
+            1,
+            Vec::new(),
+            guardrail_counters,
+            summaries,
+        );
+        assert_eq!(report.excluded_cases, 1);
+        assert!(!report.passed);
+    }
 }
