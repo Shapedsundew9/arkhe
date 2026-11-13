@@ -184,3 +184,16 @@ Blocker-report template (to be added as `doc/templates/blocker_report.md`): *Wha
 | 5 | B3, B4, B5, B7 (observability and measurement) | No | No (golden identical) |
 | 6 | B1, B2, B6 per Q1 and Q2 | Already decided in step 4 | Possibly; re-bless with rationale |
 | 7 | A5 dev-bank and confirmation records, exit review (§6) | Sign-off | — |
+
+---
+
+## 8. Readiness Execution & Exit Verification Log (2026-11-13)
+
+Status of **§6 Exit Criteria** after commits `5a7c27d`, `a47ff8d`, `22954df`, `7649e2c`, and final inventory/documentation closeout:
+
+1. **Criterion 1 (`A1`, `A2`):** Clean git commit chain `5a7c27d` $\to$ `a47ff8d` $\to$ `22954df` $\to$ `7649e2c` $\to$ closeout commit. Bit-identical golden trace verification passes (`cargo test --locked --test golden_traces`, `1 passed; 0 failed`), with no unapproved fixture re-bless (`G1B.4a:Axis1` resolved via user-approved **Option (a)** in [`src/verify_m1/m1b.rs`](../src/verify_m1/m1b.rs)).
+2. **Criterion 2 (`B1`–`B4`, `B6`–`B7`, CLI cliff telemetry):** Implemented in `a47ff8d` and `22954df`. `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --locked` pass with zero warnings, zero skipped tests, and `0` guardrail exclusions (`excluded_cases = 0`, `sprout_blocked_max_nodes = 0`) across `verify-m1a`, `verify-m1b`, and `verify-m1`.
+3. **Criterion 3 (`B5`, `A5`):** Recorded in [`doc/parameter_inventory.md §3`](parameter_inventory.md#3-compute-profile--measurement-tables) and [`doc/research_record.md §7`](research_record.md#7-pre-milestone-2-readiness-measurements--verification-2026-11-13) on clean binary `7649e2caa38e78575381c03d8e6952118a816fc6` (`source_tree_fnv1a128 = 26e9d332905dd6a6aeadce50c5266fa3`): dev `0..20` pass, `100/100` dev banks (`20..2020`) pass, and fresh confirmation bank `20000..=20019` pass (`10000..=10019` untouched; `30000..=30019` reserved).
+4. **Criterion 4 (`doc/parameter_inventory.md` & literal audit):** [`doc/parameter_inventory.md`](parameter_inventory.md) promotes and audits every non-test constant in `src/structural/` (`MDL_TIE_BREAK_EPS`, `RING_SIM_SENSITIVITY_SAMPLES`, `SMALL_CONST_CANDIDATE_CAP`, `EXACT_SENSITIVITY_MAX_BITS`, `RESERVE_MISMATCH_DENOM_FLOOR`, `EconomyConfig`, `GrowthConfig`) and `src/verify_m1/` with code links and test/measurement evidence.
+5. **Criterion 5 (Charter §3.1.2, `C5`, `C6`, `C7`, instructions amendment, link check):** Completed in commit `5a7c27d` and verified via `python3 scripts/check_doc_links.py` across `README.md` and `doc/**/*.md`.
+6. **Criterion 6 (`Q1`–`Q9` / DR #31–#39):** Recorded in [Charter Appendix A](foundational_research_charter_v3.md#appendix-a-decision-record). Readiness exit gate satisfied; `doc/milestone_2_plan.md` awaits explicit user initiation under [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-and-decision-rights).

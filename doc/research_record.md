@@ -323,3 +323,40 @@ max_nodes = 32
    - *Explicit uncertainty / abstention* (§3.4) to distinguish low confidence from channel noise (`rate` / `vote` / `abstain` coding).
    - *Macro boundary detection & retirement* (§3.6): small cut/interface, Markov-blanket test, Hoel causal-emergence effective information, usage decay + palette MDL cost in M5.
    - *Logic synthesis & open-endedness tooling* (§4, §5.5): sequential equivalence checking (SAT/BDD) for sleep consolidation proofs and Bedau–Packard activity statistics for open-ended novelty measurement.
+
+---
+
+## 7. Pre-Milestone 2 Readiness Measurements & Verification (2026-11-13)
+
+Following Decisions `Q1`–`Q9` ([Charter DR #31–#39](foundational_research_charter_v3.md#appendix-a-decision-record)) and `G1B.4a:Axis1` **Option (a)** (`a47ff8d`), all Readiness `A`–`C` code changes landed across commits `5a7c27d`, `a47ff8d`, `22954df`, and `7649e2c` (`source_tree_fnv1a128 = 26e9d332905dd6a6aeadce50c5266fa3`). Complete inventory and full tables live in [parameter_inventory.md §3](parameter_inventory.md#3-compute-profile--measurement-tables).
+
+### 7.1 `B6` Empirical Regime-Shift Latencies (Charter §3.1.2)
+
+- Single-seed diagnostic (`shift_tick=350`, `Motif5 -> Alt(k=1,clean)`): `W_obs = 256`, starvation at tick `543` (`delta_starve = 193`), immediate resprout at tick `543` (`clipped_count = 55`, `clipped_bits = 36.749`).
+- Across 10 seeds (`0..10`) in [`tests/regime_shift.rs`](../tests/regime_shift.rs):
+  - `Motif5 -> Alt(k=1,clean)`: `10/10` starved and resprouted cleanly at `207` ticks (`0.809x W_obs`).
+  - `Alt(0,1) -> Constant(0)(k=1)`: `10/10` starved and resprouted cleanly at `143` ticks (`0.559x W_obs`).
+  - `Motif013 -> Mod3(k=2,clean)`: `10/10` starved and resprouted cleanly at `20` ticks (`0.078x W_obs`).
+  - `Motif5 -> Alt(k=1,eps=0.05)`: `10/10` starved and resprouted, but only `2/10` fell within `<= W_obs` (`min=239`, `p50=294.0`, `mean=307.2`, `p95=355.0`, `max=399` ticks = `1.559x W_obs`). This directly confirms DR #31 (`Q1(a)`): `ReserveCap::HorizonDerived` (`W_obs = 256`) bounds stationary energy reserve and eventually replaces obsolete predictors under noise, without guaranteeing `delta_starve <= W_obs` on stochastic mismatches. (Note also that `Alt(0,1) -> Motif011` retains `4/6 = 66.7% > p_null = 0.5` partial match and therefore remains solvent instead of starving.)
+
+### 7.2 `B7` Multi-Channel Lock-Time Ratios
+
+Across seeds `0..10` ([`tests/multi_channel_development.rs`](../tests/multi_channel_development.rs)) with per-port `PortDevelopmentalState`:
+- `K=2:(Alt,Motif011)` `Combinational`: `ch0 = 1.00x` (`64/64`), `ch1 = 1.00x` (`255/255`, `MaxSnapshots = 3`).
+- `K=2:(Alt,Motif011)` `TicksPerHop`: `ch0 = 1.05x` (`64 -> 67`), `ch1 = 1.00x` (`66/66`).
+- `K=3:(Alt,Motif011,Motif001)` `Combinational`: `ch0 = 1.00x` (`64/64`), `ch1 = 0.25x` (`255 -> 65` concurrent speedup via cross-channel feature reuse), `ch2 = 1.02x` (`66 -> 67`).
+- `K=3:(Alt,Motif011,Motif001)` `TicksPerHop`: `ch0 = 1.00x` (`64/64`), `ch1 = 1.00x` (`66/66`), `ch2 = 1.00x` (`66/66`).
+
+### 7.3 `B5` Phase 0 Compute Scaling & Guardrail Awareness
+
+Release compute profiling ([`scripts/measure_compute_profile.py`](../scripts/measure_compute_profile.py) on `7649e2c`, 5 seeds, `horizon=512` controlled / `1024` endogenous):
+- **Node scaling (`steady_clean`, `K=1`):** rises smoothly from `2.04 us/tick` (`N=0`) through `29.30` (`N=8`) and `67.10` (`N=16`) to `206.86 us/tick` (`N=32`, roughly quadratic $\sim O(N^2)$).
+- **Channel scaling (dominant cost axis):** even at `N=0`, clean per-tick cost climbs $\sim O(K^3)$ across $K$: `2.04` ($K=1$) $\to$ `9.90` ($K=2$) $\to$ `66.96` ($K=4$) $\to$ `516.97 us/tick` ($K=8$), reaching `2293.29 us/tick` (`steady_clean`) and `3067.05 us/tick` (`diagnostic_noise`, `sprout_blocked_max_nodes = 3055` with `0.00` wasted replay ticks) at $N=32, K=8$.
+- **Endogenous $K=1..8$:** all 6 endogenous tasks (clean and $\varepsilon=0.05$) reached `0` post-500 clean errors with `0` starvation prunes and `0` `max_nodes` blocks; `K=8` solved all 8 binary motifs simultaneously in `18` final nodes (`< max_nodes = 32`). For Milestone 2 planning (`Q3`), `max_nodes = 32` leaves headroom for small multi-channel circuits, while Phase 0 of larger multi-channel / comparator suites should watch the $O(K^3)$ per-tick scaling factor.
+
+### 7.4 `A5` M1 Verification Summary (`source_tree_fnv1a128 = 26e9d332905dd6a6aeadce50c5266fa3`)
+
+- **Dev fast slice (`0..20`):** `all_passed: true`, `stage_gate_aborted: false`, `excluded_cases: 0`, `sprout_blocked_max_nodes: 0` (`26.159s`).
+- **Dev multi-bank (`20..2020`, `100` banks × `20` seeds):** `100/100` M1a banks and `100/100` M1b banks passed all gates (`excluded_cases: 0`, `sprout_blocked_max_nodes: 0`, `reserve_mismatch_floored: 0`; 99% two-sided Clopper–Pearson lower bound `0.948396`, $\chi^2 = 0.0, p = 1.0$; `7m19.102s` on 16 cores).
+- **Fresh confirmation bank (`20000..=20019`):** `all_passed: true`, `stage_gate_aborted: false`, `excluded_cases: 0`, `sprout_blocked_max_nodes: 0` (`26.387s`).
+- M1 holdout (`10000..=10019`) remained untouched; M2 holdout (`30000..=30019`) remains reserved per DR #38.
