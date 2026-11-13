@@ -1,6 +1,6 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Historical Milestone 0–1 sign-off records are preserved in [doc/research_record.md](doc/research_record.md); active pre-Milestone 2 coordinate-free scaling and readiness plans live in [doc/coordinate_free_scaling_plan.md](doc/coordinate_free_scaling_plan.md) and [doc/pre_milestone_2_readiness_plan.md](doc/pre_milestone_2_readiness_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), and historical Milestone 0–1 sign-off records plus pre-Milestone 2 readiness verification live in [doc/research_record.md](doc/research_record.md).
 
 ## Overview
 
@@ -11,7 +11,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 - **`env`**: Finite-state benchmark generators (`T1`, `T3b`, `T3c`), declared channel substitution noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
 - **`metrics`**: Surprisal null models, Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
 - **`baselines`**: Compute-matched prequential baseline harness (`RandomSearch`, `(1+λ) CGP`, `CTW`, `ReedsSloane`, and certified small-circuit `Exhaustive` synthesis) over phase-exact sliding observation windows.
-- **`rng`, `config`, & `verify`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, and the M0 plus fixed-structure M1a verification batteries.
+- **`rng`, `config`, `verify`, & `verify_m1`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, M0/M1a/M1b verification batteries, pooled Clopper–Pearson + $\chi^2$ homogeneity bank statistics, and `profile-compute` scaling/counter profiling.
 
 ## Project Structure
 
@@ -20,30 +20,39 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 ├── .devcontainer/
 ├── .github/
 ├── doc/
-│   ├── coordinate_free_scaling_plan.md
+│   ├── templates/
+│   │   ├── blocker_report.md
+│   │   └── milestone_plan_template.md
 │   ├── foundational_research_charter_v3.md
-│   ├── pre_milestone_2_readiness_plan.md
+│   ├── parameter_inventory.md
 │   └── research_record.md
 ├── scripts/
-│   └── build.rs
+│   ├── build.rs
+│   ├── check_doc_links.py
+│   └── measure_compute_profile.py
 ├── src/
 │   ├── baselines/
 │   ├── env/
 │   ├── metrics/
 │   ├── structural/
 │   ├── substrate/
+│   ├── verify_m1/
 │   ├── config.rs
 │   ├── lib.rs
 │   ├── main.rs
 │   ├── rng.rs
 │   └── verify.rs
 ├── tests/
+│   ├── fixtures/golden/
 │   ├── cli.rs
 │   ├── determinism.rs
+│   ├── golden_traces.rs
+│   ├── m0_acceptance.rs
 │   ├── m1a_economy.rs
 │   ├── m1b_neurogenesis.rs
-│   ├── m0_acceptance.rs
-│   └── post-create.sh
+│   ├── multi_channel_development.rs
+│   ├── post-create.sh
+│   └── regime_shift.rs
 ├── Cargo.toml
 ├── GEMINI.md
 ├── LICENSE
@@ -81,6 +90,13 @@ cargo run --locked --release -- verify-m1 --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m1b --banks 100 --seed-offset 20 --seeds 20
 cargo run --locked --release -- verify-m1 --banks 100 --seed-offset 20 --seeds 20
 cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdout
+```
+
+1. Run the Phase 0 / readiness compute and cliff-counter profiler:
+
+```bash
+cargo run --locked --release -- profile-compute --seed-offset 0 --seeds 5
+python3 scripts/measure_compute_profile.py --skip-build --seed-offset 0 --seeds 5
 ```
 
 1. Inspect analytical $\varepsilon$-machine and Reeds–Sloane ground-truth yardsticks for a generator:
@@ -140,10 +156,11 @@ Run Clippy across all targets and features with warnings denied:
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Check code formatting:
+Check code formatting and documentation relative links/anchors:
 
 ```bash
 cargo fmt --check
+python3 scripts/check_doc_links.py
 ```
 
 Check the container setup script with isolated mock commands:

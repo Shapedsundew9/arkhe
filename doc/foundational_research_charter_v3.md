@@ -7,7 +7,8 @@
 > - **Milestone 0 (`M0 — Simulator and yardstick`):** Completed & verified. Exact synchronous tick semantics, variable-width arithmetic, seeded determinism, $\varepsilon$-machine and Berlekamp–Massey ground truth, and compute-matched baselines are operational.
 > - **Milestone 1a (`M1a — Metabolic economy and retrograde credit`):** Completed & verified. Closed-loop metabolic economy with replacing ancestry traces (D1), calibrated point-forecast reward (D2), one-time description debt (D3), and activity recency decay (D4) passed all acceptance gates (`G1A.1`–`G1A.4`) on 100/100 development banks across $T \in \{1024, 2048, 4096\}$ and on the untouched holdout bank (`seeds 10000..=10019`).
 > - **Milestone 1b (`M1b — First to second neuron residual neurogenesis`):** Completed & verified. Residual-driven neurogenesis, finite-ring corrector stacking, autonomous ring closure, and noise-floor halting passed holdout (`e29014a`, `seeds 10000..=10019`), 100-bank statistical hardening (`seeds 20..2020`), and coordinate-free migration (`substrate::Circuit`); see [research_record.md](research_record.md).
-> - **Pre-Milestone 2 (`Readiness & Scaling Closure`):** Active preparation stage before `M2`; governed by [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md).
+> - **Pre-Milestone 2 (`Readiness & Scaling Closure`):** Completed & verified. Coordinate-free `substrate::Circuit` refactor (`A1` golden bit-identity proof), unified `observation_horizon` (`ReserveCap::HorizonDerived`, DR #31), per-port developmental state (`PortDevelopmentalState`, DR #34), cliff/guardrail telemetry (`Excluded` semantics, DR #33), `B5`–`B7` empirical profiles, `A5` 100-bank + confirmation runs (`source_tree_fnv1a128 = 26e9d332905dd6a6aeadce50c5266fa3`), and parameter/governance consolidation ([parameter_inventory.md](parameter_inventory.md), [research_record.md §7](research_record.md#7-pre-milestone-2-readiness-measurements--verification-2026-11-13)) are complete.
+> - **Milestone 2a (`M2a — Cross-channel predictive coupling`):** Next active stage (DR #35–#37).
 >
 > **Provenance & Decision Record:** Version 3 incorporates the Stage M1a metabolic economy and credit redesign decisions (D1–D4). [Appendix A](#appendix-a-decision-record) details the cumulative decision record across charter revisions.
 
@@ -192,7 +193,7 @@ Each node holds an energy reserve $E_i(t)$. Rather than arbitrary per-tick maint
 
 How contribution is measured:
 
-- **Sensitivity:** an input contributed on a rewarded tick if changing it would have changed the output. This is computed exactly for $k = 1$ and sampled for larger $k$.
+- **Sensitivity:** an input contributed on a rewarded tick if changing it would have changed the output. This is computed exhaustively across all $2^k - 1$ alternative values for widths $k \le 4$ (`EXACT_SENSITIVITY_MAX_BITS = 4`) and sampled (`sensitivity_sample_count`) for wider rings $k > 4$.
 - **Eligibility traces & replacing cap:** credit reaches structures whose contribution came several ticks earlier through `DELAY`. Ancestry weights are clamped to $\le 1.0$ (replacing traces), preventing recurrent loops from accumulating unbounded feedback gain.
 - **Activity recency decay:** input weights on identity values decay by $\gamma = 0.90$ on identity-emitting ticks, bounding single-fire detour leaks across arbitrary horizons while preserving sparse correctors.
 - **Juvenile subsidy:** new sprouts get an energy endowment and a grace period, so they can show their worth before maintenance costs kill them.
@@ -280,7 +281,7 @@ A derived axiom earns its place in the palette only if it lowers the first two t
 
 - The $K$ channels drive the boundary input ports. Each tick the network emits predictions $\hat{A}(t+1), \hat{B}(t+1), \dots$ and is rewarded according to §3.1.4.
 - Facts are written to a **bounded fact buffer**, the system's record of ground truth.
-- Corrector and redundancy sprouting (§3.1.5) and pruning (§3.1.6) run online.
+- Corrector sprouting (§3.1.5) and pruning (§3.1.6) run online in wake; redundancy sprouting (§3.1.5) is staged for `M2b` once comparator economics is pre-registered (Decision Record #35).
 
 ### 4.2 Sleep: deduction in isolation
 
@@ -365,8 +366,8 @@ Every mechanism in this charter is a **hypothesis** linked to a milestone. None 
 | ID | Hypothesis | Mechanism | Tested in |
 | :--- | :--- | :--- | :--- |
 | **H1** | Local, retrograde, surprisal-weighted credit sustains correct circuits and starves incorrect ones without gradients | §3.1.3, §3.1.4 | M1a |
-| **H2** | Residual-driven corrector sprouting reduces error toward $h_\mu$ as the residual's entropy predicts | §3.1.5, §3.3 | M1b |
-| **H3** | Redundant derivations plus comparators detect errors internally, offline | §1.3, §3.1.5 | M2, M4a |
+| **H2** | Residual-driven corrector sprouting reduces error toward $h_\mu$ as the residual's entropy predicts | §3.1.5, §3.3 | M1b, M2a |
+| **H3** | Redundant derivations plus comparators detect errors internally, offline | §1.3, §3.1.5 | M2b, M4a |
 | **H4** | Wire description-length pricing, the `SPLIT` tax, sensitivity-based credit, and compression remove free-riders, keeping circuits near minimal size | §3.1.7 | M3 |
 | **H5** | Sleep filtering beats **compute-matched** wake-only learning | §4.2 | M4a |
 | **H6** | Consistency-only sleep (S-A) performs as well as consistency-plus-replay sleep (S-B) | §4.2 | M4a |

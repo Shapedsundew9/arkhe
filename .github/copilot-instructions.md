@@ -62,8 +62,8 @@ Read `.shared/ai/core/common-instructions.md`.
    fan-out are priced only through description length (`L(C)`, `split_code_tax`).
 2. **Every constant is classified** as derived, pre-registered scientific parameter, search bound,
    or compute guardrail in the canonical inventory in `doc/parameter_inventory.md` (migrated
-   from `doc/coordinate_free_scaling_plan.md` §2.1). Adding or changing a constant requires updating
-   that inventory.
+   from retired `doc/coordinate_free_scaling_plan.md` §2.1). Adding or changing a constant requires
+   updating that inventory.
 3. **Every limit is observable.** Any cap, guardrail, clip, or window truncation must emit a named
    telemetry counter when it binds. Guardrails must never bind in an accepted run.
 4. **Behavior-preserving refactors are proven by golden traces** (`tests/golden_traces.rs`).

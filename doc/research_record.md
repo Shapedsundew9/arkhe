@@ -1,7 +1,7 @@
 # Arkhe Foundational Research Record
 
 > **Companion to:** [Foundational Research Charter v3](foundational_research_charter_v3.md)
-> **Scope:** Persistent historical ledger of empirical measurements, verification provenance, kill-criterion diagnoses, discovered mathematical traps, rejected design alternatives, parameter origins, and deferred Milestone 2–5 questions recovered from git history (`FOUNDATION` through `m1-final-lattice` and pre-M2 cleanup archival of `milestone_1b_plan.md` / `milestone_1b_review.md`).
+> **Scope:** Persistent historical ledger of empirical measurements, verification provenance, kill-criterion diagnoses, discovered mathematical traps, rejected design alternatives, parameter origins, and deferred Milestone 2–5 questions recovered from git history (`FOUNDATION` through `m1-final-lattice` and pre-M2 archival of `milestone_1b_plan.md`, `milestone_1b_review.md`, `coordinate_free_scaling_plan.md`, and `pre_milestone_2_readiness_plan.md`).
 > **Policy:** Historical planning and review drafts were periodically deleted before milestone tags (`b96fb8d`, `b541136`, `e9d38f6`, `ebf9b3d`, `ddd9056`, and pre-M2 cleanup). Going forward, **preserve durable results here rather than discarding them**, so future agents do not repeat falsified designs or guess ungrounded constants.
 
 ---
@@ -25,18 +25,20 @@
 | `c475982` (`tag: MILESTONE_1A_COMPLETE`) | 2026-11-07 | Stage M1a closeout & redesign lock. |
 | `e29014a` / `6292920` | 2026-11-07 | Executed single-shot Milestone 1 holdout sign-off (`10000..=10019`) and recorded attainment in `doc/milestone_1_plan.md`. |
 | `9544e98` | 2026-11-08 | Post-holdout M1b fix (`src/structural/growth.rs`, `src/structural/learner.rs`, changing `source_tree_fnv1a128` to `ae9e3c4d577d071163c1e0855f3342a0`); `2,000`-seed 100-bank hardening recorded `2026-11-08` (Section 2.5 below). |
-| `2ed11fd` | 2026-11-08 | Added [coordinate_free_scaling_plan.md](coordinate_free_scaling_plan.md). |
+| `2ed11fd` | 2026-11-08 | Added `doc/coordinate_free_scaling_plan.md`. |
 | `ddd9056` (`origin/main`) | 2026-11-08 | Deleted `doc/milestone_1_plan.md` and `doc/milestone_1b_plan.md`; key schemas, sign-offs, and M1b findings were consolidated into Sections 2.5, 3.3, and 6.1 below. |
 | `2d009b0` (`tag: m1-final-lattice`) | 2026-11-08 | Phase 0 anchor: golden-trace harness, cliff telemetry, and regime-shift baseline before coordinate-free scaling refactor (also final git anchor for retired spatial ablations and `doc/milestone_1b_review.md`). |
-| Pre-M2 doc cleanup | 2026-11-13 | Folded unique empirical findings, gate counts, and §10 retirement notes from `doc/milestone_1b_plan.md` and `doc/milestone_1b_review.md` into this record and removed both superseded M1b files from `doc/`. |
+| `deb200a`–`eafcec6` | 2026-11-13 | Completed coordinate-free Phases 1–4 refactor (`A1` golden proof), governance rules & Charter DR #31–#39 (`5a7c27d`), Readiness `B1`–`B7` (`a47ff8d`, `22954df`, `7649e2c`), and [parameter_inventory.md](parameter_inventory.md) (`eafcec6`). |
+| Pre-M2 plan retirement | 2026-11-13 | Folded durable M1b and Pre-M2 derivations/verification (`milestone_1b_plan.md`, `milestone_1b_review.md`, `coordinate_free_scaling_plan.md`, `pre_milestone_2_readiness_plan.md`) into [parameter_inventory.md](parameter_inventory.md) and Sections 2.5, 3.3, 6.2, and 7 below, then retired those completed plan files from `doc/`. |
 
-### 1.2 Archival Consolidation of Superseded Milestone 1 Plans & Reviews
+### 1.2 Archival Consolidation of Superseded Milestone 1 & Pre-M2 Plans & Reviews
 
-To prevent agents from confusing superseded blueprints (`milestone_1_plan.md`, `milestone_1b_plan.md`) or pre-refactor audits (`milestone_1b_review.md`, anchored against `9544e98` and deleted `src/structural/lattice.rs`) with active specifications, all durable specs and measurements from those files live here (Sections 2.5, 3.2, 3.3, and 6.1):
+To prevent agents from confusing superseded blueprints (`milestone_1_plan.md`, `milestone_1b_plan.md`, `coordinate_free_scaling_plan.md`, `pre_milestone_2_readiness_plan.md`) or pre-refactor audits (`milestone_1b_review.md`, anchored against `9544e98` and deleted `src/structural/lattice.rs`) with active specifications, all durable specs, derivations, and measurements from those files live here (Sections 2.5, 3.2, 3.3, 6.1, 6.2, and 7) and in [parameter_inventory.md](parameter_inventory.md):
 
 - **`milestone_1_plan.md` §4.0 (lines 334–352):** The seven post-M1a interface decisions and open questions (`idle nodes / switching vs pruning`, `juvenile_ticks & E_init`, `marginal ΔL_sprout`, `port M reset`, `max_energy_reserve`, `RepeatLast matched estimator`, `unowned circuit bits`). Reconstructed in Section 6.1.
 - **`milestone_1_plan.md` §5.2 (lines 444–481):** The pre-registered M1 `ExperimentConfig` TOML block (`grid_rows = 8`, `grid_cols = 8`, `trace_discount = 0.90`, `initial_energy = 4.0`, `juvenile_ticks = 128`, `max_energy_reserve = 25.0`, `diagnostic_window = 64`, `sprout_interval = 32`, `mi_threshold_bits = 0.05`, `min_match_gain = 4`, `max_nodes = 32`, `horizon_ticks = 2_000`, `max_eval_ticks = 50_000`). Reproduced verbatim in Section 6.1.
 - **`milestone_1b_plan.md` §9–§10 & `milestone_1b_review.md`:** Holdout (`e29014a`) and 100-bank hardening (`20..2020`) per-gate counts, DR #29/#30 `LocalVonNeumann` vs. `WellMixed` benchmark evidence, M1b defect diagnoses, and the `m1-final-lattice` archival anchor. Preserved in Sections 2.5 and 3.3.
+- **`coordinate_free_scaling_plan.md` & `pre_milestone_2_readiness_plan.md`:** Parameter scaling derivations (`ReserveCap::HorizonDerived`, `max_nodes` guardrail, per-port `PortDevelopmentalState`, $W_{\text{obs}}$, M5 Miller–Madow scaling, M2 lag deepening, pooled Clopper–Pearson / $\chi^2$ gates) live in [parameter_inventory.md §2.1](parameter_inventory.md#21-parameter-scaling-derivations--deferred-rules); the `A1` Phase 1–2 golden-trace bit-identity proof, `B5`–`B7` / `A5` measurements, and `Q5` comparator-economics analysis (`DR #35`) live in Sections 6.2 and 7 below.
 
 ---
 
@@ -209,8 +211,8 @@ Independent probes at `9544e98` across all four 2-stage M1b tasks (`master_seed 
    `T1_Constant(0)` passed only by empty-circuit coincidence (`0`-output matches `0`), whereas `Constant(1)` and `Constant(3)` oscillated every cycle (`4.0 < 13.75` starvation at `t = 128`). Fixed by constant-mode parity + unified survival gating before the 100-bank run.
 2. **`TicksPerHop` unprimed pipeline register panic (`Finding 1`):** Inserting a new output shift chain leaves `register_eligibility` initialized to zeros (`wire_ancestry == 0`) while an unprimed `0` output differs from `s_{t-1}`, triggering `MissingAncestry { port: 0 }`; fixed by treating unprimed post-edit pipeline registers identically to unconnected ports until upstream signal arrival.
 3. **Empty-circuit ring lockout (`Finding 3`):** Guarding ring proposal with `!uses_boundary_inputs()` rejected `0`-node graphs, stalling sparse `T1_PeriodicMotif([0, 0, 0, 0, 0, 1])` at `0.8331 = 5/6`; fixed per-port by requiring `!has_port_driver || port_uses_boundary_in`.
-4. **Width & alphabet traps (`M4/M5` preview):** Plug-in Miller–Madow scaled with theoretical $2^k$ rather than observed empirical support, subtracting `2.874` bits at $k = 8, W_{\text{diag}} = 64$ even for binary features; `1u64 << width.bits()` overflowed at $k = 64$. Both immediate bugs were fixed (`empirical support` + `width.mask()`), while fixed-$W_{\text{diag}}$ undersampling at larger joint alphabets remains deferred to M5 ([coordinate_free_scaling_plan.md](coordinate_free_scaling_plan.md) §2.6).
-5. **Pre-M2 readiness qualification:** Although `milestone_1b_review.md` §5.2 wrote *"Unconditionally ready"* after the `2026-11-08` fixes, the same paragraph noted that M2's cross-channel comparators (`EQZ(SUB(a, b))`) and redundancy pathways remain unfunded under Charter §3.4 / §3.1.4 and conflict with `D1b.1` zero-sensitivity pruning—an open theoretical blocker tracked as Decision **Q5** in [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md).
+4. **Width & alphabet traps (`M4/M5` preview):** Plug-in Miller–Madow scaled with theoretical $2^k$ rather than observed empirical support, subtracting `2.874` bits at $k = 8, W_{\text{diag}} = 64$ even for binary features; `1u64 << width.bits()` overflowed at $k = 64$. Both immediate bugs were fixed (`empirical support` + `width.mask()`), while fixed-$W_{\text{diag}}$ undersampling at larger joint alphabets remains deferred to M5 ([parameter_inventory.md §2.1](parameter_inventory.md#21-parameter-scaling-derivations--deferred-rules)).
+5. **Pre-M2 readiness qualification (`DR #35`):** Although `milestone_1b_review.md` §5.2 wrote *"Unconditionally ready"* after the `2026-11-08` fixes, the same paragraph noted that M2's cross-channel comparators (`EQZ(SUB(a, b))`) and redundancy pathways remain unfunded under Charter §3.4 / §3.1.4 and conflict with `D1b.1` zero-sensitivity pruning. Under [Charter DR #35](foundational_research_charter_v3.md#appendix-a-decision-record), Milestone 2 was split into **`M2a` (cross-channel predictive coupling)** and **`M2b` (redundancy & comparators)** so `M2a` proceeds cleanly under existing corrector economics while `M2b` awaits a dedicated Charter comparator-reward amendment (Section 6.2 below).
 
 ---
 
@@ -237,7 +239,7 @@ Independent probes at `9544e98` across all four 2-stage M1b tasks (`master_seed 
 
 ## 5. Parameter Provenance Ledger (M0–M1b)
 
-*Classification follows the project discipline: **Derived** (forced by information theory / exact algebra / environment), **Pre-registered hypothesis**, **Heuristic / Ungrounded** (introduced without principled scaling or sweep—flagged for [coordinate_free_scaling_plan.md](coordinate_free_scaling_plan.md) and [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md)), or **Removed**.*
+*Classification records historical M0–M1b origins; active classifications, bounds, and telemetry live in [parameter_inventory.md](parameter_inventory.md).*
 
 | Parameter | Value | Origin & Justification History | Classification |
 | :--- | :--- | :--- | :--- |
@@ -245,12 +247,12 @@ Independent probes at `9544e98` across all four 2-stage M1b tasks (`master_seed 
 | `KT prior` ($\tfrac12$) | `0.5` | Exact Krichevsky–Trofimov prior inherited from `LaplaceFrequency` null model (`milestone_0_plan.md`, `m1a-redesign-plan.md` `D2`) | **Derived** |
 | `CTW` verification horizon / depth | `T = 20_000`, `depth = 9` | Sized analytically so $O(\lvert \mathcal{S}\rvert \log T / kT)$ WST redundancy drops from `0.044` ($T=4000$) to $\le 0.025$ b/sym on $k=2$ `AffineLag1` (`lessons_learned.md` §4.5) | **Derived / Sized for WST** |
 | `max_mixed_states` / merge eps | `4096` / `1e-12` | M0 non-unifilar ε-machine MSP bounding guard (`milestone_0_plan.md` §12) | **Compute guardrail** |
-| `trace_discount` ($\gamma$) | `0.90` | Pre-registered M1a constant; reused unchanged for `D4` activity recency decay; **never sensitivity-swept** (`m1a-redesign-plan.md`) | **Pre-registered / Unswept** |
-| `initial_energy` ($E_{\text{init}}$) | `4.0` bits | Fixed seed endowment in `milestone_1_plan.md` §5.2; cancels out of M1a $\Delta E$ (`juvenile_ticks = 0`), sets M1b sprout deficit $\Delta L_i - 4.0$ | **Heuristic / Ungrounded** |
-| `juvenile_ticks` ($T_{\text{juvenile}}$) | `128` ticks | Chosen in `milestone_1_plan.md` to exceed M0's `~100`-tick noisy oscillator crossover (M0 actually measured `130–180`; M1b later expanded `obs_capacity` to `256` for `152.9`-tick `NoisyAlternating`) | **Heuristic (M0-informed, undershoots at scale)** |
-| `max_energy_reserve` ($E_{\max}$) | `Some(25.0)` bits | Locked in `milestone_1_plan.md` §5.2 to cap mature reserves after regime shifts (`D1b.5`); **lower than M1b $\Delta L_{\text{sprout}} \approx 17\text{–}28.5$ bits**, forcing `D1b.2` unclipped juvenile escrow workaround; replacement (Option B vs. alternatives) is pending Q1 / B1 in [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md) | **Heuristic / Superseded (pending Q1)** |
-| `diagnostic_window` ($W_{\text{diag}}$), `sprout_interval` | `64`, `32` ticks | Locked in `milestone_1_plan.md` §5.2 without sensitivity sweep (`milestone_1b_plan.md` §5.1 notes `obs_window = 2 * W_diag = 128`, later expanded to `256` to cover `152.9`-tick crossover) | **Heuristic / Unswept** |
-| `mi_threshold_bits` ($\theta_{\text{MI}}$), `min_match_gain` ($\Delta_{\min}$) | `0.05` bits, `4` symbols | Locked in `milestone_1_plan.md` §5.2 as M1b noise-floor halting heuristic without derivation across $T$ or $k$ | **Heuristic / Unswept** |
+| `trace_discount` ($\gamma$) | `0.90` | Pre-registered M1a constant; reused unchanged for `D4` activity recency decay; **never sensitivity-swept** (`m1a-redesign-plan.md`) | **Pre-registered (M1)** |
+| `initial_energy` ($E_{\text{init}}$) | `4.0` bits | Fixed seed endowment in `milestone_1_plan.md` §5.2; cancels out of M1a $\Delta E$ (`juvenile_ticks = 0`), sets M1b sprout deficit $\Delta L_i - 4.0$ | **Pre-registered (M1)** |
+| `juvenile_ticks` ($T_{\text{juvenile}}$) | `128` ticks | Chosen in `milestone_1_plan.md` to exceed M0's `~100`-tick noisy oscillator crossover (M0 actually measured `130–180`; M1b later expanded `obs_capacity` to `256` for `152.9`-tick `NoisyAlternating`) | **Pre-registered (M1)** |
+| `max_energy_reserve` ($E_{\max}$) | `Some(25.0)` bits | Locked in `milestone_1_plan.md` §5.2 to cap mature reserves after regime shifts (`D1b.5`); **lower than M1b $\Delta L_{\text{sprout}} \approx 17\text{–}28.5$ bits**, forcing `D1b.2` unclipped juvenile escrow workaround; superseded in `deb200a` / `a47ff8d` by `ReserveCap::HorizonDerived` ([Charter DR #31](foundational_research_charter_v3.md#appendix-a-decision-record), [parameter_inventory.md](parameter_inventory.md)) | **Legacy (superseded by `HorizonDerived`)** |
+| `diagnostic_window` ($W_{\text{diag}}$), `sprout_interval` | `64`, `32` ticks | Locked in `milestone_1_plan.md` §5.2 (`obs_window` later unified as $t_{\text{juv}} + 2 W_{\text{diag}} = 256$); M5 scaling deferred ([parameter_inventory.md §2.1](parameter_inventory.md#21-parameter-scaling-derivations--deferred-rules)) | **Pre-registered (M1)** |
+| `mi_threshold_bits` ($\theta_{\text{MI}}$), `min_match_gain` ($\Delta_{\min}$) | `0.05` bits, `4` symbols | Locked in `milestone_1_plan.md` §5.2 as M1b noise-floor halting thresholds; M5 prequential code-length test deferred | **Pre-registered (M1)** |
 | `max_nodes` | `32` nodes | Compute/bloat cap in `milestone_1_plan.md` §5.2 | **Compute guardrail** |
 | `DEFAULT_M1B_HORIZON`, `warmup`, `max_eval_ticks` | `2000`, `500`, `50_000` | Locked M1b evaluation protocol in `milestone_1_plan.md` §5.2 & §6 | **Pre-registered / Fixed** |
 | `grid_rows`, `grid_cols`, `max_relay_hops` | `8`, `8`, `4` | Legacy 2D spatial layout defaults (`milestone_1_plan.md` §4.2, §5.2); superseded by coordinate-free `Circuit` | **Legacy (superseded)** |
@@ -315,7 +317,7 @@ max_nodes = 32
 
 ### 6.2 Critical Open Issues & Dropped Nuance Relevant to M2–M5
 
-1. **Redundancy funding paradox (`counterpoint_response.md` §2.1 — still unresolved before M2):** Error-only corrector sprouting (`D1b.1` / `G1B`) removes or declines redundant derivations. Yet Charter Hypothesis **H3 (Milestone 2)** relies on growing *alternative derivations* that meet at `Comparator` (`EQZ(SUB(a, b))` / `XNOR`) sites! As noted in `counterpoint_response.md`, M2 must specify when and why a **second, independent pathway predicting an already-covered target** earns credit or avoids idle pruning—and account for correlation when both pathways share an input source.
+1. **Redundancy funding paradox (`counterpoint_response.md` §2.1 & Readiness `Q5` / [Charter DR #35](foundational_research_charter_v3.md#appendix-a-decision-record) — mandatory theoretical phase before `M2b`):** Under Charter §3.4 ($\Delta E = -\Delta L_{\text{null}}$) and §3.1.4 (comparator reward in *"sleep only"*), a redundant derivation of an already-predicted stream plus an internal `EQZ(SUB(a, b))` comparator adds $L(C) > 0$, lowers neither $L(\text{facts} \mid C)$ nor wake reward, and exhibits zero boundary counterfactual sensitivity so `D1b.1` deterministically prunes it. Thus under current wake economics, `M2b`'s kill criterion (*"comparators never form spontaneously"*) is the predicted outcome. Per `DR #35` (`Q5(a)`), `M2a` tests cross-channel coupling via existing corrector sprouting first; before `M2b` is planned, a dedicated theoretical & Charter research phase must evaluate and pre-register a funding rule among: (i) wake-time calibrated agreement sinks (`SignalSink::InternalComparator`), (ii) MDL justification via error-detection / switching-code value under noise or regime shifts, or (iii) coupling `M2b` comparator retention directly with `M4a` sleep loopback (accounting for shared-source correlation).
 2. **Switching codes vs. ad-hoc reserve caps (`m1a-redesign-plan.md` Open Q #1):** Replacing `D1b.1` idle heuristics and `Some(25.0)` caps with information-theoretic switching codes (`Herbster & Warmuth 1998`; `van Erven et al. 2012`) was deferred from M1b and remains an open principled candidate for regime shifts in M2+.
 3. **Common compute & loss across heterogeneous baselines (`milestone_0_review.md` §4, `milestone_0_plan.md` §8.3):** `src/baselines/rnn.rs` (`RNN/LSTM` BPTT) was deferred to **M2**. Both adding it and running `M2` baseline comparisons or `M4` sleep-vs-wake equal-compute ablations require bringing `CTW`, `ReedsSloane`, neural baselines, and `ArkheLearner` onto an explicitly declared compute and loss protocol.
 4. **Sleep replay phase integrity (`milestone_0_lessons_learned.md` §5.3):** M4a offline sleep loopback ($\hat{A}(t+1) \to A(t+1)$) must capture and step from live internal `Delay` register states (or full attractor cycles), never resetting registers to static $t = 0$ `init` values.
@@ -328,7 +330,11 @@ max_nodes = 32
 
 ## 7. Pre-Milestone 2 Readiness Measurements & Verification (2026-11-13)
 
-Following Decisions `Q1`–`Q9` ([Charter DR #31–#39](foundational_research_charter_v3.md#appendix-a-decision-record)) and `G1B.4a:Axis1` **Option (a)** (`a47ff8d`), all Readiness `A`–`C` code changes landed across commits `5a7c27d`, `a47ff8d`, `22954df`, and `7649e2c` (`source_tree_fnv1a128 = 26e9d332905dd6a6aeadce50c5266fa3`). Complete inventory and full tables live in [parameter_inventory.md §3](parameter_inventory.md#3-compute-profile--measurement-tables).
+Following Decisions `Q1`–`Q9` ([Charter DR #31–#39](foundational_research_charter_v3.md#appendix-a-decision-record)) and `G1B.4a:Axis1` **Option (a)** (`a47ff8d`), all Readiness `A`–`C` code changes landed across commits `deb200a`, `5a7c27d`, `a47ff8d`, `22954df`, `7649e2c`, and `eafcec6` (`source_tree_fnv1a128 = 26e9d332905dd6a6aeadce50c5266fa3`). Complete inventory and full tables live in [parameter_inventory.md §3](parameter_inventory.md#3-compute-profile--measurement-tables).
+
+### 7.0 Readiness `A1` Phase 1–2 Bit-Identity Proof
+
+Verified on `2026-11-13` (`deb200a`) by extracting the 8 Phase 0 golden fixtures from `2d009b0` (`git archive 2d009b0 tests/fixtures/golden | tar -x -C /tmp/arkhe_phase0_golden`), temporarily overriding `EconomyConfig::default()` with `ReserveCap::Fixed(25.0)` and pointing [`tests/golden_traces.rs`](../tests/golden_traces.rs) at the extracted fixtures, then running `cargo test --test golden_traces -- --nocapture`: `test golden_traces_are_bit_identical ... ok` (`1 passed; 0 failed; finished in 15.83s`). Reverting those temporary overrides confirmed that the re-blessed trajectory digests differ solely due to Phase 3 (`ReserveCap::HorizonDerived`), with identical structural event sequences and final circuits.
 
 ### 7.1 `B6` Empirical Regime-Shift Latencies (Charter §3.1.2)
 
@@ -342,6 +348,7 @@ Following Decisions `Q1`–`Q9` ([Charter DR #31–#39](foundational_research_ch
 ### 7.2 `B7` Multi-Channel Lock-Time Ratios
 
 Across seeds `0..10` ([`tests/multi_channel_development.rs`](../tests/multi_channel_development.rs)) with per-port `PortDevelopmentalState`:
+
 - `K=2:(Alt,Motif011)` `Combinational`: `ch0 = 1.00x` (`64/64`), `ch1 = 1.00x` (`255/255`, `MaxSnapshots = 3`).
 - `K=2:(Alt,Motif011)` `TicksPerHop`: `ch0 = 1.05x` (`64 -> 67`), `ch1 = 1.00x` (`66/66`).
 - `K=3:(Alt,Motif011,Motif001)` `Combinational`: `ch0 = 1.00x` (`64/64`), `ch1 = 0.25x` (`255 -> 65` concurrent speedup via cross-channel feature reuse), `ch2 = 1.02x` (`66 -> 67`).
@@ -350,6 +357,7 @@ Across seeds `0..10` ([`tests/multi_channel_development.rs`](../tests/multi_chan
 ### 7.3 `B5` Phase 0 Compute Scaling & Guardrail Awareness
 
 Release compute profiling ([`scripts/measure_compute_profile.py`](../scripts/measure_compute_profile.py) on `7649e2c`, 5 seeds, `horizon=512` controlled / `1024` endogenous):
+
 - **Node scaling (`steady_clean`, `K=1`):** rises smoothly from `2.04 us/tick` (`N=0`) through `29.30` (`N=8`) and `67.10` (`N=16`) to `206.86 us/tick` (`N=32`, roughly quadratic $\sim O(N^2)$).
 - **Channel scaling (dominant cost axis):** even at `N=0`, clean per-tick cost climbs $\sim O(K^3)$ across $K$: `2.04` ($K=1$) $\to$ `9.90` ($K=2$) $\to$ `66.96` ($K=4$) $\to$ `516.97 us/tick` ($K=8$), reaching `2293.29 us/tick` (`steady_clean`) and `3067.05 us/tick` (`diagnostic_noise`, `sprout_blocked_max_nodes = 3055` with `0.00` wasted replay ticks) at $N=32, K=8$.
 - **Endogenous $K=1..8$:** all 6 endogenous tasks (clean and $\varepsilon=0.05$) reached `0` post-500 clean errors with `0` starvation prunes and `0` `max_nodes` blocks; `K=8` solved all 8 binary motifs simultaneously in `18` final nodes (`< max_nodes = 32`). For Milestone 2 planning (`Q3`), `max_nodes = 32` leaves headroom for small multi-channel circuits, while Phase 0 of larger multi-channel / comparator suites should watch the $O(K^3)$ per-tick scaling factor.
