@@ -8,18 +8,14 @@ use arkhe::baselines::{
     ObservationWindow, SynthesisCertStatus, TickBudget, evaluate_circuit_on_window,
 };
 use arkhe::config::{
-    BaselineConfig, BudgetConfig, CONFIG_SCHEMA_VERSION, ConfigRunError, EnvironmentConfig,
-    ExperimentConfig, RunReport, SubstrateConfig, compute_ground_truth_yardstick,
-    execute_experiment,
+    BaselineConfig, BudgetConfig, CONFIG_SCHEMA_VERSION, EnvironmentConfig, ExperimentConfig,
+    RunReport, SubstrateConfig, compute_ground_truth_yardstick, execute_experiment,
 };
 use arkhe::env::{FiniteStateGenerator, GeneratorConfig, LfsrStage, NoiseModel};
 use arkhe::metrics::{
     BudgetAccountingMode, compute_mdl, detect_autonomous_cycle, estimate_attractor_basin,
 };
 use arkhe::rng::SeedBank;
-use arkhe::structural::{
-    BoundaryAnchor, Coord, GridShape, LatticeCircuit, PerimeterSide, WiringTopology,
-};
 use arkhe::substrate::{
     Circuit, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
 };
@@ -358,7 +354,6 @@ fn all_five_m0_baselines_execute_under_compute_matched_budgets() {
             substrate: SubstrateConfig {
                 width_bits: Width::BITS_1,
                 wire_delay: WireDelayMode::Combinational,
-                wiring_topology: WiringTopology::WellMixed,
             },
             environment: EnvironmentConfig {
                 horizon_ticks: 200,
@@ -411,7 +406,6 @@ fn all_five_m0_baselines_execute_under_compute_matched_budgets() {
         substrate: SubstrateConfig {
             width_bits: Width::BITS_2,
             wire_delay: WireDelayMode::Combinational,
-            wiring_topology: WiringTopology::WellMixed,
         },
         environment: EnvironmentConfig {
             horizon_ticks: 80,
@@ -432,56 +426,24 @@ fn all_five_m0_baselines_execute_under_compute_matched_budgets() {
 }
 
 #[test]
-fn spatial_lattice_lowering_and_mdl_accounting_work_together() {
-    let shape = GridShape::new(3, 3).unwrap();
-    let mut lat = LatticeCircuit::new(
-        shape,
-        Width::BITS_2,
-        WireDelayMode::TicksPerHop,
-        WiringTopology::LocalVonNeumann,
-        vec![BoundaryAnchor {
-            side: PerimeterSide::West,
-            offset: 1,
-        }],
-        vec![BoundaryAnchor {
-            side: PerimeterSide::East,
-            offset: 1,
-        }],
-    )
-    .unwrap();
-
-    let n0 = lat
-        .place_node(Coord { row: 1, col: 0 }, Primitive::Delay { init: 0 })
-        .unwrap();
-    let n1 = lat
-        .place_node(Coord { row: 1, col: 2 }, Primitive::Eqz)
-        .unwrap();
-    lat.connect(
+fn circuit_construction_and_mdl_accounting_work_together() {
+    let mut circ = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::TicksPerHop);
+    let n0 = circ.add_node(Primitive::Delay { init: 0 });
+    let n1 = circ.add_node(Primitive::Eqz);
+    circ.connect(
         SignalSource::BoundaryIn(0),
         SignalSink::NodeIn { node: n0, port: 0 },
-    )
-    .unwrap();
-    lat.connect(
+    );
+    circ.connect(
         SignalSource::NodeOut { node: n0, port: 0 },
         SignalSink::NodeIn { node: n1, port: 0 },
-    )
-    .unwrap();
-    lat.connect(
+    );
+    circ.connect(
         SignalSource::NodeOut { node: n1, port: 0 },
         SignalSink::BoundaryOut(0),
-    )
-    .unwrap();
-
-    let lowered = lat.lower().unwrap();
-    let mdl = compute_mdl(
-        &lowered,
-        WiringTopology::LocalVonNeumann,
-        Some(shape),
-        1.0,
-        4,
-        100,
-        5,
     );
+
+    let mdl = compute_mdl(&circ, 1.0, 4, 100, 5);
     assert!(mdl.circuit_bits > 0.0);
     assert!(mdl.palette_bits > 0.0);
     assert!(mdl.total_bits > mdl.circuit_bits);
@@ -520,7 +482,6 @@ fn cli_subcommands_yardstick_run_and_verify_m0_succeed() {
         substrate: SubstrateConfig {
             width_bits: Width::BITS_1,
             wire_delay: WireDelayMode::Combinational,
-            wiring_topology: WiringTopology::WellMixed,
         },
         environment: EnvironmentConfig {
             horizon_ticks: 120,
@@ -653,7 +614,6 @@ fn cli_yardstick_rejects_invalid_epsilon_and_reports_honest_ground_truth_bounds(
         substrate: SubstrateConfig {
             width_bits: Width::BITS_2,
             wire_delay: WireDelayMode::Combinational,
-            wiring_topology: WiringTopology::WellMixed,
         },
         environment: EnvironmentConfig {
             horizon_ticks: 120,
@@ -679,47 +639,15 @@ fn cli_yardstick_rejects_invalid_epsilon_and_reports_honest_ground_truth_bounds(
 }
 
 #[test]
-fn topology_guardrail_and_reactive_state_accounting_are_strict() {
-    // 1. Non-WellMixed topologies are explicitly rejected in `execute_experiment`.
-    for unsupported_topo in [WiringTopology::LocalVonNeumann, WiringTopology::LocalMoore] {
-        let cfg = ExperimentConfig {
-            schema_version: CONFIG_SCHEMA_VERSION,
-            master_seed: 0,
-            substrate: SubstrateConfig {
-                width_bits: Width::BITS_1,
-                wire_delay: WireDelayMode::Combinational,
-                wiring_topology: unsupported_topo,
-            },
-            environment: EnvironmentConfig {
-                horizon_ticks: 80,
-                transient_warmup_ticks: 16,
-                generator: GeneratorConfig::T1_Alternating { a: 0, b: 1 },
-                noise: NoiseModel::None,
-            },
-            budget: BudgetConfig {
-                max_eval_ticks: 5_000,
-            },
-            baseline: BaselineConfig::Cgp {
-                lambda: 4,
-                max_genes: 6,
-                fact_window: 48,
-            },
-        };
-        assert!(matches!(
-            execute_experiment(&cfg),
-            Err(ConfigRunError::UnsupportedExperimentTopology(t)) if t == unsupported_topo
-        ));
-    }
-
-    // 2. `T1_Alternating` 0-Delay reactive inverter reports `boundary_lag_register_count == Some(1)`
-    //    and `effective_excess_state_bits_over_c_mu == Some(0.0)` (not `-1.0`).
+fn reactive_state_accounting_is_strict() {
+    // `T1_Alternating` 0-Delay reactive inverter reports `boundary_lag_register_count == Some(1)`
+    // and `effective_excess_state_bits_over_c_mu == Some(0.0)` (not `-1.0`).
     let alt_cfg = ExperimentConfig {
         schema_version: CONFIG_SCHEMA_VERSION,
         master_seed: 0,
         substrate: SubstrateConfig {
             width_bits: Width::BITS_1,
             wire_delay: WireDelayMode::Combinational,
-            wiring_topology: WiringTopology::WellMixed,
         },
         environment: EnvironmentConfig {
             horizon_ticks: 160,
@@ -871,7 +799,6 @@ fn prime_period_5_and_7_sliding_windows_preserve_exact_phase() {
             substrate: SubstrateConfig {
                 width_bits: width,
                 wire_delay: WireDelayMode::Combinational,
-                wiring_topology: WiringTopology::WellMixed,
             },
             environment: EnvironmentConfig {
                 horizon_ticks: 850,

@@ -21,7 +21,6 @@ use crate::env::{
     declared_noise_entropy_bits_per_symbol, solve_epsilon_machine,
 };
 use crate::rng::{SeedBank, StreamDomain};
-use crate::structural::WiringTopology;
 use crate::substrate::{
     BitParallel64State, Circuit, EvalError, InvariantError, NodeId, Primitive, ScalarState,
     SignalSink, SignalSource, Width, WidthError, WireDelayMode,
@@ -632,7 +631,6 @@ fn verify_gate_g3_t1_optima(
                     substrate: SubstrateConfig {
                         width_bits: width,
                         wire_delay: WireDelayMode::Combinational,
-                        wiring_topology: WiringTopology::WellMixed,
                     },
                     environment: EnvironmentConfig {
                         horizon_ticks: 240,
@@ -734,7 +732,6 @@ fn verify_gate_g3_t1_optima(
                     substrate: SubstrateConfig {
                         width_bits: width,
                         wire_delay: WireDelayMode::Combinational,
-                        wiring_topology: WiringTopology::WellMixed,
                     },
                     environment: EnvironmentConfig {
                         horizon_ticks: 240,
@@ -818,7 +815,6 @@ fn verify_gate_g3_t1_optima(
                         substrate: SubstrateConfig {
                             width_bits: width,
                             wire_delay: WireDelayMode::Combinational,
-                            wiring_topology: WiringTopology::WellMixed,
                         },
                         environment: EnvironmentConfig {
                             horizon_ticks: 20_800,
@@ -892,7 +888,6 @@ fn verify_gate_g3_t1_optima(
                         substrate: SubstrateConfig {
                             width_bits: width,
                             wire_delay: WireDelayMode::Combinational,
-                            wiring_topology: WiringTopology::WellMixed,
                         },
                         environment: EnvironmentConfig {
                             horizon_ticks: 4_400,
@@ -1008,7 +1003,6 @@ fn verify_gate_g4_reproducibility(failures: &mut Vec<String>) -> bool {
             substrate: SubstrateConfig {
                 width_bits: Width::BITS_2,
                 wire_delay: WireDelayMode::Combinational,
-                wiring_topology: WiringTopology::WellMixed,
             },
             environment: EnvironmentConfig {
                 horizon_ticks: 200,
@@ -1036,7 +1030,6 @@ fn verify_gate_g4_reproducibility(failures: &mut Vec<String>) -> bool {
             substrate: SubstrateConfig {
                 width_bits: Width::BITS_1,
                 wire_delay: WireDelayMode::TicksPerHop,
-                wiring_topology: WiringTopology::WellMixed,
             },
             environment: EnvironmentConfig {
                 horizon_ticks: 160,
@@ -1059,7 +1052,6 @@ fn verify_gate_g4_reproducibility(failures: &mut Vec<String>) -> bool {
             substrate: SubstrateConfig {
                 width_bits: Width::BITS_2,
                 wire_delay: WireDelayMode::Combinational,
-                wiring_topology: WiringTopology::WellMixed,
             },
             environment: EnvironmentConfig {
                 horizon_ticks: 240,
@@ -1085,7 +1077,6 @@ fn verify_gate_g4_reproducibility(failures: &mut Vec<String>) -> bool {
             substrate: SubstrateConfig {
                 width_bits: Width::BITS_2,
                 wire_delay: WireDelayMode::Combinational,
-                wiring_topology: WiringTopology::WellMixed,
             },
             environment: EnvironmentConfig {
                 horizon_ticks: 80,
@@ -1107,7 +1098,6 @@ fn verify_gate_g4_reproducibility(failures: &mut Vec<String>) -> bool {
             substrate: SubstrateConfig {
                 width_bits: Width::BITS_1,
                 wire_delay: WireDelayMode::Combinational,
-                wiring_topology: WiringTopology::WellMixed,
             },
             environment: EnvironmentConfig {
                 horizon_ticks: 140,
@@ -1131,7 +1121,6 @@ fn verify_gate_g4_reproducibility(failures: &mut Vec<String>) -> bool {
             substrate: SubstrateConfig {
                 width_bits: Width::BITS_1,
                 wire_delay: WireDelayMode::TicksPerHop,
-                wiring_topology: WiringTopology::WellMixed,
             },
             environment: EnvironmentConfig {
                 horizon_ticks: 180,

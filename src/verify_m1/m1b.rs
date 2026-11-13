@@ -17,12 +17,9 @@ use crate::metrics::Scorecard;
 use crate::rng::SeedBank;
 use crate::structural::economy::{EconomyConfig, RewardMode};
 use crate::structural::growth::GrowthConfig;
-use crate::structural::lattice::{
-    BoundaryAnchor, Coord, GridShape, LatticeCircuit, PerimeterSide, WiringTopology,
-};
 use crate::structural::learner::ArkheLearner;
-use crate::structural::surgery::EditableLattice;
-use crate::substrate::{Primitive, SignalSink, SignalSource, Width, WireDelayMode};
+use crate::structural::surgery::EditableCircuit;
+use crate::substrate::{Circuit, Primitive, SignalSink, SignalSource, Width, WireDelayMode};
 use crate::verify_m1::{
     M1aBankReport, M1aVerificationSummary, check_seed_range_holdout, run_m1a_bank_evaluation,
     run_m1a_verification_suite_with_horizon_and_holdout,
@@ -516,29 +513,18 @@ fn verify_gate_g1b1(
             let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank)
                 .expect("valid environment");
 
-            let mut learner = ArkheLearner::new_with_spatial(
+            let mut learner = ArkheLearner::new_with_config(
                 width,
                 1,
                 WireDelayMode::Combinational,
-                WiringTopology::WellMixed,
-                GridShape::new(8, 8).unwrap(),
-                4,
                 EconomyConfig::default(),
                 GrowthConfig::default(),
                 seeds_bank,
             )
             .expect("learner creation succeeds");
 
-            let scorecard = run_prequential_harness(
-                &mut env,
-                &mut learner,
-                WiringTopology::WellMixed,
-                horizon,
-                500,
-                50_000,
-                None,
-                None,
-            );
+            let scorecard =
+                run_prequential_harness(&mut env, &mut learner, horizon, 500, 50_000, None, None);
             audits.push(OnlineRunAudit::record(
                 format!("G1B.1:{task_name}:seed={master_seed}"),
                 &learner,
@@ -585,14 +571,13 @@ struct FixedReactiveEchoBaseline {
 }
 
 impl FixedReactiveEchoBaseline {
-    fn new(lattice: &LatticeCircuit) -> Self {
-        let circuit = lattice.lower().expect("valid fixed echo lattice");
+    fn new(circuit: &Circuit) -> Self {
         let compiled = circuit.compile().expect("valid fixed echo circuit");
         let state = crate::substrate::ScalarState::new(&compiled);
         let inputs = usize::from(compiled.num_inputs());
         let outputs = usize::from(compiled.num_outputs());
         Self {
-            circuit,
+            circuit: circuit.clone(),
             compiled,
             state,
             prev_observed: vec![0; inputs],
@@ -633,87 +618,51 @@ impl crate::baselines::PredictorBaseline for FixedReactiveEchoBaseline {
     }
 }
 
-fn build_fixed_reactive_echo(width: Width, lag_ticks: usize, invert: bool) -> LatticeCircuit {
-    let mut circ = LatticeCircuit::new(
-        GridShape::new(8, 8).unwrap(),
-        width,
-        WireDelayMode::Combinational,
-        WiringTopology::WellMixed,
-        vec![BoundaryAnchor {
-            side: PerimeterSide::North,
-            offset: 3,
-        }],
-        vec![BoundaryAnchor {
-            side: PerimeterSide::North,
-            offset: 4,
-        }],
-    )
-    .unwrap();
+fn build_fixed_reactive_echo(width: Width, lag_ticks: usize, invert: bool) -> Circuit {
+    let mut circ = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
     assert!(lag_ticks >= 1);
     let mut curr_src = SignalSource::BoundaryIn(0);
-    for step in 0..lag_ticks.saturating_sub(1) {
-        let d = circ
-            .place_node(
-                Coord {
-                    row: (step / 8) as u16,
-                    col: (step % 8) as u16,
-                },
-                Primitive::Delay { init: 0 },
-            )
-            .unwrap();
-        circ.connect(curr_src, SignalSink::NodeIn { node: d, port: 0 })
-            .unwrap();
+    for _ in 0..lag_ticks.saturating_sub(1) {
+        let d = circ.add_node(Primitive::Delay { init: 0 });
+        circ.connect(curr_src, SignalSink::NodeIn { node: d, port: 0 });
         curr_src = SignalSource::NodeOut { node: d, port: 0 };
     }
     if invert {
-        let cell = circ.nearest_empty_cell(Coord { row: 0, col: 0 }).unwrap();
         if width == Width::BITS_1 {
-            let eqz = circ.place_node(cell, Primitive::Eqz).unwrap();
-            circ.connect(curr_src, SignalSink::NodeIn { node: eqz, port: 0 })
-                .unwrap();
+            let eqz = circ.add_node(Primitive::Eqz);
+            circ.connect(curr_src, SignalSink::NodeIn { node: eqz, port: 0 });
             curr_src = SignalSource::NodeOut { node: eqz, port: 0 };
         } else {
-            let sub = circ.place_node(cell, Primitive::Sub).unwrap();
-            let c_cell = circ.nearest_empty_cell(Coord { row: 0, col: 0 }).unwrap();
-            let s_cell = circ.nearest_empty_cell(Coord { row: 1, col: 0 }).unwrap();
-            let d_const = circ
-                .place_node(c_cell, Primitive::Delay { init: width.mask() })
-                .unwrap();
-            let sp = circ.place_node(s_cell, Primitive::Split).unwrap();
+            let sub = circ.add_node(Primitive::Sub);
+            let d_const = circ.add_node(Primitive::Delay { init: width.mask() });
+            let sp = circ.add_node(Primitive::Split);
             circ.connect(
                 SignalSource::NodeOut {
                     node: d_const,
                     port: 0,
                 },
                 SignalSink::NodeIn { node: sp, port: 0 },
-            )
-            .unwrap();
+            );
             circ.connect(
                 SignalSource::NodeOut { node: sp, port: 0 },
                 SignalSink::NodeIn {
                     node: d_const,
                     port: 0,
                 },
-            )
-            .unwrap();
+            );
             circ.connect(
                 SignalSource::NodeOut { node: sp, port: 1 },
                 SignalSink::NodeIn { node: sub, port: 0 },
-            )
-            .unwrap();
-            circ.connect(curr_src, SignalSink::NodeIn { node: sub, port: 1 })
-                .unwrap();
+            );
+            circ.connect(curr_src, SignalSink::NodeIn { node: sub, port: 1 });
             curr_src = SignalSource::NodeOut { node: sub, port: 0 };
         }
     } else if matches!(curr_src, SignalSource::BoundaryIn(_)) {
-        let sp = circ
-            .place_node(Coord { row: 0, col: 0 }, Primitive::Split)
-            .unwrap();
-        circ.connect(curr_src, SignalSink::NodeIn { node: sp, port: 0 })
-            .unwrap();
+        let sp = circ.add_node(Primitive::Split);
+        circ.connect(curr_src, SignalSink::NodeIn { node: sp, port: 0 });
         curr_src = SignalSource::NodeOut { node: sp, port: 0 };
     }
-    circ.connect(curr_src, SignalSink::BoundaryOut(0)).unwrap();
+    circ.connect(curr_src, SignalSink::BoundaryOut(0));
     circ
 }
 
@@ -742,13 +691,10 @@ fn verify_gate_g1b2(
                 let generator = gen_cfg.build(width).expect("valid generator");
                 let mut env =
                     NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
-                let mut learner = ArkheLearner::new_with_spatial(
+                let mut learner = ArkheLearner::new_with_config(
                     width,
                     1,
                     WireDelayMode::Combinational,
-                    WiringTopology::WellMixed,
-                    GridShape::new(8, 8).unwrap(),
-                    4,
                     EconomyConfig::default(),
                     GrowthConfig::default(),
                     seeds_bank,
@@ -757,7 +703,6 @@ fn verify_gate_g1b2(
                 let scorecard = run_prequential_harness(
                     &mut env,
                     &mut learner,
-                    WiringTopology::WellMixed,
                     horizon,
                     500,
                     50_000,
@@ -843,28 +788,17 @@ fn verify_gate_g1b2(
             let seeds_bank = SeedBank::new(master_seed);
             let generator = gen_cfg.build(width).expect("valid generator");
             let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
-            let mut learner = ArkheLearner::new_with_spatial(
+            let mut learner = ArkheLearner::new_with_config(
                 width,
                 1,
                 WireDelayMode::Combinational,
-                WiringTopology::WellMixed,
-                GridShape::new(8, 8).unwrap(),
-                4,
                 EconomyConfig::default(),
                 GrowthConfig::default(),
                 seeds_bank,
             )
             .unwrap();
-            let scorecard = run_prequential_harness(
-                &mut env,
-                &mut learner,
-                WiringTopology::WellMixed,
-                horizon,
-                500,
-                50_000,
-                None,
-                None,
-            );
+            let scorecard =
+                run_prequential_harness(&mut env, &mut learner, horizon, 500, 50_000, None, None);
             audits.push(OnlineRunAudit::record(
                 format!("G1B.2a:{name}:seed={master_seed}"),
                 &learner,
@@ -910,13 +844,10 @@ fn verify_gate_g1b2(
                 let seeds_bank = SeedBank::new(master_seed);
                 let generator = const_cfg.build(width).unwrap();
                 let mut env = NoisyEnvironment::new(generator, noise.clone(), seeds_bank).unwrap();
-                let mut learner = ArkheLearner::new_with_spatial(
+                let mut learner = ArkheLearner::new_with_config(
                     width,
                     1,
                     WireDelayMode::Combinational,
-                    WiringTopology::WellMixed,
-                    GridShape::new(8, 8).unwrap(),
-                    4,
                     EconomyConfig::default(),
                     GrowthConfig::default(),
                     seeds_bank,
@@ -925,7 +856,6 @@ fn verify_gate_g1b2(
                 let scorecard = run_prequential_harness(
                     &mut env,
                     &mut learner,
-                    WiringTopology::WellMixed,
                     horizon,
                     500,
                     50_000,
@@ -1029,13 +959,10 @@ fn verify_gate_g1b2(
             let seeds_bank = SeedBank::new(master_seed);
             let generator = task_cfg.build(width).unwrap();
             let mut env = NoisyEnvironment::new(generator, noise.clone(), seeds_bank).unwrap();
-            let mut learner = ArkheLearner::new_with_spatial(
+            let mut learner = ArkheLearner::new_with_config(
                 width,
                 1,
                 WireDelayMode::Combinational,
-                WiringTopology::WellMixed,
-                GridShape::new(8, 8).unwrap(),
-                4,
                 EconomyConfig::default(),
                 GrowthConfig::default(),
                 seeds_bank,
@@ -1044,7 +971,6 @@ fn verify_gate_g1b2(
             let scorecard = run_prequential_harness(
                 &mut env,
                 &mut learner,
-                WiringTopology::WellMixed,
                 horizon,
                 500,
                 50_000,
@@ -1073,7 +999,6 @@ fn verify_gate_g1b2(
             let echo_score = run_prequential_harness(
                 &mut echo_env,
                 &mut echo_baseline,
-                WiringTopology::WellMixed,
                 horizon,
                 500,
                 50_000,
@@ -1132,99 +1057,23 @@ fn verify_gate_g1b3(online_audits: &[OnlineRunAudit], failures: &mut Vec<String>
     for width in [Width::BITS_1, Width::BITS_2] {
         for delay_mode in [WireDelayMode::Combinational, WireDelayMode::TicksPerHop] {
             stress_cases += 1;
-            let shape = GridShape::new(8, 8).unwrap();
-            let mut lattice = LatticeCircuit::new(
-                shape,
-                width,
-                delay_mode,
-                WiringTopology::LocalVonNeumann,
-                vec![BoundaryAnchor {
-                    side: PerimeterSide::North,
-                    offset: 3,
-                }],
-                vec![BoundaryAnchor {
-                    side: PerimeterSide::North,
-                    offset: 4,
-                }],
-            )
-            .unwrap();
-
-            let out_cell = Coord { row: 0, col: 4 };
-            let split = lattice.place_node(out_cell, Primitive::Split).unwrap();
-            lattice
-                .route_connect(
-                    SignalSource::NodeOut {
-                        node: split,
-                        port: 1,
-                    },
-                    SignalSink::BoundaryOut(0),
-                    4,
-                )
-                .unwrap();
-
             let template = if width.bits() == 1 {
                 [0, 1, 1]
             } else {
                 [0, 1, 2]
             };
 
-            let d0 = lattice
-                .place_node(
-                    Coord { row: 1, col: 4 },
-                    Primitive::Delay { init: template[2] },
-                )
-                .unwrap();
-            let d1 = lattice
-                .place_node(
-                    Coord { row: 2, col: 4 },
-                    Primitive::Delay { init: template[1] },
-                )
-                .unwrap();
-            let d2 = lattice
-                .place_node(
-                    Coord { row: 3, col: 4 },
-                    Primitive::Delay { init: template[0] },
-                )
-                .unwrap();
-
-            lattice
-                .route_connect(
-                    SignalSource::NodeOut { node: d0, port: 0 },
-                    SignalSink::NodeIn { node: d1, port: 0 },
-                    4,
-                )
-                .unwrap();
-            lattice
-                .route_connect(
-                    SignalSource::NodeOut { node: d1, port: 0 },
-                    SignalSink::NodeIn { node: d2, port: 0 },
-                    4,
-                )
-                .unwrap();
-            lattice
-                .route_connect(
-                    SignalSource::NodeOut { node: d2, port: 0 },
-                    SignalSink::NodeIn {
-                        node: split,
-                        port: 0,
-                    },
-                    4,
-                )
-                .unwrap();
-            lattice
-                .route_connect(
-                    SignalSource::NodeOut {
-                        node: split,
-                        port: 0,
-                    },
-                    SignalSink::NodeIn { node: d0, port: 0 },
-                    4,
-                )
-                .unwrap();
+            let mut circuit = Circuit::new(width, 1, 1, delay_mode);
+            crate::structural::graph_edit::build_autonomous_ring(
+                &mut circuit,
+                template.len(),
+                &template,
+                0,
+            );
 
             let mut editable =
-                EditableLattice::new(lattice.clone(), EconomyConfig::default()).unwrap();
-            let mut ref_editable = EditableLattice::new(lattice, EconomyConfig::default()).unwrap();
+                EditableCircuit::new(circuit.clone(), EconomyConfig::default()).unwrap();
+            let mut ref_editable = EditableCircuit::new(circuit, EconomyConfig::default()).unwrap();
 
             let zeros = [0u64];
             let mut pred = [0u64];
@@ -1249,40 +1098,35 @@ fn verify_gate_g1b3(online_audits: &[OnlineRunAudit], failures: &mut Vec<String>
                     phase_slips += 1;
                 }
 
-                let sec_cell = Coord {
-                    row: 7,
-                    col: (step % 8) as u16,
-                };
-                let mut staged = editable.lattice().clone();
-                if let Ok(node) = staged.place_node(sec_cell, Primitive::Eqz) {
-                    let old_to_new: Vec<Option<crate::substrate::NodeId>> =
-                        (0..editable.circuit().node_count())
-                            .map(|i| Some(crate::substrate::NodeId(i as u32)))
-                            .collect();
-                    if editable
-                        .recompile_preserving_state(staged, &old_to_new)
-                        .is_ok()
-                    {
-                        if editable.circuit().compile().is_err() {
-                            failures.push(format!(
-                                "G1B.3b: post-edit circuit failed compile at edit {step}"
-                            ));
-                            break;
-                        }
-                        let mut idle = std::collections::BTreeSet::new();
-                        idle.insert(node);
-                        let _ = editable.prune_zero_sensitivity_mature_nodes(
-                            &idle,
-                            &[vec![0]],
-                            &[vec![ref_pred[0]]],
-                            true,
-                        );
-                        if editable.circuit().compile().is_err() {
-                            failures.push(format!(
-                                "G1B.3b: post-prune circuit failed compile at edit {step}"
-                            ));
-                            break;
-                        }
+                let mut staged = editable.circuit().clone();
+                let node = staged.add_node(Primitive::Eqz);
+                let old_to_new: Vec<Option<crate::substrate::NodeId>> =
+                    (0..editable.circuit().node_count())
+                        .map(|i| Some(crate::substrate::NodeId(i as u32)))
+                        .collect();
+                if editable
+                    .recompile_preserving_state(staged, &old_to_new)
+                    .is_ok()
+                {
+                    if editable.circuit().compile().is_err() {
+                        failures.push(format!(
+                            "G1B.3b: post-edit circuit failed compile at edit {step}"
+                        ));
+                        break;
+                    }
+                    let mut idle = std::collections::BTreeSet::new();
+                    idle.insert(node);
+                    let _ = editable.prune_zero_sensitivity_mature_nodes(
+                        &idle,
+                        &[vec![0]],
+                        &[vec![ref_pred[0]]],
+                        true,
+                    );
+                    if editable.circuit().compile().is_err() {
+                        failures.push(format!(
+                            "G1B.3b: post-prune circuit failed compile at edit {step}"
+                        ));
+                        break;
                     }
                 }
             }
@@ -1298,78 +1142,10 @@ fn verify_gate_g1b3(online_audits: &[OnlineRunAudit], failures: &mut Vec<String>
     (failures.is_empty(), online_audits.len() + stress_cases)
 }
 
-fn build_seeded_autonomous_ring(width: Width, template: &[u64]) -> LatticeCircuit {
-    let shape = GridShape::new(8, 8).unwrap();
-    let mut lat = LatticeCircuit::new(
-        shape,
-        width,
-        WireDelayMode::Combinational,
-        WiringTopology::WellMixed,
-        vec![BoundaryAnchor {
-            side: PerimeterSide::North,
-            offset: 3,
-        }],
-        vec![BoundaryAnchor {
-            side: PerimeterSide::North,
-            offset: 4,
-        }],
-    )
-    .unwrap();
-    let period = template.len();
-    let mut delays = Vec::with_capacity(period);
-    for j in 0..period {
-        let init = template[(period - 1 - j) % period];
-        let cell = lat.nearest_empty_cell(Coord { row: 0, col: 0 }).unwrap();
-        delays.push(lat.place_node(cell, Primitive::Delay { init }).unwrap());
-    }
-    let split_cell = lat.nearest_empty_cell(Coord { row: 0, col: 0 }).unwrap();
-    let split = lat.place_node(split_cell, Primitive::Split).unwrap();
-    for i in 0..period.saturating_sub(1) {
-        lat.connect(
-            SignalSource::NodeOut {
-                node: delays[i],
-                port: 0,
-            },
-            SignalSink::NodeIn {
-                node: delays[i + 1],
-                port: 0,
-            },
-        )
-        .unwrap();
-    }
-    if let Some(&last_d) = delays.last() {
-        lat.connect(
-            SignalSource::NodeOut {
-                node: last_d,
-                port: 0,
-            },
-            SignalSink::NodeIn {
-                node: split,
-                port: 0,
-            },
-        )
-        .unwrap();
-        lat.connect(
-            SignalSource::NodeOut {
-                node: split,
-                port: 0,
-            },
-            SignalSink::NodeIn {
-                node: delays[0],
-                port: 0,
-            },
-        )
-        .unwrap();
-    }
-    lat.connect(
-        SignalSource::NodeOut {
-            node: split,
-            port: 1,
-        },
-        SignalSink::BoundaryOut(0),
-    )
-    .unwrap();
-    lat
+fn build_seeded_autonomous_ring(width: Width, template: &[u64]) -> Circuit {
+    let mut circ = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
+    crate::structural::graph_edit::build_autonomous_ring(&mut circ, template.len(), template, 0);
+    circ
 }
 
 /// Gate G1B.4: Charter §8 M1 ablations across seeds & subprocess reproducibility.
@@ -1381,7 +1157,6 @@ fn verify_gate_g1b4(
     failures: &mut Vec<String>,
 ) -> (bool, usize) {
     let min_pass = ((seeds as f64) * 0.90).ceil() as u32;
-    let shape = GridShape::new(8, 8).unwrap();
     let mut cases = 0usize;
 
     // Axis 1: All 4 RewardModes across T1_Constant(0) and sparse T1_PeriodicMotif([0,0,0,0,0,1]),
@@ -1416,13 +1191,10 @@ fn verify_gate_g1b4(
                     let generator = gen_cfg.build(width).unwrap();
                     let mut env =
                         NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
-                    let mut learner = ArkheLearner::new_with_spatial(
+                    let mut learner = ArkheLearner::new_with_config(
                         width,
                         1,
                         WireDelayMode::Combinational,
-                        WiringTopology::WellMixed,
-                        shape,
-                        4,
                         econ,
                         GrowthConfig {
                             max_nodes: 2,
@@ -1432,12 +1204,11 @@ fn verify_gate_g1b4(
                     )
                     .unwrap();
                     *learner.editable_mut() =
-                        EditableLattice::new(const_loop_zero.clone(), econ).unwrap();
+                        EditableCircuit::new(const_loop_zero.clone(), econ).unwrap();
 
                     let scorecard = run_prequential_harness(
                         &mut env,
                         &mut learner,
-                        WiringTopology::WellMixed,
                         horizon.min(400),
                         100,
                         20_000,
@@ -1498,26 +1269,22 @@ fn verify_gate_g1b4(
             .unwrap();
             let mut env_osc6 =
                 NoisyEnvironment::new(gen_osc6, NoiseModel::None, seeds_bank).unwrap();
-            let mut learner_osc6 = ArkheLearner::new_with_spatial(
+            let mut learner_osc6 = ArkheLearner::new_with_config(
                 width,
                 1,
                 WireDelayMode::Combinational,
-                WiringTopology::WellMixed,
-                shape,
-                4,
                 econ,
                 GrowthConfig::default(),
                 seeds_bank,
             )
             .unwrap();
-            *learner_osc6.editable_mut() = EditableLattice::new(osc6.clone(), econ).unwrap();
+            *learner_osc6.editable_mut() = EditableCircuit::new(osc6.clone(), econ).unwrap();
             let n_osc6 = learner_osc6.editable().circuit().node_count();
             learner_osc6.ledger_mut().node_debts = vec![0.0; n_osc6];
             learner_osc6.ledger_mut().debt_paid = vec![true; n_osc6];
             let score_osc6 = run_prequential_harness(
                 &mut env_osc6,
                 &mut learner_osc6,
-                WiringTopology::WellMixed,
                 horizon.min(500),
                 100,
                 20_000,
@@ -1555,13 +1322,10 @@ fn verify_gate_g1b4(
             .unwrap();
             let mut env_rare =
                 NoisyEnvironment::new(gen_rare, NoiseModel::None, seeds_bank).unwrap();
-            let mut learner_rare = ArkheLearner::new_with_spatial(
+            let mut learner_rare = ArkheLearner::new_with_config(
                 width,
                 1,
                 WireDelayMode::Combinational,
-                WiringTopology::WellMixed,
-                shape,
-                4,
                 EconomyConfig::default(),
                 GrowthConfig::default(),
                 seeds_bank,
@@ -1570,7 +1334,6 @@ fn verify_gate_g1b4(
             let score_rare = run_prequential_harness(
                 &mut env_rare,
                 &mut learner_rare,
-                WiringTopology::WellMixed,
                 horizon,
                 500,
                 50_000,
@@ -1604,52 +1367,38 @@ fn verify_gate_g1b4(
     let fanout_tasks = [
         (
             Width::BITS_1,
-            WiringTopology::WellMixed,
             GeneratorConfig::T1_PeriodicMotif {
                 motif: vec![0, 1, 1],
             },
-            "WellMixed:Motif011(k=1)",
+            "Motif011(k=1)",
         ),
         (
             Width::BITS_2,
-            WiringTopology::WellMixed,
             GeneratorConfig::T1_PeriodicMotif {
                 motif: vec![0, 1, 3],
             },
-            "WellMixed:Motif013(k=2)",
+            "Motif013(k=2)",
         ),
         (
             Width::BITS_2,
-            WiringTopology::WellMixed,
             GeneratorConfig::T1_AffineLag1 {
                 mul_a: 1,
                 add_b: 1,
                 init: 0,
             },
-            "WellMixed:AffineLag1(k=2)",
+            "AffineLag1(k=2)",
         ),
         (
             Width::BITS_2,
-            WiringTopology::WellMixed,
             GeneratorConfig::T3b_CounterModN {
                 modulus: 3,
                 init: 0,
             },
-            "WellMixed:CounterModN3(k=2)",
-        ),
-        (
-            Width::BITS_2,
-            WiringTopology::LocalVonNeumann,
-            GeneratorConfig::T1_AffineLag1 {
-                mul_a: 1,
-                add_b: 1,
-                init: 0,
-            },
-            "Local:AffineLag1(k=2)",
+            "CounterModN3(k=2)",
         ),
     ];
 
-    for (width, topology, task_cfg, task_name) in fanout_tasks {
+    for (width, task_cfg, task_name) in fanout_tasks {
         let mut total_splits_tax = 0usize;
         let mut total_splits_notax = 0usize;
         let mut acc_sum_tax = 0.0;
@@ -1662,13 +1411,10 @@ fn verify_gate_g1b4(
 
             let gen_tax = task_cfg.build(width).unwrap();
             let mut env_tax = NoisyEnvironment::new(gen_tax, NoiseModel::None, seeds_bank).unwrap();
-            let mut learner_tax = ArkheLearner::new_with_spatial(
+            let mut learner_tax = ArkheLearner::new_with_config(
                 width,
                 1,
                 WireDelayMode::Combinational,
-                topology,
-                shape,
-                4,
                 EconomyConfig {
                     split_code_tax: true,
                     ..EconomyConfig::default()
@@ -1680,7 +1426,6 @@ fn verify_gate_g1b4(
             let score_tax = run_prequential_harness(
                 &mut env_tax,
                 &mut learner_tax,
-                topology,
                 horizon,
                 500,
                 50_000,
@@ -1697,13 +1442,10 @@ fn verify_gate_g1b4(
             let gen_notax = task_cfg.build(width).unwrap();
             let mut env_notax =
                 NoisyEnvironment::new(gen_notax, NoiseModel::None, seeds_bank).unwrap();
-            let mut learner_notax = ArkheLearner::new_with_spatial(
+            let mut learner_notax = ArkheLearner::new_with_config(
                 width,
                 1,
                 WireDelayMode::Combinational,
-                topology,
-                shape,
-                4,
                 EconomyConfig {
                     split_code_tax: false,
                     ..EconomyConfig::default()
@@ -1715,7 +1457,6 @@ fn verify_gate_g1b4(
             let score_notax = run_prequential_harness(
                 &mut env_notax,
                 &mut learner_notax,
-                topology,
                 horizon,
                 500,
                 50_000,
@@ -1761,168 +1502,44 @@ fn verify_gate_g1b4(
         }
     }
 
-    // Axis 3: Spatial locality (LocalVonNeumann vs WellMixed) across Alternating and AffineLag1
-    let locality_tasks = [
-        (
-            Width::BITS_1,
-            GeneratorConfig::T1_Alternating { a: 0, b: 1 },
-            "Alternating(k=1)",
-        ),
-        (
-            Width::BITS_2,
-            GeneratorConfig::T1_Alternating { a: 0, b: 3 },
-            "Alternating(k=2)",
-        ),
-        (
-            Width::BITS_2,
-            GeneratorConfig::T1_AffineLag1 {
-                mul_a: 1,
-                add_b: 1,
-                init: 0,
-            },
-            "AffineLag1(k=2)",
-        ),
-    ];
-
-    for (width, task_cfg, task_name) in locality_tasks {
-        let mut local_pass = 0u32;
-        let mut wm_pass = 0u32;
-        let mut total_nodes_local = 0usize;
-        let mut total_nodes_wm = 0usize;
-
-        for seed_idx in 0..seeds {
-            cases += 2;
-            let master_seed = u64::from(seed_offset + seed_idx);
-            let seeds_bank = SeedBank::new(master_seed);
-
-            let gen_local = task_cfg.build(width).unwrap();
-            let mut env_local =
-                NoisyEnvironment::new(gen_local, NoiseModel::None, seeds_bank).unwrap();
-            let mut learner_local = ArkheLearner::new_with_spatial(
-                width,
-                1,
-                WireDelayMode::Combinational,
-                WiringTopology::LocalVonNeumann,
-                shape,
-                4,
-                EconomyConfig::default(),
-                GrowthConfig::default(),
-                seeds_bank,
-            )
-            .unwrap();
-            let score_local = run_prequential_harness(
-                &mut env_local,
-                &mut learner_local,
-                WiringTopology::LocalVonNeumann,
-                horizon,
-                500,
-                50_000,
-                None,
-                None,
-            );
-            audits.push(OnlineRunAudit::record(
-                format!("G1B.4a:Axis3:Local:{task_name}:seed={master_seed}"),
-                &learner_local,
-                &score_local,
-                50_000,
-            ));
-
-            let gen_wm = task_cfg.build(width).unwrap();
-            let mut env_wm = NoisyEnvironment::new(gen_wm, NoiseModel::None, seeds_bank).unwrap();
-            let mut learner_wm = ArkheLearner::new_with_spatial(
-                width,
-                1,
-                WireDelayMode::Combinational,
-                WiringTopology::WellMixed,
-                shape,
-                4,
-                EconomyConfig::default(),
-                GrowthConfig::default(),
-                seeds_bank,
-            )
-            .unwrap();
-            let score_wm = run_prequential_harness(
-                &mut env_wm,
-                &mut learner_wm,
-                WiringTopology::WellMixed,
-                horizon,
-                500,
-                50_000,
-                None,
-                None,
-            );
-            audits.push(OnlineRunAudit::record(
-                format!("G1B.4a:Axis3:WellMixed:{task_name}:seed={master_seed}"),
-                &learner_wm,
-                &score_wm,
-                50_000,
-            ));
-
-            if score_local.post_transient_clean_mismatches == 0 {
-                local_pass += 1;
-            }
-            if score_wm.post_transient_clean_mismatches == 0 {
-                wm_pass += 1;
-            }
-            total_nodes_local += learner_local.editable().circuit().node_count();
-            total_nodes_wm += learner_wm.editable().circuit().node_count();
-        }
-
-        if local_pass < min_pass || wm_pass < min_pass {
-            failures.push(format!(
-                "G1B.4a (Axis 3): {task_name} solve rate local={local_pass}/{seeds}, well_mixed={wm_pass}/{seeds} (required {min_pass})"
-            ));
-        }
-        if total_nodes_local < total_nodes_wm {
-            failures.push(format!(
-                "G1B.4a (Axis 3): {task_name} expected LocalVonNeumann nodes ({total_nodes_local}) >= WellMixed nodes ({total_nodes_wm})"
-            ));
-        }
-    }
-
     // Axis 4: Wire propagation delay (TicksPerHop across Alternating, PeriodicMotif, and AffineLag1)
     let tph_tasks = [
         (
             Width::BITS_1,
-            WiringTopology::LocalVonNeumann,
             GeneratorConfig::T1_Alternating { a: 0, b: 1 },
-            "TPH:Local:Alternating(k=1)",
+            "TPH:Alternating(k=1)",
         ),
         (
             Width::BITS_2,
-            WiringTopology::LocalVonNeumann,
             GeneratorConfig::T1_Alternating { a: 0, b: 3 },
-            "TPH:Local:Alternating(k=2)",
+            "TPH:Alternating(k=2)",
         ),
         (
             Width::BITS_1,
-            WiringTopology::WellMixed,
             GeneratorConfig::T1_PeriodicMotif {
                 motif: vec![0, 1, 1],
             },
-            "TPH:WellMixed:Motif011(k=1)",
+            "TPH:Motif011(k=1)",
         ),
         (
             Width::BITS_2,
-            WiringTopology::WellMixed,
             GeneratorConfig::T1_PeriodicMotif {
                 motif: vec![0, 1, 3],
             },
-            "TPH:WellMixed:Motif013(k=2)",
+            "TPH:Motif013(k=2)",
         ),
         (
             Width::BITS_2,
-            WiringTopology::LocalVonNeumann,
             GeneratorConfig::T1_AffineLag1 {
                 mul_a: 1,
                 add_b: 1,
                 init: 0,
             },
-            "TPH:Local:AffineLag1(k=2)",
+            "TPH:AffineLag1(k=2)",
         ),
     ];
 
-    for (width, topology, task_cfg, label) in tph_tasks {
+    for (width, task_cfg, label) in tph_tasks {
         let mut tph_pass = 0u32;
         for seed_idx in 0..seeds {
             cases += 1;
@@ -1930,13 +1547,10 @@ fn verify_gate_g1b4(
             let seeds_bank = SeedBank::new(master_seed);
             let gen_tph = task_cfg.build(width).unwrap();
             let mut env_tph = NoisyEnvironment::new(gen_tph, NoiseModel::None, seeds_bank).unwrap();
-            let mut learner_tph = ArkheLearner::new_with_spatial(
+            let mut learner_tph = ArkheLearner::new_with_config(
                 width,
                 1,
                 WireDelayMode::TicksPerHop,
-                topology,
-                shape,
-                4,
                 EconomyConfig::default(),
                 GrowthConfig::default(),
                 seeds_bank,
@@ -1945,7 +1559,6 @@ fn verify_gate_g1b4(
             let score_tph = run_prequential_harness(
                 &mut env_tph,
                 &mut learner_tph,
-                topology,
                 horizon,
                 500,
                 50_000,
@@ -1982,7 +1595,6 @@ fn verify_gate_g1b4(
     let child_matrix = [
         (
             Width::BITS_1,
-            WiringTopology::WellMixed,
             WireDelayMode::Combinational,
             GeneratorConfig::T1_PeriodicMotif {
                 motif: vec![0, 1, 1],
@@ -1991,7 +1603,6 @@ fn verify_gate_g1b4(
         ),
         (
             Width::BITS_1,
-            WiringTopology::LocalVonNeumann,
             WireDelayMode::Combinational,
             GeneratorConfig::T1_Alternating { a: 0, b: 1 },
             NoiseModel::IndependentSubstitution {
@@ -2001,7 +1612,6 @@ fn verify_gate_g1b4(
         ),
         (
             Width::BITS_2,
-            WiringTopology::WellMixed,
             WireDelayMode::Combinational,
             GeneratorConfig::T1_AffineLag1 {
                 mul_a: 1,
@@ -2012,7 +1622,6 @@ fn verify_gate_g1b4(
         ),
         (
             Width::BITS_2,
-            WiringTopology::WellMixed,
             WireDelayMode::TicksPerHop,
             GeneratorConfig::T1_PeriodicMotif {
                 motif: vec![0, 1, 3],
@@ -2021,7 +1630,6 @@ fn verify_gate_g1b4(
         ),
         (
             Width::BITS_2,
-            WiringTopology::LocalVonNeumann,
             WireDelayMode::Combinational,
             GeneratorConfig::T1_PeriodicMotif {
                 motif: vec![0, 1, 3],
@@ -2032,8 +1640,7 @@ fn verify_gate_g1b4(
             },
         ),
         (
-            Width::BITS_2,
-            WiringTopology::LocalVonNeumann,
+            Width::BITS_1,
             WireDelayMode::TicksPerHop,
             GeneratorConfig::T1_AffineLag1 {
                 mul_a: 1,
@@ -2044,9 +1651,7 @@ fn verify_gate_g1b4(
         ),
     ];
 
-    for (c_idx, (width, topology, delay_mode, generator, noise)) in
-        child_matrix.into_iter().enumerate()
-    {
+    for (c_idx, (width, delay_mode, generator, noise)) in child_matrix.into_iter().enumerate() {
         cases += 1;
         let seq = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
         let cfg_path = tmp_dir.join(format!("arkhe_g1b4_{pid}_{seq}_{c_idx}.toml"));
@@ -2059,7 +1664,6 @@ fn verify_gate_g1b4(
             substrate: SubstrateConfig {
                 width_bits: width,
                 wire_delay: delay_mode,
-                wiring_topology: topology,
             },
             environment: EnvironmentConfig {
                 horizon_ticks: 320,
@@ -2071,9 +1675,6 @@ fn verify_gate_g1b4(
                 max_eval_ticks: 30_000,
             },
             baseline: BaselineConfig::ArkheM1 {
-                grid_rows: 8,
-                grid_cols: 8,
-                max_relay_hops: 4,
                 economy: EconomyConfig::default(),
                 growth: GrowthConfig::default(),
             },

@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::env::{FiniteStateGenerator, GeneratorConfig, NoiseModel, NoisyEnvironment};
 use crate::metrics::{NullModelKind, circuit_code_bits, null_calibrated_mdl_delta};
 use crate::rng::SeedBank;
-use crate::structural::WiringTopology;
-use crate::structural::economy::EconomyConfig;
+use crate::structural::economy::{EconomyConfig, ReserveCap};
 use crate::structural::live::{LiveCircuit, well_mixed_description_debts};
 use crate::substrate::{
     Circuit, NodeId, Primitive, SignalSink, SignalSource, Width, WireDelayMode,
@@ -822,7 +821,7 @@ pub fn run_panel_case(
     let debts = well_mixed_description_debts(&pc.circuit);
     let config = EconomyConfig {
         juvenile_ticks: 0,
-        max_energy_reserve: None,
+        reserve_cap: ReserveCap::Uncapped,
         ..EconomyConfig::default()
     };
     let mut live = LiveCircuit::new(pc.circuit.clone(), &debts, config, SeedBank::new(seed), 8)
@@ -932,12 +931,10 @@ pub fn run_panel_case(
         )
     };
 
-    let code_bits = circuit_code_bits(&pc.circuit, WiringTopology::WellMixed, None, 0);
+    let code_bits = circuit_code_bits(&pc.circuit, 0);
 
     let delta_l_null = null_calibrated_mdl_delta(
         &pc.circuit,
-        WiringTopology::WellMixed,
-        None,
         0.0,
         0,
         &observed_facts,
@@ -1060,7 +1057,7 @@ mod tests {
                 let debts = well_mixed_description_debts(&pc.circuit);
                 assert_eq!(debts.len(), pc.circuit.node_count());
                 let sum: f64 = debts.iter().sum();
-                let total = circuit_code_bits(&pc.circuit, WiringTopology::WellMixed, None, 0);
+                let total = circuit_code_bits(&pc.circuit, 0);
                 assert!(
                     (sum - total).abs() < 1e-12,
                     "task {} circuit {} debts sum {sum} != total {total}",

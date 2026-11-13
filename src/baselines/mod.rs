@@ -34,7 +34,6 @@ use crate::env::{
     declared_noise_entropy_bits_per_symbol, realized_oracle_step_bits,
 };
 use crate::metrics::{BudgetAccountingMode, Scorecard, compute_mdl_with_tax, facts_code_bits};
-use crate::structural::{GridShape, WiringTopology};
 use crate::substrate::{Circuit, CompiledCircuit, ScalarState};
 
 const WINDOW_EVICT_CHUNK: usize = 16;
@@ -184,6 +183,12 @@ impl ObservationWindow {
         self.frames.len()
     }
 
+    /// Target steady-state capacity of the window ($W_{\text{obs}}$).
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Returns `true` if no frames have been pushed yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -209,11 +214,6 @@ pub trait PredictorBaseline {
     /// Declares whether internal candidate evaluations are metered against [`TickBudget`].
     fn budget_accounting_mode(&self) -> BudgetAccountingMode {
         BudgetAccountingMode::CandidateHistoryReplay
-    }
-
-    /// Spatial grid dimensions if this predictor uses a 2D lattice.
-    fn grid_shape(&self) -> Option<GridShape> {
-        None
     }
 
     /// Whether split nodes owe full code description tax.
@@ -382,11 +382,9 @@ pub fn evaluate_circuit_on_window_unmetered(
 }
 
 /// Executes a prequential evaluation run of `baseline` on `env` over `horizon_ticks` and builds a [`Scorecard`].
-#[allow(clippy::too_many_arguments)]
 pub fn run_prequential_harness<G: FiniteStateGenerator>(
     env: &mut NoisyEnvironment<G>,
     baseline: &mut dyn PredictorBaseline,
-    wiring_topology: WiringTopology,
     horizon_ticks: u64,
     warmup_ticks: u64,
     max_eval_ticks: u64,
@@ -541,13 +539,10 @@ pub fn run_prequential_harness<G: FiniteStateGenerator>(
         (Some(n), Some(opt)) => Some((n as isize) - (opt as isize)),
         _ => None,
     };
-    let grid_shape = baseline.grid_shape();
     let split_code_tax = baseline.split_code_tax();
     let mdl = best_circ.map(|c| {
         compute_mdl_with_tax(
             c,
-            wiring_topology,
-            grid_shape,
             0.0,
             0,
             total_symbols,

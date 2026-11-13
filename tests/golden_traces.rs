@@ -11,7 +11,6 @@ use arkhe::env::{GeneratorConfig, NoiseModel, NoisyEnvironment};
 use arkhe::rng::SeedBank;
 use arkhe::structural::economy::EconomyConfig;
 use arkhe::structural::growth::GrowthConfig;
-use arkhe::structural::lattice::{GridShape, WiringTopology};
 use arkhe::structural::learner::ArkheLearner;
 use arkhe::substrate::{Width, WireDelayMode};
 use serde::{Deserialize, Serialize};
@@ -96,19 +95,18 @@ struct RunConfig {
     horizon: u64,
 }
 
-fn execute_trace(cfg: &RunConfig) -> (GoldenTraceFixture, Vec<(u64, Vec<u64>, u64, Vec<u64>)>) {
+type TraceHistory = Vec<(u64, Vec<u64>, u64, Vec<u64>)>;
+
+fn execute_trace(cfg: &RunConfig) -> (GoldenTraceFixture, TraceHistory) {
     assert_not_holdout(cfg.seed);
     let seed_bank = SeedBank::new(cfg.seed);
     let generator = cfg.gen_cfg.build(cfg.width).expect("build generator");
     let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seed_bank).expect("build env");
 
-    let mut learner = ArkheLearner::new_with_spatial(
+    let mut learner = ArkheLearner::new_with_config(
         cfg.width,
         1,
         cfg.wire_delay,
-        WiringTopology::WellMixed,
-        GridShape::new(8, 8).unwrap(),
-        4,
         EconomyConfig::default(),
         GrowthConfig::default(),
         seed_bank,
@@ -254,7 +252,9 @@ fn test_cases() -> Vec<RunConfig> {
         },
         RunConfig {
             name: "motif011_k1_comb_s22",
-            gen_cfg: GeneratorConfig::T1_PeriodicMotif { motif: vec![0, 1, 1] },
+            gen_cfg: GeneratorConfig::T1_PeriodicMotif {
+                motif: vec![0, 1, 1],
+            },
             width: Width::BITS_1,
             wire_delay: WireDelayMode::Combinational,
             seed: 22,
@@ -262,7 +262,9 @@ fn test_cases() -> Vec<RunConfig> {
         },
         RunConfig {
             name: "motif013_k2_comb_s22",
-            gen_cfg: GeneratorConfig::T1_PeriodicMotif { motif: vec![0, 1, 3] },
+            gen_cfg: GeneratorConfig::T1_PeriodicMotif {
+                motif: vec![0, 1, 3],
+            },
             width: Width::BITS_2,
             wire_delay: WireDelayMode::Combinational,
             seed: 22,
@@ -270,7 +272,11 @@ fn test_cases() -> Vec<RunConfig> {
         },
         RunConfig {
             name: "affine_k2_comb_s23",
-            gen_cfg: GeneratorConfig::T1_AffineLag1 { mul_a: 1, add_b: 1, init: 0 },
+            gen_cfg: GeneratorConfig::T1_AffineLag1 {
+                mul_a: 1,
+                add_b: 1,
+                init: 0,
+            },
             width: Width::BITS_2,
             wire_delay: WireDelayMode::Combinational,
             seed: 23,
@@ -278,7 +284,11 @@ fn test_cases() -> Vec<RunConfig> {
         },
         RunConfig {
             name: "affine_k2_tph_s23",
-            gen_cfg: GeneratorConfig::T1_AffineLag1 { mul_a: 1, add_b: 1, init: 0 },
+            gen_cfg: GeneratorConfig::T1_AffineLag1 {
+                mul_a: 1,
+                add_b: 1,
+                init: 0,
+            },
             width: Width::BITS_2,
             wire_delay: WireDelayMode::TicksPerHop,
             seed: 23,

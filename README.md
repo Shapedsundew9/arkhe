@@ -1,13 +1,13 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and **Milestone 1 (`M1 — First-to-second neuron`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Stage M1a (fixed-structure economy) and Stage M1b (online neurogenesis, corrector stacking, noise-floor halting, and ablations) are fully implemented and verified; see [doc/milestone_1_plan.md](doc/milestone_1_plan.md) and [doc/milestone_1b_plan.md](doc/milestone_1b_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Historical Milestone 0–1 sign-off records are preserved in [doc/research_record.md](doc/research_record.md); active pre-Milestone 2 coordinate-free scaling and readiness plans live in [doc/coordinate_free_scaling_plan.md](doc/coordinate_free_scaling_plan.md) and [doc/pre_milestone_2_readiness_plan.md](doc/pre_milestone_2_readiness_plan.md).
 
 ## Overview
 
 Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k}$ ($1 \le k \le 64$) with:
 
 - **`substrate`**: Exact $\mathbb{Z}_{2^k}$ ring arithmetic, Level-0 primitives (`ADD`, `SUB`, `MUL`, `EQZ`, `SPLIT`, `DELAY`), Charter §2.5 structural invariant checks, scalar evaluator (`ScalarState`), and 64-lane bit-parallel evaluator (`BitParallel64State` at $k = 1$).
-- **`structural`**: 2D spatial lattice placement and deterministic local relay routing, metabolic reserves and retrograde sensitivity, state-preserving graph surgery, and finite-ring residual diagnostics.
+- **`structural`**: Coordinate-free graph editing over `substrate::Circuit`, metabolic reserves and retrograde sensitivity, state-preserving live surgery, and finite-ring residual diagnostics.
 - **`env`**: Finite-state benchmark generators (`T1`, `T3b`, `T3c`), declared channel substitution noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
 - **`metrics`**: Surprisal null models, Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
 - **`baselines`**: Compute-matched prequential baseline harness (`RandomSearch`, `(1+λ) CGP`, `CTW`, `ReedsSloane`, and certified small-circuit `Exhaustive` synthesis) over phase-exact sliding observation windows.
@@ -20,14 +20,10 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 ├── .devcontainer/
 ├── .github/
 ├── doc/
+│   ├── coordinate_free_scaling_plan.md
 │   ├── foundational_research_charter_v3.md
-│   ├── milestone_0_closeout_plan.md
-│   ├── milestone_0_lessons_learned.md
-│   ├── milestone_0_plan.md
-│   ├── milestone_0_review.md
-│   ├── milestone_1_plan.md
-│   ├── milestone_1b_plan.md
-│   └── milestone_1b_review.md
+│   ├── pre_milestone_2_readiness_plan.md
+│   └── research_record.md
 ├── scripts/
 │   └── build.rs
 ├── src/

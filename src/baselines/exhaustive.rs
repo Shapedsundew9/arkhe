@@ -15,7 +15,6 @@ use crate::baselines::{
 };
 use crate::env::FiniteStateSpec;
 use crate::metrics::{circuit_code_bits, compute_mdl};
-use crate::structural::WiringTopology;
 use crate::substrate::{
     Circuit, CompiledCircuit, NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width,
     WireDelayMode,
@@ -131,8 +130,8 @@ fn enumerate_exact_size(
     }
 
     size_bucket.sort_by(|a, b| {
-        let mdl_a = circuit_code_bits(a, WiringTopology::WellMixed, None, 0);
-        let mdl_b = circuit_code_bits(b, WiringTopology::WellMixed, None, 0);
+        let mdl_a = circuit_code_bits(a, 0);
+        let mdl_b = circuit_code_bits(b, 0);
         let eff_a = a.delay_count() + a.active_boundary_input_count();
         let eff_b = b.delay_count() + b.active_boundary_input_count();
         mdl_a.total_cmp(&mdl_b).then_with(|| eff_a.cmp(&eff_b))
@@ -702,7 +701,7 @@ impl ExhaustiveBaseline {
         let mut candidates: Vec<(Circuit, CompiledCircuit, f64)> = raw
             .into_iter()
             .map(|c| {
-                let c_bits = circuit_code_bits(&c, WiringTopology::WellMixed, None, 0);
+                let c_bits = circuit_code_bits(&c, 0);
                 let comp = c
                     .compile()
                     .expect("canonical enumerator emits §2.5-valid circuits");
@@ -711,7 +710,7 @@ impl ExhaustiveBaseline {
             .collect();
         if candidates.is_empty() {
             let empty = Circuit::new(width, channels, channels, wire_delay);
-            let c_bits = circuit_code_bits(&empty, WiringTopology::WellMixed, None, 0);
+            let c_bits = circuit_code_bits(&empty, 0);
             let comp = empty.compile().unwrap();
             candidates.push((empty, comp, c_bits));
         }
@@ -787,8 +786,7 @@ impl PredictorBaseline for ExhaustiveBaseline {
             else {
                 break;
             };
-            let mdl =
-                compute_mdl(circ, WiringTopology::WellMixed, None, 0.0, 0, total, err).total_bits;
+            let mdl = compute_mdl(circ, 0.0, 0, total, err).total_bits;
             if mdl < best_mdl {
                 best_mdl = mdl;
                 self.best_idx = idx;

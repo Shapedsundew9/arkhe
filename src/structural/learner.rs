@@ -12,15 +12,13 @@ use crate::structural::growth::{
     DiagnosticBuffer, GrowthConfig, GrowthError, SproutTelemetry, diagnose_residual,
     propose_autonomous_delay_ring, propose_sprout_with_telemetry,
 };
-use crate::structural::lattice::{
-    BoundaryAnchor, Coord, GridShape, LatticeCircuit, PerimeterSide, WiringTopology,
-};
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
     CausalAncestry, SensitivitySnapshot, assemble_causal_ancestry, counterfactual_sensitivity,
 };
 use crate::structural::surgery::{
-    EditableLattice, MarginalDebtLedger, explicit_delay_register_index, port_cone_changed,
+    EditableCircuit, MarginalDebtLedger, explicit_delay_register_index, port_cone_changed,
+    port_is_cone_mature, port_is_primed,
 };
 use crate::substrate::{Circuit, NodeId, Primitive, SignalSink, Width, WireDelayMode};
 
@@ -41,136 +39,38 @@ pub struct GrowthEpochSnapshot {
     pub node_count: usize,
 }
 
-fn default_anchors(channels: u16, shape: GridShape) -> (Vec<BoundaryAnchor>, Vec<BoundaryAnchor>) {
-    if channels <= 1 {
-        let mut in_anchors = Vec::with_capacity(channels as usize);
-        let mut out_anchors = Vec::with_capacity(channels as usize);
-        if channels == 1 {
-            in_anchors.push(BoundaryAnchor {
-                side: PerimeterSide::North,
-                offset: 3 % shape.cols,
-            });
-            out_anchors.push(BoundaryAnchor {
-                side: PerimeterSide::North,
-                offset: 4 % shape.cols,
-            });
-        }
-        return (in_anchors, out_anchors);
-    }
+/// Developmental state maintained independently for each output port (§2.4).
+#[derive(Clone, Debug)]
+pub struct PortDevelopmentalState {
+    pub diagnostic_buffer: DiagnosticBuffer,
+    pub ticks_since_last_check: u64,
+}
 
-    let mut pairs: Vec<(BoundaryAnchor, BoundaryAnchor)> = Vec::new();
-    let mut used_border_cells = std::collections::BTreeSet::<Coord>::new();
-    let sides = [
-        PerimeterSide::North,
-        PerimeterSide::South,
-        PerimeterSide::West,
-        PerimeterSide::East,
-    ];
-    let max_dim = shape.rows.max(shape.cols);
-
-    // Pair adjacent interior border cells per side, starting near the side midpoint so each
-    // channel's (in_c, out_c) pair is 1 hop apart with ample surrounding lattice cells.
-    let mut base_offsets = Vec::new();
-    if max_dim >= 6 {
-        base_offsets.push(3);
-    }
-    let mut off = 1u16;
-    while off + 2 < max_dim {
-        if off != 3 && off != 4 {
-            base_offsets.push(off);
-        }
-        off += 2;
-    }
-
-    for base in base_offsets {
-        for side in sides {
-            let limit = match side {
-                PerimeterSide::North | PerimeterSide::South => shape.cols,
-                PerimeterSide::West | PerimeterSide::East => shape.rows,
-            };
-            if base + 2 < limit {
-                let a_in = BoundaryAnchor { side, offset: base };
-                let a_out = BoundaryAnchor {
-                    side,
-                    offset: base + 1,
-                };
-                if let (Ok(c_in), Ok(c_out)) = (
-                    a_in.adjacent_border_cell(shape),
-                    a_out.adjacent_border_cell(shape),
-                ) && !used_border_cells.contains(&c_in)
-                    && !used_border_cells.contains(&c_out)
-                    && c_in != c_out
-                {
-                    used_border_cells.insert(c_in);
-                    used_border_cells.insert(c_out);
-                    pairs.push((a_in, a_out));
-                }
-            }
+impl PortDevelopmentalState {
+    #[must_use]
+    pub fn new(diagnostic_window: usize) -> Self {
+        Self {
+            diagnostic_buffer: DiagnosticBuffer::new(diagnostic_window),
+            ticks_since_last_check: 0,
         }
     }
-
-    // Fallback pass over any remaining unclaimed border cells for small grids or high channel counts.
-    let mut leftovers = Vec::new();
-    for side in sides {
-        let limit = match side {
-            PerimeterSide::North | PerimeterSide::South => shape.cols,
-            PerimeterSide::West | PerimeterSide::East => shape.rows,
-        };
-        for offset in 0..limit {
-            let anchor = BoundaryAnchor { side, offset };
-            if let Ok(cell) = anchor.adjacent_border_cell(shape)
-                && used_border_cells.insert(cell)
-            {
-                leftovers.push(anchor);
-            }
-        }
-    }
-    for chunk in leftovers.chunks(2) {
-        if chunk.len() == 2 {
-            pairs.push((chunk[0], chunk[1]));
-        }
-    }
-    if pairs.is_empty() {
-        pairs.push((
-            BoundaryAnchor {
-                side: PerimeterSide::North,
-                offset: 0,
-            },
-            BoundaryAnchor {
-                side: PerimeterSide::North,
-                offset: 1 % shape.cols,
-            },
-        ));
-    }
-
-    let count = usize::from(channels);
-    let mut in_anchors = Vec::with_capacity(count);
-    let mut out_anchors = Vec::with_capacity(count);
-    for c in 0..count {
-        let (a_in, a_out) = pairs[c % pairs.len()];
-        in_anchors.push(a_in);
-        out_anchors.push(a_out);
-    }
-    (in_anchors, out_anchors)
 }
 
 type PendingPrediction = (Vec<u64>, CausalAncestry, SensitivitySnapshot, u64, Vec<u64>);
 
-/// Online gradient-free closed-loop learner driving spatial lattice neurogenesis and metabolic economy.
+/// Online gradient-free closed-loop learner driving coordinate-free structural neurogenesis and metabolic economy.
 pub struct ArkheLearner {
-    editable: EditableLattice,
+    editable: EditableCircuit,
     ledger: MarginalDebtLedger,
     economy_config: EconomyConfig,
     growth_config: GrowthConfig,
     seed_bank: SeedBank,
     sample_count: usize,
-    max_relay_hops: u8,
     tick: u64,
-    ticks_since_last_check: u64,
     prev_observed_frame: Vec<u64>,
     pending_prediction: Option<PendingPrediction>,
     obs_window: ObservationWindow,
-    post_juvenile_diag: DiagnosticBuffer,
+    port_states: Vec<PortDevelopmentalState>,
     sprout_events: u64,
     starvation_prune_events: u64,
     idle_prune_events: u64,
@@ -184,11 +84,10 @@ pub struct ArkheLearner {
     candidate_undecidable: u64,
     candidate_list_truncated: u64,
     lag_horizon_exhausted: u64,
-    grid_shape: Option<GridShape>,
 }
 
 impl ArkheLearner {
-    /// Creates a deterministic learner on the default 8x8 lattice in WellMixed mode.
+    /// Creates a deterministic learner in coordinate-free mode.
     ///
     /// # Errors
     ///
@@ -200,33 +99,25 @@ impl ArkheLearner {
         growth: GrowthConfig,
         seeds: SeedBank,
     ) -> Result<Self, GrowthError> {
-        let shape = GridShape::new(8, 8).map_err(|_| GrowthError::InvalidConfig)?;
-        Self::new_with_spatial(
+        Self::new_with_config(
             width,
             channels,
             wire_delay,
-            WiringTopology::WellMixed,
-            shape,
-            4,
             EconomyConfig::default(),
             growth,
             seeds,
         )
     }
 
-    /// Full spatial constructor supporting arbitrary grid shapes and topologies.
+    /// Full constructor supporting custom economy configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`GrowthError::InvalidConfig`] if configuration validation or lattice lowering fails.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_spatial(
+    /// Returns [`GrowthError::InvalidConfig`] if configuration validation or circuit initialization fails.
+    pub fn new_with_config(
         width: Width,
         channels: u16,
         wire_delay: WireDelayMode,
-        topology: WiringTopology,
-        shape: GridShape,
-        max_relay_hops: u8,
         economy_config: EconomyConfig,
         growth_config: GrowthConfig,
         seed_bank: SeedBank,
@@ -234,17 +125,17 @@ impl ArkheLearner {
         if !growth_config.is_valid() {
             return Err(GrowthError::InvalidConfig);
         }
-        let (in_anchors, out_anchors) = default_anchors(channels, shape);
-        let lattice =
-            LatticeCircuit::new(shape, width, wire_delay, topology, in_anchors, out_anchors)
-                .map_err(|_| GrowthError::InvalidConfig)?;
-
-        let editable = EditableLattice::new(lattice, economy_config)
+        let circuit = Circuit::new(width, channels, channels, wire_delay);
+        let editable = EditableCircuit::new(circuit, economy_config)
             .map_err(|_| GrowthError::InvalidConfig)?;
 
         let channels_usize = usize::from(channels);
         let obs_capacity =
             (economy_config.juvenile_ticks as usize) + 2 * growth_config.diagnostic_window;
+
+        let port_states = (0..channels_usize)
+            .map(|_| PortDevelopmentalState::new(growth_config.diagnostic_window))
+            .collect();
 
         Ok(Self {
             editable,
@@ -253,13 +144,11 @@ impl ArkheLearner {
             growth_config,
             seed_bank,
             sample_count: 8,
-            max_relay_hops,
             tick: 0,
-            ticks_since_last_check: 0,
             prev_observed_frame: vec![0; channels_usize],
             pending_prediction: None,
             obs_window: ObservationWindow::new(channels, obs_capacity),
-            post_juvenile_diag: DiagnosticBuffer::new(growth_config.diagnostic_window),
+            port_states,
             sprout_events: 0,
             starvation_prune_events: 0,
             idle_prune_events: 0,
@@ -273,22 +162,29 @@ impl ArkheLearner {
             candidate_undecidable: 0,
             candidate_list_truncated: 0,
             lag_horizon_exhausted: 0,
-            grid_shape: if topology == WiringTopology::WellMixed {
-                None
-            } else {
-                Some(shape)
-            },
         })
     }
 
-    /// Current editable lattice.
+    /// Active port developmental states.
     #[must_use]
-    pub const fn editable(&self) -> &EditableLattice {
+    pub fn port_states(&self) -> &[PortDevelopmentalState] {
+        &self.port_states
+    }
+
+    /// Primary port 0 diagnostic buffer (for telemetry and backward-compatible access).
+    #[must_use]
+    pub fn post_juvenile_diag(&self) -> &DiagnosticBuffer {
+        &self.port_states[0].diagnostic_buffer
+    }
+
+    /// Current editable circuit.
+    #[must_use]
+    pub const fn editable(&self) -> &EditableCircuit {
         &self.editable
     }
 
-    /// Mutable reference to current editable lattice.
-    pub fn editable_mut(&mut self) -> &mut EditableLattice {
+    /// Mutable reference to current editable circuit.
+    pub fn editable_mut(&mut self) -> &mut EditableCircuit {
         &mut self.editable
     }
 
@@ -378,23 +274,14 @@ impl ArkheLearner {
             .filter(|n| n.juvenile_ticks == 0)
             .map(|n| n.energy)
             .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let shape = if self.editable.lattice().topology() == WiringTopology::WellMixed {
-            None
-        } else {
-            self.grid_shape
-        };
         let code_bits = circuit_code_bits_with_tax(
             self.editable.circuit(),
-            self.editable.lattice().topology(),
-            shape,
             0,
             self.economy_config.split_code_tax,
         );
         let null_calibrated_mdl_delta_bits = code_bits - self.cumulative_net_flux;
 
         ArkheM1Telemetry {
-            grid_rows: self.grid_shape.map_or(8, |s| s.rows),
-            grid_cols: self.grid_shape.map_or(8, |s| s.cols),
             final_node_count,
             final_split_count,
             final_delay_count,
@@ -505,12 +392,11 @@ impl PredictorBaseline for ArkheLearner {
 
         let n = self.editable.circuit().node_count();
         if self.ledger.node_debts.len() != n {
-            self.ledger.ensure_capacity(
-                self.editable.circuit(),
-                self.editable.lattice().topology(),
-                self.grid_shape,
-                self.economy_config.split_code_tax,
-            );
+            self.ledger
+                .ensure_capacity(self.editable.circuit(), self.economy_config.split_code_tax);
+            self.editable
+                .economy_mut()
+                .assign_sprout_debts(&self.ledger.node_debts);
         }
         let mut maintenance_costs = vec![0.0; n];
         for (i, cost) in maintenance_costs.iter_mut().enumerate().take(n) {
@@ -518,6 +404,9 @@ impl PredictorBaseline for ArkheLearner {
             if node.juvenile_ticks == 0 && !self.ledger.debt_paid[i] {
                 *cost = self.ledger.node_debts[i];
                 self.ledger.debt_paid[i] = true;
+                if let Some(n) = self.editable.economy_mut().node_mut(i) {
+                    n.debt_paid = true;
+                }
             }
         }
 
@@ -533,20 +422,18 @@ impl PredictorBaseline for ArkheLearner {
 
         // Starvation pruning
         if !econ_tick.starved_nodes.is_empty() {
-            let pre_prune_lattice = self.editable.lattice().clone();
+            let pre_prune_circuit = self.editable.circuit().clone();
             if let Ok(old_to_new) = self.editable.prune_starved_nodes() {
                 self.ledger.on_prune(
                     self.editable.circuit(),
-                    self.editable.lattice().topology(),
-                    self.grid_shape,
                     self.economy_config.split_code_tax,
                     &old_to_new,
                 );
                 let changed_ports: Vec<usize> = (0..num_ports)
                     .filter(|&p| {
                         port_cone_changed(
-                            &pre_prune_lattice,
-                            self.editable.lattice(),
+                            &pre_prune_circuit,
+                            self.editable.circuit(),
                             &old_to_new,
                             p as u16,
                         )
@@ -557,109 +444,105 @@ impl PredictorBaseline for ArkheLearner {
                         .economy_mut()
                         .port_scorer_mut(p)
                         .reset_predictor_counts();
+                    self.port_states[p].diagnostic_buffer.clear();
+                    self.port_states[p].ticks_since_last_check = 0;
                 }
                 self.starvation_prune_events += 1;
-                self.post_juvenile_diag.clear();
-                self.ticks_since_last_check = 0;
             }
         }
 
         // Post-juvenile diagnostic buffer
-        let all_mature = self.editable.circuit().node_count() == 0
-            || self
-                .editable
-                .economy()
-                .nodes()
-                .iter()
-                .all(|node| node.juvenile_ticks == 0);
-        let all_driven_ports_primed = (0..num_ports).all(|p| {
-            let is_driven = self
+        let mut res = vec![0u64; num_ports];
+        for p in 0..num_ports {
+            res[p] = self
                 .editable
                 .circuit()
-                .edges()
-                .iter()
-                .any(|edge| edge.dst == SignalSink::BoundaryOut(p as u16));
-            !is_driven
-                || ancestry
-                    .port_shares
-                    .get(p)
-                    .is_some_and(|shares| shares.iter().sum::<f64>() > 0.0)
-        });
+                .width()
+                .sub(truth[p], predictions[p]);
+        }
+        let node_outs = node_output_values(self.editable.circuit(), self.editable.state());
+        let node_count = self.editable.circuit().node_count();
+        let mut sensitive = vec![false; node_count];
+        for (i, sens) in sensitive.iter_mut().enumerate().take(node_count) {
+            *sens = snapshot.output_by_node[i].iter().any(|&s| s > 0.0)
+                || snapshot.latch_by_node[i].iter().any(|&s| s > 0.0);
+        }
 
-        if all_mature && all_driven_ports_primed {
-            let mut res = vec![0u64; num_ports];
-            for p in 0..num_ports {
-                res[p] = self
-                    .editable
-                    .circuit()
-                    .width()
-                    .sub(truth[p], predictions[p]);
+        for p in 0..num_ports {
+            let port_u16 = p as u16;
+            if port_is_cone_mature(self.editable.circuit(), self.editable.economy(), port_u16)
+                && port_is_primed(self.editable.circuit(), &ancestry, port_u16)
+            {
+                self.port_states[p].diagnostic_buffer.push_frame(
+                    &input_frame,
+                    truth,
+                    &predictions,
+                    &res,
+                    &node_outs,
+                    &sensitive,
+                );
+                self.port_states[p].ticks_since_last_check += 1;
             }
-            let node_outs = node_output_values(self.editable.circuit(), self.editable.state());
-            let node_count = self.editable.circuit().node_count();
-            let mut sensitive = vec![false; node_count];
-            for (i, sens) in sensitive.iter_mut().enumerate().take(node_count) {
-                *sens = snapshot.output_by_node[i].iter().any(|&s| s > 0.0)
-                    || snapshot.latch_by_node[i].iter().any(|&s| s > 0.0);
-            }
-            self.post_juvenile_diag.push_frame(
-                &input_frame,
-                truth,
-                &predictions,
-                &res,
-                &node_outs,
-                &sensitive,
-            );
-            self.ticks_since_last_check += 1;
         }
 
         // Sprouting and autonomous delay-ring check
-        if all_mature
-            && all_driven_ports_primed
-            && self.post_juvenile_diag.len() >= self.growth_config.diagnostic_window
-            && self.ticks_since_last_check >= self.growth_config.sprout_interval
-        {
-            self.ticks_since_last_check = 0;
+        let start_port = (self.tick as usize) % num_ports;
+        for offset in 0..num_ports {
+            let p = (start_port + offset) % num_ports;
+            let port_u16 = p as u16;
+
+            let is_cone_mature =
+                port_is_cone_mature(self.editable.circuit(), self.editable.economy(), port_u16);
+            let is_primed = port_is_primed(self.editable.circuit(), &ancestry, port_u16);
+            let buf_ready =
+                self.port_states[p].diagnostic_buffer.len() >= self.growth_config.diagnostic_window;
+            let timer_ready =
+                self.port_states[p].ticks_since_last_check >= self.growth_config.sprout_interval;
+
+            if !(is_cone_mature && is_primed && buf_ready && timer_ready) {
+                continue;
+            }
+
+            self.port_states[p].ticks_since_last_check = 0;
 
             // 1. Idle mature node pruning (D1b.1)
-            let idle_nodes = self
-                .post_juvenile_diag
+            let idle_nodes = self.port_states[p]
+                .diagnostic_buffer
                 .idle_mature_nodes(self.editable.economy());
             if !idle_nodes.is_empty() {
-                let pre_prune_lattice = self.editable.lattice().clone();
+                let pre_prune_circuit = self.editable.circuit().clone();
                 if let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes(
                     &idle_nodes,
-                    &self.post_juvenile_diag.inputs,
-                    &self.post_juvenile_diag.predictions,
+                    &self.port_states[p].diagnostic_buffer.inputs,
+                    &self.port_states[p].diagnostic_buffer.predictions,
                     self.economy_config.split_code_tax,
                 ) {
                     let any_pruned = old_to_new.iter().any(Option::is_none);
                     if any_pruned {
                         self.ledger.on_prune(
                             self.editable.circuit(),
-                            self.editable.lattice().topology(),
-                            self.grid_shape,
                             self.economy_config.split_code_tax,
                             &old_to_new,
                         );
                         let changed_ports: Vec<usize> = (0..num_ports)
-                            .filter(|&p| {
+                            .filter(|&q| {
                                 port_cone_changed(
-                                    &pre_prune_lattice,
-                                    self.editable.lattice(),
+                                    &pre_prune_circuit,
+                                    self.editable.circuit(),
                                     &old_to_new,
-                                    p as u16,
+                                    q as u16,
                                 )
                             })
                             .collect();
-                        for p in changed_ports {
+                        for q in changed_ports {
                             self.editable
                                 .economy_mut()
-                                .port_scorer_mut(p)
+                                .port_scorer_mut(q)
                                 .reset_predictor_counts();
+                            self.port_states[q].diagnostic_buffer.clear();
+                            self.port_states[q].ticks_since_last_check = 0;
                         }
                         self.idle_prune_events += 1;
-                        self.post_juvenile_diag.clear();
                         self.tick += 1;
                         return None;
                     }
@@ -667,18 +550,19 @@ impl PredictorBaseline for ArkheLearner {
             }
 
             // Check if Snapshot 2 needs to be recorded after Sprout 2 has settled
-            if self.sprout_events == 2 && self.epoch_snapshots.len() == 2 {
-                let residuals: Vec<u64> = self
-                    .post_juvenile_diag
+            if p == 0 && self.sprout_events == 2 && self.epoch_snapshots.len() == 2 {
+                let residuals: Vec<u64> = self.port_states[0]
+                    .diagnostic_buffer
                     .residuals
                     .iter()
                     .map(|f| f[0])
                     .collect();
-                let features = self.post_juvenile_diag.build_signal_pool(
-                    self.editable.lattice(),
+                let features = self.port_states[0].diagnostic_buffer.build_signal_pool(
+                    self.editable.circuit(),
                     &self.obs_window,
-                    self.max_relay_hops,
                     0,
+                    3,
+                    Some(self.editable.economy()),
                 );
                 if let Ok(diag_res) = diagnose_residual(
                     self.editable.circuit().width(),
@@ -686,14 +570,14 @@ impl PredictorBaseline for ArkheLearner {
                     &features,
                     self.growth_config,
                 ) {
-                    let mismatches = self
-                        .post_juvenile_diag
+                    let mismatches = self.port_states[0]
+                        .diagnostic_buffer
                         .truth
                         .iter()
-                        .zip(&self.post_juvenile_diag.predictions)
+                        .zip(&self.port_states[0].diagnostic_buffer.predictions)
                         .filter(|(t, p)| t[0] != p[0])
                         .count();
-                    let w = self.post_juvenile_diag.len() as u64;
+                    let w = self.port_states[0].diagnostic_buffer.len() as u64;
                     let l2 = facts_code_bits(self.editable.circuit().width(), w, mismatches as u64)
                         / (w as f64);
                     self.epoch_snapshots.push(GrowthEpochSnapshot {
@@ -707,38 +591,35 @@ impl PredictorBaseline for ArkheLearner {
                 }
             }
 
-            // 2. Evaluate Candidate Sprout or Ring Closure across output ports
-            for p in 0..num_ports {
-                let port_u16 = p as u16;
-
-                // 2a. Candidate motif sprouting
-                let mut sprouted = false;
-                let mut sprout_tel = SproutTelemetry::default();
-                if self.editable.circuit().node_count() < self.growth_config.max_nodes {
-                    if let Ok(Some(sprout_lat)) = propose_sprout_with_telemetry(
-                        &self.editable,
-                        &self.obs_window,
-                        &self.post_juvenile_diag,
-                        &self.growth_config,
-                        &self.economy_config,
-                        budget,
-                        port_u16,
-                        self.max_relay_hops,
-                        &mut sprout_tel,
-                    ) {
-                        // Diagnostic snapshot for G1B.1 before committing sprout
+            // 2a. Candidate motif sprouting (tau <= 3)
+            let mut sprouted = false;
+            let mut sprout_tel = SproutTelemetry::default();
+            if self.editable.circuit().node_count() < self.growth_config.max_nodes {
+                if let Ok(Some(sprout_circ)) = propose_sprout_with_telemetry(
+                    &self.editable,
+                    &self.obs_window,
+                    &self.port_states[p].diagnostic_buffer,
+                    &self.growth_config,
+                    &self.economy_config,
+                    budget,
+                    port_u16,
+                    3,
+                    &mut sprout_tel,
+                ) {
+                    // Diagnostic snapshot for G1B.1 before committing sprout
                     if p == 0 && (self.sprout_events == 0 || self.sprout_events == 1) {
-                        let residuals: Vec<u64> = self
-                            .post_juvenile_diag
+                        let residuals: Vec<u64> = self.port_states[0]
+                            .diagnostic_buffer
                             .residuals
                             .iter()
                             .map(|f| f[0])
                             .collect();
-                        let features = self.post_juvenile_diag.build_signal_pool(
-                            self.editable.lattice(),
+                        let features = self.port_states[0].diagnostic_buffer.build_signal_pool(
+                            self.editable.circuit(),
                             &self.obs_window,
-                            self.max_relay_hops,
                             0,
+                            3,
+                            Some(self.editable.economy()),
                         );
                         if let Ok(diag_res) = diagnose_residual(
                             self.editable.circuit().width(),
@@ -746,14 +627,14 @@ impl PredictorBaseline for ArkheLearner {
                             &features,
                             self.growth_config,
                         ) {
-                            let mismatches = self
-                                .post_juvenile_diag
+                            let mismatches = self.port_states[0]
+                                .diagnostic_buffer
                                 .truth
                                 .iter()
-                                .zip(&self.post_juvenile_diag.predictions)
+                                .zip(&self.port_states[0].diagnostic_buffer.predictions)
                                 .filter(|(t, p)| t[0] != p[0])
                                 .count();
-                            let w = self.post_juvenile_diag.len() as u64;
+                            let w = self.port_states[0].diagnostic_buffer.len() as u64;
                             let loss = facts_code_bits(
                                 self.editable.circuit().width(),
                                 w,
@@ -774,93 +655,198 @@ impl PredictorBaseline for ArkheLearner {
                         }
                     }
 
+                    let pre_sprout_circuit = self.editable.circuit().clone();
                     let old_to_new: Vec<Option<NodeId>> = (0..self.editable.circuit().node_count())
                         .map(|i| Some(NodeId(i as u32)))
                         .collect();
                     if self
                         .editable
-                        .recompile_preserving_state(sprout_lat, &old_to_new)
+                        .recompile_preserving_state(sprout_circ, &old_to_new)
                         .is_ok()
                     {
                         self.ledger.on_sprout(
                             self.editable.circuit(),
-                            self.editable.lattice().topology(),
-                            self.grid_shape,
                             self.economy_config.split_code_tax,
                             &old_to_new,
                         );
                         self.editable
                             .economy_mut()
-                            .port_scorer_mut(p)
-                            .reset_predictor_counts();
+                            .assign_sprout_debts(&self.ledger.node_debts);
+                        let changed_ports: Vec<usize> = (0..num_ports)
+                            .filter(|&q| {
+                                port_cone_changed(
+                                    &pre_sprout_circuit,
+                                    self.editable.circuit(),
+                                    &old_to_new,
+                                    q as u16,
+                                )
+                            })
+                            .collect();
+                        for q in changed_ports {
+                            self.editable
+                                .economy_mut()
+                                .port_scorer_mut(q)
+                                .reset_predictor_counts();
+                            self.port_states[q].diagnostic_buffer.clear();
+                            self.port_states[q].ticks_since_last_check = 0;
+                        }
                         self.sprout_events += 1;
-                        self.post_juvenile_diag.clear();
                         sprouted = true;
                     }
                 }
             } else {
                 self.sprout_blocked_max_nodes += 1;
             }
-                self.sprout_blocked_max_nodes += sprout_tel.sprout_blocked_max_nodes;
-                self.candidate_undecidable += sprout_tel.candidate_undecidable;
-                self.candidate_list_truncated += sprout_tel.candidate_list_truncated;
-                self.lag_horizon_exhausted += sprout_tel.lag_horizon_exhausted;
+            self.sprout_blocked_max_nodes += sprout_tel.sprout_blocked_max_nodes;
+            self.candidate_undecidable += sprout_tel.candidate_undecidable;
+            self.candidate_list_truncated += sprout_tel.candidate_list_truncated;
 
-                if sprouted {
-                    break;
-                }
+            if sprouted {
+                break;
+            }
 
-                // 2b. Autonomous delay ring proposal under noise
-                if let Some(ring_prop) = propose_autonomous_delay_ring(
-                    &self.editable,
-                    &self.obs_window,
-                    &self.growth_config,
-                    &self.economy_config,
-                    budget,
-                    port_u16,
-                    self.max_relay_hops,
-                ) {
-                    let old_to_new = ring_prop.old_to_new;
-                    let ring_delay_nodes = ring_prop.ring_delay_nodes;
-                    let period = ring_prop.period;
-                    let template = ring_prop.template;
-                    if self
-                        .editable
-                        .recompile_preserving_state(ring_prop.lattice, &old_to_new)
-                        .is_ok()
-                    {
-                        self.ledger.on_sprout(
-                            self.editable.circuit(),
-                            self.editable.lattice().topology(),
-                            self.grid_shape,
-                            self.economy_config.split_code_tax,
-                            &old_to_new,
-                        );
-                        let mut regs = self.editable.state().registers().to_vec();
-                        let mut ok_regs = true;
-                        for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
-                            if let Some(reg_idx) =
-                                explicit_delay_register_index(self.editable.circuit(), delay_node)
-                            {
-                                regs[reg_idx] = template
-                                    [(((self.tick + 1) as usize) + (period - 1 - j)) % period];
-                            } else {
-                                ok_regs = false;
-                                break;
-                            }
+            // 2b. Autonomous delay ring proposal under noise
+            if let Some(ring_prop) = propose_autonomous_delay_ring(
+                &self.editable,
+                &self.obs_window,
+                &self.growth_config,
+                &self.economy_config,
+                budget,
+                port_u16,
+            ) {
+                let pre_ring_circuit = self.editable.circuit().clone();
+                let old_to_new = ring_prop.old_to_new;
+                let ring_delay_nodes = ring_prop.ring_delay_nodes;
+                let period = ring_prop.period;
+                let template = ring_prop.template;
+                if self
+                    .editable
+                    .recompile_preserving_state(ring_prop.candidate_circuit, &old_to_new)
+                    .is_ok()
+                {
+                    self.ledger.on_sprout(
+                        self.editable.circuit(),
+                        self.economy_config.split_code_tax,
+                        &old_to_new,
+                    );
+                    self.editable
+                        .economy_mut()
+                        .assign_sprout_debts(&self.ledger.node_debts);
+                    let mut regs = self.editable.state().registers().to_vec();
+                    let mut ok_regs = true;
+                    for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
+                        if let Some(reg_idx) =
+                            explicit_delay_register_index(self.editable.circuit(), delay_node)
+                        {
+                            regs[reg_idx] =
+                                template[(((self.tick + 1) as usize) + (period - 1 - j)) % period];
+                        } else {
+                            ok_regs = false;
+                            break;
                         }
-                        if ok_regs {
-                            let _ = self.editable.set_registers(&regs);
-                        }
+                    }
+                    if ok_regs {
+                        let _ = self.editable.set_registers(&regs);
+                    }
+                    let changed_ports: Vec<usize> = (0..num_ports)
+                        .filter(|&q| {
+                            port_cone_changed(
+                                &pre_ring_circuit,
+                                self.editable.circuit(),
+                                &old_to_new,
+                                q as u16,
+                            )
+                        })
+                        .collect();
+                    for q in changed_ports {
                         self.editable
                             .economy_mut()
-                            .port_scorer_mut(p)
+                            .port_scorer_mut(q)
                             .reset_predictor_counts();
-                        self.ring_closure_events += 1;
-                        self.post_juvenile_diag.clear();
+                        self.port_states[q].diagnostic_buffer.clear();
+                        self.port_states[q].ticks_since_last_check = 0;
+                    }
+                    self.ring_closure_events += 1;
+                    break;
+                }
+            }
+
+            // 2c. Reactive lag deepening search (§2.7)
+            // Evaluated only after observation window reaches steady-state 2 * W_diag,
+            // preserving autonomous delay-ring discovery for periodic limit cycles.
+            if self.obs_window.len() >= 2 * self.growth_config.diagnostic_window
+                && self.editable.circuit().node_count() < self.growth_config.max_nodes
+            {
+                let max_allowed_tau = (self.growth_config.diagnostic_window / 2).clamp(3, 32) as u8;
+                let mut tau = 6u8;
+                while tau <= max_allowed_tau {
+                    if let Ok(Some(sprout_circ)) = propose_sprout_with_telemetry(
+                        &self.editable,
+                        &self.obs_window,
+                        &self.port_states[p].diagnostic_buffer,
+                        &self.growth_config,
+                        &self.economy_config,
+                        budget,
+                        port_u16,
+                        tau,
+                        &mut sprout_tel,
+                    ) {
+                        let pre_sprout_circuit = self.editable.circuit().clone();
+                        let old_to_new: Vec<Option<NodeId>> =
+                            (0..self.editable.circuit().node_count())
+                                .map(|i| Some(NodeId(i as u32)))
+                                .collect();
+                        if self
+                            .editable
+                            .recompile_preserving_state(sprout_circ, &old_to_new)
+                            .is_ok()
+                        {
+                            self.ledger.on_sprout(
+                                self.editable.circuit(),
+                                self.economy_config.split_code_tax,
+                                &old_to_new,
+                            );
+                            self.editable
+                                .economy_mut()
+                                .assign_sprout_debts(&self.ledger.node_debts);
+                            let changed_ports: Vec<usize> = (0..num_ports)
+                                .filter(|&q| {
+                                    port_cone_changed(
+                                        &pre_sprout_circuit,
+                                        self.editable.circuit(),
+                                        &old_to_new,
+                                        q as u16,
+                                    )
+                                })
+                                .collect();
+                            for q in changed_ports {
+                                self.editable
+                                    .economy_mut()
+                                    .port_scorer_mut(q)
+                                    .reset_predictor_counts();
+                                self.port_states[q].diagnostic_buffer.clear();
+                                self.port_states[q].ticks_since_last_check = 0;
+                            }
+                            self.sprout_events += 1;
+                            sprouted = true;
+                            break;
+                        }
+                    }
+                    if tau == max_allowed_tau {
                         break;
                     }
+                    tau = (tau * 2).min(max_allowed_tau);
                 }
+                if !sprouted && tau >= max_allowed_tau {
+                    self.lag_horizon_exhausted += 1;
+                }
+            }
+            self.sprout_blocked_max_nodes += sprout_tel.sprout_blocked_max_nodes;
+            self.candidate_undecidable += sprout_tel.candidate_undecidable;
+            self.candidate_list_truncated += sprout_tel.candidate_list_truncated;
+
+            if sprouted {
+                break;
             }
         }
 
@@ -870,10 +856,6 @@ impl PredictorBaseline for ArkheLearner {
 
     fn best_circuit(&self) -> Option<&Circuit> {
         Some(self.editable.circuit())
-    }
-
-    fn grid_shape(&self) -> Option<GridShape> {
-        self.grid_shape
     }
 
     fn split_code_tax(&self) -> bool {
@@ -895,43 +877,23 @@ mod tests {
     use crate::env::{FiniteStateGenerator, GeneratorConfig, NoiseModel, NoisyEnvironment};
 
     #[test]
-    fn default_anchors_distribute_multi_channel_without_border_collisions() {
-        let shape = GridShape::new(8, 8).unwrap();
-        let (ins, outs) = default_anchors(8, shape);
-        assert_eq!(ins.len(), 8);
-        assert_eq!(outs.len(), 8);
-        let mut cells = std::collections::BTreeSet::new();
-        for a in ins.iter().chain(outs.iter()) {
-            let cell = a.adjacent_border_cell(shape).unwrap();
-            assert!(cells.insert(cell), "duplicate border cell {cell:?}");
-        }
-    }
-
-    #[test]
     fn ticks_per_hop_multistage_tasks_run_without_missing_ancestry_panic() {
-        let shape = GridShape::new(8, 8).unwrap();
-        for topology in [WiringTopology::WellMixed, WiringTopology::LocalVonNeumann] {
-            let mut learner = ArkheLearner::new_with_spatial(
-                Width::BITS_1,
-                1,
-                WireDelayMode::TicksPerHop,
-                topology,
-                shape,
-                4,
-                EconomyConfig::default(),
-                GrowthConfig::default(),
-                SeedBank::new(7),
-            )
-            .unwrap();
-            let mut budget = TickBudget::new(200_000);
-            let motif = [0u64, 1, 1];
-            for t in 0..800 {
-                let _ = learner.predict(&mut budget);
-                learner.observe(&[motif[t % 3]], &mut budget);
-            }
-            assert!(learner.best_circuit().unwrap().compile().is_ok());
-            assert!(learner.sprout_events() >= 1);
+        let mut learner = ArkheLearner::new(
+            Width::BITS_1,
+            1,
+            WireDelayMode::TicksPerHop,
+            GrowthConfig::default(),
+            SeedBank::new(7),
+        )
+        .unwrap();
+        let mut budget = TickBudget::new(200_000);
+        let motif = [0u64, 1, 1];
+        for t in 0..800 {
+            let _ = learner.predict(&mut budget);
+            learner.observe(&[motif[t % 3]], &mut budget);
         }
+        assert!(learner.best_circuit().unwrap().compile().is_ok());
+        assert!(learner.sprout_events() >= 1);
     }
 
     #[test]
@@ -1020,15 +982,10 @@ mod tests {
 
     #[test]
     fn two_channel_ring_closure_preserves_other_channel_subcircuit() {
-        let shape = GridShape::new(8, 8).unwrap();
-        let mut learner = ArkheLearner::new_with_spatial(
+        let mut learner = ArkheLearner::new(
             Width::BITS_1,
             2,
             WireDelayMode::Combinational,
-            WiringTopology::LocalVonNeumann,
-            shape,
-            4,
-            EconomyConfig::default(),
             GrowthConfig::default(),
             SeedBank::new(23),
         )

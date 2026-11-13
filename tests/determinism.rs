@@ -6,7 +6,6 @@ use arkhe::config::{
 };
 use arkhe::env::{GeneratorConfig, NoiseModel};
 use arkhe::rng::{SeedBank, StreamDomain, fnv1a_128_hex};
-use arkhe::structural::WiringTopology;
 use arkhe::substrate::{Width, WireDelayMode};
 use rand_core::Rng;
 
@@ -115,7 +114,6 @@ fn execute_experiment_is_byte_identical_across_runs_and_distinct_across_seeds() 
         substrate: SubstrateConfig {
             width_bits: Width::BITS_2,
             wire_delay: WireDelayMode::Combinational,
-            wiring_topology: WiringTopology::WellMixed,
         },
         environment: EnvironmentConfig {
             horizon_ticks: 320,

@@ -2,18 +2,13 @@
 
 pub mod m1b;
 pub mod panel;
+pub mod stats;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::BuildProvenance;
-use crate::env::{GeneratorConfig, NoiseModel, NoisyEnvironment};
-use crate::metrics::circuit_node_description_debts;
 use crate::rng::SeedBank;
 use crate::structural::economy::EconomyConfig;
-use crate::structural::lattice::{
-    BoundaryAnchor, Coord, GridShape, LatticeCircuit, PerimeterSide, WiringTopology,
-};
-use crate::structural::live::LiveCircuit;
 use crate::structural::sensitivity::counterfactual_sensitivity;
 use crate::substrate::{
     Circuit, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
@@ -25,6 +20,10 @@ pub use m1b::{
     run_m1_combined_verification, run_m1b_bank_evaluation, run_m1b_verification_suite,
 };
 pub use panel::{CircuitClass, DEFAULT_HORIZON, PanelRun, run_panel_matrix};
+pub use stats::{
+    BankDistributionSummary, BankSample, MultiBankGateResult, PooledSuccessResult,
+    chi_squared_p_value, clopper_pearson_lower_bound, evaluate_multi_bank_gate,
+};
 
 /// Pre-registered holdout range start seed.
 pub const HOLDOUT_SEED_START: u32 = 10000;
@@ -632,7 +631,7 @@ fn verify_g1a1(runs: &[PanelRun]) -> M1aGateReport {
     gate_report("G1A.1", cases, failures)
 }
 
-fn verify_g1a2(runs: &[PanelRun], horizon: u64) -> M1aGateReport {
+fn verify_g1a2(runs: &[PanelRun], _horizon: u64) -> M1aGateReport {
     let mut failures = Vec::new();
     let mut cases = 0u64;
     let initial_energy = EconomyConfig::default().initial_energy;
@@ -710,35 +709,10 @@ fn verify_g1a2(runs: &[PanelRun], horizon: u64) -> M1aGateReport {
         }
     }
 
-    // Spatial case: build Osc2(0, hi) for alt at k ∈ {1, 2}
-    for width in [Width::BITS_1, Width::BITS_2] {
-        cases += 2;
-        match run_spatial_osc2(width, horizon) {
-            Ok((delta_e, min_node_energy)) => {
-                if delta_e <= 0.0 {
-                    failures.push(format!(
-                        "G1A.2 / spatial / alt / {} / osc2: delta_e {} <= 0.0",
-                        width.bits(),
-                        delta_e
-                    ));
-                }
-                if min_node_energy <= initial_energy {
-                    failures.push(format!(
-                        "G1A.2 / spatial / alt / {} / osc2: min_node_energy {} <= initial_energy {}",
-                        width.bits(),
-                        min_node_energy,
-                        initial_energy
-                    ));
-                }
-            }
-            Err(e) => failures.push(format!("G1A.2 / spatial / alt / {}: {e}", width.bits())),
-        }
-    }
-
     gate_report("G1A.2", cases, failures)
 }
 
-fn verify_g1a3(runs: &[PanelRun], horizon: u64) -> M1aGateReport {
+fn verify_g1a3(runs: &[PanelRun], _horizon: u64) -> M1aGateReport {
     let mut failures = Vec::new();
     let mut cases = 0u64;
 
@@ -822,31 +796,6 @@ fn verify_g1a3(runs: &[PanelRun], horizon: u64) -> M1aGateReport {
         }
     }
 
-    // Spatial case: Add(Osc2, ConstLoop(0)) as a LocalVonNeumann lattice
-    for width in [Width::BITS_1, Width::BITS_2] {
-        cases += 2;
-        match run_spatial_detour(width, horizon) {
-            Ok((detour_credit, detour_delta_e, ref_delta_e)) => {
-                if detour_credit != 0.0 {
-                    failures.push(format!(
-                        "G1A.3 / spatial / alt / {} / detour: detour_credit_after_tick0 {} != 0.0",
-                        width.bits(),
-                        detour_credit
-                    ));
-                }
-                if detour_delta_e >= ref_delta_e {
-                    failures.push(format!(
-                        "G1A.3 / spatial / alt / {} / detour: delta_e {} >= reference delta_e {}",
-                        width.bits(),
-                        detour_delta_e,
-                        ref_delta_e
-                    ));
-                }
-            }
-            Err(e) => failures.push(format!("G1A.3 / spatial / alt / {}: {e}", width.bits())),
-        }
-    }
-
     gate_report("G1A.3", cases, failures)
 }
 
@@ -876,274 +825,6 @@ fn verify_g1a4(runs: &[PanelRun], _seed_offset: u32) -> M1aGateReport {
     }
 
     gate_report("G1A.4", cases, failures)
-}
-
-fn run_spatial_osc2(width: Width, horizon: u64) -> Result<(f64, f64), String> {
-    let k = width.bits();
-    let hi = (1u64 << k) - 1;
-    let shape = GridShape::new(2, 2).map_err(|e| e.to_string())?;
-    let mut lattice = LatticeCircuit::new(
-        shape,
-        width,
-        WireDelayMode::Combinational,
-        WiringTopology::LocalVonNeumann,
-        vec![BoundaryAnchor {
-            side: PerimeterSide::North,
-            offset: 0,
-        }],
-        vec![BoundaryAnchor {
-            side: PerimeterSide::South,
-            offset: 1,
-        }],
-    )
-    .map_err(|e| e.to_string())?;
-
-    let d1 = lattice
-        .place_node(Coord { row: 0, col: 0 }, Primitive::Delay { init: hi })
-        .map_err(|e| e.to_string())?;
-    let d2 = lattice
-        .place_node(Coord { row: 0, col: 1 }, Primitive::Delay { init: 0 })
-        .map_err(|e| e.to_string())?;
-    let s = lattice
-        .place_node(Coord { row: 1, col: 1 }, Primitive::Split)
-        .map_err(|e| e.to_string())?;
-    let relay = lattice
-        .place_node(Coord { row: 1, col: 0 }, Primitive::Split)
-        .map_err(|e| e.to_string())?;
-
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: d1, port: 0 },
-            SignalSink::NodeIn { node: d2, port: 0 },
-        )
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: d2, port: 0 },
-            SignalSink::NodeIn { node: s, port: 0 },
-        )
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: s, port: 0 },
-            SignalSink::NodeIn {
-                node: relay,
-                port: 0,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut {
-                node: relay,
-                port: 0,
-            },
-            SignalSink::NodeIn { node: d1, port: 0 },
-        )
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: s, port: 1 },
-            SignalSink::BoundaryOut(0),
-        )
-        .map_err(|e| e.to_string())?;
-
-    let circuit = lattice.lower().map_err(|e| e.to_string())?;
-    let debts =
-        circuit_node_description_debts(&circuit, lattice.topology(), Some(lattice.shape()), 0);
-
-    let generator = GeneratorConfig::T1_Alternating { a: 0, b: hi }
-        .build(width)
-        .map_err(|e| e.to_string())?;
-    let mut env = NoisyEnvironment::new(generator, NoiseModel::None, SeedBank::new(0))
-        .map_err(|e| e.to_string())?;
-    let config = EconomyConfig {
-        juvenile_ticks: 0,
-        max_energy_reserve: None,
-        ..EconomyConfig::default()
-    };
-    let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(0), 8)
-        .map_err(|e| e.to_string())?;
-
-    let mut clean = vec![0u64; 1];
-    let mut observed = vec![0u64; 1];
-    let mut prev = vec![0u64; 1];
-
-    for _ in 0..horizon {
-        env.step_frame(&mut clean, &mut observed);
-        let _ = live.predict(&prev).map_err(|e| e.to_string())?;
-        live.settle(&observed).map_err(|e| e.to_string())?;
-        prev[0] = observed[0];
-    }
-
-    let delta_e = live
-        .economy()
-        .nodes()
-        .iter()
-        .map(|n| n.energy - config.initial_energy)
-        .sum();
-    let min_node_energy = live
-        .economy()
-        .nodes()
-        .iter()
-        .map(|n| n.energy)
-        .fold(f64::INFINITY, f64::min);
-    Ok((delta_e, min_node_energy))
-}
-
-fn run_spatial_detour(width: Width, horizon: u64) -> Result<(f64, f64, f64), String> {
-    let k = width.bits();
-    let hi = (1u64 << k) - 1;
-    let shape = GridShape::new(3, 3).map_err(|e| e.to_string())?;
-    let mut lattice = LatticeCircuit::new(
-        shape,
-        width,
-        WireDelayMode::Combinational,
-        WiringTopology::LocalVonNeumann,
-        vec![BoundaryAnchor {
-            side: PerimeterSide::North,
-            offset: 0,
-        }],
-        vec![BoundaryAnchor {
-            side: PerimeterSide::East,
-            offset: 1,
-        }],
-    )
-    .map_err(|e| e.to_string())?;
-
-    // Osc2 ring
-    let d1 = lattice
-        .place_node(Coord { row: 0, col: 0 }, Primitive::Delay { init: hi })
-        .map_err(|e| e.to_string())?;
-    let d2 = lattice
-        .place_node(Coord { row: 0, col: 1 }, Primitive::Delay { init: 0 })
-        .map_err(|e| e.to_string())?;
-    let s = lattice
-        .place_node(Coord { row: 1, col: 1 }, Primitive::Split)
-        .map_err(|e| e.to_string())?;
-    let relay = lattice
-        .place_node(Coord { row: 1, col: 0 }, Primitive::Split)
-        .map_err(|e| e.to_string())?;
-
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: d1, port: 0 },
-            SignalSink::NodeIn { node: d2, port: 0 },
-        )
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: d2, port: 0 },
-            SignalSink::NodeIn { node: s, port: 0 },
-        )
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: s, port: 0 },
-            SignalSink::NodeIn {
-                node: relay,
-                port: 0,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut {
-                node: relay,
-                port: 0,
-            },
-            SignalSink::NodeIn { node: d1, port: 0 },
-        )
-        .map_err(|e| e.to_string())?;
-
-    // Add node at (1, 2)
-    let add = lattice
-        .place_node(Coord { row: 1, col: 2 }, Primitive::Add)
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: s, port: 1 },
-            SignalSink::NodeIn { node: add, port: 0 },
-        )
-        .map_err(|e| e.to_string())?;
-
-    // ConstLoop(0): dc at (2, 1), sc at (2, 2)
-    let dc = lattice
-        .place_node(Coord { row: 2, col: 1 }, Primitive::Delay { init: 0 })
-        .map_err(|e| e.to_string())?;
-    let sc = lattice
-        .place_node(Coord { row: 2, col: 2 }, Primitive::Split)
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: dc, port: 0 },
-            SignalSink::NodeIn { node: sc, port: 0 },
-        )
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: sc, port: 0 },
-            SignalSink::NodeIn { node: dc, port: 0 },
-        )
-        .map_err(|e| e.to_string())?;
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: sc, port: 1 },
-            SignalSink::NodeIn { node: add, port: 1 },
-        )
-        .map_err(|e| e.to_string())?;
-
-    lattice
-        .connect(
-            SignalSource::NodeOut { node: add, port: 0 },
-            SignalSink::BoundaryOut(0),
-        )
-        .map_err(|e| e.to_string())?;
-
-    let detour_nodes = vec![dc, sc];
-    let circuit = lattice.lower().map_err(|e| e.to_string())?;
-    let debts =
-        circuit_node_description_debts(&circuit, lattice.topology(), Some(lattice.shape()), 0);
-
-    let generator = GeneratorConfig::T1_Alternating { a: 0, b: hi }
-        .build(width)
-        .map_err(|e| e.to_string())?;
-    let mut env = NoisyEnvironment::new(generator, NoiseModel::None, SeedBank::new(0))
-        .map_err(|e| e.to_string())?;
-    let config = EconomyConfig {
-        juvenile_ticks: 0,
-        max_energy_reserve: None,
-        ..EconomyConfig::default()
-    };
-    let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(0), 8)
-        .map_err(|e| e.to_string())?;
-
-    let mut clean = vec![0u64; 1];
-    let mut observed = vec![0u64; 1];
-    let mut prev = vec![0u64; 1];
-    let mut detour_credit_after_tick0 = 0.0f64;
-
-    for t in 0..horizon {
-        env.step_frame(&mut clean, &mut observed);
-        let _ = live.predict(&prev).map_err(|e| e.to_string())?;
-        let tick = live.settle(&observed).map_err(|e| e.to_string())?;
-        if t >= 1 {
-            for &node in &detour_nodes {
-                detour_credit_after_tick0 += tick.economy.node_credit[node.index()];
-            }
-        }
-        prev[0] = observed[0];
-    }
-
-    let detour_delta_e = live
-        .economy()
-        .nodes()
-        .iter()
-        .map(|n| n.energy - config.initial_energy)
-        .sum();
-
-    let (ref_delta_e, _) = run_spatial_osc2(width, horizon)?;
-    Ok((detour_credit_after_tick0, detour_delta_e, ref_delta_e))
 }
 
 #[cfg(test)]

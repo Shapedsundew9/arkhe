@@ -54,3 +54,20 @@ Read `.shared/ai/core/common-instructions.md`.
 - Prefer well-established, maintained crates when a dependency is genuinely needed.
 - Add every new dependency to the appropriate section of `Cargo.toml` and verify with `cargo check`.
 - Avoid introducing a dependency for functionality that is small and clear to implement with the standard library.
+
+## Architectural Integrity & Parameter Discipline
+
+1. **Topology is coordinate-free.** `substrate::Circuit` is the only topology representation.
+   Do not reintroduce grid shapes, coordinates, relay hops, or perimeter anchors. Locality and
+   fan-out are priced only through description length (`L(C)`, `split_code_tax`).
+2. **Every constant is classified** as derived, pre-registered scientific parameter, or compute
+   guardrail, in the inventory in `doc/coordinate_free_scaling_plan.md` §2.1 (or its successor).
+   Adding or changing a constant requires updating that inventory.
+3. **Every limit is observable.** Any cap, guardrail, clip, or window truncation must emit a named
+   telemetry counter when it binds. Guardrails must never bind in an accepted run.
+4. **Behavior-preserving refactors are proven by golden traces** (`tests/golden_traces.rs`).
+   Re-blessing fixtures requires a written rationale and is only allowed for intentional behavior changes.
+5. **Hitting a structural limit or starvation cliff means STOP and discuss** the scaling rule with
+   the user. Do not apply local workarounds or retune constants.
+6. **Multi-bank acceptance uses pooled confidence bounds plus a homogeneity test**, never compound
+   per-bank hurdles.

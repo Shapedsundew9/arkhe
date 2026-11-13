@@ -1,8 +1,8 @@
 # Coordinate-Free Architecture and Principled Parameter Scaling Plan
 
-**Date:** 2026-11-08 (revision 2)  
-**Status:** Pre-Milestone 2 refactoring plan. Revision 2 checks every claim in the draft against `HEAD` (`78ca414`). It puts behavior-preserving work ahead of behavior-changing work and adds a verification safety net (§3, Phase 0).  
-**Scope:** Separate graph morphogenesis from the leftover 2D grid. Replace ungrounded scalar constants with scaling rules, or reclassify them explicitly. Make every remaining limit observable, so that parameter cliffs show up instead of failing silently.
+**Date:** 2026-11-08 (updated 2026-11-13)  
+**Status:** Active pre-Milestone 2 specification. The Phases 1–4 refactor landed as an uncommitted diff on top of `2d009b0` (`tag: m1-final-lattice`), with open implementation gaps, pending user decisions (`Q1`–`Q4`), and provenance recovery tracked in [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md). Section 2.1 serves as the temporary Constants Inventory cited by `.github/copilot-instructions.md` Rule 2 until `doc/parameter_inventory.md` is split out under Readiness C4.  
+**Scope:** Separate graph morphogenesis from the retired 2D grid. Replace ungrounded scalar constants with scaling rules, or reclassify them explicitly. Make every remaining limit observable, so that parameter cliffs show up instead of failing silently.
 
 ---
 
@@ -33,46 +33,45 @@ Revision 2 changes how the work is run, not what it aims at:
 
 **Under the default `WellMixed` regime, nothing behavioral.**
 
-M0 assumed spatial locality meant nearest-neighbour routing on a planar substrate (`LocalVonNeumann` with single-cell `SPLIT` relays). As documented in [Charter v3 §3.1.1](foundational_research_charter_v3.md#311-spatial-lattice-and-graph-connectivity) and Decision Record #29, planar relays congested the output ports and blocked multi-stage neurogenesis. The M1b review measured this directly ([review §1.2](milestone_1b_review.md#12-architectural-and-mathematical-strengths)). Charter v3 therefore pivoted to:
+M0 assumed spatial locality meant nearest-neighbour routing on a planar substrate (`LocalVonNeumann` with single-cell `SPLIT` relays). As documented in [Charter v3 §3.1.1](foundational_research_charter_v3.md#311-coordinate-free-graph-connectivity) and Decision Record #29, planar relays congested the output ports and blocked multi-stage neurogenesis. The M1b closeout review measured this directly ([research_record.md §2.5](research_record.md#25-redesigned-m1a--milestone-1-attainment-sign-offs-2026-11-072026-11-08)). Charter v3 therefore pivoted to:
 
 * **Direct point-to-point wiring** (`WellMixed`) as the default.
 * **Locality priced by description length:** $L_{\text{wire}} = \log_2(S \times D)$ bits per edge, plus explicit `SPLIT` taxes in [`circuit_code_bits_with_tax`](../src/metrics/mdl.rs). Under `WellMixed` this code length is already independent of coordinates, because `placement_bits_per_node = 0` and the wire cost uses port counts only.
 
-### 1.2 What does keeping the grid cost?
+### 1.2 Why the grid was removed
 
-The spatial data structure stayed behind in [`LatticeCircuit`](../src/structural/lattice.rs#L260) and [`EditableLattice`](../src/structural/surgery.rs#L68):
+The Phase 1 refactor deleted the leftover spatial data structures (`LatticeCircuit` in retired `src/structural/lattice.rs`, 1,956 lines including tests; `EditableLattice` → [`EditableCircuit`](../src/structural/surgery.rs)):
 
-1. **Hard 64-cell ceiling.** [`ArkheLearner::new`](../src/structural/learner.rs#L190) hardcodes `GridShape::new(8, 8)`. Even under `WellMixed`, every node needs an empty cell (`place_node`, `nearest_empty_cell`, `best_empty_cell_between`), so placement fails with `NoSpace`/`UnknownEndpoint` at node 65.
-2. **Perimeter anchor bookkeeping.** [`default_anchors`](../src/structural/learner.rs#L44) is about 110 lines of side and offset allocation that exists only to give boundary ports a coordinate.
-3. **Code surface.** `lattice.rs` is 1,956 lines including tests. **The largest consumer is [`growth.rs`](../src/structural/growth.rs) (about 170 references to `Coord`/`LatticeCircuit`/`max_relay_hops`), not `surgery.rs`.** It covers candidate materialization, `materialize_const_loop` (BFS cell search), feature/motif start coordinates, ring placement (`2 × ⌈(p+2)/2⌉` rectangular loops), and `build_autonomous_ring_lattice`. `verify_m1/` (about 43), `config.rs`, `metrics/mdl.rs`, and four integration test files also depend on it.
-4. **Misleading failure modes.** `LatticeError::NoSpace` and `UnknownEndpoint` invite future agents to write placement heuristics for an abstraction that has no meaning in the project.
-5. **A `max_relay_hops` parameter threaded through every growth API**, even though it has no effect under `WellMixed`.
+1. **Hard 64-cell ceiling.** `GridShape::new(8, 8)` required every node to occupy an empty cell (`place_node`, `nearest_empty_cell`, `best_empty_cell_between`), failing with `NoSpace`/`UnknownEndpoint` at node 65 even under `WellMixed`.
+2. **Perimeter anchor bookkeeping.** `default_anchors` (~110 lines) existed only to assign boundary ports coordinates.
+3. **Code surface.** [`growth.rs`](../src/structural/growth.rs) alone held ~170 `Coord`/`LatticeCircuit`/`max_relay_hops` references across candidate materialization, BFS const-loop search, rectangular ring placement, and ring rebuilding, alongside dependents in `verify_m1/`, `config.rs`, `metrics/mdl.rs`, and four integration test suites.
+4. **Misleading failure modes & unused arguments.** `LatticeError::NoSpace`, `UnknownEndpoint`, and `max_relay_hops` invited coordinate-placement heuristics for an abstraction with zero behavioral effect under `WellMixed`.
 
 ### 1.3 The replacement: `substrate::Circuit` as the only topology
 
-`substrate::Circuit` ([`circuit.rs`](../src/substrate/circuit.rs#L61)) already stores `Vec<Primitive>` indexed by `NodeId(u32)` and `Vec<Edge { src, dst, hops }>`, and it already enforces invariants in `compile()`. `LatticeCircuit::lower()` copies nodes and edges in insertion order and assigns `hops = 1` per edge under `WellMixed` + `TicksPerHop`. Building another graph type would duplicate this. Instead:
+`substrate::Circuit` ([`circuit.rs`](../src/substrate/circuit.rs)) stores `Vec<Primitive>` indexed by `NodeId(u32)` and `Vec<Edge { src, dst, hops }>`, enforcing invariants in `compile()`. Rather than duplicating it:
 
 * **Substrate additions (pure graph operations, integer-only, no new dependencies):** `disconnect(src, dst)`, `replace_edge_source`, and `remove_nodes(&BTreeSet<NodeId>) -> Vec<Option<NodeId>>` (stable, order-preserving compaction).
-* **Structural policy helpers** (`tap_source` with automatic `SPLIT` insertion, `stack_output_binary_op`, const-loop and ring materialization) become free functions over `&mut Circuit` in a new `structural/graph_edit.rs`. They encode growth policy, not substrate semantics.
+* **Structural policy helpers** (`tap_source` with automatic `SPLIT` insertion, `stack_output_binary_op`, const-loop and ring materialization) live as free functions over `&mut Circuit` in [`graph_edit.rs`](../src/structural/graph_edit.rs). They encode growth policy, not substrate semantics.
 * **`EditableLattice` → `EditableCircuit`**, wrapping `Circuit`, `CompiledCircuit`, `ScalarState`, and `EconomyState`. `recompile_preserving_state` stays the single transactional edit path.
-* **Timing:** combinational wires, with registers only as explicit `Primitive::Delay` nodes. Under the `TicksPerHop` ablation, every edge carries `hops = 1`, which matches the current `WellMixed` lowering.
-* **Determinism constraint:** every edit helper must keep the **node and edge insertion order** of the current `WellMixed` code paths. Node indices drive feature names, candidate tie-breaking, and sensitivity sampling, so reordering would break the Phase 1 bit-identity gate (§3).
+* **Timing:** combinational wires, with registers only as explicit `Primitive::Delay` nodes. Under the `TicksPerHop` ablation, every edge carries `hops = 1`.
+* **Determinism constraint:** edit helpers must preserve **node and edge insertion order** so node indices, feature names, candidate tie-breaking, and sensitivity sampling remain deterministic.
 
 > [!NOTE]
-> The draft listed a `SignalSink::InternalComparator(id)` variant. It does not exist in `HEAD`. Addressable internal comparator sinks are an M2/M4a requirement ([review §3.1, §3.3](milestone_1b_review.md#31-specific-readiness-analysis-for-m2-multi-channel--redundancy-sprouting)). They are **deferred to the M2 plan**, with one constraint here: Phase 2 must key per-port developmental state and scorers by a sink index type that can later grow a comparator variant without another refactor.
+> Addressable internal comparator sinks (`SignalSink::InternalComparator`) are an M2/M4a requirement ([research_record.md](research_record.md) §6.2; [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md) **Q5**). They remain deferred to M2 planning; per-port developmental state and scorers key by a sink index type ready to grow a comparator variant cleanly.
 
-### 1.4 What is lost, and how to retire it properly
+### 1.4 Retirement of spatial ablations
 
-Removing the grid removes the `LocalVonNeumann`/`LocalMoore` ablations, which are **pre-registered evidence**:
+Removing the grid retired the pre-registered `LocalVonNeumann`/`LocalMoore` spatial ablations:
 
 | Pre-registered artefact | Location | Action |
 | :--- | :--- | :--- |
-| `G1B.4a` Axis 3 (spatial locality vs. `WellMixed`) | [`verify_m1/m1b.rs`](../src/verify_m1/m1b.rs#L1764) | Retire |
-| M1a spatial case `Add(Osc2, ConstLoop(0))` on `LocalVonNeumann` | [`verify_m1/mod.rs`](../src/verify_m1/mod.rs) (around line 825) | Retire |
-| Spatial unit and integration tests | `lattice.rs`, `surgery.rs`, `learner.rs`, `tests/m0_acceptance.rs`, `tests/m1b_neurogenesis.rs` | Delete or port to `WellMixed` |
-| `grid_rows`, `grid_cols`, `max_relay_hops`, `wiring_topology` config fields | [`config.rs`](../src/config.rs) | Remove (breaking changes are allowed) |
+| `G1B.4a` Axis 3 (spatial locality vs. `WellMixed`) | [`verify_m1/m1b.rs`](../src/verify_m1/m1b.rs) | Retired (archived at `m1-final-lattice`) |
+| M1a spatial case `Add(Osc2, ConstLoop(0))` on `LocalVonNeumann` | [`verify_m1/mod.rs`](../src/verify_m1/mod.rs) | Retired (archived at `m1-final-lattice`) |
+| Spatial unit and integration tests | Removed `lattice.rs`, `surgery.rs`, `learner.rs`, `tests/` | Deleted or ported to `WellMixed` |
+| `grid_rows`, `grid_cols`, `max_relay_hops`, `wiring_topology` config fields | [`config.rs`](../src/config.rs) | Removed |
 
-Retirement protocol: (1) add Charter Decision Record #30 stating that the topology pivot is now structural and the spatial ablation is closed. (2) Tag the last commit that still contains the lattice (for example `m1-final-lattice`) as the reproduction anchor for the retired evidence. (3) Record the retirement in an addendum to `milestone_1b_plan.md` so the M1 sign-off record stays internally consistent.
+Retirement protocol: (1) Charter Decision Record #30 makes topology retirement structural and closes the spatial ablation. (2) Commit tag `m1-final-lattice` (`2d009b0`) anchors historical spatial reproduction. (3) Durable attainment metrics and retirement records are preserved in [research_record.md](research_record.md) §2.5.
 
 ---
 
@@ -88,28 +87,32 @@ Retirement protocol: (1) add Charter Decision Record #30 stating that the topolo
 3. **Reduction to M1.** Where possible, a new rule must reduce *exactly* to M1 behavior at M1 configurations (`K = 1`, `k ∈ {1, 2}`). That makes it checkable by golden traces. A rule that cannot reduce this way is behavior-changing and goes in Phase 3.
 4. **No post-hoc fitting.** Choosing a multiplier because it "recovers the historical constant" is fitting, not grounding. Any rule that still has a free multiplier is a pre-registered parameter and needs a sensitivity sweep.
 
-### 2.1 Constants inventory (single source of truth)
+### 2.1 Constants inventory (temporary home pending Readiness C4)
 
-| Constant | Current value / location | Class (revision 2) | Action | Phase |
-| :--- | :--- | :--- | :--- | :---: |
-| Grid shape | `8 × 8`, [`learner.rs`](../src/structural/learner.rs#L197) | Leftover | Delete (§1) | 1 |
-| `max_relay_hops` | `4`, learner + growth APIs | Leftover | Delete (§1) | 1 |
-| `max_energy_reserve` | `Some(25.0)`, [`economy.rs`](../src/structural/economy.rs#L97) | Ungrounded | Measure, then decide (§2.2) | 0 → 3 |
-| `max_nodes` | `32`, [`growth.rs`](../src/structural/growth.rs#L43) | Compute guardrail | Guardrail semantics plus telemetry (§2.3) | 2 |
-| Global juvenile sprout freeze | [`learner.rs`](../src/structural/learner.rs#L548-L554) | Multi-channel defect | Per-port developmental state (§2.4) | 2 |
-| `obs_window` capacity | `juvenile + 2·W_diag = 256`, [`learner.rs`](../src/structural/learner.rs#L240-L241) | **Already implemented** | Add `CandidateUndecidable` telemetry (§2.5) | 0 |
-| Miller–Madow alphabet | Empirical support, [`growth.rs`](../src/structural/growth.rs#L272-L276) | **Already implemented** | Fix doc claims; window/estimator scaling deferred to M5 (§2.6) | — |
-| Reactive lag horizon | `τ ∈ 1..=3` (feature pool, lagged MI), [`growth.rs`](../src/structural/growth.rs#L630-L634) | Ungrounded | Search bound with telemetry (§2.7) | 2 |
-| Candidate feature cap | `.take(6)`, [`growth.rs`](../src/structural/growth.rs#L231) | Ungrounded compute bound | Guardrail semantics plus telemetry (§2.7) | 2 |
-| `juvenile_ticks` | `128` | Pre-registered (M1) | Keep; record derivation gap; `CandidateUndecidable` shows if it is too short | — |
-| `diagnostic_window` | `64` | Pre-registered (M1) | Keep; revisit with the M5 estimator decision (§2.6) | — |
-| `sprout_interval` | `32` | Pre-registered (M1) | Keep | — |
-| `mi_threshold_bits`, `min_match_gain` | `0.05`, `4` | Pre-registered (M1) | Keep; candidate for consolidation in M5 (§2.6) | — |
-| `initial_energy` | `4.0` | Pre-registered (M1) | Keep | — |
-| `trace_discount` γ | `0.90` | Pre-registered (Charter DR #26) | Keep | — |
-| Sensitivity `sample_count` | `8`, [`learner.rs`](../src/structural/learner.rs#L249) | Pre-registered (M1, `k > 1` only) | Keep; characterize in the M5 width sweep | — |
-| KT prior mass in `q̂` | `½·2^k` pseudo-counts, [`point_forecast.rs`](../src/metrics/point_forecast.rs#L92) | Derived (symbol-level KT) | Characterize earning latency vs. `k` in the M5 width sweep | — |
-| Stage-gate statistics | per-bank pass hurdles | Ungrounded | Pooled confidence bound (§2.8), pre-registered in the M2 plan | 4 |
+*See [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md) §1.1 (`F1`–`F13`) for the audit behind each `Implementation` status below. Splitting this table into standalone `doc/parameter_inventory.md` is tracked under Readiness `C4`.*
+
+| Constant | Current value / location | Class | Target Action | Implementation | Evidence / Next Step |
+| :--- | :--- | :--- | :--- | :---: | :--- |
+| Grid shape | Removed (`lattice.rs` deleted) | Leftover | Delete (§1) | Done (uncommitted) | Pending Phase 1/2 `A1`–`A2` provenance check |
+| `max_relay_hops` | Removed (`config.rs`, `growth.rs`) | Leftover | Delete (§1) | Done (uncommitted) | Pending `A1`–`A2` |
+| `max_energy_reserve` | `juvenile_ticks + 128.0` (`W_obs` mismatch + hardcoded `128.0`), [`economy.rs`](../src/structural/economy.rs) | Pending **Q1** (Option B candidate vs. alternatives) | Single `W_obs` helper + user decision **Q1** (§2.2) | Partial (`F2`–`F5`) | Pending `Q1`, `B1`, `B6`, `A4` |
+| `max_nodes` | `32`, [`growth.rs`](../src/structural/growth.rs) | Compute guardrail | Single `node + motif <= max_nodes` check + harness zero-assert (§2.3) | Partial (`F6`, `F7`, `F10`) | Pending `B3`, `B4`, `B5`, `Q3` |
+| Global juvenile sprout freeze | Per-port `PortDevelopmentalState`, [`learner.rs`](../src/structural/learner.rs) | Multi-channel defect fix | Per-port maturity/diagnostics/snapshots + lock-time test (§2.4) | Partial (`F11`, `F12`) | Pending `B7`, `Q4` |
+| `obs_window` capacity | `juvenile + 2·W_diag = 256`, [`learner.rs`](../src/structural/learner.rs) | Derived | Unify with `observation_horizon`, assert `CandidateUndecidable` (§2.5) | Partial (`F3`, `F7`) | Pending `B1`, `B3` |
+| Miller–Madow alphabet | Empirical support, [`growth.rs`](../src/structural/growth.rs) | Verified fix | Active; `W_diag` scaling deferred to M5 (§2.6) | Done | Covered by M1b hardening & dev suites (`A5`) |
+| Reactive lag horizon | Literal `max_tau = 3` / `1..=3` in [`learner.rs`](../src/structural/learner.rs) & [`growth.rs`](../src/structural/growth.rs) | Search bound (candidate) | Either deepening (§2.7) or config bound + telemetry (`B2` / **Q2**) | Not started (`F1`) | Pending `Q2`, `B2` |
+| Candidate feature cap | Literal `.take(6)` in [`growth.rs`](../src/structural/growth.rs) | Search bound (candidate) | Config field + `CandidateListTruncated` harness wiring | Not started (`F1`, `F7`) | Pending `Q2`, `B2`, `B3` |
+| Ring period search range | Literal `2..=6` in [`growth.rs`](../src/structural/growth.rs) | Search bound (unlisted in config) | Config field + `RingPeriodBound` telemetry (`B2`) | Not started (`F13`) | Pending `Q2`, `B2` |
+| Candidate tie-break threshold | Literal `1e-9` in [`growth.rs`](../src/structural/growth.rs) | Numerical tie-break (unlisted) | Document or parameterize (`F13`) | Unlisted (`F13`) | Pending `B2` / `C4` |
+| `juvenile_ticks` | `128` (`EconomyConfig`) | Pre-registered (M1) | Kept; unclipped escrow & maturity settlement | Pre-registered | M1 sign-offs in [research_record.md](research_record.md) §2.5 |
+| `diagnostic_window` | `64` (`GrowthConfig`) | Pre-registered (M1) | Kept | Pre-registered | Same |
+| `sprout_interval` | `32` (`GrowthConfig`) | Pre-registered (M1) | Kept | Pre-registered | Same |
+| `mi_threshold_bits`, `min_match_gain` | `0.05`, `4` (`GrowthConfig`) | Pre-registered (M1) | Kept | Pre-registered | Same |
+| `initial_energy` | `4.0` (`EconomyConfig`) | Pre-registered (M1) | Kept | Pre-registered | Same |
+| `trace_discount` γ | `0.90` (`EconomyConfig`) | Pre-registered (Charter DR #26) | Kept | Pre-registered | Same |
+| Sensitivity `sample_count` | `8` struct literal in [`learner.rs`](../src/structural/learner.rs) | Pre-registered (M1, `k > 1` only) | Kept (`F13`: move from literal into config/docs) | Partial (`F13`) | Pending `C4` |
+| KT prior mass in `q̂` | `½·2^k` pseudo-counts, [`point_forecast.rs`](../src/metrics/point_forecast.rs) | Derived (symbol-level KT) | Kept | Derived | [point_forecast.rs](../src/metrics/point_forecast.rs) |
+| Stage-gate statistics | Pooled Clopper–Pearson 99% + χ² homogeneity, [`verify_m1/stats.rs`](../src/verify_m1/stats.rs) | Derived | Ready for M2 pre-registration (**Q9**) (§2.8) | Done (uncommitted) | Pending `Q9` for M2 gate targets |
 
 ### 2.2 Energy reserve ceiling $E_{\max}$
 
@@ -121,8 +124,8 @@ Retirement protocol: (1) add Charter Decision Record #30 stating that the topolo
 
 1. **The O(k) loss claim does not hold under `CalibratedPointForecast`.** A mismatch costs $\log_2\frac{1-q}{1-p}$. That is set by the predictor's confidence $q$ (roughly its running hit rate) and is about $\log_2 \varepsilon$ under substitution noise $\varepsilon$, whatever the width. Width enters the **hit** reward $\log_2(q/p)$ through $p \sim 2^{-k}$. A confident predictor that suddenly becomes wrong loses about $\log_2(t)$ bits per tick, which grows with its match history, not with $k$.
 2. **$k / \ln 2$ has no derivation.** The quantities are already in bits, so the $\ln 2$ factor is spurious. The stated burst length $\ell \approx 3\text{–}5$ never appears in the formula.
-3. **$\beta = 2.0$ "recovering 25.0" is post-hoc fitting.** Real per-node debts are not 12.5 bits. For example, `Split` owes about 13.75 bits ([review Finding 2](milestone_1b_review.md#finding-2-high--halting--metabolic-defect-epoch-1-bypass-of-flux-and-survival-checks-causes-infinite-sproutstarveprune-thrashing-on-noisy-non-zero-constant-streams)), and debts grow with graph size because $\log_2(S \cdot D)$ does.
-4. **Plumbing.** Per-node $\Delta L_v$ lives in [`MarginalDebtLedger`](../src/structural/surgery.rs#L643) (and again in `LiveCircuit::description_debts`), not in `EconomyState`. A debt-dependent cap needs the debt to move into `NodeEconomy`, which also removes the duplicate copy.
+3. **$\beta = 2.0$ "recovering 25.0" is post-hoc fitting.** Real per-node debts are not 12.5 bits. For example, `Split` owes about 13.75 bits ([research_record.md §3.3](research_record.md)), and debts grow with graph size because $\log_2(S \cdot D)$ does.
+4. **Plumbing.** Per-node $\Delta L_v$ lives in [`MarginalDebtLedger`](../src/structural/surgery.rs) (and again in [`LiveCircuit`](../src/structural/live.rs) description debts), not in `EconomyState`. A debt-dependent cap needs the debt to move into `NodeEconomy`, which also removes the duplicate copy.
 
 #### Plan
 
@@ -141,7 +144,7 @@ The draft's $N_{\max} = K \times 16$ replaces one magic number with another. At 
 
 **Rule:** `max_nodes` is a **compute guardrail**, not a developmental parameter. Growth is meant to be limited by MDL debt and calibrated flux.
 
-* Check `node_count + motif_size <= max_nodes`. Today the check is `node_count < max_nodes` before proposing ([`learner.rs`](../src/structural/learner.rs#L696)), so a multi-node motif can overshoot.
+* Check `node_count + motif_size <= max_nodes`. Readiness Finding `F10` notes [`learner.rs`](../src/structural/learner.rs) still retains the pre-check `node_count < max_nodes` and mixed `>=`/`>` comparisons (tracked for cleanup in Readiness `B4`).
 * Emit `SproutBlocked::MaxNodes`. Verification harnesses assert it is zero, and a run where it binds is flagged and excluded.
 * Set the value from the Phase 0 compute profile (per-tick cost against $N$ and $K$), not from a per-channel node estimate. At M1 sizes (≤ 9 nodes observed) any value ≥ 32 is M1-neutral.
 
@@ -153,7 +156,7 @@ The draft scopes only the juvenile check to the target port's cone. Channel-isol
 
 | Global coupling in `ArkheLearner::observe` | Effect at $K > 1$ |
 | :--- | :--- |
-| `all_mature` over every node ([L548-L554](../src/structural/learner.rs#L548-L554)) | Any juvenile node freezes diagnosis and sprouting on every channel |
+| `all_mature` over every node ([`learner.rs`](../src/structural/learner.rs)) | Any juvenile node freezes diagnosis and sprouting on every channel |
 | One `post_juvenile_diag` buffer, cleared on *any* sprout or prune | One channel's edit throws away every other channel's diagnostic evidence |
 | One `ticks_since_last_check` timer, plus `break` after the first sprouting port | Serial development, plus a port-index bias (port 0 always gets first chance) |
 | `all_driven_ports_primed` over every port | One unprimed `TicksPerHop` chain blocks every channel |
@@ -173,17 +176,17 @@ In addition:
 
 **M1 reduction:** at $K = 1$ every live node sits in port 0's cone, so the per-port state matches the global state exactly. This step is therefore covered by the golden-trace gate. **New acceptance test:** $K$ independent single-channel tasks run side by side should each lock within the single-channel tick budget, not $K$ times later.
 
-### 2.5 Observation window $W_{\text{obs}}$: already implemented
+### 2.5 Observation window $W_{\text{obs}}$: horizon unification pending `B1` / `B3`
 
-`HEAD` already sets `obs_capacity = juvenile_ticks + 2 · diagnostic_window` (256 ticks), introduced in the post-review hardening ([review §5.1](milestone_1b_review.md#51-resolution-of-review-findings), Finding 3).
+[`ArkheLearner`](../src/structural/learner.rs) already sets `obs_capacity = juvenile_ticks + 2 · diagnostic_window` (256 ticks), introduced in the post-review hardening ([research_record.md §2.5](research_record.md)). (`economy.rs` currently uses `juvenile_ticks + 128.0` for Option B; unifying both behind one helper is tracked in Readiness `B1` / `Q1`.)
 
 **Correction:** the rule does **not** guarantee $W_{\text{obs}} \ge W^*$ in general. $W^* = \Delta L / \Delta I$ depends on the candidate's debt, the noise level, the width, and the motif size. The draft's "every candidate capable of surviving is recognized" holds only for the measured `NoisyAlternating(k=1)` case ($W^* \approx 152.9$).
 
-**Remaining work (Phase 0, telemetry only, M1-neutral):** in candidate replay, compute $W^*_{\text{cand}} = \Delta L_{\text{cand}} / \widehat{\Delta I}_{\text{cand}}$. When a candidate is rejected and $W^*_{\text{cand}} > W_{\text{obs}}$, emit `CandidateUndecidable`. If this counter is non-zero in M2/M5 runs, the window (and with it `juvenile_ticks`) is too short for that regime. That is a visible signal rather than a silent cliff.
+**Remaining work (`B3`):** `CandidateUndecidable` exists in learner telemetry, but `verify-m1` harnesses do not yet aggregate or report it (Readiness `F7`).
 
-### 2.6 Miller–Madow support: already implemented; estimator scaling deferred to M5
+### 2.6 Miller–Madow support: implemented; estimator scaling deferred to M5
 
-[`score_feature_group`](../src/structural/growth.rs#L255-L277) already uses the empirical support of both the joint feature alphabet and the residual alphabet.
+[`score_feature_group`](../src/structural/growth.rs) already uses the empirical support of both the joint feature alphabet and the residual alphabet.
 
 **Correction:** the draft's claim that empirical support "guarantees that the bias penalty can never exceed the empirical entropy" is false. With $N = 64$ and all-distinct values, $(63 \cdot 63)/(2 \cdot 64 \ln 2) \approx 44.7$ bits, against an entropy of $\log_2 64 = 6$ bits. $\min(N, |\text{Unique}|)$ is also redundant, since unique values never exceed $N$.
 
@@ -192,15 +195,17 @@ In addition:
 1. Scale $W_{\text{diag}}$ with observed joint support.
 2. Replace the triple (`mi_threshold_bits`, Miller–Madow, `min_match_gain`) with a single **prequential code-length gain** test: the KT-coded residual given the feature against the residual alone. This charges for model complexity automatically, fits the project's MDL foundations, and removes two pre-registered constants.
 
-### 2.7 Reactive lag horizon and candidate caps (new)
+### 2.7 Reactive lag horizon and candidate caps (pending `Q2` / `B2`)
 
-The executive summary listed `τ ≤ 3` as a cliff, but the draft had no rule for it. It was the root cause of the sparse `PeriodicMotif([0,0,0,0,0,1])` stall ([review Finding 3](milestone_1b_review.md#finding-3-high--verification-gap-g1b2-and-g1b4-omit-pre-registered-plan-cases-masking-an-unimplemented-sparse-rare-event-capability)), which ring closure later worked around.
+> *Status:* Not yet implemented (`max_tau = 3` and `.take(6)` remain literal constants in the working tree; see Readiness `F1` and `Q2`/`B2`).
+
+The executive summary listed `τ ≤ 3` as a cliff, which was the root cause of the sparse `PeriodicMotif([0,0,0,0,0,1])` stall ([research_record.md §3.3](research_record.md)) that autonomous ring closure later bypassed.
 
 **Rule:** a lag horizon is a **search bound**, not a model constraint. Every materialized `Delay` is already priced by $L(C)$.
 
 * Search lags by iterative deepening ($\tau_{\max} = 1, 2, 4, \dots$) only while no feature passes the growth criterion. Stop at `TickBudget` exhaustion or $\tau_{\max} \ge W_{\text{diag}}/2$, where the remaining sample count makes the MI estimate meaningless.
-* Apply the same treatment to `.take(6)` candidate features and to lagged residual MI over lags `1..=3`, which is also currently unused (review Finding 6.1).
-* Emit `LagHorizonExhausted` and `CandidateListTruncated`.
+* Apply the same treatment to `.take(6)` candidate features and to lagged residual MI over lags `1..=3`.
+* Emit `LagHorizonBound` (`LagHorizonExhausted`) and `CandidateListTruncated` when bounds fire (Readiness `B2`).
 
 **M1 reduction:** run the deepening only when the `τ ≤ 3` pass finds nothing. M1 trajectories that sprouted with `τ ≤ 3` then stay identical. Runs that stalled (such as sparse $p = 6$) can now change, so this step needs a targeted test and does not rely on the golden trace alone.
 
@@ -255,6 +260,10 @@ Work in place, strangler-style: delete coordinate code path by path rather than 
 
 **Exit gate:** golden traces bit-identical; `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --locked` pass; `verify-m0` and `verify-m1` pass on development seeds, minus the retired cases.
 
+> [!NOTE]
+> **Readiness A1 evidence (Phase 1–2 bit-identical under the M1 cap):**
+> Verified on `2026-11-13` by extracting the 8 Phase 0 golden fixtures from `2d009b0` (`git archive 2d009b0 tests/fixtures/golden | tar -x -C /tmp/arkhe_phase0_golden`), temporarily overriding `EconomyConfig::default()` with `ReserveCap::Fixed(25.0)` and pointing `tests/golden_traces.rs` at the extracted fixtures, then running `cargo test --test golden_traces -- --nocapture`. Observed output: `running 1 test`, `test golden_traces_are_bit_identical ... ok`, `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.83s`. After reverting those two temporary test overrides, the working-tree `HorizonDerived` fixtures also passed `cargo test --locked` (all unit and integration suites green). This isolates the re-blessed trajectory digest deltas strictly to Phase 3 (`ReserveCap::HorizonDerived`).
+
 ### Phase 2: Multi-channel generalization (reduces to M1 at `K = 1`)
 
 1. Per-port developmental state, juvenile-feature exclusion, and port rotation (§2.4), keyed by a sink index that can later hold comparators (§1.3 note).
@@ -278,28 +287,9 @@ Work in place, strangler-style: delete coordinate code path by path rather than 
 
 ---
 
-## 4. Proposed amendment to `.github/copilot-instructions.md`
+## 4. Instructions status
 
-`GEMINI.md` is a symlink to `.github/copilot-instructions.md`, so there is only one file to edit. The amendment states **principles and pointers**, not specific formulas: formulas may change, and copies inside instructions go stale. It extends the existing "NEVER search for magic numbers" requirement instead of duplicating it.
-
-```markdown
-## Architectural Integrity & Parameter Discipline
-
-1. **Topology is coordinate-free.** `substrate::Circuit` is the only topology representation.
-   Do not reintroduce grid shapes, coordinates, relay hops, or perimeter anchors. Locality and
-   fan-out are priced only through description length (`L(C)`, `split_code_tax`).
-2. **Every constant is classified** as derived, pre-registered scientific parameter, or compute
-   guardrail, in the inventory in `doc/coordinate_free_scaling_plan.md` §2.1 (or its successor).
-   Adding or changing a constant requires updating that inventory.
-3. **Every limit is observable.** Any cap, guardrail, clip, or window truncation must emit a named
-   telemetry counter when it binds. Guardrails must never bind in an accepted run.
-4. **Behavior-preserving refactors are proven by golden traces** (`tests/golden_traces.rs`).
-   Re-blessing fixtures requires a written rationale and is only allowed for intentional behavior changes.
-5. **Hitting a structural limit or starvation cliff means STOP and discuss** the scaling rule with
-   the user. Do not apply local workarounds or retune constants.
-6. **Multi-bank acceptance uses pooled confidence bounds plus a homogeneity test**, never compound
-   per-bank hurdles.
-```
+The `Architectural Integrity & Parameter Discipline` block proposed here was applied to `.github/copilot-instructions.md` (`GEMINI.md`). Its proposed expansion (Rule 5 and Rules 7–11) lives in [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md#43-proposed-amendment-to-githubcopilot-instructionsmd).
 
 ---
 
@@ -308,18 +298,8 @@ Work in place, strangler-style: delete coordinate code path by path rather than 
 | Risk | Mitigation |
 | :--- | :--- |
 | A refactor silently changes node or edge order and therefore tie-breaking | Golden traces with first-divergence reporting (Phase 0); order-preservation unit tests for `Circuit` mutations |
-| Retiring spatial gates looks like moving goalposts | Decision Record #30, a tagged reproduction commit, and a plan addendum (§1.4) |
-| A reserve-cap change destabilizes M1 halting or noise-floor behavior | Phase 0 measures whether the cap binds; regime-shift test; Phase 3 is gated on user sign-off and a full M1 dev-bank re-run |
+| Retiring spatial gates looks like moving goalposts | Decision Record #30, tagged reproduction commit `m1-final-lattice`, and [research_record.md](research_record.md) §2.5 (§1.4) |
+| A reserve-cap change destabilizes M1 halting or noise-floor behavior | Phase 0 measures whether the cap binds; regime-shift test; Phase 3 is gated on user sign-off (`Q1`) and a full M1 dev-bank re-run |
 | Per-port development exposes cross-channel juvenile tapping | Juvenile-feature exclusion (§2.4) |
-| M2 hits compute limits rather than structural limits | Phase 0 compute profile; `max_nodes` set from measured cost; guardrail counters asserted zero |
-| Scope creep into M2 features (comparator sinks, redundancy protection) | Explicitly deferred to the M2 plan; Phase 2 only keeps the sink index extensible |
-
----
-
-## 6. Revision log (draft → revision 2)
-
-* **Corrected status:** §2.4 (observation window) and §2.5 (empirical Miller–Madow) were already implemented in `HEAD`. They are reclassified, and only telemetry remains.
-* **Corrected claims:** the O(k) mismatch-loss rationale and the $k/\ln 2$ term for $E_{\max}$; "recovers 25.0" as post-hoc fitting; the false bound "Miller–Madow penalty ≤ entropy"; "~2,000 lines" (1,956 including tests); the speed-up claim, which is not expected under `WellMixed` and is no longer a success criterion; the nonexistent `InternalComparator` sink.
-* **Removed:** a new `GraphCircuit` type (reuse `substrate::Circuit`); $N_{\max} = K \times 16$, which would also have halved the M1 limit; free multipliers inside the instruction text; the duplicate `GEMINI.md` edit (it is a symlink).
-* **Fixed inconsistency:** the draft required bit-for-bit M0/M1 equivalence *after* behavior-changing parameter rules. Equivalence is now gated after Phases 1–2, and Phase 3 re-validates by pass/fail.
-* **Added:** Phase 0 safety net (golden traces, cliff telemetry, compute profile, regime-shift test); constants inventory and classification rules; retirement protocol for the pre-registered spatial ablations; the full per-port developmental state needed for channel isolation; the missing `τ ≤ 3` / `.take(6)` rules; a falsifiable homogeneity criterion for bank statistics; `growth.rs`, `verify_m1/`, `config.rs`, and `mdl.rs` in the refactor scope.
+| M2 hits compute limits rather than structural limits | Phase 0 / Readiness `B5` compute profile; `max_nodes` set from measured cost (`Q3`); guardrail counters asserted zero |
+| Scope creep into M2 features (comparator sinks, redundancy protection) | Explicitly deferred to M2 planning after Readiness `Q5`–`Q9`; Phase 2 keeps the sink index extensible |

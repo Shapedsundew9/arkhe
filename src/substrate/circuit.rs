@@ -1,5 +1,7 @@
 //! Directed port-accurate circuit representation and wire-delay configuration.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::substrate::primitive::Primitive;
@@ -292,5 +294,134 @@ impl Circuit {
             }
         }
         result
+    }
+
+    /// Removes all directed edges exactly matching `(src, dst)`. Returns `true` if any edges were removed.
+    pub fn disconnect(&mut self, src: SignalSource, dst: SignalSink) -> bool {
+        let original_len = self.edges.len();
+        self.edges.retain(|e| e.src != src || e.dst != dst);
+        self.edges.len() != original_len
+    }
+
+    /// Replaces the source endpoint of the edge driving `dst`. Returns `true` if found and replaced.
+    pub fn replace_edge_source(&mut self, dst: SignalSink, src: SignalSource) -> bool {
+        if let Some(edge) = self.edges.iter_mut().find(|e| e.dst == dst) {
+            edge.src = src;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Compacts nodes after deletion and returns `old_node -> Some(new_node)` for survivors.
+    ///
+    /// Preserves existing relative order of surviving nodes and incident edges.
+    pub fn remove_nodes(&mut self, removed: &BTreeSet<NodeId>) -> Vec<Option<NodeId>> {
+        let mut mapping = vec![None; self.nodes.len()];
+        let mut nodes = Vec::with_capacity(self.nodes.len().saturating_sub(removed.len()));
+        for (old_index, &primitive) in self.nodes.iter().enumerate() {
+            let old = NodeId(u32::try_from(old_index).expect("node index fits in u32"));
+            if removed.contains(&old) {
+                continue;
+            }
+            let new = NodeId(u32::try_from(nodes.len()).expect("node count fits in u32"));
+            mapping[old_index] = Some(new);
+            nodes.push(primitive);
+        }
+        let remap_source = |source: SignalSource| -> Option<SignalSource> {
+            match source {
+                SignalSource::BoundaryIn(_) => Some(source),
+                SignalSource::NodeOut { node, port } => Some(SignalSource::NodeOut {
+                    node: mapping.get(node.index()).copied().flatten()?,
+                    port,
+                }),
+            }
+        };
+        let remap_sink = |sink: SignalSink| -> Option<SignalSink> {
+            match sink {
+                SignalSink::BoundaryOut(_) => Some(sink),
+                SignalSink::NodeIn { node, port } => Some(SignalSink::NodeIn {
+                    node: mapping.get(node.index()).copied().flatten()?,
+                    port,
+                }),
+            }
+        };
+        self.edges = self
+            .edges
+            .iter()
+            .filter_map(|&edge| {
+                Some(Edge {
+                    src: remap_source(edge.src)?,
+                    dst: remap_sink(edge.dst)?,
+                    hops: edge.hops,
+                })
+            })
+            .collect();
+        self.nodes = nodes;
+        mapping
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn circuit_graph_mutation_primitives() {
+        let mut c = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+        let n0 = c.add_node(Primitive::Eqz);
+        let n1 = c.add_node(Primitive::Split);
+        let n2 = c.add_node(Primitive::Delay { init: 0 });
+
+        c.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: n0, port: 0 },
+        );
+        c.connect(
+            SignalSource::NodeOut { node: n0, port: 0 },
+            SignalSink::NodeIn { node: n1, port: 0 },
+        );
+        c.connect(
+            SignalSource::NodeOut { node: n1, port: 0 },
+            SignalSink::NodeIn { node: n2, port: 0 },
+        );
+        c.connect(
+            SignalSource::NodeOut { node: n2, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+
+        assert_eq!(c.node_count(), 3);
+        assert_eq!(c.edges().len(), 4);
+
+        // Test disconnect
+        assert!(c.disconnect(
+            SignalSource::NodeOut { node: n1, port: 0 },
+            SignalSink::NodeIn { node: n2, port: 0 }
+        ));
+        assert_eq!(c.edges().len(), 3);
+
+        // Test replace_edge_source
+        assert!(c.replace_edge_source(
+            SignalSink::BoundaryOut(0),
+            SignalSource::NodeOut { node: n1, port: 1 }
+        ));
+        assert!(c.edges().contains(&Edge {
+            src: SignalSource::NodeOut { node: n1, port: 1 },
+            dst: SignalSink::BoundaryOut(0),
+            hops: 0,
+        }));
+
+        // Test remove_nodes
+        let mut removed = BTreeSet::new();
+        removed.insert(n2);
+        let mapping = c.remove_nodes(&removed);
+
+        assert_eq!(c.node_count(), 2);
+        assert_eq!(mapping[n0.index()], Some(NodeId(0)));
+        assert_eq!(mapping[n1.index()], Some(NodeId(1)));
+        assert_eq!(mapping[n2.index()], None);
+
+        // Surviving nodes order preserved
+        assert_eq!(c.nodes(), &[Primitive::Eqz, Primitive::Split]);
     }
 }

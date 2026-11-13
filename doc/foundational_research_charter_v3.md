@@ -6,7 +6,8 @@
 >
 > - **Milestone 0 (`M0 — Simulator and yardstick`):** Completed & verified. Exact synchronous tick semantics, variable-width arithmetic, seeded determinism, $\varepsilon$-machine and Berlekamp–Massey ground truth, and compute-matched baselines are operational.
 > - **Milestone 1a (`M1a — Metabolic economy and retrograde credit`):** Completed & verified. Closed-loop metabolic economy with replacing ancestry traces (D1), calibrated point-forecast reward (D2), one-time description debt (D3), and activity recency decay (D4) passed all acceptance gates (`G1A.1`–`G1A.4`) on 100/100 development banks across $T \in \{1024, 2048, 4096\}$ and on the untouched holdout bank (`seeds 10000..=10019`).
-> - **Milestone 1b (`M1b — First to second neuron residual neurogenesis`):** Active implementation stage. Governed by [milestone_1_plan.md](milestone_1_plan.md).
+> - **Milestone 1b (`M1b — First to second neuron residual neurogenesis`):** Completed & verified. Residual-driven neurogenesis, finite-ring corrector stacking, autonomous ring closure, and noise-floor halting passed holdout (`e29014a`, `seeds 10000..=10019`), 100-bank statistical hardening (`seeds 20..2020`), and coordinate-free migration (`substrate::Circuit`); see [research_record.md](research_record.md).
+> - **Pre-Milestone 2 (`Readiness & Scaling Closure`):** Active preparation stage before `M2`; governed by [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md).
 >
 > **Provenance & Decision Record:** Version 3 incorporates the Stage M1a metabolic economy and credit redesign decisions (D1–D4). [Appendix A](#appendix-a-decision-record) details the cumulative decision record across charter revisions.
 
@@ -75,7 +76,7 @@ The class axiom is where fallibilism comes back in. If the class is wrong or the
 
 ### 1.5 Core research question
 
-> *Can a minimal set of exact arithmetic axioms, placed on a spatial substrate with local metabolic constraints, enable a system to (a) grow structure that predicts a mathematical environment, (b) check itself through redundant derivations, (c) deduce and verify new theorems in isolation, and (d) compile those theorems into higher-order axioms, so that its vocabulary grows open-endedly and every level of the hierarchy can be verified exactly?*
+> *Can a minimal set of exact arithmetic axioms, placed on a coordinate-free graph substrate with local metabolic constraints, enable a system to (a) grow structure that predicts a mathematical environment, (b) check itself through redundant derivations, (c) deduce and verify new theorems in isolation, and (d) compile those theorems into higher-order axioms, so that its vocabulary grows open-endedly and every level of the hierarchy can be verified exactly?*
 
 ### 1.6 What this charter does not claim
 
@@ -111,7 +112,7 @@ Every wire carries a value in $\mathbb{Z}_{2^k} = \{0, 1, \dots, 2^k - 1\}$, and
 | `MUL` | $y = a \cdot b \bmod 2^k$ | The ring's nonlinearity; **coincidence / gating** | `AND` |
 | `EQZ` | $y = 1$ if $x = 0$, else $0$ | **Exact agreement test**; inversion; restores completeness | `NOT` |
 | `DELAY` | $y(t) = x(t-1)$ | $z^{-1}$ unit memory; the only state-holding primitive | `DELAY` |
-| `SPLIT` | $y_1 = y_2 = x$, at cost $c_{\text{split}} > c_{\text{base}}$ | Linear fan-out; signals cannot multiply for free | `SPLIT` |
+| `SPLIT` | $y_1 = y_2 = x$, priced via explicit `SPLIT` node and dual-wire MDL cost (`split_code_tax`) | Linear fan-out; signals cannot multiply for free | `SPLIT` |
 
 At $k = 1$ the set reduces **exactly** to v1's five axioms, so all v1 intuitions and early milestones carry over unchanged.
 
@@ -144,7 +145,7 @@ These are hard invariants, enforced whenever structure changes:
 
 1. **Synchronous update.** All `DELAY` registers update simultaneously at each tick. All other primitives are combinational within a tick.
 2. **Every cycle contains at least one `DELAY`.** Combinational loops are forbidden, because they have no well-defined value. Sprouting that would create one is rejected. Evaluation is then a topological pass, costing $O(1)$ per node and $O(N)$ per tick.
-3. **Wire delay and topology are explicit configuration parameters.** Circuits support arbitrary direct graph wiring (`WellMixed`) allowing any number of edges directly between endpoints without planar relay blockage; combinational wires propagate without tick delay and only `DELAY` holds state. Planar nearest-neighbour routing (`LocalVonNeumann` / `LocalMoore`) and per-hop wire delays (`TicksPerHop`) remain supported as controlled ablations (§8).
+3. **Wire delay is an explicit configuration parameter on a coordinate-free graph.** Circuits use direct point-to-point wiring (`substrate::Circuit`) allowing arbitrary edges between endpoints without planar relay blockage; combinational wires propagate without tick delay and only `DELAY` holds state. Per-hop wire delays (`TicksPerHop`, unit delay per graph edge) remain supported as a controlled ablation (§8). Planar grid routing (`LocalVonNeumann` / `LocalMoore`) is retired under Decision Record #30 (historical M1 baseline anchored at commit tag `m1-final-lattice`).
 4. **Each output port has one driver.** Competing hypotheses meet at comparators and output adders. Only one structure drives each boundary prediction port at a time. Replacing or augmenting the driver with a stacked corrector is a structural event decided by the economy.
 5. **Fan-out happens only through `SPLIT`.** Unconnected outputs are allowed (discarding is free). When an output signal feeds multiple destinations, explicit `SPLIT` primitives distribute it. Description length ($L(C)$) prices non-local wiring and branching, preventing bloat without planar congestion.
 
@@ -164,24 +165,24 @@ The measurable quantities are cycle length, transient length, **basin size** (th
 
 > **Direction:** The system has **two distinct layers**, and the charter, the code, and the hypotheses keep them apart.
 >
-> - The **structural layer** is *engineering*. It contains the lattice, metabolism, credit, growth, and pruning. It decides **where circuits come from**.
+> - The **structural layer** is *engineering*. It contains graph surgery, metabolism, credit, growth, and pruning. It decides **where circuits come from**.
 > - The **logical layer** is the *alchemy*. It contains composition, equivalence, theorems, and closure. It decides **what new truths follow from what is held**.
 >
 > **Why:** v1 tied its use of Algorithmic Chemistry to *network structure*. That invited the objection that gates never produce gates, so the system is not a chemistry. The intent was always that alchemy happens in the **logical space**: combining axioms produces new truths. Structural growth is the supporting machinery and makes no claim to be a chemistry.
 
 ### 3.1 The structural layer
 
-#### 3.1.1 Spatial lattice and graph connectivity
+#### 3.1.1 Coordinate-free graph connectivity
 
-Nodes sit on coordinates of a graph representation (defaulting to well-mixed direct graph wiring, with optional 2D discrete grid layouts). Wiring connects primitive ports directly without requiring intermediate single-cell relay paths.
+Circuits are coordinate-free directed multigraphs (`substrate::Circuit`). Wiring connects primitive and boundary ports directly without intermediate planar routing paths or coordinate placement.
 
-> **Architectural Decision (M1b):** The early metaphor of a physical 2D planar lattice with strict nearest-neighbour wiring (`LocalVonNeumann` with single-cell `SPLIT` relays and `max_relay_hops`) treated empty cells as routing relays. In practice, during multi-neuron neurogenesis, routing wires through empty cells rapidly saturated border cells around input/output ports and produced severe spatial congestion and routing deadlock, forcing fragile coordinate-relocation heuristics. The metaphor of a 2D spatial droplet or breadboard had gotten baked into the architecture as an accidental bottleneck. The restriction is removed: circuits support arbitrary direct graph wiring (`WellMixed` direct connections between any endpoints without planar relay blockage), allowing any number of edges directly between nodes. The true resource cost of non-local wiring is already principledly tracked by MDL circuit description length ($L(C)$ wire code bits and split pricing), preventing bloat without artificial gridlock. `LocalVonNeumann` and `LocalMoore` remain available as controlled ablations (§8).
+> **Architectural Decision (M1b & Decision Record #30):** The early metaphor of a physical 2D planar lattice (`LocalVonNeumann` with single-cell `SPLIT` relays and `max_relay_hops`) treated empty cells as routing relays. During multi-neuron neurogenesis, routing wires through empty cells rapidly saturated border cells around input/output ports and produced severe spatial congestion and routing deadlock (measured in [research_record.md](research_record.md)). Under Decision Records #29 and #30, circuits use direct point-to-point wiring (`substrate::Circuit`), and 2D grid coordinates, perimeter anchors, and `LocalVonNeumann` / `LocalMoore` ablations are permanently retired (historical spatial baseline anchored at commit tag `m1-final-lattice`). Locality and fan-out are priced purely through MDL circuit description length ($L(C)$ wire code bits and `split_code_tax`), preventing bloat without planar gridlock.
 
 #### 3.1.2 Metabolism
 
 Each node holds an energy reserve $E_i(t)$. Rather than arbitrary per-tick maintenance rent (which diverges with horizon $T$), each placed node incurs a **one-time description debt** $\Delta L_i$ charged upon maturity through the maintenance channel, matching its share of the circuit's description length $L(C) = \sum_i \Delta L_i$. A node driving multiple wires (such as `SPLIT`) naturally owes more wire code bits ($L(\text{split}) > L(\text{other})$) without tuning arbitrary constants. A node whose reserve runs out is removed. Energy enters the system **only** through reward (§3.1.4).
 
-> **Design note on post-maturity reserve bounding (scaling rule vs. hard cap):** Online runs bound mature reserves so obsolete structures cannot coast indefinitely after regime shifts (implemented in M1b as a fixed ceiling `max_energy_reserve = 25.0` bits). Because single-tick surprisal swings scale as $O(k)$ bits under noise and structural replacement cost scales with $\Delta L_i$, fixed bit caps become brittle as width $k$ (M5) and macro complexity (M4) grow; post-M1 stages should replace hard reserve caps with a dimensionless scaling rule (for example, bounding mature reserves as a multiple of $\max(\Delta L_i, k)$ or via exponential reserve forgetting) rather than a fixed bit constant.
+> **Design note on post-maturity reserve bounding:** Online runs require a grounded mechanism to bound mature reserves so obsolete structures cannot coast indefinitely after regime shifts (superseding M1's fixed `25.0`-bit ceiling). Candidate rules include an observation-horizon reserve ceiling ($W_{\text{obs}}$), exponential reserve forgetting, or switching codes ([research_record.md](research_record.md) §6.2). The canonical definition of $W_{\text{obs}}$ and choice of reserve rule (Option B vs. alternatives) remain open for user decision **Q1** in [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md); until signed off and validated on multi-seed regime-shift experiments, no fixed exhaustion-latency bound is asserted as proven.
 
 #### 3.1.3 Credit assignment: retrograde, activity-gated flow
 
@@ -211,7 +212,7 @@ How contribution is measured:
 
 Energy surplus near a persistent, structured signal triggers sprouting of one of two kinds:
 
-1. **Corrector sprouting** (reduces error). Triggered where a residual stream is *structured*, that is, predictable below its maximum entropy. Structure is detected locally by residual autocorrelation, a small compressibility estimate, or **mutual information between the residual and a neighbouring signal**. The candidate input with the highest mutual information becomes the new node's input. This is the cascade-correlation criterion. See §3.3 for the formal version.
+1. **Corrector sprouting** (reduces error). Triggered where a residual stream is *structured*, that is, predictable below its maximum entropy. Structure is detected locally by residual autocorrelation, a small compressibility estimate, or **mutual information between the residual and another candidate signal in the circuit**. The candidate input with the highest mutual information becomes the new node's input. This is the cascade-correlation criterion. See §3.3 for the formal version.
 2. **Redundancy sprouting** (enables self-checking). Triggered where an established prediction has **only one derivation**. The system grows an alternative route to the same quantity, plus a comparator where the two meet. This is what makes internal falsification possible (§1.3).
 
 #### 3.1.6 Pruning
@@ -223,7 +224,7 @@ Energy surplus near a persistent, structured signal triggers sprouting of one of
 
 > **Direction:** The main structural threat is **credit free-riders**: no-op detours, redundant chains, and structures that sit inside a rewarded pathway and draw energy without contributing. This is the circuit equivalent of genetic-programming bloat.
 >
-> **Why:** Nothing in this substrate self-replicates, so there are no parasites in the artificial-chemistry sense. An isolated self-exciting loop earns no reward and starves by construction, so testing it proves nothing. The real exploit is getting onto the credit path. Locality, the `SPLIT` tax, sensitivity-based credit, and sleep compression (§3.2) are the defences, and Milestone M3 tests them.
+> **Why:** Nothing in this substrate self-replicates, so there are no parasites in the artificial-chemistry sense. An isolated self-exciting loop earns no reward and starves by construction, so testing it proves nothing. The real exploit is getting onto the credit path. Wire MDL pricing, the `SPLIT` tax, sensitivity-based credit, and sleep compression (§3.2) are the defences, and Milestone M3 tests them.
 
 ### 3.2 The logical layer (the alchemy)
 
@@ -277,7 +278,7 @@ A derived axiom earns its place in the palette only if it lowers the first two t
 
 ### 4.1 Wake: gathering facts and deducing under the class axiom
 
-- The $K$ channels drive the grid boundaries. Each tick the network emits predictions $\hat{A}(t+1), \hat{B}(t+1), \dots$ and is rewarded according to §3.1.4.
+- The $K$ channels drive the boundary input ports. Each tick the network emits predictions $\hat{A}(t+1), \hat{B}(t+1), \dots$ and is rewarded according to §3.1.4.
 - Facts are written to a **bounded fact buffer**, the system's record of ground truth.
 - Corrector and redundancy sprouting (§3.1.5) and pruning (§3.1.6) run online.
 
@@ -324,7 +325,7 @@ Under the asymmetry principle, surviving sleep earns **retention**, not promotio
 
 ### 5.1 Generators and channels
 
-The environment is a deterministic generator that emits $K$ parallel channels of $k$-bit symbols, entering along distinct boundaries of the grid. For robustness tests, a **declared noise model** (for example, independent symbol substitution at rate $\varepsilon$ on named channels) may be added. Noise is always explicit, parameterised, and recorded.
+The environment is a deterministic generator that emits $K$ parallel channels of $k$-bit symbols, entering via distinct boundary input ports of the circuit. For robustness tests, a **declared noise model** (for example, independent symbol substitution at rate $\varepsilon$ on named channels) may be added. Noise is always explicit, parameterised, and recorded.
 
 ### 5.2 Measuring difficulty: computational mechanics
 
@@ -346,7 +347,7 @@ Two further sources of ground truth are **Berlekamp–Massey**, which gives the 
 | :--- | :--- | :--- |
 | **T1 — Local temporal** | Short periods and rhythms on one channel | Solvable by 1–2 primitives with `DELAY`; identical to v1 at $k = 1$ |
 | **T2 — Cross-channel coupling** | Channel $B$ is a delayed function of channel $A$ (for example, a delayed sum or parity) | Requires pathways from separate boundaries to meet at comparators |
-| **T3a — Spatially presented CA** | A cellular-automaton row is fed as $K$ parallel channels along one boundary | The local rule is learnable by local wiring, which matches the lattice's geometry. Outer-totalistic rules are a neighbourhood **sum and comparison**; elementary rules are polynomials over GF(2) |
+| **T3a — Spatially presented CA** | A cellular-automaton row is fed as $K$ parallel boundary channels | The local rule is learnable by low-degree sparse wiring, priced compactly by wire MDL $L(C)$. Outer-totalistic rules are a neighbourhood **sum and comparison**; elementary rules are polynomials over GF(2) |
 | **T3b — Modular counters** | Counters modulo $2^j$ (native to the ring) and modulo other $n$ (which need `EQZ`) | Tests width and completeness |
 | **T3c — LFSR curricula** | Shift registers presented through sub-structures that are learned first | See the caveat below |
 | **T4 — Task families** | Families of generators that share sub-structure (CA rules with common neighbourhood logic, LFSRs with shared taps, channels recombining base rhythms) | Needed to test reuse and transfer of derived axioms (Level 2) |
@@ -366,7 +367,7 @@ Every mechanism in this charter is a **hypothesis** linked to a milestone. None 
 | **H1** | Local, retrograde, surprisal-weighted credit sustains correct circuits and starves incorrect ones without gradients | §3.1.3, §3.1.4 | M1a |
 | **H2** | Residual-driven corrector sprouting reduces error toward $h_\mu$ as the residual's entropy predicts | §3.1.5, §3.3 | M1b |
 | **H3** | Redundant derivations plus comparators detect errors internally, offline | §1.3, §3.1.5 | M2, M4a |
-| **H4** | Locality, the `SPLIT` tax, sensitivity-based credit, and compression remove free-riders, keeping circuits near minimal size | §3.1.7 | M3 |
+| **H4** | Wire description-length pricing, the `SPLIT` tax, sensitivity-based credit, and compression remove free-riders, keeping circuits near minimal size | §3.1.7 | M3 |
 | **H5** | Sleep filtering beats **compute-matched** wake-only learning | §4.2 | M4a |
 | **H6** | Consistency-only sleep (S-A) performs as well as consistency-plus-replay sleep (S-B) | §4.2 | M4a |
 | **H7** | Equality saturation over held circuits discovers non-trivial, verified theorems, and promotion lowers $L$ | §3.2, §4.3 | M4b |
@@ -384,7 +385,7 @@ From M1a on, every milestone runs at **$k = 1$ and $k = 2$ at least**, so the ec
 | :--- | :--- | :--- | :--- |
 | **M0 — Simulator and yardstick** | Tick semantics and invariants (§2.5); variable-width values; seeded determinism; generator library with ε-machine and Berlekamp–Massey ground truth; baseline harness | **Completed & verified.** Baselines reach known optima on T1; every run reproducible from seed and configuration | — (infrastructure) |
 | **M1a — Economy on fixed structure** | Validate credit and reward (H1) on **hand-built** correct, incorrect, and bloated circuits, before any growth | **Completed & verified.** Correct circuits gain energy; incorrect ones and detours lose it; exact identity $\Delta E(T) \equiv -\Delta L_{\text{null}}(T)$ holds on all runs; 100/100 banks passed | Energy does not separate correct from incorrect circuits: redesign credit before attempting growth |
-| **M1b — First to second neuron** | Error-driven corrector sprouting (H2) | **Active stage.** Combined error falls as the residual's entropy predicts; no backpropagation (see [milestone_1_plan.md](milestone_1_plan.md)) | No consistent error reduction on T1 across seeds: revisit the sprouting criterion |
+| **M1b — First to second neuron** | Error-driven corrector sprouting (H2) | **Completed & verified.** Combined error falls as the residual's entropy predicts; no backpropagation ([research_record.md](research_record.md#25-redesigned-m1a--milestone-1-attainment-sign-offs-2026-11-072026-11-08)) | No consistent error reduction on T1 across seeds: revisit the sprouting criterion |
 | **M2 — Redundancy and cross-channel bridges** | Redundancy sprouting; pathways from separate boundaries meet at comparators (H3) | T2 solved; comparators flag injected inconsistencies; recovery from declared noise; compared against baselines | Comparators never form spontaneously: revisit redundancy sprouting |
 | **M3 — Free-rider resistance** | Inject no-op detours and redundant branches into working circuits (H4) | Bloat is pruned; circuit size converges toward the exact-synthesis minimum | Circuit size grows without bound under stable error: revisit credit and the `SPLIT` tax |
 | **M4a — Sleep as internal falsification** | Arms S-A and S-B against compute-matched wake-only (H5, H6) | Sleep beats wake-only by a pre-registered margin; spurious cycles are rejected | Neither arm beats compute-matched wake-only: revisit sleep before attempting consolidation |
@@ -405,7 +406,7 @@ From M1a on, every milestone runs at **$k = 1$ and $k = 2$ at least**, so the ec
   - **Context-Tree Weighting** or a PPM-family predictor (strong universal sequence predictors) as a demanding reference,
   - **Berlekamp–Massey** as the exact deductive reference for LFSR streams,
   - exhaustive enumeration for the smallest tiers.
-- **Ablations:** sleep vs. no sleep; S-A vs. S-B; lattice vs. well-mixed wiring; `SPLIT` cost $> 0$ vs. $= 0$; surprisal reward vs. raw accuracy; redundancy sprouting on vs. off; wire delay on vs. off.
+- **Ablations:** sleep vs. no sleep; S-A vs. S-B; `SPLIT` cost $> 0$ vs. $= 0$; surprisal reward vs. raw accuracy; redundancy sprouting on vs. off; wire delay on vs. off.
 - **Equal compute:** every comparison that involves sleep uses the same total tick budget, so sleep cannot win simply by getting more computation.
 - **Pre-registration:** for each milestone, success margins, seed counts, and kill criteria are written down **before** the runs.
 - **Reproducibility:** every source of randomness is seeded through a portable, version-stable generator, and every run can be reproduced from its seed and configuration file.
@@ -414,7 +415,7 @@ From M1a on, every milestone runs at **$k = 1$ and $k = 2$ at least**, so the ec
 
 ## 9. Implementation Guidance (Rust)
 
-- **Layer separation:** keep the **substrate** (values, primitives, tick semantics, invariants), the **structural layer** (lattice, economy, growth, pruning), the **logical layer** (composition, e-graph, verification), the **sleep controller**, the **environment** (generators, ground truth), and **measurement** behind distinct traits or modules. Most research steps change one layer and hold the others fixed.
+- **Layer separation:** keep the **substrate** (values, primitives, tick semantics, invariants), the **structural layer** (graph editing, economy, growth, pruning), the **logical layer** (composition, e-graph, verification), the **sleep controller**, the **environment** (generators, ground truth), and **measurement** behind distinct traits or modules. Most research steps change one layer and hold the others fixed.
 - **Values:** store values as unsigned machine integers masked to $k$ bits, using `wrapping_add`, `wrapping_sub`, and `wrapping_mul`, which are deterministic on every platform. Uniform width can use const generics for speed; heterogeneous width (Phase W2) needs a width tag at runtime.
 - **Bit-parallel evaluation:** at $k = 1`, pack 64 independent evaluations of **one fixed circuit** into a `u64` (64 noise realisations, perturbed dream starts, or phase offsets). For $k > 1$, use SIMD lanes in the same way. This speeds up energy estimation, basin measurement, and verification. It does not parallelise structural search, because structure differs between seeds.
 - **Determinism:** use a portable, seedable RNG whose output is stable across crate versions (for example, a ChaCha-based generator) rather than a platform-default generator.
@@ -492,7 +493,7 @@ From M1a on, every milestone runs at **$k = 1$ and $k = 2$ at least**, so the ec
 
 ## Appendix A: Decision Record
 
-Each row records a point where earlier designs were revised or where their intent needed stating explicitly. The **Why** column is the short rationale. Rows 1–24 record the v1 → v2 evolution; rows 25–28 record the v2 → v3 M1a metabolic economy redesign.
+Each row records a point where earlier designs were revised or where their intent needed stating explicitly. The **Why** column is the short rationale. Rows 1–24 record the v1 → v2 evolution; rows 25–28 record the v2 → v3 M1a metabolic economy redesign; rows 29–30 record the M1 coordinate-free and developmental topology scaling.
 
 | # | Topic | Earlier Baseline (v1/v2) | Direction (v2/v3) | Why |
 | :--- | :--- | :--- | :--- | :--- |
@@ -525,3 +526,4 @@ Each row records a point where earlier designs were revised or where their inten
 | 27 | Reward calibration | Centered surprisal $(\mathbf{1}[\hat{s} = s] - p)(-\log_2 p)$ | **Calibrated point-forecast reward** $r = \log_2(q/p)$ or $\log_2((1-q)/(1-p))$ (§3.1.4) | Centered surprisal is a zero-mean random walk whose variance spreads as $O(\sqrt{T})$, creating a chance lottery; calibrated forecast guarantees constant circuits score $0$ on every run and bounds cumulative variance by Ville's inequality |
 | 28 | Global-local economy alignment | Maintenance and reward "approximate" description length terms | Total energy change **identically equals** minus null-calibrated MDL change: $\Delta E(T) = -\Delta L_{\text{null}}(T)$ (§3.4) | With description debt (§3.1.2) and prequential calibrated reward (§3.1.4), local energy balance is an exact microscopic realization of global MDL, turning G1A.4 into a structural conservation law |
 | 29 | Connectivity & graph topology | 2D planar grid nearest-neighbour routing (`LocalVonNeumann` with single-cell `SPLIT` relays and `max_relay_hops`) | **Arbitrary direct graph wiring / well-mixed connectivity** without planar relay blockage (§3.1.1) | Treating empty cells as relays rapidly created spatial congestion and blocked output ports during multi-neuron neurogenesis, forcing brittle coordinate heuristics; the physical 2D breadboard/spatial droplet metaphor had become an accidental constraint, whereas MDL description length already penalises non-local edges without artificial planar gridlock |
+| 30 | Coordinate-free topology & spatial ablation closure | Legacy 2D grid coordinates, perimeter anchors, and LocalVonNeumann/Moore ablations retained in code | **Coordinate-free `substrate::Circuit` as single representation**; complete retirement of 2D grid and spatial ablations | Spatial lattice provided no behavioral value under default WellMixed wiring, imposed artificial 64-cell ceilings and placement code debt; locality is priced purely via MDL wire description length; historical reproduction anchored at commit tag `m1-final-lattice` |

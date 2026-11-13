@@ -75,8 +75,6 @@ pub struct LiveCircuit {
     compiled: CompiledCircuit,
     state: ScalarState,
     economy: EconomyState,
-    description_debts: Vec<f64>,
-    debt_paid: Vec<bool>,
     seed_bank: SeedBank,
     sample_count: usize,
     tick: u64,
@@ -97,7 +95,7 @@ impl LiveCircuit {
         }
         let compiled = circuit.compile().map_err(LiveError::Invariant)?;
         let state = ScalarState::new(&compiled);
-        let economy = EconomyState::new(
+        let mut economy = EconomyState::new(
             config,
             circuit.width(),
             circuit.node_count(),
@@ -105,14 +103,13 @@ impl LiveCircuit {
             compiled.total_registers(),
         )
         .map_err(LiveError::Economy)?;
+        economy.assign_sprout_debts(description_debts);
 
         Ok(Self {
             circuit,
             compiled,
             state,
             economy,
-            description_debts: description_debts.to_vec(),
-            debt_paid: vec![false; description_debts.len()],
             seed_bank,
             sample_count,
             tick: 0,
@@ -178,10 +175,10 @@ impl LiveCircuit {
             .map_err(LiveError::Economy)?;
 
         let mut maintenance = vec![0.0; self.circuit.node_count()];
-        for (index, node) in self.economy.nodes().iter().enumerate() {
-            if !self.debt_paid[index] && node.juvenile_ticks == 0 {
-                maintenance[index] = self.description_debts[index];
-                self.debt_paid[index] = true;
+        for (index, node) in self.economy.nodes_mut().iter_mut().enumerate() {
+            if !node.debt_paid && node.juvenile_ticks == 0 {
+                maintenance[index] = node.description_debt;
+                node.debt_paid = true;
             }
         }
 
@@ -224,15 +221,10 @@ impl LiveCircuit {
     }
 }
 
-/// Description debts for a well-mixed circuit (Level-0 palette).
+/// Description debts for a circuit (Level-0 palette).
 #[must_use]
 pub fn well_mixed_description_debts(circuit: &Circuit) -> Vec<f64> {
-    crate::metrics::circuit_node_description_debts(
-        circuit,
-        crate::structural::WiringTopology::WellMixed,
-        None,
-        0,
-    )
+    crate::metrics::circuit_node_description_debts(circuit, 0)
 }
 
 /// WellMixed wire steps: 1 per incoming NodeIn edge + 1 per BoundaryOut edge driven by the node.
@@ -270,6 +262,7 @@ pub fn node_output_values(circuit: &Circuit, state: &ScalarState) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structural::economy::ReserveCap;
     use crate::substrate::{NodeId, Primitive, Width, WireDelayMode};
 
     #[test]
@@ -301,7 +294,7 @@ mod tests {
         let debts = well_mixed_description_debts(&circuit);
         let config = EconomyConfig {
             juvenile_ticks: 0,
-            max_energy_reserve: None,
+            reserve_cap: ReserveCap::Uncapped,
             ..EconomyConfig::default()
         };
         let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(42), 8).unwrap();
@@ -356,7 +349,7 @@ mod tests {
         let debts = well_mixed_description_debts(&circuit);
         let config = EconomyConfig {
             juvenile_ticks: 0,
-            max_energy_reserve: None,
+            reserve_cap: ReserveCap::Uncapped,
             ..EconomyConfig::default()
         };
         let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(7), 8).unwrap();
@@ -408,7 +401,7 @@ mod tests {
         let debts = well_mixed_description_debts(&circuit);
         let config = EconomyConfig {
             juvenile_ticks: 8,
-            max_energy_reserve: None,
+            reserve_cap: ReserveCap::Uncapped,
             ..EconomyConfig::default()
         };
         let mut live = LiveCircuit::new(circuit, &debts, config, SeedBank::new(1), 8).unwrap();

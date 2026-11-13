@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::metrics::{NullModelKind, PointForecastScorer};
-use crate::structural::{GridShape, WiringTopology};
 use crate::substrate::{Circuit, Primitive, SignalSink, SignalSource, Width};
 
 /// Decomposed Minimum Description Length (MDL) accounting in bits (§3.4).
@@ -120,13 +119,8 @@ pub fn facts_code_bits(width: Width, total_symbols: u64, mismatches: u64) -> f64
 
 /// Encodes $L(\text{circuit} \mid \text{palette})$ for a Level-0 [`Circuit`].
 #[must_use]
-pub fn circuit_code_bits(
-    circuit: &Circuit,
-    topology: WiringTopology,
-    grid_shape: Option<GridShape>,
-    extra_palette_entries: usize,
-) -> f64 {
-    circuit_code_bits_with_tax(circuit, topology, grid_shape, extra_palette_entries, true)
+pub fn circuit_code_bits(circuit: &Circuit, extra_palette_entries: usize) -> f64 {
+    circuit_code_bits_with_tax(circuit, extra_palette_entries, true)
 }
 
 /// Encodes $L(\text{circuit} \mid \text{palette})$ for a Level-0 [`Circuit`] with an optional
@@ -134,8 +128,6 @@ pub fn circuit_code_bits(
 #[must_use]
 pub fn circuit_code_bits_with_tax(
     circuit: &Circuit,
-    topology: WiringTopology,
-    grid_shape: Option<GridShape>,
     extra_palette_entries: usize,
     split_code_tax: bool,
 ) -> f64 {
@@ -150,20 +142,12 @@ pub fn circuit_code_bits_with_tax(
     let base_node_bits = palette_card.log2();
     let k_bits = f64::from(circuit.width().bits());
 
-    let placement_bits_per_node = match (topology, grid_shape) {
-        (WiringTopology::LocalVonNeumann | WiringTopology::LocalMoore, Some(shape)) => {
-            let cells = (usize::from(shape.rows) * usize::from(shape.cols)).max(1) as f64;
-            cells.log2()
-        }
-        _ => 0.0,
-    };
-
     let mut node_bits = 0.0;
     for &prim in circuit.nodes() {
         if !split_code_tax && prim == Primitive::Split {
             continue;
         }
-        node_bits += base_node_bits + placement_bits_per_node;
+        node_bits += base_node_bits;
         if let Primitive::Delay { init } = prim {
             node_bits += if init == 0 { 1.0 } else { 1.0 + k_bits };
         }
@@ -182,14 +166,8 @@ pub fn circuit_code_bits_with_tax(
             .map(|p| usize::from(p.input_arity()))
             .sum::<usize>();
 
-    let bit_per_wire = match (topology, grid_shape) {
-        (WiringTopology::LocalVonNeumann, Some(_)) => 3.0,
-        (WiringTopology::LocalMoore, Some(_)) => 4.0,
-        _ => {
-            let pairs = (src_ports.max(1) * dst_ports.max(1)) as f64;
-            pairs.log2()
-        }
-    };
+    let pairs = (src_ports.max(1) * dst_ports.max(1)) as f64;
+    let bit_per_wire = pairs.log2();
 
     let mut wiring_bits = 0.0;
     for edge in circuit.edges() {
@@ -219,8 +197,6 @@ pub struct CircuitDescriptionAllocation {
 #[must_use]
 pub fn allocate_circuit_description_bits(
     circuit: &Circuit,
-    topology: WiringTopology,
-    grid_shape: Option<GridShape>,
     extra_palette_entries: usize,
     split_code_tax: bool,
 ) -> CircuitDescriptionAllocation {
@@ -238,14 +214,6 @@ pub fn allocate_circuit_description_bits(
     let base_node_bits = palette_card.log2();
     let k_bits = f64::from(circuit.width().bits());
 
-    let placement_bits_per_node = match (topology, grid_shape) {
-        (WiringTopology::LocalVonNeumann | WiringTopology::LocalMoore, Some(shape)) => {
-            let cells = (usize::from(shape.rows) * usize::from(shape.cols)).max(1) as f64;
-            cells.log2()
-        }
-        _ => 0.0,
-    };
-
     let src_ports = usize::from(circuit.num_inputs())
         + circuit
             .nodes()
@@ -259,14 +227,8 @@ pub fn allocate_circuit_description_bits(
             .map(|p| usize::from(p.input_arity()))
             .sum::<usize>();
 
-    let bit_per_wire = match (topology, grid_shape) {
-        (WiringTopology::LocalVonNeumann, Some(_)) => 3.0,
-        (WiringTopology::LocalMoore, Some(_)) => 4.0,
-        _ => {
-            let pairs = (src_ports.max(1) * dst_ports.max(1)) as f64;
-            pairs.log2()
-        }
-    };
+    let pairs = (src_ports.max(1) * dst_ports.max(1)) as f64;
+    let bit_per_wire = pairs.log2();
 
     if n == 0 {
         let mut unowned_bits = header_bits;
@@ -284,7 +246,7 @@ pub fn allocate_circuit_description_bits(
     for prim in circuit.nodes() {
         let mut node_debt = header_share;
         if split_code_tax || *prim != Primitive::Split {
-            node_debt += base_node_bits + placement_bits_per_node;
+            node_debt += base_node_bits;
         }
         if let Primitive::Delay { init } = *prim {
             node_debt += if init == 0 { 1.0 } else { 1.0 + k_bits };
@@ -312,13 +274,8 @@ pub fn allocate_circuit_description_bits(
     }
 
     let total_debt: f64 = debts.iter().sum::<f64>() + unowned_bits;
-    let total_circuit_bits = circuit_code_bits_with_tax(
-        circuit,
-        topology,
-        grid_shape,
-        extra_palette_entries,
-        split_code_tax,
-    );
+    let total_circuit_bits =
+        circuit_code_bits_with_tax(circuit, extra_palette_entries, split_code_tax);
     debug_assert!(
         (total_debt - total_circuit_bits).abs() < 1e-12,
         "sum of debts and unowned {total_debt} does not match circuit_code_bits_with_tax {total_circuit_bits}"
@@ -335,28 +292,17 @@ pub fn allocate_circuit_description_bits(
 ///
 /// Each node owes:
 /// - Its share of the header bits: $(\ell_\gamma(n) + \ell_\gamma(m)) / n$
-/// - Its node bits: palette index $\log_2(\text{palette})$, `Delay` init bits, and lattice placement bits $\log_2(\text{cells})$
+/// - Its node bits: palette index $\log_2(\text{palette})$ and `Delay` init bits
 /// - The bits for each wire it drives, or incoming from `BoundaryIn` for the node it feeds
 ///
 /// Fails loudly (panics) if there are unowned bits (e.g. $n = 0$ or direct `BoundaryIn` -> `BoundaryOut` wire).
 #[must_use]
-pub fn circuit_node_description_debts(
-    circuit: &Circuit,
-    topology: WiringTopology,
-    grid_shape: Option<GridShape>,
-    extra_palette_entries: usize,
-) -> Vec<f64> {
+pub fn circuit_node_description_debts(circuit: &Circuit, extra_palette_entries: usize) -> Vec<f64> {
     assert!(
         circuit.node_count() > 0,
         "circuit has no nodes to own description length (unallocated header/wire bits)"
     );
-    let alloc = allocate_circuit_description_bits(
-        circuit,
-        topology,
-        grid_shape,
-        extra_palette_entries,
-        true,
-    );
+    let alloc = allocate_circuit_description_bits(circuit, extra_palette_entries, true);
     assert!(
         alloc.unowned_bits == 0.0,
         "circuit has direct BoundaryIn -> BoundaryOut wire with no node owner"
@@ -368,8 +314,6 @@ pub fn circuit_node_description_debts(
 #[must_use]
 pub fn compute_mdl(
     circuit: &Circuit,
-    topology: WiringTopology,
-    grid_shape: Option<GridShape>,
     palette_bits: f64,
     extra_palette_entries: usize,
     total_symbols: u64,
@@ -377,8 +321,6 @@ pub fn compute_mdl(
 ) -> MdlBreakdown {
     compute_mdl_with_tax(
         circuit,
-        topology,
-        grid_shape,
         palette_bits,
         extra_palette_entries,
         total_symbols,
@@ -390,24 +332,15 @@ pub fn compute_mdl(
 /// Computes the full [`MdlBreakdown`] for a candidate circuit and its observed prediction counts
 /// with an explicit `split_code_tax` setting.
 #[must_use]
-#[allow(clippy::too_many_arguments)]
 pub fn compute_mdl_with_tax(
     circuit: &Circuit,
-    topology: WiringTopology,
-    grid_shape: Option<GridShape>,
     palette_bits: f64,
     extra_palette_entries: usize,
     total_symbols: u64,
     mismatches: u64,
     split_code_tax: bool,
 ) -> MdlBreakdown {
-    let circuit_bits = circuit_code_bits_with_tax(
-        circuit,
-        topology,
-        grid_shape,
-        extra_palette_entries,
-        split_code_tax,
-    );
+    let circuit_bits = circuit_code_bits_with_tax(circuit, extra_palette_entries, split_code_tax);
     let facts_bits = facts_code_bits(circuit.width(), total_symbols, mismatches);
     let total_bits = palette_bits + circuit_bits + facts_bits;
     MdlBreakdown {
@@ -422,11 +355,8 @@ pub fn compute_mdl_with_tax(
 ///
 /// The centered exact-match reward is the reduction in prequential residual code length relative
 /// to the null stream; the circuit description is then added once, as required by the MDL balance.
-#[allow(clippy::too_many_arguments)]
 pub fn null_calibrated_mdl_delta(
     circuit: &Circuit,
-    topology: WiringTopology,
-    grid_shape: Option<GridShape>,
     palette_bits: f64,
     extra_palette_entries: usize,
     facts: &[u64],
@@ -445,10 +375,7 @@ pub fn null_calibrated_mdl_delta(
     for (&fact, &prediction) in facts.iter().zip(predictions) {
         net_reward += scorer.observe(prediction, fact);
     }
-    Ok(
-        palette_bits + circuit_code_bits(circuit, topology, grid_shape, extra_palette_entries)
-            - net_reward,
-    )
+    Ok(palette_bits + circuit_code_bits(circuit, extra_palette_entries) - net_reward)
 }
 
 #[cfg(test)]
@@ -464,8 +391,6 @@ mod tests {
         let facts: Vec<u64> = (0..64).map(|tick| tick % 2).collect();
         let delta = null_calibrated_mdl_delta(
             &circuit,
-            WiringTopology::WellMixed,
-            None,
             0.0,
             0,
             &facts,
@@ -481,8 +406,6 @@ mod tests {
         let circuit = Circuit::new(Width::BITS_1, 0, 1, WireDelayMode::Combinational);
         let error = null_calibrated_mdl_delta(
             &circuit,
-            WiringTopology::WellMixed,
-            None,
             0.0,
             0,
             &[0, 1],
@@ -500,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn description_debts_sum_to_circuit_code_bits_for_well_mixed_and_lattice() {
+    fn description_debts_sum_to_circuit_code_bits() {
         let mut c1 = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
         let d = c1.add_node(Primitive::Delay { init: 1 });
         let s = c1.add_node(Primitive::Split);
@@ -521,33 +444,17 @@ mod tests {
             SignalSink::NodeIn { node: d, port: 0 },
         );
 
-        // Well-mixed
-        let debts1 = circuit_node_description_debts(&c1, WiringTopology::WellMixed, None, 0);
+        let debts1 = circuit_node_description_debts(&c1, 0);
         let sum1: f64 = debts1.iter().sum();
-        let expected1 = circuit_code_bits(&c1, WiringTopology::WellMixed, None, 0);
+        let expected1 = circuit_code_bits(&c1, 0);
         assert!((sum1 - expected1).abs() < 1e-12);
-
-        // Lattice (Von Neumann)
-        let shape = GridShape::new(3, 3).unwrap();
-        let debts2 =
-            circuit_node_description_debts(&c1, WiringTopology::LocalVonNeumann, Some(shape), 0);
-        let sum2: f64 = debts2.iter().sum();
-        let expected2 = circuit_code_bits(&c1, WiringTopology::LocalVonNeumann, Some(shape), 0);
-        assert!((sum2 - expected2).abs() < 1e-12);
-
-        // Lattice (Moore)
-        let debts3 =
-            circuit_node_description_debts(&c1, WiringTopology::LocalMoore, Some(shape), 0);
-        let sum3: f64 = debts3.iter().sum();
-        let expected3 = circuit_code_bits(&c1, WiringTopology::LocalMoore, Some(shape), 0);
-        assert!((sum3 - expected3).abs() < 1e-12);
     }
 
     #[test]
     #[should_panic(expected = "circuit has no nodes to own description length")]
     fn description_debts_fails_on_empty_circuit() {
         let c = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
-        let _ = circuit_node_description_debts(&c, WiringTopology::WellMixed, None, 0);
+        let _ = circuit_node_description_debts(&c, 0);
     }
 
     #[test]
@@ -558,7 +465,7 @@ mod tests {
         let mut c = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
         let _d = c.add_node(Primitive::Delay { init: 0 });
         c.connect(SignalSource::BoundaryIn(0), SignalSink::BoundaryOut(0));
-        let _ = circuit_node_description_debts(&c, WiringTopology::WellMixed, None, 0);
+        let _ = circuit_node_description_debts(&c, 0);
     }
 
     #[test]
@@ -589,8 +496,8 @@ mod tests {
             SignalSink::BoundaryOut(1),
         );
 
-        let debts_a = circuit_node_description_debts(&ca, WiringTopology::WellMixed, None, 0);
-        let debts_b = circuit_node_description_debts(&cb, WiringTopology::WellMixed, None, 0);
+        let debts_a = circuit_node_description_debts(&ca, 0);
+        let debts_b = circuit_node_description_debts(&cb, 0);
 
         assert!(
             debts_b[s.index()] > debts_a[d.index()],
@@ -602,26 +509,19 @@ mod tests {
 
     #[test]
     fn allocate_circuit_description_bits_empty_and_unowned_boundary() {
-        let shape = GridShape::new(4, 4).unwrap();
         // 1. Empty circuit
         let empty = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
-        let alloc_empty =
-            allocate_circuit_description_bits(&empty, WiringTopology::WellMixed, None, 0, true);
+        let alloc_empty = allocate_circuit_description_bits(&empty, 0, true);
         assert_eq!(alloc_empty.node_debts.len(), 0);
         assert_eq!(alloc_empty.unowned_bits, 0.0);
-        assert_eq!(
-            circuit_code_bits_with_tax(&empty, WiringTopology::WellMixed, None, 0, true),
-            0.0
-        );
+        assert_eq!(circuit_code_bits_with_tax(&empty, 0, true), 0.0);
 
         // 2. Direct BoundaryIn -> BoundaryOut with no nodes
         let mut direct = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
         direct.connect(SignalSource::BoundaryIn(0), SignalSink::BoundaryOut(0));
-        let alloc_direct =
-            allocate_circuit_description_bits(&direct, WiringTopology::WellMixed, None, 0, true);
+        let alloc_direct = allocate_circuit_description_bits(&direct, 0, true);
         assert_eq!(alloc_direct.node_debts.len(), 0);
-        let expected_direct =
-            circuit_code_bits_with_tax(&direct, WiringTopology::WellMixed, None, 0, true);
+        let expected_direct = circuit_code_bits_with_tax(&direct, 0, true);
         assert!((alloc_direct.unowned_bits - expected_direct).abs() < 1e-12);
 
         // 3. Node-containing circuit with direct unowned wire alongside a node
@@ -636,21 +536,9 @@ mod tests {
             SignalSink::BoundaryOut(0),
         );
         hybrid.connect(SignalSource::BoundaryIn(1), SignalSink::BoundaryOut(1));
-        let alloc_hybrid = allocate_circuit_description_bits(
-            &hybrid,
-            WiringTopology::LocalVonNeumann,
-            Some(shape),
-            0,
-            true,
-        );
+        let alloc_hybrid = allocate_circuit_description_bits(&hybrid, 0, true);
         let sum_hybrid = alloc_hybrid.node_debts.iter().sum::<f64>() + alloc_hybrid.unowned_bits;
-        let expected_hybrid = circuit_code_bits_with_tax(
-            &hybrid,
-            WiringTopology::LocalVonNeumann,
-            Some(shape),
-            0,
-            true,
-        );
+        let expected_hybrid = circuit_code_bits_with_tax(&hybrid, 0, true);
         assert!((sum_hybrid - expected_hybrid).abs() < 1e-12);
         assert!(alloc_hybrid.unowned_bits > 0.0);
 
@@ -670,36 +558,12 @@ mod tests {
             SignalSink::BoundaryOut(1),
         );
 
-        let alloc_taxed = allocate_circuit_description_bits(
-            &split_circ,
-            WiringTopology::LocalVonNeumann,
-            Some(shape),
-            0,
-            true,
-        );
-        let alloc_untaxed = allocate_circuit_description_bits(
-            &split_circ,
-            WiringTopology::LocalVonNeumann,
-            Some(shape),
-            0,
-            false,
-        );
+        let alloc_taxed = allocate_circuit_description_bits(&split_circ, 0, true);
+        let alloc_untaxed = allocate_circuit_description_bits(&split_circ, 0, false);
         assert!(alloc_taxed.node_debts[0] > alloc_untaxed.node_debts[0]);
 
-        let cost_taxed = circuit_code_bits_with_tax(
-            &split_circ,
-            WiringTopology::LocalVonNeumann,
-            Some(shape),
-            0,
-            true,
-        );
-        let cost_untaxed = circuit_code_bits_with_tax(
-            &split_circ,
-            WiringTopology::LocalVonNeumann,
-            Some(shape),
-            0,
-            false,
-        );
+        let cost_taxed = circuit_code_bits_with_tax(&split_circ, 0, true);
+        let cost_untaxed = circuit_code_bits_with_tax(&split_circ, 0, false);
         assert!(cost_taxed > cost_untaxed);
         let sum_untaxed = alloc_untaxed.node_debts.iter().sum::<f64>() + alloc_untaxed.unowned_bits;
         assert!((sum_untaxed - cost_untaxed).abs() < 1e-12);

@@ -1,20 +1,22 @@
 //! Finite-ring residual diagnostics for bounded corrector growth.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::baselines::{ObservationWindow, TickBudget};
 use crate::metrics::{PointForecastScorer, circuit_code_bits_with_tax, facts_code_bits};
 use crate::rng::SeedBank;
 use crate::structural::economy::{EconomyConfig, EconomyState, score_with_reward_mode};
-use crate::structural::lattice::{Coord, LatticeCircuit, LatticeError, WiringTopology};
+use crate::structural::graph_edit::{
+    build_autonomous_ring, materialize_const_loop, stack_output_binary_op, tap_source,
+};
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{assemble_causal_ancestry, counterfactual_sensitivity};
 use crate::structural::surgery::{
-    EditableLattice, MarginalDebtLedger, explicit_delay_register_index,
+    EditableCircuit, MarginalDebtLedger, explicit_delay_register_index,
     port_upstream_cone_and_edges, port_uses_boundary_in, register_mapping,
 };
 use crate::substrate::{
-    NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
+    Circuit, NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
 };
 
 /// Growth thresholds and resource bounds used by an online M1 learner.
@@ -237,17 +239,12 @@ pub fn diagnose_residual(
             ));
         }
     }
-    let passing_candidates = scores
-        .iter()
-        .filter(|s| {
-            s.corrected_mutual_information_bits > config.mi_threshold_bits
-                && s.match_gain >= config.min_match_gain
-        });
+    let passing_candidates = scores.iter().filter(|s| {
+        s.corrected_mutual_information_bits > config.mi_threshold_bits
+            && s.match_gain >= config.min_match_gain
+    });
     let total_passing = passing_candidates.clone().count();
-    let candidate_features: Vec<FeatureScore> = passing_candidates
-        .take(6)
-        .cloned()
-        .collect();
+    let candidate_features: Vec<FeatureScore> = passing_candidates.take(6).cloned().collect();
     let candidate_list_truncated = total_passing > 6;
 
     let growth_criterion_met = !zero_error
@@ -574,12 +571,15 @@ impl DiagnosticBuffer {
     }
 
     /// Builds the causal signal pool $\mathcal{U}$ over buffered ticks (§4.2).
+    ///
+    /// When `economy` is provided, features originating from juvenile nodes are excluded (§2.4).
     pub fn build_signal_pool(
         &self,
-        lattice: &LatticeCircuit,
+        circuit: &Circuit,
         obs_window: &ObservationWindow,
-        max_relay_hops: u8,
         out_port: u16,
+        max_tau: u8,
+        economy: Option<&EconomyState>,
     ) -> Vec<ResidualFeature> {
         let mut features = Vec::new();
         let len = self.len();
@@ -597,41 +597,24 @@ impl DiagnosticBuffer {
             });
         }
 
-        // 2. Live internal node outputs within spatial routing reach
-        let out_cell = lattice
-            .output_anchors()
-            .get(usize::from(out_port))
-            .and_then(|a| a.adjacent_border_cell(lattice.shape()).ok());
-
-        for (node_idx, &(_, primitive)) in lattice.nodes().iter().enumerate() {
+        // 2. Live internal node outputs (excluding juvenile nodes, §2.4)
+        for (node_idx, &primitive) in circuit.nodes().iter().enumerate() {
+            if let Some(econ) = economy
+                && econ
+                    .nodes()
+                    .get(node_idx)
+                    .is_some_and(|n| n.juvenile_ticks > 0)
+            {
+                continue;
+            }
             let node = NodeId(u32::try_from(node_idx).expect("fits in u32"));
             if primitive == Primitive::Split {
-                let consumers = lattice
+                let consumers = circuit
                     .edges()
                     .iter()
-                    .filter(
-                        |&(s, _)| matches!(s, SignalSource::NodeOut { node: n, .. } if *n == node),
-                    )
+                    .filter(|e| matches!(e.src, SignalSource::NodeOut { node: n, .. } if n == node))
                     .count();
                 if consumers <= 1 {
-                    continue;
-                }
-            }
-            if let Some(out_cell) = out_cell
-                && let Some(coord) = lattice.node_coord(node)
-            {
-                let in_reach = match lattice.topology() {
-                    WiringTopology::LocalVonNeumann => {
-                        usize::from(coord.manhattan_distance(out_cell))
-                            <= usize::from(max_relay_hops) + 1
-                    }
-                    WiringTopology::LocalMoore => {
-                        usize::from(coord.chebyshev_distance(out_cell))
-                            <= usize::from(max_relay_hops) + 1
-                    }
-                    WiringTopology::WellMixed => true,
-                };
-                if !in_reach {
                     continue;
                 }
             }
@@ -646,11 +629,11 @@ impl DiagnosticBuffer {
             });
         }
 
-        // 3. Virtual causal z^-tau delay taps (tau in 1..=3)
+        // 3. Virtual causal z^-tau delay taps (tau in 1..=max_tau)
         let window_len = obs_window.len();
         let start_in_window = window_len.saturating_sub(len);
 
-        for tau in 1..=3u8 {
+        for tau in 1..=max_tau {
             for c in 0..num_channels {
                 let mut values = Vec::with_capacity(len);
                 for t in 0..len {
@@ -675,10 +658,10 @@ impl DiagnosticBuffer {
                 });
             }
 
-            let is_driven = lattice
+            let is_driven = circuit
                 .edges()
                 .iter()
-                .any(|&(_, dst)| dst == SignalSink::BoundaryOut(out_port));
+                .any(|e| e.dst == SignalSink::BoundaryOut(out_port));
 
             if is_driven {
                 let mut yhat_vals = Vec::with_capacity(len);
@@ -812,741 +795,393 @@ pub fn generate_candidate_motifs(
     candidates
 }
 
-fn source_coord(lattice: &LatticeCircuit, src: SignalSource) -> Result<Coord, LatticeError> {
-    match src {
-        SignalSource::BoundaryIn(c) => {
-            if let Some(anchor) = lattice.input_anchors().get(usize::from(c)) {
-                anchor.adjacent_border_cell(lattice.shape())
-            } else {
-                Ok(Coord { row: 0, col: 0 })
-            }
-        }
-        SignalSource::NodeOut { node, .. } => lattice
-            .node_coord(node)
-            .ok_or(LatticeError::UnknownEndpoint),
-    }
-}
-
-fn target_out_cell(lattice: &LatticeCircuit, out_port: u16) -> Option<Coord> {
-    if lattice.topology() == WiringTopology::WellMixed {
-        None
-    } else {
-        lattice
-            .output_anchors()
-            .get(usize::from(out_port))
-            .and_then(|a| a.adjacent_border_cell(lattice.shape()).ok())
-    }
-}
-
 fn materialize_source(
-    lattice: &mut LatticeCircuit,
+    circuit: &mut Circuit,
     source: &SourceFeature,
-    target_cell: Option<Coord>,
-    out_port: u16,
-    max_relay_hops: u8,
-) -> Result<SignalSource, LatticeError> {
-    let out_cell = target_cell.or_else(|| target_out_cell(lattice, out_port));
+    _out_port: u16,
+) -> SignalSource {
     match source {
-        SourceFeature::BoundaryIn(c) => Ok(SignalSource::BoundaryIn(*c)),
-        SourceFeature::NodeOut { node, port } => Ok(SignalSource::NodeOut {
+        SourceFeature::BoundaryIn(c) => SignalSource::BoundaryIn(*c),
+        SourceFeature::NodeOut { node, port } => SignalSource::NodeOut {
             node: *node,
             port: *port,
-        }),
+        },
         SourceFeature::LagIn { channel, tau } => {
-            let mut curr =
-                lattice.tap_source(SignalSource::BoundaryIn(*channel), max_relay_hops)?;
+            let mut curr = tap_source(circuit, SignalSource::BoundaryIn(*channel));
             for _ in 0..*tau {
-                let coord = source_coord(lattice, curr)?;
-                let cell = lattice
-                    .best_empty_cell_between(coord, out_cell, max_relay_hops)
-                    .ok_or(LatticeError::UnknownEndpoint)?;
-                let delay = lattice.place_node(cell, Primitive::Delay { init: 0 })?;
-                lattice.route_connect(
+                let delay = circuit.add_node(Primitive::Delay { init: 0 });
+                circuit.connect(
                     curr,
                     SignalSink::NodeIn {
                         node: delay,
                         port: 0,
                     },
-                    usize::from(max_relay_hops),
-                )?;
+                );
                 curr = SignalSource::NodeOut {
                     node: delay,
                     port: 0,
                 };
             }
-            Ok(curr)
+            curr
         }
         SourceFeature::LagYhat { port, tau } => {
-            let old_edge = lattice
+            let old_edge = circuit
                 .edges()
                 .iter()
-                .find(|&(_, dst)| *dst == SignalSink::BoundaryOut(*port))
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let mut driver = old_edge.0;
+                .find(|e| e.dst == SignalSink::BoundaryOut(*port))
+                .expect("driven output port exists");
+            let mut driver = old_edge.src;
             if let SignalSource::NodeOut { node, .. } = driver
-                && lattice.node_primitive(node) == Some(Primitive::Split)
+                && circuit.nodes().get(node.index()) == Some(&Primitive::Split)
             {
-                let consumers = lattice
+                let consumers = circuit
                     .edges()
                     .iter()
-                    .filter(
-                        |&(s, _)| matches!(s, SignalSource::NodeOut { node: n, .. } if *n == node),
-                    )
+                    .filter(|e| matches!(e.src, SignalSource::NodeOut { node: n, .. } if n == node))
                     .count();
                 if consumers == 1
-                    && let Some(in_edge) = lattice
+                    && let Some(in_edge) = circuit
                         .edges()
                         .iter()
-                        .find(|&(_, dst)| *dst == SignalSink::NodeIn { node, port: 0 })
+                        .find(|e| e.dst == SignalSink::NodeIn { node, port: 0 })
                 {
-                    driver = in_edge.0;
+                    driver = in_edge.src;
                 }
             }
-            let mut curr = lattice.tap_source(driver, max_relay_hops)?;
+            let mut curr = tap_source(circuit, driver);
             for _ in 0..*tau {
-                let coord = source_coord(lattice, curr)?;
-                let cell = lattice
-                    .best_empty_cell_between(coord, out_cell, max_relay_hops)
-                    .ok_or(LatticeError::UnknownEndpoint)?;
-                let delay = lattice.place_node(cell, Primitive::Delay { init: 0 })?;
-                lattice.route_connect(
+                let delay = circuit.add_node(Primitive::Delay { init: 0 });
+                circuit.connect(
                     curr,
                     SignalSink::NodeIn {
                         node: delay,
                         port: 0,
                     },
-                    usize::from(max_relay_hops),
-                )?;
+                );
                 curr = SignalSource::NodeOut {
                     node: delay,
                     port: 0,
                 };
             }
-            Ok(curr)
+            curr
         }
         SourceFeature::LagRes { port, tau } => {
-            let s_tap = lattice.tap_source(SignalSource::BoundaryIn(*port), max_relay_hops)?;
-            let old_edge = lattice
+            let s_tap = tap_source(circuit, SignalSource::BoundaryIn(*port));
+            let old_edge = circuit
                 .edges()
                 .iter()
-                .find(|&(_, dst)| *dst == SignalSink::BoundaryOut(*port))
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let mut driver = old_edge.0;
+                .find(|e| e.dst == SignalSink::BoundaryOut(*port))
+                .expect("driven output port exists");
+            let mut driver = old_edge.src;
             if let SignalSource::NodeOut { node, .. } = driver
-                && lattice.node_primitive(node) == Some(Primitive::Split)
+                && circuit.nodes().get(node.index()) == Some(&Primitive::Split)
             {
-                let consumers = lattice
+                let consumers = circuit
                     .edges()
                     .iter()
-                    .filter(
-                        |&(s, _)| matches!(s, SignalSource::NodeOut { node: n, .. } if *n == node),
-                    )
+                    .filter(|e| matches!(e.src, SignalSource::NodeOut { node: n, .. } if n == node))
                     .count();
                 if consumers == 1
-                    && let Some(in_edge) = lattice
+                    && let Some(in_edge) = circuit
                         .edges()
                         .iter()
-                        .find(|&(_, dst)| *dst == SignalSink::NodeIn { node, port: 0 })
+                        .find(|e| e.dst == SignalSink::NodeIn { node, port: 0 })
                 {
-                    driver = in_edge.0;
+                    driver = in_edge.src;
                 }
             }
-            let y_tap = lattice.tap_source(driver, max_relay_hops)?;
-            let coord = source_coord(lattice, y_tap)?;
-            let d_cell = lattice
-                .best_empty_cell_between(coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let d_node = lattice.place_node(d_cell, Primitive::Delay { init: 0 })?;
-            lattice.route_connect(
+            let y_tap = tap_source(circuit, driver);
+            let d_node = circuit.add_node(Primitive::Delay { init: 0 });
+            circuit.connect(
                 y_tap,
                 SignalSink::NodeIn {
                     node: d_node,
                     port: 0,
                 },
-                usize::from(max_relay_hops),
-            )?;
+            );
             let y_lag1 = SignalSource::NodeOut {
                 node: d_node,
                 port: 0,
             };
 
-            let sub_cell = lattice
-                .best_empty_cell_between(d_cell, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let sub_node = lattice.place_node(sub_cell, Primitive::Sub)?;
-            let s_tap2 = lattice.tap_source(s_tap, max_relay_hops)?;
-            lattice.route_connect(
+            let sub_node = circuit.add_node(Primitive::Sub);
+            let s_tap2 = tap_source(circuit, s_tap);
+            circuit.connect(
                 s_tap2,
                 SignalSink::NodeIn {
                     node: sub_node,
                     port: 0,
                 },
-                usize::from(max_relay_hops),
-            )?;
-            lattice.route_connect(
+            );
+            circuit.connect(
                 y_lag1,
                 SignalSink::NodeIn {
                     node: sub_node,
                     port: 1,
                 },
-                usize::from(max_relay_hops),
-            )?;
+            );
             let mut curr = SignalSource::NodeOut {
                 node: sub_node,
                 port: 0,
             };
 
             for _ in 1..*tau {
-                let coord = source_coord(lattice, curr)?;
-                let cell = lattice
-                    .best_empty_cell_between(coord, out_cell, max_relay_hops)
-                    .ok_or(LatticeError::UnknownEndpoint)?;
-                let delay = lattice.place_node(cell, Primitive::Delay { init: 0 })?;
-                lattice.route_connect(
+                let delay = circuit.add_node(Primitive::Delay { init: 0 });
+                circuit.connect(
                     curr,
                     SignalSink::NodeIn {
                         node: delay,
                         port: 0,
                     },
-                    usize::from(max_relay_hops),
-                )?;
+                );
                 curr = SignalSource::NodeOut {
                     node: delay,
                     port: 0,
                 };
             }
-            Ok(curr)
+            curr
         }
     }
 }
 
-fn materialize_const_loop(
-    lattice: &mut LatticeCircuit,
-    c: u64,
-    near: Option<Coord>,
-    out_cell: Option<Coord>,
-    max_relay_hops: u8,
-) -> Result<SignalSource, LatticeError> {
-    let forbidden = out_cell
-        .map(|g| {
-            let mut set: BTreeSet<Coord> = lattice.neighbors(g).into_iter().collect();
-            set.insert(g);
-            set
-        })
-        .unwrap_or_default();
-
-    let start = near.or(out_cell).unwrap_or(Coord { row: 0, col: 0 });
-    let mut queue = VecDeque::new();
-    let mut visited = BTreeSet::new();
-    visited.insert(start);
-    queue.push_back(start);
-    let mut cell0 = None;
-    while let Some(current) = queue.pop_front() {
-        if lattice.cell_node(current).is_none() && !forbidden.contains(&current) {
-            cell0 = Some(current);
-            break;
-        }
-        for next in lattice.neighbors(current) {
-            if visited.insert(next) {
-                queue.push_back(next);
-            }
-        }
-    }
-    let cell0 = cell0.ok_or(LatticeError::UnknownEndpoint)?;
-    let split = lattice.place_node(cell0, Primitive::Split)?;
-    let cell1 = lattice
-        .nearest_empty_cell(cell0)
-        .ok_or(LatticeError::UnknownEndpoint)?;
-    let delay = lattice.place_node(cell1, Primitive::Delay { init: c })?;
-    lattice.route_connect(
-        SignalSource::NodeOut {
-            node: delay,
-            port: 0,
-        },
-        SignalSink::NodeIn {
-            node: split,
-            port: 0,
-        },
-        usize::from(max_relay_hops),
-    )?;
-    lattice.route_connect(
-        SignalSource::NodeOut {
-            node: split,
-            port: 0,
-        },
-        SignalSink::NodeIn {
-            node: delay,
-            port: 0,
-        },
-        usize::from(max_relay_hops),
-    )?;
-    Ok(SignalSource::NodeOut {
-        node: split,
-        port: 1,
-    })
-}
-
-fn feature_coord(lattice: &LatticeCircuit, u: &SourceFeature) -> Option<Coord> {
-    match u {
-        SourceFeature::BoundaryIn(c) => lattice
-            .input_anchors()
-            .get(usize::from(*c))
-            .and_then(|a| a.adjacent_border_cell(lattice.shape()).ok()),
-        SourceFeature::NodeOut { node, .. } => lattice.node_coord(*node),
-        SourceFeature::LagIn { channel, .. } => lattice
-            .input_anchors()
-            .get(usize::from(*channel))
-            .and_then(|a| a.adjacent_border_cell(lattice.shape()).ok()),
-        SourceFeature::LagYhat { port, .. } | SourceFeature::LagRes { port, .. } => lattice
-            .output_anchors()
-            .get(usize::from(*port))
-            .and_then(|a| a.adjacent_border_cell(lattice.shape()).ok()),
-    }
-}
-
-fn motif_start_coord(lattice: &LatticeCircuit, motif: &CandidateMotif, fallback: Coord) -> Coord {
-    match motif {
-        CandidateMotif::Identity(u)
-        | CandidateMotif::Eqz(u)
-        | CandidateMotif::AddSelf(u)
-        | CandidateMotif::AddConst(u, _)
-        | CandidateMotif::EqzAddConst(u, _)
-        | CandidateMotif::Neg(u)
-        | CandidateMotif::ScaleEqz(u, _) => feature_coord(lattice, u).unwrap_or(fallback),
-        CandidateMotif::AddPair(u1, u2)
-        | CandidateMotif::SubPair(u1, u2)
-        | CandidateMotif::MulPair(u1, u2)
-        | CandidateMotif::AddEqz(u1, u2)
-        | CandidateMotif::MulEqz(u1, u2)
-        | CandidateMotif::MulEqzPair(u1, u2) => feature_coord(lattice, u1)
-            .or_else(|| feature_coord(lattice, u2))
-            .unwrap_or(fallback),
-        CandidateMotif::ConstLoop(_) => fallback,
-    }
-}
-
-fn materialize_motif(
-    lattice: &mut LatticeCircuit,
-    motif: &CandidateMotif,
-    out_port: u16,
-    max_relay_hops: u8,
-) -> Result<SignalSource, LatticeError> {
-    let out_cell = target_out_cell(lattice, out_port);
-    let fallback_start = out_cell.unwrap_or(Coord { row: 0, col: 0 });
-    let start_coord = motif_start_coord(lattice, motif, fallback_start);
+fn materialize_motif(circuit: &mut Circuit, motif: &CandidateMotif, out_port: u16) -> SignalSource {
     match motif {
         CandidateMotif::Identity(u) => {
-            let src = materialize_source(lattice, u, out_cell, out_port, max_relay_hops)?;
-            lattice.tap_source(src, max_relay_hops)
+            let src = materialize_source(circuit, u, out_port);
+            tap_source(circuit, src)
         }
         CandidateMotif::Eqz(u) => {
-            let cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let eqz = lattice.place_node(cell, Primitive::Eqz)?;
-            let src = materialize_source(lattice, u, Some(cell), out_port, max_relay_hops)?;
-            let tapped = lattice.tap_source(src, max_relay_hops)?;
-            lattice.route_connect(
-                tapped,
-                SignalSink::NodeIn { node: eqz, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: eqz, port: 0 })
+            let eqz = circuit.add_node(Primitive::Eqz);
+            let src = materialize_source(circuit, u, out_port);
+            let tapped = tap_source(circuit, src);
+            circuit.connect(tapped, SignalSink::NodeIn { node: eqz, port: 0 });
+            SignalSource::NodeOut { node: eqz, port: 0 }
         }
         CandidateMotif::AddSelf(u) => {
-            let add_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let add = lattice.place_node(add_cell, Primitive::Add)?;
-            let split_cell = lattice
-                .best_empty_cell_between(start_coord, Some(add_cell), max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let split = lattice.place_node(split_cell, Primitive::Split)?;
-            let src = materialize_source(lattice, u, Some(split_cell), out_port, max_relay_hops)?;
-            let tapped = lattice.tap_source(src, max_relay_hops)?;
-            lattice.route_connect(
+            let add = circuit.add_node(Primitive::Add);
+            let split = circuit.add_node(Primitive::Split);
+            let src = materialize_source(circuit, u, out_port);
+            let tapped = tap_source(circuit, src);
+            circuit.connect(
                 tapped,
                 SignalSink::NodeIn {
                     node: split,
                     port: 0,
                 },
-                usize::from(max_relay_hops),
-            )?;
-            lattice.route_connect(
+            );
+            circuit.connect(
                 SignalSource::NodeOut {
                     node: split,
                     port: 0,
                 },
                 SignalSink::NodeIn { node: add, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            lattice.route_connect(
+            );
+            circuit.connect(
                 SignalSource::NodeOut {
                     node: split,
                     port: 1,
                 },
                 SignalSink::NodeIn { node: add, port: 1 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: add, port: 0 })
+            );
+            SignalSource::NodeOut { node: add, port: 0 }
         }
         CandidateMotif::AddPair(u1, u2) => {
-            let add_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let add = lattice.place_node(add_cell, Primitive::Add)?;
-            let s1 = materialize_source(lattice, u1, Some(add_cell), out_port, max_relay_hops)?;
-            let t1 = lattice.tap_source(s1, max_relay_hops)?;
-            lattice.route_connect(
-                t1,
-                SignalSink::NodeIn { node: add, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            let s2 = materialize_source(lattice, u2, Some(add_cell), out_port, max_relay_hops)?;
-            let t2 = lattice.tap_source(s2, max_relay_hops)?;
-            lattice.route_connect(
-                t2,
-                SignalSink::NodeIn { node: add, port: 1 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: add, port: 0 })
+            let add = circuit.add_node(Primitive::Add);
+            let s1 = materialize_source(circuit, u1, out_port);
+            let t1 = tap_source(circuit, s1);
+            circuit.connect(t1, SignalSink::NodeIn { node: add, port: 0 });
+            let s2 = materialize_source(circuit, u2, out_port);
+            let t2 = tap_source(circuit, s2);
+            circuit.connect(t2, SignalSink::NodeIn { node: add, port: 1 });
+            SignalSource::NodeOut { node: add, port: 0 }
         }
         CandidateMotif::SubPair(u1, u2) => {
-            let sub_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let sub = lattice.place_node(sub_cell, Primitive::Sub)?;
-            let s1 = materialize_source(lattice, u1, Some(sub_cell), out_port, max_relay_hops)?;
-            let t1 = lattice.tap_source(s1, max_relay_hops)?;
-            lattice.route_connect(
-                t1,
-                SignalSink::NodeIn { node: sub, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            let s2 = materialize_source(lattice, u2, Some(sub_cell), out_port, max_relay_hops)?;
-            let t2 = lattice.tap_source(s2, max_relay_hops)?;
-            lattice.route_connect(
-                t2,
-                SignalSink::NodeIn { node: sub, port: 1 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: sub, port: 0 })
+            let sub = circuit.add_node(Primitive::Sub);
+            let s1 = materialize_source(circuit, u1, out_port);
+            let t1 = tap_source(circuit, s1);
+            circuit.connect(t1, SignalSink::NodeIn { node: sub, port: 0 });
+            let s2 = materialize_source(circuit, u2, out_port);
+            let t2 = tap_source(circuit, s2);
+            circuit.connect(t2, SignalSink::NodeIn { node: sub, port: 1 });
+            SignalSource::NodeOut { node: sub, port: 0 }
         }
         CandidateMotif::MulPair(u1, u2) => {
-            let mul_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let mul = lattice.place_node(mul_cell, Primitive::Mul)?;
-            let s1 = materialize_source(lattice, u1, Some(mul_cell), out_port, max_relay_hops)?;
-            let t1 = lattice.tap_source(s1, max_relay_hops)?;
-            lattice.route_connect(
-                t1,
-                SignalSink::NodeIn { node: mul, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            let s2 = materialize_source(lattice, u2, Some(mul_cell), out_port, max_relay_hops)?;
-            let t2 = lattice.tap_source(s2, max_relay_hops)?;
-            lattice.route_connect(
-                t2,
-                SignalSink::NodeIn { node: mul, port: 1 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: mul, port: 0 })
+            let mul = circuit.add_node(Primitive::Mul);
+            let s1 = materialize_source(circuit, u1, out_port);
+            let t1 = tap_source(circuit, s1);
+            circuit.connect(t1, SignalSink::NodeIn { node: mul, port: 0 });
+            let s2 = materialize_source(circuit, u2, out_port);
+            let t2 = tap_source(circuit, s2);
+            circuit.connect(t2, SignalSink::NodeIn { node: mul, port: 1 });
+            SignalSource::NodeOut { node: mul, port: 0 }
         }
-        CandidateMotif::ConstLoop(c) => {
-            materialize_const_loop(lattice, *c, out_cell, out_cell, max_relay_hops)
-        }
+        CandidateMotif::ConstLoop(c) => materialize_const_loop(circuit, *c),
         CandidateMotif::AddConst(u, c) => {
-            let add_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let add = lattice.place_node(add_cell, Primitive::Add)?;
-            let u_src = materialize_source(lattice, u, Some(add_cell), out_port, max_relay_hops)?;
-            let u_tap = lattice.tap_source(u_src, max_relay_hops)?;
-            lattice.route_connect(
-                u_tap,
-                SignalSink::NodeIn { node: add, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            let c_src =
-                materialize_const_loop(lattice, *c, Some(add_cell), out_cell, max_relay_hops)?;
-            lattice.route_connect(
-                c_src,
-                SignalSink::NodeIn { node: add, port: 1 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: add, port: 0 })
+            let add = circuit.add_node(Primitive::Add);
+            let u_src = materialize_source(circuit, u, out_port);
+            let u_tap = tap_source(circuit, u_src);
+            circuit.connect(u_tap, SignalSink::NodeIn { node: add, port: 0 });
+            let c_src = materialize_const_loop(circuit, *c);
+            circuit.connect(c_src, SignalSink::NodeIn { node: add, port: 1 });
+            SignalSource::NodeOut { node: add, port: 0 }
         }
         CandidateMotif::EqzAddConst(u, c) => {
-            let eqz_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let eqz = lattice.place_node(eqz_cell, Primitive::Eqz)?;
-            let add_src = materialize_motif(
-                lattice,
-                &CandidateMotif::AddConst(u.clone(), *c),
-                out_port,
-                max_relay_hops,
-            )?;
-            lattice.route_connect(
-                add_src,
-                SignalSink::NodeIn { node: eqz, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: eqz, port: 0 })
+            let eqz = circuit.add_node(Primitive::Eqz);
+            let add_src =
+                materialize_motif(circuit, &CandidateMotif::AddConst(u.clone(), *c), out_port);
+            circuit.connect(add_src, SignalSink::NodeIn { node: eqz, port: 0 });
+            SignalSource::NodeOut { node: eqz, port: 0 }
         }
         CandidateMotif::Neg(u) => {
-            if lattice.width().bits() > 1 {
-                let mult = (1u64 << lattice.width().bits()) - 1;
-                let mul_cell = lattice
-                    .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                    .ok_or(LatticeError::UnknownEndpoint)?;
-                let mul = lattice.place_node(mul_cell, Primitive::Mul)?;
-                let u_src =
-                    materialize_source(lattice, u, Some(mul_cell), out_port, max_relay_hops)?;
-                let u_tap = lattice.tap_source(u_src, max_relay_hops)?;
-                lattice.route_connect(
-                    u_tap,
-                    SignalSink::NodeIn { node: mul, port: 0 },
-                    usize::from(max_relay_hops),
-                )?;
-                let c_src = materialize_const_loop(
-                    lattice,
-                    mult,
-                    Some(mul_cell),
-                    out_cell,
-                    max_relay_hops,
-                )?;
-                lattice.route_connect(
-                    c_src,
-                    SignalSink::NodeIn { node: mul, port: 1 },
-                    usize::from(max_relay_hops),
-                )?;
-                Ok(SignalSource::NodeOut { node: mul, port: 0 })
+            if circuit.width().bits() > 1 {
+                let mult = (1u64 << circuit.width().bits()) - 1;
+                let mul = circuit.add_node(Primitive::Mul);
+                let u_src = materialize_source(circuit, u, out_port);
+                let u_tap = tap_source(circuit, u_src);
+                circuit.connect(u_tap, SignalSink::NodeIn { node: mul, port: 0 });
+                let c_src = materialize_const_loop(circuit, mult);
+                circuit.connect(c_src, SignalSink::NodeIn { node: mul, port: 1 });
+                SignalSource::NodeOut { node: mul, port: 0 }
             } else {
-                let sub_cell = lattice
-                    .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                    .ok_or(LatticeError::UnknownEndpoint)?;
-                let sub = lattice.place_node(sub_cell, Primitive::Sub)?;
-                let u_src =
-                    materialize_source(lattice, u, Some(sub_cell), out_port, max_relay_hops)?;
-                let u_tap = lattice.tap_source(u_src, max_relay_hops)?;
-                lattice.route_connect(
-                    u_tap,
-                    SignalSink::NodeIn { node: sub, port: 1 },
-                    usize::from(max_relay_hops),
-                )?;
-                let zero_src =
-                    materialize_const_loop(lattice, 0, Some(sub_cell), out_cell, max_relay_hops)?;
-                lattice.route_connect(
-                    zero_src,
-                    SignalSink::NodeIn { node: sub, port: 0 },
-                    usize::from(max_relay_hops),
-                )?;
-                Ok(SignalSource::NodeOut { node: sub, port: 0 })
+                let sub = circuit.add_node(Primitive::Sub);
+                let u_src = materialize_source(circuit, u, out_port);
+                let u_tap = tap_source(circuit, u_src);
+                circuit.connect(u_tap, SignalSink::NodeIn { node: sub, port: 1 });
+                let zero_src = materialize_const_loop(circuit, 0);
+                circuit.connect(zero_src, SignalSink::NodeIn { node: sub, port: 0 });
+                SignalSource::NodeOut { node: sub, port: 0 }
             }
         }
         CandidateMotif::ScaleEqz(u, c) => {
-            let mul_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let mul = lattice.place_node(mul_cell, Primitive::Mul)?;
-            let eqz_cell = lattice
-                .best_empty_cell_between(start_coord, Some(mul_cell), max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let eqz = lattice.place_node(eqz_cell, Primitive::Eqz)?;
-            let u_src = materialize_source(lattice, u, Some(eqz_cell), out_port, max_relay_hops)?;
-            let u_tap = lattice.tap_source(u_src, max_relay_hops)?;
-            lattice.route_connect(
-                u_tap,
-                SignalSink::NodeIn { node: eqz, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            lattice.route_connect(
+            let mul = circuit.add_node(Primitive::Mul);
+            let eqz = circuit.add_node(Primitive::Eqz);
+            let u_src = materialize_source(circuit, u, out_port);
+            let u_tap = tap_source(circuit, u_src);
+            circuit.connect(u_tap, SignalSink::NodeIn { node: eqz, port: 0 });
+            circuit.connect(
                 SignalSource::NodeOut { node: eqz, port: 0 },
                 SignalSink::NodeIn { node: mul, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            let c_src =
-                materialize_const_loop(lattice, *c, Some(mul_cell), out_cell, max_relay_hops)?;
-            lattice.route_connect(
-                c_src,
-                SignalSink::NodeIn { node: mul, port: 1 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: mul, port: 0 })
+            );
+            let c_src = materialize_const_loop(circuit, *c);
+            circuit.connect(c_src, SignalSink::NodeIn { node: mul, port: 1 });
+            SignalSource::NodeOut { node: mul, port: 0 }
         }
         CandidateMotif::AddEqz(u1, u2) => {
-            let add_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let add = lattice.place_node(add_cell, Primitive::Add)?;
-            let s1 = materialize_source(lattice, u1, Some(add_cell), out_port, max_relay_hops)?;
-            let t1 = lattice.tap_source(s1, max_relay_hops)?;
-            lattice.route_connect(
-                t1,
-                SignalSink::NodeIn { node: add, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            let eqz_cell = lattice
-                .best_empty_cell_between(start_coord, Some(add_cell), max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let eqz = lattice.place_node(eqz_cell, Primitive::Eqz)?;
-            let s2 = materialize_source(lattice, u2, Some(eqz_cell), out_port, max_relay_hops)?;
-            let t2 = lattice.tap_source(s2, max_relay_hops)?;
-            lattice.route_connect(
-                t2,
-                SignalSink::NodeIn { node: eqz, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            lattice.route_connect(
+            let add = circuit.add_node(Primitive::Add);
+            let s1 = materialize_source(circuit, u1, out_port);
+            let t1 = tap_source(circuit, s1);
+            circuit.connect(t1, SignalSink::NodeIn { node: add, port: 0 });
+            let eqz = circuit.add_node(Primitive::Eqz);
+            let s2 = materialize_source(circuit, u2, out_port);
+            let t2 = tap_source(circuit, s2);
+            circuit.connect(t2, SignalSink::NodeIn { node: eqz, port: 0 });
+            circuit.connect(
                 SignalSource::NodeOut { node: eqz, port: 0 },
                 SignalSink::NodeIn { node: add, port: 1 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: add, port: 0 })
+            );
+            SignalSource::NodeOut { node: add, port: 0 }
         }
         CandidateMotif::MulEqz(u1, u2) => {
-            let mul_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let mul = lattice.place_node(mul_cell, Primitive::Mul)?;
-            let s1 = materialize_source(lattice, u1, Some(mul_cell), out_port, max_relay_hops)?;
-            let t1 = lattice.tap_source(s1, max_relay_hops)?;
-            lattice.route_connect(
-                t1,
-                SignalSink::NodeIn { node: mul, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            let eqz_cell = lattice
-                .best_empty_cell_between(start_coord, Some(mul_cell), max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let eqz = lattice.place_node(eqz_cell, Primitive::Eqz)?;
-            let s2 = materialize_source(lattice, u2, Some(eqz_cell), out_port, max_relay_hops)?;
-            let t2 = lattice.tap_source(s2, max_relay_hops)?;
-            lattice.route_connect(
-                t2,
-                SignalSink::NodeIn { node: eqz, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            lattice.route_connect(
+            let mul = circuit.add_node(Primitive::Mul);
+            let s1 = materialize_source(circuit, u1, out_port);
+            let t1 = tap_source(circuit, s1);
+            circuit.connect(t1, SignalSink::NodeIn { node: mul, port: 0 });
+            let eqz = circuit.add_node(Primitive::Eqz);
+            let s2 = materialize_source(circuit, u2, out_port);
+            let t2 = tap_source(circuit, s2);
+            circuit.connect(t2, SignalSink::NodeIn { node: eqz, port: 0 });
+            circuit.connect(
                 SignalSource::NodeOut { node: eqz, port: 0 },
                 SignalSink::NodeIn { node: mul, port: 1 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: mul, port: 0 })
+            );
+            SignalSource::NodeOut { node: mul, port: 0 }
         }
         CandidateMotif::MulEqzPair(u1, u2) => {
-            let mul_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let mul = lattice.place_node(mul_cell, Primitive::Mul)?;
-            let eqz1_cell = lattice
-                .best_empty_cell_between(start_coord, Some(mul_cell), max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let eqz1 = lattice.place_node(eqz1_cell, Primitive::Eqz)?;
-            let s1 = materialize_source(lattice, u1, Some(eqz1_cell), out_port, max_relay_hops)?;
-            let t1 = lattice.tap_source(s1, max_relay_hops)?;
-            lattice.route_connect(
+            let mul = circuit.add_node(Primitive::Mul);
+            let eqz1 = circuit.add_node(Primitive::Eqz);
+            let s1 = materialize_source(circuit, u1, out_port);
+            let t1 = tap_source(circuit, s1);
+            circuit.connect(
                 t1,
                 SignalSink::NodeIn {
                     node: eqz1,
                     port: 0,
                 },
-                usize::from(max_relay_hops),
-            )?;
-            lattice.route_connect(
+            );
+            circuit.connect(
                 SignalSource::NodeOut {
                     node: eqz1,
                     port: 0,
                 },
                 SignalSink::NodeIn { node: mul, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            let eqz2_cell = lattice
-                .best_empty_cell_between(start_coord, Some(mul_cell), max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let eqz2 = lattice.place_node(eqz2_cell, Primitive::Eqz)?;
-            let s2 = materialize_source(lattice, u2, Some(eqz2_cell), out_port, max_relay_hops)?;
-            let t2 = lattice.tap_source(s2, max_relay_hops)?;
-            lattice.route_connect(
+            );
+            let eqz2 = circuit.add_node(Primitive::Eqz);
+            let s2 = materialize_source(circuit, u2, out_port);
+            let t2 = tap_source(circuit, s2);
+            circuit.connect(
                 t2,
                 SignalSink::NodeIn {
                     node: eqz2,
                     port: 0,
                 },
-                usize::from(max_relay_hops),
-            )?;
-            lattice.route_connect(
+            );
+            circuit.connect(
                 SignalSource::NodeOut {
                     node: eqz2,
                     port: 0,
                 },
                 SignalSink::NodeIn { node: mul, port: 1 },
-                usize::from(max_relay_hops),
-            )?;
-            Ok(SignalSource::NodeOut { node: mul, port: 0 })
+            );
+            SignalSource::NodeOut { node: mul, port: 0 }
         }
     }
 }
 
-/// Materializes a candidate motif onto a staged lattice and stacks it onto `out_port`.
+/// Materializes a candidate motif onto a staged circuit and stacks it onto `out_port`.
 pub fn materialize_candidate(
-    lattice: &mut LatticeCircuit,
+    circuit: &mut Circuit,
     motif: &CandidateMotif,
     out_port: u16,
-    max_relay_hops: u8,
-) -> Result<NodeId, LatticeError> {
-    let is_driven = lattice
+) -> NodeId {
+    let is_driven = circuit
         .edges()
         .iter()
-        .any(|&(_, dst)| dst == SignalSink::BoundaryOut(out_port));
+        .any(|edge| edge.dst == SignalSink::BoundaryOut(out_port));
     match motif {
         CandidateMotif::Neg(u) if is_driven => {
-            let out_cell = target_out_cell(lattice, out_port);
-            let u_src = materialize_source(lattice, u, out_cell, out_port, max_relay_hops)?;
-            lattice.stack_output_subtractor(out_port, u_src, max_relay_hops)
+            let u_src = materialize_source(circuit, u, out_port);
+            stack_output_binary_op(circuit, Primitive::Sub, out_port, u_src)
         }
-        CandidateMotif::ScaleEqz(u, c) if is_driven && *c == lattice.width().mask() => {
-            let out_cell = target_out_cell(lattice, out_port);
-            let fallback_start = out_cell.unwrap_or(Coord { row: 0, col: 0 });
-            let start_coord = motif_start_coord(lattice, motif, fallback_start);
-            let eqz_cell = lattice
-                .best_empty_cell_between(start_coord, out_cell, max_relay_hops)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let eqz = lattice.place_node(eqz_cell, Primitive::Eqz)?;
-            let u_src = materialize_source(lattice, u, Some(eqz_cell), out_port, max_relay_hops)?;
-            let u_tap = lattice.tap_source(u_src, max_relay_hops)?;
-            lattice.route_connect(
-                u_tap,
-                SignalSink::NodeIn { node: eqz, port: 0 },
-                usize::from(max_relay_hops),
-            )?;
-            lattice.stack_output_subtractor(
+        CandidateMotif::ScaleEqz(u, c) if is_driven && *c == circuit.width().mask() => {
+            let eqz = circuit.add_node(Primitive::Eqz);
+            let u_src = materialize_source(circuit, u, out_port);
+            let u_tap = tap_source(circuit, u_src);
+            circuit.connect(u_tap, SignalSink::NodeIn { node: eqz, port: 0 });
+            stack_output_binary_op(
+                circuit,
+                Primitive::Sub,
                 out_port,
                 SignalSource::NodeOut { node: eqz, port: 0 },
-                max_relay_hops,
             )
         }
         _ => {
-            let motif_src = materialize_motif(lattice, motif, out_port, max_relay_hops)?;
-            lattice.stack_output_adder(out_port, motif_src, max_relay_hops)
+            let motif_src = materialize_motif(circuit, motif, out_port);
+            stack_output_binary_op(circuit, Primitive::Add, out_port, motif_src)
         }
     }
 }
 
-/// Evaluates candidates from $\mathcal{K}(u_1, u_2)$ on `obs_window` and returns the best staged lattice if admissible (§4.3).
+/// Evaluates candidates from $\mathcal{K}(u_1, u_2)$ on `obs_window` and returns the best staged circuit if admissible (§4.3).
 #[allow(clippy::too_many_arguments)]
 pub fn propose_sprout(
-    editable: &EditableLattice,
+    editable: &EditableCircuit,
     obs_window: &ObservationWindow,
     diag: &DiagnosticBuffer,
     growth_config: &GrowthConfig,
     economy_config: &EconomyConfig,
     budget: &mut TickBudget,
     out_port: u16,
-    max_relay_hops: u8,
-) -> Result<Option<LatticeCircuit>, GrowthError> {
+) -> Result<Option<Circuit>, GrowthError> {
     propose_sprout_with_telemetry(
         editable,
         obs_window,
@@ -1555,7 +1190,7 @@ pub fn propose_sprout(
         economy_config,
         budget,
         out_port,
-        max_relay_hops,
+        3,
         &mut SproutTelemetry::default(),
     )
 }
@@ -1563,16 +1198,16 @@ pub fn propose_sprout(
 /// Evaluates candidates from $\mathcal{K}(u_1, u_2)$ on `obs_window` with telemetry collection.
 #[allow(clippy::too_many_arguments)]
 pub fn propose_sprout_with_telemetry(
-    editable: &EditableLattice,
+    editable: &EditableCircuit,
     obs_window: &ObservationWindow,
     diag: &DiagnosticBuffer,
     growth_config: &GrowthConfig,
     economy_config: &EconomyConfig,
     budget: &mut TickBudget,
     out_port: u16,
-    max_relay_hops: u8,
+    max_tau: u8,
     telemetry: &mut SproutTelemetry,
-) -> Result<Option<LatticeCircuit>, GrowthError> {
+) -> Result<Option<Circuit>, GrowthError> {
     let len = diag.len();
     if len < growth_config.diagnostic_window {
         return Ok(None);
@@ -1582,16 +1217,23 @@ pub fn propose_sprout_with_telemetry(
         .iter()
         .map(|f| f[usize::from(out_port)])
         .collect();
-    let features = diag.build_signal_pool(editable.lattice(), obs_window, max_relay_hops, out_port);
+
+    let features = diag.build_signal_pool(
+        editable.circuit(),
+        obs_window,
+        out_port,
+        max_tau,
+        Some(editable.economy()),
+    );
 
     let is_epoch_1 = !editable
-        .lattice()
+        .circuit()
         .edges()
         .iter()
-        .any(|&(_, dst)| dst == SignalSink::BoundaryOut(out_port));
+        .any(|edge| edge.dst == SignalSink::BoundaryOut(out_port));
 
     let diagnostics = diagnose_residual(
-        editable.lattice().width(),
+        editable.circuit().width(),
         &residuals,
         &features,
         *growth_config,
@@ -1639,7 +1281,7 @@ pub fn propose_sprout_with_telemetry(
     let mut candidates = Vec::new();
     if feature_pairs.is_empty() {
         if let Some((c_off, _)) = diagnostics.constant_offset {
-            let norm_c = editable.lattice().width().normalize(c_off);
+            let norm_c = editable.circuit().width().normalize(c_off);
             if norm_c != 0 {
                 candidates.push(CandidateMotif::ConstLoop(norm_c));
             }
@@ -1649,7 +1291,7 @@ pub fn propose_sprout_with_telemetry(
             let cands = generate_candidate_motifs(
                 u1_feat,
                 u2_feat.as_ref(),
-                editable.lattice().width(),
+                editable.circuit().width(),
                 diagnostics.constant_offset,
                 is_epoch_1,
                 num_channels,
@@ -1676,7 +1318,7 @@ pub fn propose_sprout_with_telemetry(
 
     let max_sym_count = frequencies(obs_window.frames()[eval_start_idx..].iter().map(|f| {
         editable
-            .lattice()
+            .circuit()
             .width()
             .normalize(f[usize::from(out_port)])
     }))
@@ -1694,7 +1336,7 @@ pub fn propose_sprout_with_telemetry(
     }
     let mut curr_pred = vec![0u64; usize::from(editable.compiled().num_outputs())];
     let mut curr_scorer =
-        PointForecastScorer::new(editable.lattice().width(), economy_config.null_model);
+        PointForecastScorer::new(editable.circuit().width(), economy_config.null_model);
 
     let mut e_curr = 0usize;
     let mut flux_curr = 0.0;
@@ -1720,7 +1362,7 @@ pub fn propose_sprout_with_telemetry(
             score_with_reward_mode(
                 &mut curr_scorer,
                 economy_config.reward_mode,
-                editable.lattice().width(),
+                editable.circuit().width(),
                 p_curr,
                 p_truth,
             )
@@ -1733,45 +1375,29 @@ pub fn propose_sprout_with_telemetry(
         }
     }
 
-    let shape = if editable.lattice().topology() == WiringTopology::WellMixed {
-        None
-    } else {
-        Some(editable.lattice().shape())
-    };
-    let l_curr = circuit_code_bits_with_tax(
-        editable.circuit(),
-        editable.lattice().topology(),
-        shape,
-        0,
-        economy_config.split_code_tax,
-    );
-    let j_curr = l_curr + facts_code_bits(editable.lattice().width(), w_diag as u64, e_curr as u64);
+    let l_curr = circuit_code_bits_with_tax(editable.circuit(), 0, economy_config.split_code_tax);
+    let j_curr = l_curr + facts_code_bits(editable.circuit().width(), w_diag as u64, e_curr as u64);
     let survivor_map: Vec<Option<NodeId>> = (0..editable.circuit().node_count())
         .map(|i| Some(NodeId(i as u32)))
         .collect();
 
-    let mut best_proposal: Option<(LatticeCircuit, usize, f64, f64, bool)> = None;
+    let mut best_proposal: Option<(Circuit, usize, f64, f64, bool)> = None;
 
     for motif in &candidates {
         if !budget.try_consume(w_replay as u64) {
             break;
         }
-        let mut staged = editable.lattice().clone();
+        let mut staged = editable.circuit().clone();
         if staged.nodes().len() >= growth_config.max_nodes {
             telemetry.sprout_blocked_max_nodes += 1;
             continue;
         }
-        if materialize_candidate(&mut staged, motif, out_port, max_relay_hops).is_err() {
-            continue;
-        }
+        materialize_candidate(&mut staged, motif, out_port);
         if staged.nodes().len() > growth_config.max_nodes {
             telemetry.sprout_blocked_max_nodes += 1;
             continue;
         }
-        let Ok(staged_circuit) = staged.lower() else {
-            continue;
-        };
-        let Ok(staged_compiled) = staged_circuit.compile() else {
+        let Ok(staged_compiled) = staged.compile() else {
             continue;
         };
 
@@ -1781,7 +1407,7 @@ pub fn propose_sprout_with_telemetry(
         {
             let reg_map = register_mapping(
                 editable.circuit(),
-                &staged_circuit,
+                &staged,
                 editable.compiled(),
                 &staged_compiled,
                 &survivor_map,
@@ -1853,18 +1479,7 @@ pub fn propose_sprout_with_telemetry(
         }
 
         let delta_flux = flux_cand - flux_curr;
-        let staged_shape = if staged.topology() == WiringTopology::WellMixed {
-            None
-        } else {
-            Some(staged.shape())
-        };
-        let l_cand = circuit_code_bits_with_tax(
-            &staged_circuit,
-            staged.topology(),
-            staged_shape,
-            0,
-            economy_config.split_code_tax,
-        );
+        let l_cand = circuit_code_bits_with_tax(&staged, 0, economy_config.split_code_tax);
         let delta_l_sprout = (l_cand - l_curr).max(0.0);
         let is_1_op = is_epoch_1
             && matches!(
@@ -1880,7 +1495,7 @@ pub fn propose_sprout_with_telemetry(
                 let delta_i_hat = pos_flux_cand / (w_diag as f64);
                 if delta_i_hat > 0.0 {
                     let w_star = delta_l_sprout / delta_i_hat;
-                    if w_star > (obs_window.len() as f64) {
+                    if w_star > (obs_window.capacity() as f64) {
                         telemetry.candidate_undecidable += 1;
                     }
                 }
@@ -1931,11 +1546,11 @@ pub fn propose_sprout_with_telemetry(
 /// Autonomous delay ring proposal under channel noise (§4.5).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutonomousRingProposal {
-    /// Staged lattice circuit containing the autonomous delay ring.
-    pub lattice: LatticeCircuit,
+    /// Staged circuit containing the autonomous delay ring.
+    pub candidate_circuit: Circuit,
     /// Node survival map from pre-edit circuit nodes (`None` for replaced `out_port` cone nodes).
     pub old_to_new: Vec<Option<NodeId>>,
-    /// Explicit `Delay` node IDs in `lattice` forming the period-`p` ring (`0..period`).
+    /// Explicit `Delay` node IDs in `candidate_circuit` forming the period-`p` ring (`0..period`).
     pub ring_delay_nodes: Vec<NodeId>,
     /// Period of the delay ring.
     pub period: usize,
@@ -1943,18 +1558,15 @@ pub struct AutonomousRingProposal {
     pub template: Vec<u64>,
 }
 
-type BuiltRingLattice = (LatticeCircuit, Vec<Option<NodeId>>, Vec<NodeId>);
-
-fn build_autonomous_ring_lattice(
-    base: &LatticeCircuit,
+fn build_autonomous_ring_circuit(
+    base: &Circuit,
     period: usize,
     mu: &[u64],
     out_port: u16,
-    max_relay_hops: u8,
-) -> Result<BuiltRingLattice, LatticeError> {
+) -> (Circuit, Vec<Option<NodeId>>, Vec<NodeId>) {
     let (target_cone, _) = port_upstream_cone_and_edges(base, out_port);
     let mut protected_nodes = BTreeSet::new();
-    for q in 0..(base.output_anchors().len() as u16) {
+    for q in 0..base.num_outputs() {
         if q != out_port {
             let (other_cone, _) = port_upstream_cone_and_edges(base, q);
             protected_nodes.extend(other_cone);
@@ -1969,239 +1581,21 @@ fn build_autonomous_ring_lattice(
     let old_out_edges: Vec<(SignalSource, SignalSink)> = staged
         .edges()
         .iter()
-        .copied()
-        .filter(|&(_, dst)| dst == SignalSink::BoundaryOut(out_port))
+        .filter_map(|e| (e.dst == SignalSink::BoundaryOut(out_port)).then_some((e.src, e.dst)))
         .collect();
     for (src, dst) in old_out_edges {
         staged.disconnect(src, dst);
     }
     let old_to_new = staged.remove_nodes(&removed);
-
-    if staged.topology() == WiringTopology::WellMixed {
-        let mut delays = Vec::with_capacity(period);
-        for j in 0..period {
-            let init_val = mu[(period - 1 - j) % period];
-            let cell = staged
-                .nearest_empty_cell(Coord { row: 0, col: 0 })
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let d = staged.place_node(cell, Primitive::Delay { init: init_val })?;
-            delays.push(d);
-        }
-        let s_cell = staged
-            .nearest_empty_cell(Coord { row: 0, col: 0 })
-            .ok_or(LatticeError::UnknownEndpoint)?;
-        let split = staged.place_node(s_cell, Primitive::Split)?;
-
-        for i in 0..(period - 1) {
-            staged.connect(
-                SignalSource::NodeOut {
-                    node: delays[i],
-                    port: 0,
-                },
-                SignalSink::NodeIn {
-                    node: delays[i + 1],
-                    port: 0,
-                },
-            )?;
-        }
-        staged.connect(
-            SignalSource::NodeOut {
-                node: delays[period - 1],
-                port: 0,
-            },
-            SignalSink::NodeIn {
-                node: split,
-                port: 0,
-            },
-        )?;
-        staged.connect(
-            SignalSource::NodeOut {
-                node: split,
-                port: 0,
-            },
-            SignalSink::NodeIn {
-                node: delays[0],
-                port: 0,
-            },
-        )?;
-        staged.connect(
-            SignalSource::NodeOut {
-                node: split,
-                port: 1,
-            },
-            SignalSink::BoundaryOut(out_port),
-        )?;
-        return Ok((staged, old_to_new, delays));
-    }
-
-    let anchor = *staged
-        .output_anchors()
-        .get(usize::from(out_port))
-        .ok_or(LatticeError::UnknownEndpoint)?;
-    let out_cell = anchor.adjacent_border_cell(staged.shape())?;
-    let split_cell = staged
-        .nearest_empty_cell(out_cell)
-        .ok_or(LatticeError::UnknownEndpoint)?;
-
-    let split = staged.place_node(split_cell, Primitive::Split)?;
-    staged.route_connect(
-        SignalSource::NodeOut {
-            node: split,
-            port: 1,
-        },
-        SignalSink::BoundaryOut(out_port),
-        usize::from(max_relay_hops),
-    )?;
-
-    let border_cells: BTreeSet<Coord> = staged
-        .input_anchors()
-        .iter()
-        .chain(staged.output_anchors().iter())
-        .filter_map(|a| a.adjacent_border_cell(staged.shape()).ok())
-        .collect();
-    let half_span = (period + 2) / 2;
-    let mut cycle_cells: Option<Vec<Coord>> = None;
-    for &(horizontal_first, step_a, step_b) in &[
-        (true, 1i32, 1i32),
-        (true, 1, -1),
-        (true, -1, 1),
-        (true, -1, -1),
-        (false, 1, 1),
-        (false, 1, -1),
-        (false, -1, 1),
-        (false, -1, -1),
-    ] {
-        let mut loop_coords = Vec::with_capacity(2 * half_span - 1);
-        let mut ok = true;
-        for s in 1..half_span {
-            let (r, c) = if horizontal_first {
-                (
-                    i32::from(split_cell.row),
-                    i32::from(split_cell.col) + (s as i32) * step_a,
-                )
-            } else {
-                (
-                    i32::from(split_cell.row) + (s as i32) * step_a,
-                    i32::from(split_cell.col),
-                )
-            };
-            if r < 0
-                || c < 0
-                || r >= i32::from(staged.shape().rows)
-                || c >= i32::from(staged.shape().cols)
-            {
-                ok = false;
-                break;
-            }
-            loop_coords.push(Coord {
-                row: r as u16,
-                col: c as u16,
-            });
-        }
-        if !ok {
-            continue;
-        }
-        for s in (0..half_span).rev() {
-            let (r, c) = if horizontal_first {
-                (
-                    i32::from(split_cell.row) + step_b,
-                    i32::from(split_cell.col) + (s as i32) * step_a,
-                )
-            } else {
-                (
-                    i32::from(split_cell.row) + (s as i32) * step_a,
-                    i32::from(split_cell.col) + step_b,
-                )
-            };
-            if r < 0
-                || c < 0
-                || r >= i32::from(staged.shape().rows)
-                || c >= i32::from(staged.shape().cols)
-            {
-                ok = false;
-                break;
-            }
-            loop_coords.push(Coord {
-                row: r as u16,
-                col: c as u16,
-            });
-        }
-        if !ok || loop_coords.len() < period {
-            continue;
-        }
-        if loop_coords
-            .iter()
-            .any(|cell| staged.cell_node(*cell).is_some() || border_cells.contains(cell))
-        {
-            continue;
-        }
-        cycle_cells = Some(loop_coords);
-        break;
-    }
-
-    let mut delays = Vec::with_capacity(period);
-    if let Some(loop_coords) = cycle_cells {
-        for (j, &cell) in loop_coords.iter().take(period).enumerate() {
-            let init_val = mu[(period - 1 - j) % period];
-            let d = staged.place_node(cell, Primitive::Delay { init: init_val })?;
-            delays.push(d);
-        }
-    } else {
-        let mut prev_cell = split_cell;
-        for j in 0..period {
-            let init_val = mu[(period - 1 - j) % period];
-            let cell = staged
-                .nearest_empty_cell(prev_cell)
-                .ok_or(LatticeError::UnknownEndpoint)?;
-            let d = staged.place_node(cell, Primitive::Delay { init: init_val })?;
-            delays.push(d);
-            prev_cell = cell;
-        }
-    }
-    for i in 0..(period - 1) {
-        staged.route_connect(
-            SignalSource::NodeOut {
-                node: delays[i],
-                port: 0,
-            },
-            SignalSink::NodeIn {
-                node: delays[i + 1],
-                port: 0,
-            },
-            usize::from(max_relay_hops),
-        )?;
-    }
-    staged.route_connect(
-        SignalSource::NodeOut {
-            node: delays[period - 1],
-            port: 0,
-        },
-        SignalSink::NodeIn {
-            node: split,
-            port: 0,
-        },
-        usize::from(max_relay_hops),
-    )?;
-    staged.route_connect(
-        SignalSource::NodeOut {
-            node: split,
-            port: 0,
-        },
-        SignalSink::NodeIn {
-            node: delays[0],
-            port: 0,
-        },
-        usize::from(max_relay_hops),
-    )?;
-
-    Ok((staged, old_to_new, delays))
+    let (delays, _split) = build_autonomous_ring(&mut staged, period, mu, out_port);
+    (staged, old_to_new, delays)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn simulate_ring_juvenile_survival(
-    editable: &EditableLattice,
+    editable: &EditableCircuit,
     obs_window: &ObservationWindow,
-    staged: &LatticeCircuit,
+    staged: &Circuit,
     old_to_new: &[Option<NodeId>],
     ring_delay_nodes: &[NodeId],
     period: usize,
@@ -2211,11 +1605,6 @@ fn simulate_ring_juvenile_survival(
     economy_config: &EconomyConfig,
 ) -> bool {
     let j_ticks = economy_config.juvenile_ticks as usize;
-    let ring_shape = if staged.topology() == WiringTopology::WellMixed {
-        None
-    } else {
-        Some(staged.shape())
-    };
     let mut sim = editable.clone();
     if sim
         .recompile_preserving_state(staged.clone(), old_to_new)
@@ -2227,13 +1616,7 @@ fn simulate_ring_juvenile_survival(
         last_committed_code_bits: l_curr,
         ..MarginalDebtLedger::default()
     };
-    sim_ledger.on_sprout(
-        sim.circuit(),
-        sim.lattice().topology(),
-        ring_shape,
-        economy_config.split_code_tax,
-        old_to_new,
-    );
+    sim_ledger.on_sprout(sim.circuit(), economy_config.split_code_tax, old_to_new);
 
     let mut is_survivor = vec![false; sim.circuit().node_count()];
     for &mapped in old_to_new.iter().flatten() {
@@ -2351,23 +1734,22 @@ fn simulate_ring_juvenile_survival(
 
 /// Evaluates autonomous delay-ring candidates of period $p \in 2..=6$ under channel noise (§4.5).
 pub fn propose_autonomous_delay_ring(
-    editable: &EditableLattice,
+    editable: &EditableCircuit,
     obs_window: &ObservationWindow,
     growth_config: &GrowthConfig,
     economy_config: &EconomyConfig,
     budget: &mut TickBudget,
     out_port: u16,
-    max_relay_hops: u8,
 ) -> Option<AutonomousRingProposal> {
-    if editable.lattice().wire_delay() != WireDelayMode::Combinational {
+    if editable.circuit().wire_delay() != WireDelayMode::Combinational {
         return None;
     }
     let has_port_driver = editable
-        .lattice()
+        .circuit()
         .edges()
         .iter()
-        .any(|&(_, dst)| dst == SignalSink::BoundaryOut(out_port));
-    if has_port_driver && !port_uses_boundary_in(editable.lattice(), out_port) {
+        .any(|edge| edge.dst == SignalSink::BoundaryOut(out_port));
+    if has_port_driver && !port_uses_boundary_in(editable.circuit(), out_port) {
         return None;
     }
     let w_diag = growth_config.diagnostic_window;
@@ -2387,7 +1769,7 @@ pub fn propose_autonomous_delay_ring(
     }
     let mut curr_pred = vec![0u64; usize::from(editable.compiled().num_outputs())];
     let mut curr_scorer =
-        PointForecastScorer::new(editable.lattice().width(), economy_config.null_model);
+        PointForecastScorer::new(editable.circuit().width(), economy_config.null_model);
     let mut e_curr = 0usize;
     let mut e_curr_diag = 0usize;
     let mut flux_curr = 0.0;
@@ -2419,7 +1801,7 @@ pub fn propose_autonomous_delay_ring(
             flux_curr += score_with_reward_mode(
                 &mut curr_scorer,
                 economy_config.reward_mode,
-                editable.lattice().width(),
+                editable.circuit().width(),
                 p_curr,
                 p_truth,
             );
@@ -2431,25 +1813,14 @@ pub fn propose_autonomous_delay_ring(
         return None;
     }
 
-    let shape = if editable.lattice().topology() == WiringTopology::WellMixed {
-        None
-    } else {
-        Some(editable.lattice().shape())
-    };
-    let l_curr = circuit_code_bits_with_tax(
-        editable.circuit(),
-        editable.lattice().topology(),
-        shape,
-        0,
-        economy_config.split_code_tax,
-    );
+    let l_curr = circuit_code_bits_with_tax(editable.circuit(), 0, economy_config.split_code_tax);
     let j_curr =
-        l_curr + facts_code_bits(editable.lattice().width(), w_replay as u64, e_curr as u64);
+        l_curr + facts_code_bits(editable.circuit().width(), w_replay as u64, e_curr as u64);
 
     let mut best_ring: Option<(AutonomousRingProposal, f64)> = None;
 
     for p in 2..=6usize {
-        if p + 1 > growth_config.max_nodes {
+        if editable.circuit().node_count() + p + 1 > growth_config.max_nodes {
             continue;
         }
         let mut residue_counts = vec![BTreeMap::<u64, usize>::new(); p];
@@ -2475,18 +1846,12 @@ pub fn propose_autonomous_delay_ring(
             break;
         }
 
-        let Ok((staged, old_to_new, ring_delay_nodes)) =
-            build_autonomous_ring_lattice(editable.lattice(), p, &mu, out_port, max_relay_hops)
-        else {
-            continue;
-        };
+        let (staged, old_to_new, ring_delay_nodes) =
+            build_autonomous_ring_circuit(editable.circuit(), p, &mu, out_port);
         if staged.nodes().len() > growth_config.max_nodes {
             continue;
         }
-        let Ok(staged_circuit) = staged.lower() else {
-            continue;
-        };
-        let Ok(staged_compiled) = staged_circuit.compile() else {
+        let Ok(staged_compiled) = staged.compile() else {
             continue;
         };
 
@@ -2497,7 +1862,7 @@ pub fn propose_autonomous_delay_ring(
         {
             let reg_map = register_mapping(
                 editable.circuit(),
-                &staged_circuit,
+                &staged,
                 editable.compiled(),
                 &staged_compiled,
                 &old_to_new,
@@ -2513,7 +1878,7 @@ pub fn propose_autonomous_delay_ring(
         let start_tick = obs_window.start_tick();
         let mut reg_map_ok = true;
         for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
-            let Some(reg_idx) = explicit_delay_register_index(&staged_circuit, delay_node) else {
+            let Some(reg_idx) = explicit_delay_register_index(&staged, delay_node) else {
                 reg_map_ok = false;
                 break;
             };
@@ -2560,18 +1925,7 @@ pub fn propose_autonomous_delay_ring(
         if flux_ring <= flux_curr {
             continue;
         }
-        let ring_shape = if staged.topology() == WiringTopology::WellMixed {
-            None
-        } else {
-            Some(staged.shape())
-        };
-        let l_ring = circuit_code_bits_with_tax(
-            &staged_circuit,
-            staged.topology(),
-            ring_shape,
-            0,
-            economy_config.split_code_tax,
-        );
+        let l_ring = circuit_code_bits_with_tax(&staged, 0, economy_config.split_code_tax);
         let j_ring = l_ring + facts_code_bits(staged.width(), w_replay as u64, e_ring as u64);
         if j_ring >= j_curr {
             continue;
@@ -2598,7 +1952,7 @@ pub fn propose_autonomous_delay_ring(
         {
             best_ring = Some((
                 AutonomousRingProposal {
-                    lattice: staged,
+                    candidate_circuit: staged,
                     old_to_new,
                     ring_delay_nodes,
                     period: p,
@@ -2673,37 +2027,18 @@ mod tests {
 
     #[test]
     fn materialize_candidate_on_unconnected_port_correctly_negates_and_scales() {
-        use crate::structural::lattice::{BoundaryAnchor, GridShape, PerimeterSide};
         use crate::substrate::WireDelayMode;
 
-        let shape = GridShape::new(8, 8).unwrap();
-        let lattice = LatticeCircuit::new(
-            shape,
-            Width::BITS_2,
-            WireDelayMode::Combinational,
-            WiringTopology::WellMixed,
-            vec![BoundaryAnchor {
-                side: PerimeterSide::North,
-                offset: 3,
-            }],
-            vec![BoundaryAnchor {
-                side: PerimeterSide::North,
-                offset: 4,
-            }],
-        )
-        .unwrap();
+        let circuit = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
 
         // 1. Neg on unconnected port: -x mod 4
-        let mut neg_lat = lattice.clone();
+        let mut neg_circ = circuit.clone();
         materialize_candidate(
-            &mut neg_lat,
+            &mut neg_circ,
             &CandidateMotif::Neg(SourceFeature::BoundaryIn(0)),
             0,
-            4,
-        )
-        .unwrap();
-        let circuit = neg_lat.lower().unwrap();
-        let compiled = circuit.compile().unwrap();
+        );
+        let compiled = neg_circ.compile().unwrap();
         let mut state = ScalarState::new(&compiled);
         let mut out = [0u64];
         // For input = 1, -1 mod 4 = 3
@@ -2711,16 +2046,13 @@ mod tests {
         assert_eq!(out[0], 3, "Neg(1) mod 4 must be 3, got {}", out[0]);
 
         // 2. ScaleEqz on unconnected port: 3 * Eqz(x) mod 4
-        let mut scale_lat = lattice;
+        let mut scale_circ = circuit;
         materialize_candidate(
-            &mut scale_lat,
+            &mut scale_circ,
             &CandidateMotif::ScaleEqz(SourceFeature::BoundaryIn(0), 3),
             0,
-            4,
-        )
-        .unwrap();
-        let circuit2 = scale_lat.lower().unwrap();
-        let compiled2 = circuit2.compile().unwrap();
+        );
+        let compiled2 = scale_circ.compile().unwrap();
         let mut state2 = ScalarState::new(&compiled2);
         let mut out2 = [0u64];
         // For input = 0, Eqz(0) = 1, so 3 * 1 = 3 mod 4
@@ -2740,7 +2072,6 @@ mod tests {
 
     #[test]
     fn two_stage_synthesis_all_four_g1b1_tasks() {
-        use crate::structural::lattice::{BoundaryAnchor, GridShape, PerimeterSide};
         use crate::structural::live::node_output_values;
         use crate::substrate::WireDelayMode;
 
@@ -2753,22 +2084,7 @@ mod tests {
 
         for (width, period_seq, name) in tasks {
             let p_len = period_seq.len();
-            let shape = GridShape::new(8, 8).unwrap();
-            let lattice = LatticeCircuit::new(
-                shape,
-                width,
-                WireDelayMode::Combinational,
-                WiringTopology::WellMixed,
-                vec![BoundaryAnchor {
-                    side: PerimeterSide::North,
-                    offset: 3,
-                }],
-                vec![BoundaryAnchor {
-                    side: PerimeterSide::North,
-                    offset: 4,
-                }],
-            )
-            .unwrap();
+            let circuit = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
 
             let economy_config = EconomyConfig {
                 initial_energy: 10.0,
@@ -2784,7 +2100,7 @@ mod tests {
                 max_nodes: 32,
             };
 
-            let mut editable = EditableLattice::new(lattice, economy_config).unwrap();
+            let mut editable = EditableCircuit::new(circuit, economy_config).unwrap();
             let mut obs_window = ObservationWindow::new(1, 128);
             let mut diag = DiagnosticBuffer::new(64);
             let mut budget = TickBudget::new(100_000);
@@ -2823,7 +2139,6 @@ mod tests {
                 &economy_config,
                 &mut budget,
                 0,
-                4,
             )
             .unwrap();
             assert!(
@@ -2869,6 +2184,11 @@ mod tests {
                     .economy_mut()
                     .port_scorer_mut(0)
                     .observe(pred[0], truth);
+                for node in editable.economy_mut().nodes_mut() {
+                    if node.juvenile_ticks > 0 {
+                        node.juvenile_ticks -= 1;
+                    }
+                }
                 prev_sym = truth;
             }
             assert!(e1 < e0, "Task {name}: expected e1 ({e1}) < e0 ({e0})");
@@ -2882,7 +2202,6 @@ mod tests {
                 &economy_config,
                 &mut budget,
                 0,
-                4,
             )
             .unwrap();
             assert!(
@@ -2919,8 +2238,6 @@ mod tests {
 
     #[test]
     fn k64_width_safety_diagnose_and_materialize_without_overflow() {
-        use crate::structural::lattice::{BoundaryAnchor, GridShape, PerimeterSide};
-
         let w64 = Width::new(64).unwrap();
         let config = GrowthConfig {
             min_match_gain: 2,
@@ -2951,36 +2268,17 @@ mod tests {
             u64::MAX
         )));
 
-        let shape = GridShape::new(8, 8).unwrap();
-        let mut lattice = LatticeCircuit::new(
-            shape,
-            w64,
-            WireDelayMode::Combinational,
-            WiringTopology::WellMixed,
-            vec![BoundaryAnchor {
-                side: PerimeterSide::North,
-                offset: 3,
-            }],
-            vec![BoundaryAnchor {
-                side: PerimeterSide::North,
-                offset: 4,
-            }],
-        )
-        .unwrap();
+        let mut circuit = Circuit::new(w64, 1, 1, WireDelayMode::Combinational);
         materialize_candidate(
-            &mut lattice,
+            &mut circuit,
             &CandidateMotif::Identity(SourceFeature::BoundaryIn(0)),
             0,
-            4,
-        )
-        .unwrap();
+        );
         materialize_candidate(
-            &mut lattice,
+            &mut circuit,
             &CandidateMotif::ScaleEqz(SourceFeature::BoundaryIn(0), u64::MAX),
             0,
-            4,
-        )
-        .unwrap();
-        assert!(lattice.lower().unwrap().compile().is_ok());
+        );
+        assert!(circuit.compile().is_ok());
     }
 }

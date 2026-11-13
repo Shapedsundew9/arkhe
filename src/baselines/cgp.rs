@@ -16,7 +16,6 @@ use crate::baselines::{
 use crate::env::noise::uniform_u64_below;
 use crate::metrics::compute_mdl;
 use crate::rng::{SeedBank, StreamDomain};
-use crate::structural::WiringTopology;
 use crate::substrate::{
     Circuit, CompiledCircuit, NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width,
     WireDelayMode,
@@ -502,16 +501,8 @@ impl PredictorBaseline for CgpBaseline {
 
         let (mut parent_err, parent_total, parent_end_state) =
             evaluate_circuit_on_window(&self.best_compiled, &self.window, budget)?;
-        let mut parent_mdl = compute_mdl(
-            &self.best_circuit,
-            WiringTopology::WellMixed,
-            None,
-            0.0,
-            0,
-            parent_total,
-            parent_err,
-        )
-        .total_bits;
+        let mut parent_mdl =
+            compute_mdl(&self.best_circuit, 0.0, 0, parent_total, parent_err).total_bits;
         self.live_state = parent_end_state;
 
         let gens = if parent_err == 0 {
@@ -553,16 +544,7 @@ impl PredictorBaseline for CgpBaseline {
                     .expect("CGP lowered circuit satisfies §2.5 invariants");
                 let (c_err, c_total, c_state) =
                     evaluate_circuit_on_window(&child_comp, &self.window, budget)?;
-                let c_mdl = compute_mdl(
-                    &child_circ,
-                    WiringTopology::WellMixed,
-                    None,
-                    0.0,
-                    0,
-                    c_total,
-                    c_err,
-                )
-                .total_bits;
+                let c_mdl = compute_mdl(&child_circ, 0.0, 0, c_total, c_err).total_bits;
 
                 if c_mdl <= parent_mdl + 1e-12 {
                     if c_mdl < parent_mdl - 1e-12 {

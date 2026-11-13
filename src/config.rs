@@ -16,9 +16,7 @@ use crate::env::{
 };
 use crate::metrics::Scorecard;
 use crate::rng::{SeedBank, fnv1a_128_hex};
-use crate::structural::{
-    ArkheLearner, EconomyConfig, GridShape, GrowthConfig, GrowthError, LatticeError, WiringTopology,
-};
+use crate::structural::{ArkheLearner, EconomyConfig, GrowthConfig, GrowthError};
 use crate::substrate::{Circuit, Width, WireDelayMode};
 
 /// Current configuration schema version.
@@ -76,14 +74,10 @@ pub enum ConfigRunError {
     UnsupportedSchemaVersion(u32),
     /// `transient_warmup_ticks` must be strictly less than `horizon_ticks`.
     InvalidHorizon { horizon: u64, warmup: u64 },
-    /// Milestone 0 baseline runners only implement `WiringTopology::WellMixed` candidate search.
-    UnsupportedExperimentTopology(WiringTopology),
     /// Generator construction failed.
     Generator(GeneratorError),
     /// Noise configuration failed validation.
     Noise(NoiseError),
-    /// Lattice operation or coordinate mapping failed.
-    Lattice(LatticeError),
     /// Growth or diagnostics operation failed.
     Growth(GrowthError),
     /// TOML/JSON serialisation error.
@@ -103,13 +97,8 @@ impl fmt::Display for ConfigRunError {
                 f,
                 "invalid horizon_ticks={horizon} with transient_warmup_ticks={warmup} (expected warmup < horizon)"
             ),
-            Self::UnsupportedExperimentTopology(topo) => write!(
-                f,
-                "unsupported wiring_topology {topo:?} in M0 baseline runner (only WellMixed is implemented in M0)"
-            ),
             Self::Generator(e) => write!(f, "generator error: {e}"),
             Self::Noise(e) => write!(f, "noise error: {e}"),
-            Self::Lattice(e) => write!(f, "lattice error: {e:?}"),
             Self::Growth(e) => write!(f, "growth error: {e:?}"),
             Self::Serialization(e) => write!(f, "serialization error: {e}"),
         }
@@ -130,12 +119,6 @@ impl From<NoiseError> for ConfigRunError {
     }
 }
 
-impl From<LatticeError> for ConfigRunError {
-    fn from(value: LatticeError) -> Self {
-        Self::Lattice(value)
-    }
-}
-
 impl From<GrowthError> for ConfigRunError {
     fn from(value: GrowthError) -> Self {
         Self::Growth(value)
@@ -150,9 +133,6 @@ pub struct SubstrateConfig {
     /// Combinational vs. hop-delayed wire mode.
     #[serde(default)]
     pub wire_delay: WireDelayMode,
-    /// Spatial wiring locality constraint.
-    #[serde(default)]
-    pub wiring_topology: WiringTopology,
 }
 
 /// Environment configuration block in [`ExperimentConfig`].
@@ -213,12 +193,6 @@ pub enum BaselineConfig {
     },
     /// Online gradient-free structural learning from an empty spatial lattice.
     ArkheM1 {
-        #[serde(default = "default_arkhe_grid_dim")]
-        grid_rows: u16,
-        #[serde(default = "default_arkhe_grid_dim")]
-        grid_cols: u16,
-        #[serde(default = "default_max_relay_hops")]
-        max_relay_hops: u8,
         #[serde(default)]
         economy: EconomyConfig,
         #[serde(default)]
@@ -226,12 +200,6 @@ pub enum BaselineConfig {
     },
 }
 
-const fn default_arkhe_grid_dim() -> u16 {
-    8
-}
-const fn default_max_relay_hops() -> u8 {
-    4
-}
 const fn default_fact_window() -> usize {
     128
 }
@@ -292,8 +260,6 @@ pub struct GroundTruthReport {
 /// Detailed online telemetry from [`crate::structural::learner::ArkheLearner`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ArkheM1Telemetry {
-    pub grid_rows: u16,
-    pub grid_cols: u16,
     pub final_node_count: usize,
     pub final_split_count: usize,
     pub final_delay_count: usize,
@@ -477,13 +443,6 @@ pub fn execute_experiment(config: &ExperimentConfig) -> Result<RunReport, Config
             warmup: config.environment.transient_warmup_ticks,
         });
     }
-    if config.substrate.wiring_topology != WiringTopology::WellMixed
-        && !matches!(config.baseline, BaselineConfig::ArkheM1 { .. })
-    {
-        return Err(ConfigRunError::UnsupportedExperimentTopology(
-            config.substrate.wiring_topology,
-        ));
-    }
 
     let canonical_json =
         serde_json::to_vec(config).map_err(|e| ConfigRunError::Serialization(e.to_string()))?;
@@ -551,29 +510,14 @@ pub fn execute_experiment(config: &ExperimentConfig) -> Result<RunReport, Config
             *max_nodes,
             *fact_window,
         )),
-        BaselineConfig::ArkheM1 {
-            grid_rows,
-            grid_cols,
-            max_relay_hops,
-            economy,
-            growth,
-        } => Box::new(ArkheLearner::new_with_spatial(
-            width,
-            channels,
-            wire_delay,
-            config.substrate.wiring_topology,
-            GridShape::new(*grid_rows, *grid_cols)?,
-            *max_relay_hops,
-            *economy,
-            *growth,
-            seeds,
+        BaselineConfig::ArkheM1 { economy, growth } => Box::new(ArkheLearner::new_with_config(
+            width, channels, wire_delay, *economy, *growth, seeds,
         )?),
     };
 
     let scorecard = run_prequential_harness(
         &mut noisy_env,
         predictor.as_mut(),
-        config.substrate.wiring_topology,
         config.environment.horizon_ticks,
         config.environment.transient_warmup_ticks,
         config.budget.max_eval_ticks,

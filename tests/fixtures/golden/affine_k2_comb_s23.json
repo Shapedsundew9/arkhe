@@ -18,7 +18,7 @@
       "details": "sprout_events=2"
     }
   ],
-  "trajectory_digest_fnv1a": "5cfa85360b90bd57fe03540a5450f118",
+  "trajectory_digest_fnv1a": "033ed44f015d20f5b81c46ade4906e92",
   "final_circuit_nodes": [
     "Eqz",
     "Add",

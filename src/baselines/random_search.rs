@@ -12,7 +12,6 @@ use crate::baselines::{
 use crate::env::noise::uniform_u64_below;
 use crate::metrics::compute_mdl;
 use crate::rng::{SeedBank, StreamDomain};
-use crate::structural::WiringTopology;
 use crate::substrate::{
     Circuit, CompiledCircuit, NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width,
     WireDelayMode,
@@ -221,16 +220,8 @@ impl PredictorBaseline for RandomSearchBaseline {
 
         let (inc_mismatches, inc_total, inc_state) =
             evaluate_circuit_on_window(&self.best_compiled, &self.window, budget)?;
-        let mut best_mdl = compute_mdl(
-            &self.best_circuit,
-            WiringTopology::WellMixed,
-            None,
-            0.0,
-            0,
-            inc_total,
-            inc_mismatches,
-        )
-        .total_bits;
+        let mut best_mdl =
+            compute_mdl(&self.best_circuit, 0.0, 0, inc_total, inc_mismatches).total_bits;
         self.live_state = inc_state;
 
         // Only burn search budget when incumbent still makes errors on the window (or occasionally to compress).
@@ -255,16 +246,7 @@ impl PredictorBaseline for RandomSearchBaseline {
             else {
                 break;
             };
-            let mdl = compute_mdl(
-                &cand,
-                WiringTopology::WellMixed,
-                None,
-                0.0,
-                0,
-                total,
-                mismatches,
-            )
-            .total_bits;
+            let mdl = compute_mdl(&cand, 0.0, 0, total, mismatches).total_bits;
             if mdl < best_mdl {
                 best_mdl = mdl;
                 self.best_circuit = cand;
