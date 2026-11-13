@@ -2,6 +2,7 @@
 
 pub mod m1b;
 pub mod panel;
+pub mod profile;
 pub mod stats;
 
 use serde::{Deserialize, Serialize};

@@ -133,6 +133,24 @@ pub enum Commands {
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
     },
+    /// Profiles compute time (`us/tick`), replay eval ticks, and cliff/bound counters across circuit scale $(N, K)$ (B5).
+    ProfileCompute {
+        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
+        #[arg(long, default_value_t = 0)]
+        seed_offset: u32,
+        /// Number of master seeds evaluated per `(regime, N, K)` cell and endogenous workload.
+        #[arg(long, default_value_t = 5)]
+        seeds: u32,
+        /// Controlled `(N, K)` sweep simulation horizon in ticks.
+        #[arg(long, default_value_t = verify_m1::profile::DEFAULT_PROFILE_HORIZON)]
+        horizon: u64,
+        /// Endogenous online neurogenesis simulation horizon in ticks.
+        #[arg(long, default_value_t = verify_m1::profile::DEFAULT_ENDOGENOUS_HORIZON)]
+        endogenous_horizon: u64,
+        /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
+        #[arg(long, alias = "allow-holdout", default_value_t = false)]
+        holdout: bool,
+    },
 }
 
 /// Returns the crate banner string.
@@ -329,6 +347,23 @@ where
                     Err("Milestone 1 combined verification failed one or more gates".into())
                 }
             }
+        }
+        Some(Commands::ProfileCompute {
+            seed_offset,
+            seeds,
+            horizon,
+            endogenous_horizon,
+            holdout,
+        }) => {
+            let report = verify_m1::profile::run_compute_profile(
+                seed_offset,
+                seeds,
+                horizon,
+                endogenous_horizon,
+                holdout,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
         }
     }
 }
