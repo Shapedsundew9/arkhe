@@ -3,7 +3,7 @@
 //! Implements Milestone 0 (`M0 — Simulator and yardstick`) of the Foundational Research Charter v2:
 //! - [`rng`]: Domain-separated portable `ChaCha8Rng` streams and deterministic fingerprinting.
 //! - [`substrate`]: Exact $\mathbb{Z}_{2^k}$ arithmetic, Level-0 primitives, §2.5 invariants, and evaluators.
-//! - [`structural`]: 2D spatial lattice coordinates, perimeter ports, and wiring-topology lowering.
+//! - [`structural`]: Coordinate-free graph morphogenesis, metabolic economy, sensitivity credit, and online learner.
 //! - [`env`]: Finite-state benchmark tiers (`T1`, `T3b`, `T3c`), noise, exact $\varepsilon$-machines, and Reeds–Sloane synthesis.
 //! - [`metrics`]: Surprisal null models, Minimum Description Length ($L$), limit-cycle/basin inspection, and scorecards.
 //! - [`baselines`]: Compute-matched prequential baseline harness (`RandomSearch`, `CGP`, `CTW`, `ReedsSloane`, `Exhaustive`).

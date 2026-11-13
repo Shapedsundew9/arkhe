@@ -60,14 +60,38 @@ Read `.shared/ai/core/common-instructions.md`.
 1. **Topology is coordinate-free.** `substrate::Circuit` is the only topology representation.
    Do not reintroduce grid shapes, coordinates, relay hops, or perimeter anchors. Locality and
    fan-out are priced only through description length (`L(C)`, `split_code_tax`).
-2. **Every constant is classified** as derived, pre-registered scientific parameter, or compute
-   guardrail, in the inventory in `doc/coordinate_free_scaling_plan.md` §2.1 (or its successor).
-   Adding or changing a constant requires updating that inventory.
+2. **Every constant is classified** as derived, pre-registered scientific parameter, search bound,
+   or compute guardrail in the canonical inventory in `doc/parameter_inventory.md` (migrated
+   from `doc/coordinate_free_scaling_plan.md` §2.1). Adding or changing a constant requires updating
+   that inventory.
 3. **Every limit is observable.** Any cap, guardrail, clip, or window truncation must emit a named
    telemetry counter when it binds. Guardrails must never bind in an accepted run.
 4. **Behavior-preserving refactors are proven by golden traces** (`tests/golden_traces.rs`).
    Re-blessing fixtures requires a written rationale and is only allowed for intentional behavior changes.
-5. **Hitting a structural limit or starvation cliff means STOP and discuss** the scaling rule with
-   the user. Do not apply local workarounds or retune constants.
+5. **Stop and escalate** (write a blocker report per `doc/templates/blocker_report.md`, then wait
+   for the user) when any of these occur:
+   - a structural limit, guardrail, starvation cliff, or search bound binds;
+   - a pre-registered gate fails on development seeds and the cause is not an implementation bug
+     with a demonstrable fix;
+   - a fix would add, remove, or change a constant, a threshold, a gate, a test assertion, or a
+     golden fixture;
+   - two consecutive fix attempts for the same failure brought no new diagnostic understanding;
+   - the charter, a milestone plan, the inventory, and the code disagree;
+   - a theoretical argument suggests the target is unreachable under the current rules.
 6. **Multi-bank acceptance uses pooled confidence bounds plus a homogeneity test**, never compound
    per-bank hurdles.
+7. **Decision rights.** Agents decide engineering details that preserve behavior. Only the user
+   decides scientific parameters and their values, gate thresholds, seed banks, evidence retirement,
+   golden re-blessing, charter text, kill-criterion interpretation, and milestone sign-off. See
+   Charter §7.1.
+8. **Exploratory vs. confirmatory.** Before a threshold is pre-registered, runs are exploratory:
+   they measure and report and never gate. Confirmatory runs use only thresholds the user has
+   signed off. Never tune toward an exploratory number.
+9. **Feasibility before targets.** Every gate threshold must cite a theoretical bound or a measured
+   baseline that shows it is reachable. A threshold without one is a characterisation metric, not
+   a gate.
+10. **Definition of done.** A plan item is done only when it links to evidence: a test name, a commit,
+    or a recorded command plus its output. "Complete" with no evidence is a defect.
+11. **Kill criteria are results.** Reaching a charter kill or revisit criterion is a finding to report,
+    not an obstacle to engineer around. One phase per commit; golden traces verified at each
+    behavior-preserving commit.

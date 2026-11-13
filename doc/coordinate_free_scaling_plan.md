@@ -1,7 +1,7 @@
 # Coordinate-Free Architecture and Principled Parameter Scaling Plan
 
 **Date:** 2026-11-08 (updated 2026-11-13)  
-**Status:** Active pre-Milestone 2 specification. The Phases 1–4 refactor landed as an uncommitted diff on top of `2d009b0` (`tag: m1-final-lattice`), with open implementation gaps, pending user decisions (`Q1`–`Q4`), and provenance recovery tracked in [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md). Section 2.1 serves as the temporary Constants Inventory cited by `.github/copilot-instructions.md` Rule 2 until `doc/parameter_inventory.md` is split out under Readiness C4.  
+**Status:** **Completed, historical.** The coordinate-free Phases 1–4 refactor is committed (`deb200a` on top of `2d009b0` `tag: m1-final-lattice`). The canonical constants inventory has moved to [parameter_inventory.md](parameter_inventory.md) (referenced by `.github/copilot-instructions.md` Rule 2), and remaining implementation gaps / M2 readiness items are tracked in [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md).  
 **Scope:** Separate graph morphogenesis from the retired 2D grid. Replace ungrounded scalar constants with scaling rules, or reclassify them explicitly. Make every remaining limit observable, so that parameter cliffs show up instead of failing silently.
 
 ---
@@ -87,9 +87,9 @@ Retirement protocol: (1) Charter Decision Record #30 makes topology retirement s
 3. **Reduction to M1.** Where possible, a new rule must reduce *exactly* to M1 behavior at M1 configurations (`K = 1`, `k ∈ {1, 2}`). That makes it checkable by golden traces. A rule that cannot reduce this way is behavior-changing and goes in Phase 3.
 4. **No post-hoc fitting.** Choosing a multiplier because it "recovers the historical constant" is fitting, not grounding. Any rule that still has a free multiplier is a pre-registered parameter and needs a sensitivity sweep.
 
-### 2.1 Constants inventory (temporary home pending Readiness C4)
+### 2.1 Constants inventory (historical snapshot; migrated to [parameter_inventory.md](parameter_inventory.md))
 
-*See [pre_milestone_2_readiness_plan.md](pre_milestone_2_readiness_plan.md) §1.1 (`F1`–`F13`) for the audit behind each `Implementation` status below. Splitting this table into standalone `doc/parameter_inventory.md` is tracked under Readiness `C4`.*
+*Historical audit snapshot migrated to [parameter_inventory.md](parameter_inventory.md) under Readiness `C4`. Retain this table read-only as part of the completed Phase 1–4 specification; update [parameter_inventory.md](parameter_inventory.md) for active work.*
 
 | Constant | Current value / location | Class | Target Action | Implementation | Evidence / Next Step |
 | :--- | :--- | :--- | :--- | :---: | :--- |
