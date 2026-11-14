@@ -389,7 +389,7 @@ When `verify-m2a` expanded the active scale axes ($\tau \le 12$, multi-channel $
 
 ## 9. Milestone 2a Implementation, Cochran Fallback, & Verification Record (`2026-11-14`)
 
-All four Milestone 2a phases (`691ad6f`, `e9fc185`, `5886135`, `9fc8689`, `918cb02`, and Phase 4) landed with **`source_tree_fnv1a128 = 19c86928ef76420ed887c0ead7a97abe`** (`rustc 1.99.1 (58cf8f9c3 2026-10-13)`, `x86_64-unknown-linux-gnu`, `cargo_lock_fnv1a128 = 8d29cd24b1fbdbb743cf5c0b3933b22d`), `cargo fmt --check` clean, `cargo clippy --all-targets --all-features -- -D warnings` clean (`0` warnings), and `cargo test --locked` passing `142/142` tests (`105` unit + `37` integration tests including bit-identical `golden_traces`).
+All four Milestone 2a phases (`691ad6f`, `e9fc185`, `5886135`, `9fc8689`, `918cb02`, and `aa6fb6d`) landed with **`source_tree_fnv1a128 = 19c86928ef76420ed887c0ead7a97abe`** (`rustc 1.99.1 (58cf8f9c3 2026-10-13)`, `x86_64-unknown-linux-gnu`, `cargo_lock_fnv1a128 = 8d29cd24b1fbdbb743cf5c0b3933b22d`), `cargo fmt --check` clean, `cargo clippy --all-targets --all-features -- -D warnings` clean (`0` warnings), and `cargo test --locked` passing `142/142` tests (`105` unit + `37` integration tests including bit-identical `golden_traces`).
 
 ### 9.1 Statistical Homogeneity & `G2A.4b`/`G2A.5` Resolution
 
@@ -404,6 +404,7 @@ All four Milestone 2a phases (`691ad6f`, `e9fc185`, `5886135`, `9fc8689`, `918cb
 | M2a dev fast slice (`0..20`) | `target/release/arkhe verify-m2a --seed-offset 0 --seeds 20` | `all_passed: true` | `G2A.1`–`G2A.4`: **`20/20`** (`max_g4b_dev=0.010456 <= 0.040`); `G2A.5`: **`19/20`** (`min_margin=0.499830 >= 0.25`) | `0` | `0` | `1m51.943s` | `reserve_clipped_count=665,824`, `reserve_mismatch_floored=0`, `candidate_undecidable=48,303`, `lag_horizon_bound=15,197`, `lag_deepening_steps=33,118`, `sprout_budget_exhausted=93,819` |
 | M2a dev multi-bank (`20..1020`, `50` banks × `20` seeds) | `target/release/arkhe verify-m2a --banks 50 --seed-offset 20 --seeds 20` | `all_passed: true` | `G2A.1`–`3`: **`50/50` banks (`1000/1000`, `CP99=0.995405`, $\chi^2=0.0, p=1.0$)**; `G2A.4`: **`50/50` (`990/1000`, `CP99=0.979957`, $p=1.00000$, `max_g4b=0.007207`)**; `G2A.5`: **`50/50` (`983/1000`, `CP99=0.970871`, $\chi^2=75.4593$, $p=0.01997$, `min_margin=0.904210`)** | `0` | `0` | `81m58.409s` | `reserve_clipped_count=33,533,643`, `reserve_mismatch_floored=0`, `candidate_undecidable=2,427,364`, `candidate_list_truncated=2,074,633`, `lag_horizon_bound=758,091`, `ring_period_bound=0`, `lag_deepening_steps=1,666,583`, `sprout_budget_exhausted=4,692,105` |
 | M2a fresh confirmation (`20020..=20039`) | `target/release/arkhe verify-m2a --seed-offset 20020 --seeds 20` | `all_passed: true` | `G2A.1`–`G2A.5`: all **`20/20` (`1.0000`)** (`max_g4b_dev=0.007992 <= 0.040`, `min_margin=0.919261 >= 0.25`) | `0` | `0` | `1m52.358s` | `reserve_clipped_count=674,402`, `reserve_mismatch_floored=0`, `candidate_undecidable=48,916`, `lag_horizon_bound=15,165`, `lag_deepening_steps=33,174`, `sprout_budget_exhausted=94,208` |
+| M2a single-shot holdout (`30000..=30019`, `aa6fb6d`, `git_dirty=false`) | `target/release/arkhe verify-m2a --seed-offset 30000 --seeds 20 --holdout` | `all_passed: true` | `G2A.1`–`G2A.5`: all **`20/20` (`1.0000`, `CP99=0.794328`)** (`max_g4b_dev=0.009303 <= 0.040`, `min_margin=0.895113 >= 0.25`) | `0` | `0` | `1m53.165s` | `reserve_clipped_count=675,584` (`1,184,947.79` bits), `reserve_mismatch_floored=0`, `candidate_undecidable=48,612`, `candidate_list_truncated=41,497`, `lag_horizon_bound=15,174`, `ring_period_bound=0`, `lag_deepening_steps=33,768`, `sprout_budget_exhausted=94,084` |
 
 ### 9.3 `G2A.5` Equal-Compute Multi-Bank Benchmark (`20..1020`, `1,000` seeds/task, $T = 2000$, Budget $= 200,000$)
 
@@ -416,4 +417,15 @@ Target-channel mean prequential KT residual bits/symbol [`clean_match_rate`] (pl
 | `CrossMulEqz(d=1,2,k=2)` (NL) | `0.0041` [`1.0000`] (`199,840`) | `1.0672` [`0.7891`] (`199,892`) | `0.9083` [`0.8309`] (`199,941`) | `0.9463` [`0.8260`] (`0`) | `2.0157` [`0.2380`] (`0`) | `0.4877` [`0.9287`] (`108,000`) | `0.1009` [`0.9890`] (`31,880`) |
 | `CrossAddEqz(d=1,2,k=2)` (NL) | `0.0041` [`1.0000`] (`199,840`) | `1.1573` [`0.7667`] (`199,892`) | `1.1573` [`0.7667`] (`199,938`) | `2.0035` [`0.2573`] (`0`) | `1.0897` [`0.7867`] (`0`) | `0.7816` [`0.8667`] (`108,000`) | `1.0858` [`0.7768`] (`31,880`) |
 
-- **Holdout Seed Governance:** M1 holdout (`10000..=10019`), M2a holdout (`30000..=30019`), and M2b holdout (`40000..=40019`) were **never touched**.
+### 9.4 `G2A.5` Single-Shot Holdout Benchmark (`30000..=30019`, `20` seeds/task, $T = 2000$, Budget $= 200,000$)
+
+Target-channel mean prequential KT residual bits/symbol [`clean_match_rate`] (plus mean compute ticks consumed over $T=2000$; frozen clean binary `aa6fb6d`, `git_dirty = false`):
+
+| Task ($k$-bit) | `ArkheM1` (`CandidateHistoryReplay`) | `RandomSearch` (`CandidateHistoryReplay`) | `CGP` (`CandidateHistoryReplay`) | `CTW` (`AnalyticalUnmetered`) | `ReedsSloane` (`AnalyticalUnmetered`) | `CrossChannelCTW` (`ContextTreeDepthSteps`) | `RnnBptt` (`BpttUnrollSteps`) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `CrossSum(d=1,2,k=1)` | `0.0041` [`1.0000`] (`199,900`) | `1.0171` [`0.4867`] (`199,892`) | `0.9610` [`0.5194`] (`199,952`) | `1.0034` [`0.5100`] (`0`) | `0.0041` [`1.0000`] (`0`) | `0.0041` [`1.0000`] (`54,000`) | `0.4613` [`0.8332`] (`31,880`) |
+| `CrossSum(d=1,2,k=2)` | `0.0041` [`1.0000`] (`199,904`) | `1.3037` [`0.5169`] (`199,892`) | `1.6081` [`0.3992`] (`199,942`) | `2.0044` [`0.2493`] (`0`) | `0.0041` [`1.0000`] (`0`) | `1.9502` [`0.3733`] (`108,000`) | `2.0056` [`0.2544`] (`31,880`) |
+| `CrossMulEqz(d=1,2,k=2)` (NL) | `0.0041` [`1.0000`] (`199,840`) | `1.0912` [`0.7818`] (`199,892`) | `0.8992` [`0.8347`] (`199,935`) | `0.9463` [`0.8260`] (`0`) | `2.0157` [`0.2380`] (`0`) | `0.4877` [`0.9287`] (`108,000`) | `0.0812` [`0.9922`] (`31,880`) |
+| `CrossAddEqz(d=1,2,k=2)` (NL) | `0.0041` [`1.0000`] (`199,840`) | `1.1573` [`0.7667`] (`199,892`) | `1.1573` [`0.7667`] (`199,945`) | `2.0035` [`0.2573`] (`0`) | `1.0897` [`0.7867`] (`0`) | `0.7816` [`0.8667`] (`108,000`) | `1.1835` [`0.7464`] (`31,880`) |
+
+- **Holdout Seed Governance:** M2a single-shot holdout (`30000..=30019`) executed once (`all_passed: true`, `excluded_cases: 0`); M1 holdout (`10000..=10019`) and M2b holdout (`40000..=40019`) remain **never touched**.

@@ -1,7 +1,7 @@
 # Milestone M2a: Cross-Channel Predictive Coupling Pre-Registration Plan
 
 **Date:** 2026-11-13 (pre-registration finalized 2026-11-14)  
-**Status:** `Pre-registered & approved (S1–S5, S3-A, S4-A, C1-a, C2-a ratified 2026-11-13; S4-A baseline metering/architecture & G2A.2(b) TicksPerHop causal lags ratified 2026-11-14; ready for Phase 1–4 execution)`  
+**Status:** `Attained & signed off via single-shot holdout 30000..=30019 (2026-11-14; commit aa6fb6d, source_tree_fnv1a128 = 19c86928ef76420ed887c0ead7a97abe; all 5 gates 20/20, excluded_cases = 0)`  
 **Charter Links:** [Foundational Research Charter v3](foundational_research_charter_v3.md), [Parameter Inventory](parameter_inventory.md), [Research Record](research_record.md)
 
 ## 1. Charter Hypotheses & Decision Rights
@@ -166,6 +166,11 @@ Updates for [`doc/parameter_inventory.md`](parameter_inventory.md) (§4 pre-regi
     - `G2A.4`: `50/50` banks, `990/1000` (`0.9900`), `CP99 LB = 0.979957 >= 0.85`, $\chi^2 = 40.4040$, exact permutation $p = 1.00000$, `max_g2a4b_mean_h_reactive_dev_bits = 0.007207 <= 0.040`
     - `G2A.5`: `50/50` banks, `983/1000` (`0.9830`), `CP99 LB = 0.970871 >= 0.85`, $\chi^2 = 75.4593$, exact permutation $p = 0.01997 >= 0.01$, `min_required_mean_margin_bits = 0.904210 >= 0.25` (`ArkheM1` = `1.0000` clean match across all `4,000` panel runs)
   - **Fresh confirmation bank (`20020..=20039`):** `all_passed: true`, `excluded_cases: 0`, `sprout_blocked_max_nodes: 0` (`G2A.1`–`G2A.5` all **`20/20` (`1.0000`)**, `max_g2a4b_mean_h_reactive_dev_bits = 0.007992 <= 0.040`, `min_required_mean_margin_bits = 0.919261 >= 0.25`; wall `1m52.358s`).
-- **Single-shot holdout outcome:** `Untouched — 30000..=30019 (M2a holdout), 10000..=10019 (M1 holdout), and 40000..=40019 (M2b holdout) remain strictly untouched pending explicit user holdout authorization`
+- **Single-shot holdout outcome (`30000..=30019`, executed once `2026-11-14` on clean commit `aa6fb6d8080cbd865e2d036b770e7c6c75c5652e`, `git_dirty = false`):**
+  - Command: `./target/release/arkhe verify-m2a --seed-offset 30000 --seeds 20 --holdout` (`1m53.165s` wall, `15m53.910s` user, `0m0.236s` sys; `all_passed: true`, `excluded_cases: 0`, `sprout_blocked_max_nodes: 0`, `reserve_mismatch_floored: 0`).
+  - Gate pass counts: **`G2A.1` `20/20` (`1.0000`, `LB99 = 0.794328`), `G2A.2` `20/20` (`1.0000`), `G2A.3` `20/20` (`1.0000`), `G2A.4` `20/20` (`1.0000`, `max_g2a4b_mean_h_reactive_dev_bits = 0.009303 <= 0.040`), `G2A.5` `20/20` (`1.0000`, `min_required_mean_margin_bits = 0.895113 >= 0.25`)**.
+  - Cliff counters: `reserve_clipped_count = 675,584` (`1,184,947.79` bits), `reserve_mismatch_floored = 0`, `sprout_blocked_max_nodes = 0`, `candidate_undecidable = 48,612`, `candidate_list_truncated = 41,497`, `lag_horizon_bound = 15,174`, `ring_period_bound = 0`, `lag_deepening_steps = 33,768`, `sprout_budget_exhausted = 94,084`.
+  - Holdout `G2A.5` per-task breakdown (`mean KT b/sym [clean match]`, `20` seeds): `CrossSum(d=1,2,k=1)` `Arkhe=0.0041[1.0000]` vs `RS=1.0171`, `CGP=0.9610`, `CTW=1.0034`, `BM=0.0041`, `CrossCTW=0.0041`, `RNN=0.4613`; `CrossSum(d=1,2,k=2)` `Arkhe=0.0041[1.0000]` vs `RS=1.3037`, `CGP=1.6081`, `CTW=2.0044`, `BM=0.0041`, `CrossCTW=1.9502`, `RNN=2.0056`; `CrossMulEqz(d=1,2,k=2)` `Arkhe=0.0041[1.0000]` vs `RS=1.0912`, `CGP=0.8992`, `CTW=0.9463`, `BM=2.0157`, `CrossCTW=0.4877`, `RNN=0.0812`; `CrossAddEqz(d=1,2,k=2)` `Arkhe=0.0041[1.0000]` vs `RS=1.1573`, `CGP=1.1573`, `CTW=2.0035`, `BM=1.0897`, `CrossCTW=0.7816`, `RNN=1.1835`.
+  - Untouched ranges: `10000..=10019` (M1 holdout) and `40000..=40019` (M2b holdout) remain strictly untouched.
 - **Source digest (`source_tree_fnv1a128`):** `19c86928ef76420ed887c0ead7a97abe`
-- **Independent review status:** `Dev & confirmation suites passed; awaiting user sign-off / holdout authorization`
+- **Independent review status:** `Milestone M2a verified & closed on single-shot holdout 30000..=30019 (commit aa6fb6d)`
