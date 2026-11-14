@@ -1736,7 +1736,13 @@ struct BaselineReplayMetrics {
     e_curr_by_port: Vec<usize>,
     start_idx: usize,
     eval_start_idx: usize,
+    eval_offset: usize,
     w_replay: usize,
+    num_inputs: usize,
+    can_fast_comb: bool,
+    norm_inputs: Vec<u64>,
+    out_pred_trace: Vec<u64>,
+    out_truth_trace: Vec<u64>,
     survivor_map: Vec<Option<NodeId>>,
 }
 
@@ -1753,13 +1759,13 @@ fn replay_current_baseline(
     let w_replay = obs_window.len().min(2 * w_diag);
     let start_idx = obs_window.len() - w_replay;
     let eval_start_idx = obs_window.len() - w_diag;
+    let width = editable.circuit().width();
 
-    let max_sym_count = frequencies(obs_window.frames()[eval_start_idx..].iter().map(|f| {
-        editable
-            .circuit()
-            .width()
-            .normalize(f[usize::from(out_port)])
-    }))
+    let max_sym_count = frequencies(
+        obs_window.frames()[eval_start_idx..]
+            .iter()
+            .map(|f| width.normalize(f[usize::from(out_port)])),
+    )
     .values()
     .copied()
     .max()
@@ -1773,6 +1779,7 @@ fn replay_current_baseline(
         let _ = curr_state.set_registers(editable.compiled(), snap_regs);
     }
     let num_outputs = usize::from(editable.compiled().num_outputs());
+    let num_inputs = usize::from(editable.compiled().num_inputs());
     let driven_ports: Vec<bool> = (0..num_outputs)
         .map(|q| {
             let port_u16 = u16::try_from(q).expect("output port fits in u16");
@@ -1785,8 +1792,29 @@ fn replay_current_baseline(
         .collect();
     let mut curr_pred = vec![0u64; num_outputs];
     let mut e_curr_by_port = vec![0usize; num_outputs];
-    let mut curr_scorer =
-        PointForecastScorer::new(editable.circuit().width(), economy_config.null_model);
+    let mut curr_scorer = PointForecastScorer::new(width, economy_config.null_model);
+
+    let can_fast_comb = editable.circuit().wire_delay() == WireDelayMode::Combinational
+        && is_epoch_1
+            == !driven_ports
+                .get(usize::from(out_port))
+                .copied()
+                .unwrap_or(false);
+    let mut norm_inputs = if can_fast_comb {
+        Vec::with_capacity(w_replay * num_inputs)
+    } else {
+        Vec::new()
+    };
+    let mut out_pred_trace = if can_fast_comb {
+        Vec::with_capacity(w_replay)
+    } else {
+        Vec::new()
+    };
+    let mut out_truth_trace = if can_fast_comb {
+        Vec::with_capacity(w_replay)
+    } else {
+        Vec::new()
+    };
 
     let mut e_curr = 0usize;
     let mut flux_curr = 0.0;
@@ -1805,6 +1833,13 @@ fn replay_current_baseline(
             curr_pred[usize::from(out_port)]
         };
         let p_truth = truth[usize::from(out_port)];
+        if can_fast_comb {
+            for &inp in input.iter().take(num_inputs) {
+                norm_inputs.push(width.normalize(inp));
+            }
+            out_pred_trace.push(p_curr);
+            out_truth_trace.push(p_truth);
+        }
         let reward_curr = if is_epoch_1 {
             curr_scorer.null_model_mut().observe_and_surprisal(p_truth);
             0.0
@@ -1812,7 +1847,7 @@ fn replay_current_baseline(
             score_with_reward_mode(
                 &mut curr_scorer,
                 economy_config.reward_mode,
-                editable.circuit().width(),
+                width,
                 p_curr,
                 p_truth,
             )
@@ -1831,7 +1866,7 @@ fn replay_current_baseline(
     }
 
     let l_curr = circuit_code_bits_with_tax(editable.circuit(), 0, economy_config.split_code_tax);
-    let facts_curr = facts_code_bits(editable.circuit().width(), w_diag as u64, e_curr as u64);
+    let facts_curr = facts_code_bits(width, w_diag as u64, e_curr as u64);
     let survivor_map: Vec<Option<NodeId>> = (0..editable.circuit().node_count())
         .map(|i| Some(NodeId(i as u32)))
         .collect();
@@ -1846,7 +1881,13 @@ fn replay_current_baseline(
         e_curr_by_port,
         start_idx,
         eval_start_idx,
+        eval_offset: eval_start_idx - start_idx,
         w_replay,
+        num_inputs,
+        can_fast_comb,
+        norm_inputs,
+        out_pred_trace,
+        out_truth_trace,
         survivor_map,
     }
 }
@@ -1864,6 +1905,433 @@ enum SproutMotifOutcome {
     OutOfBudget,
 }
 
+#[derive(Clone, Copy)]
+enum CombSourceSpec {
+    BoundaryIn(usize),
+    LagIn { channel: usize, tau: usize },
+    LagYhat { tau: usize },
+    LagRes { port: usize, tau_m1: usize },
+}
+
+impl CombSourceSpec {
+    fn from_feature(
+        sf: &SourceFeature,
+        num_inputs: usize,
+        out_port: u16,
+        is_epoch_1: bool,
+    ) -> Option<Self> {
+        match sf {
+            SourceFeature::BoundaryIn(c) if usize::from(*c) < num_inputs => {
+                Some(Self::BoundaryIn(usize::from(*c)))
+            }
+            SourceFeature::LagIn { channel, tau } if usize::from(*channel) < num_inputs => {
+                Some(Self::LagIn {
+                    channel: usize::from(*channel),
+                    tau: usize::from(*tau),
+                })
+            }
+            SourceFeature::LagYhat { port, tau } if *port == out_port && !is_epoch_1 => {
+                Some(Self::LagYhat {
+                    tau: usize::from(*tau),
+                })
+            }
+            SourceFeature::LagRes { port, tau }
+                if *port == out_port && !is_epoch_1 && *tau >= 1 =>
+            {
+                Some(Self::LagRes {
+                    port: usize::from(*port),
+                    tau_m1: usize::from(*tau - 1),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    const fn max_added_nodes(self) -> usize {
+        match self {
+            Self::BoundaryIn(_) => 1,
+            Self::LagIn { tau, .. } | Self::LagYhat { tau } => tau + 1,
+            Self::LagRes { tau_m1, .. } => tau_m1 + 5,
+        }
+    }
+
+    #[inline(always)]
+    fn eval_at(self, i: usize, width: Width, baseline: &BaselineReplayMetrics) -> u64 {
+        let num_inputs = baseline.num_inputs;
+        match self {
+            Self::BoundaryIn(c) => baseline.norm_inputs[i * num_inputs + c],
+            Self::LagIn { channel, tau } => {
+                if i < tau {
+                    0
+                } else {
+                    baseline.norm_inputs[(i - tau) * num_inputs + channel]
+                }
+            }
+            Self::LagYhat { tau } => {
+                if i < tau {
+                    0
+                } else {
+                    baseline.out_pred_trace[i - tau]
+                }
+            }
+            Self::LagRes { port, tau_m1 } => {
+                if i < tau_m1 {
+                    0
+                } else {
+                    let j = i - tau_m1;
+                    let y_lag1 = if j == 0 {
+                        0
+                    } else {
+                        baseline.out_pred_trace[j - 1]
+                    };
+                    width.sub(baseline.norm_inputs[j * num_inputs + port], y_lag1)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FastCombKind {
+    ConstLoop(u64),
+    Identity(CombSourceSpec),
+    Eqz(CombSourceSpec),
+    AddSelf(CombSourceSpec),
+    AddConst(CombSourceSpec, u64),
+    EqzAddConst(CombSourceSpec, u64),
+    NegAddConst(CombSourceSpec, u64),
+    Neg(CombSourceSpec),
+    ScaleEqz(CombSourceSpec, u64),
+    AddPair(CombSourceSpec, CombSourceSpec),
+    SubPair(CombSourceSpec, CombSourceSpec),
+    MulPair(CombSourceSpec, CombSourceSpec),
+    AddEqz(CombSourceSpec, CombSourceSpec),
+    MulEqz(CombSourceSpec, CombSourceSpec),
+    MulEqzPair(CombSourceSpec, CombSourceSpec),
+}
+
+struct FastCombPlan {
+    kind: FastCombKind,
+    is_epoch_1: bool,
+}
+
+enum FastCombPrep {
+    BlockedMaxNodes,
+    Plan(FastCombPlan),
+    Fallback,
+}
+
+const fn comb_source_min_nodes(sf: &SourceFeature) -> usize {
+    match sf {
+        SourceFeature::BoundaryIn(_) | SourceFeature::NodeOut { .. } => 0,
+        SourceFeature::LagIn { tau, .. } | SourceFeature::LagYhat { tau, .. } => *tau as usize,
+        SourceFeature::LagRes { tau, .. } => (*tau as usize).saturating_add(1),
+    }
+}
+
+fn comb_motif_min_added_nodes(width: Width, motif: &CandidateMotif, is_epoch_1: bool) -> usize {
+    let stack = usize::from(!is_epoch_1);
+    match motif {
+        CandidateMotif::ConstLoop(_) => 2 + stack,
+        CandidateMotif::Identity(u) => comb_source_min_nodes(u) + stack,
+        CandidateMotif::Eqz(u) => comb_source_min_nodes(u) + 1 + stack,
+        CandidateMotif::AddSelf(u) => comb_source_min_nodes(u) + 2 + stack,
+        CandidateMotif::AddConst(u, _) | CandidateMotif::NegAddConst(u, _) => {
+            comb_source_min_nodes(u) + 3 + stack
+        }
+        CandidateMotif::EqzAddConst(u, _) => comb_source_min_nodes(u) + 4 + stack,
+        CandidateMotif::Neg(u) => comb_source_min_nodes(u) + if !is_epoch_1 { 1 } else { 3 },
+        CandidateMotif::ScaleEqz(u, c) => {
+            if !is_epoch_1 && *c == width.mask() {
+                comb_source_min_nodes(u) + 2
+            } else {
+                comb_source_min_nodes(u) + 4 + stack
+            }
+        }
+        CandidateMotif::AddPair(u1, u2)
+        | CandidateMotif::SubPair(u1, u2)
+        | CandidateMotif::MulPair(u1, u2) => {
+            comb_source_min_nodes(u1) + comb_source_min_nodes(u2) + 1 + stack
+        }
+        CandidateMotif::AddEqz(u1, u2) | CandidateMotif::MulEqz(u1, u2) => {
+            comb_source_min_nodes(u1) + comb_source_min_nodes(u2) + 2 + stack
+        }
+        CandidateMotif::MulEqzPair(u1, u2) => {
+            comb_source_min_nodes(u1) + comb_source_min_nodes(u2) + 3 + stack
+        }
+    }
+}
+
+impl FastCombPlan {
+    fn prepare(
+        circuit: &Circuit,
+        motif: &CandidateMotif,
+        baseline: &BaselineReplayMetrics,
+        out_port: u16,
+        is_epoch_1: bool,
+        max_nodes: usize,
+    ) -> FastCombPrep {
+        if !baseline.can_fast_comb {
+            return FastCombPrep::Fallback;
+        }
+        let width = circuit.width();
+        let base_nodes = circuit.nodes().len();
+        let min_added = comb_motif_min_added_nodes(width, motif, is_epoch_1);
+        if base_nodes.saturating_add(min_added) > max_nodes {
+            return FastCombPrep::BlockedMaxNodes;
+        }
+        let n_in = baseline.num_inputs;
+        let src = |sf: &SourceFeature| CombSourceSpec::from_feature(sf, n_in, out_port, is_epoch_1);
+        let stack_max = if is_epoch_1 { 2 } else { 3 };
+        let Some((kind, max_added)) = (match motif {
+            CandidateMotif::ConstLoop(c) => {
+                Some((FastCombKind::ConstLoop(width.normalize(*c)), 2 + stack_max))
+            }
+            CandidateMotif::Identity(u) => src(u).map(|s| {
+                let extra = if is_epoch_1 { 2 } else { 3 };
+                (FastCombKind::Identity(s), s.max_added_nodes() + extra)
+            }),
+            CandidateMotif::Eqz(u) => {
+                src(u).map(|s| (FastCombKind::Eqz(s), s.max_added_nodes() + 2 + stack_max))
+            }
+            CandidateMotif::AddSelf(u) => src(u).map(|s| {
+                (
+                    FastCombKind::AddSelf(s),
+                    s.max_added_nodes() + 3 + stack_max,
+                )
+            }),
+            CandidateMotif::AddConst(u, c) => src(u).map(|s| {
+                (
+                    FastCombKind::AddConst(s, width.normalize(*c)),
+                    s.max_added_nodes() + 4 + stack_max,
+                )
+            }),
+            CandidateMotif::EqzAddConst(u, c) => src(u).map(|s| {
+                (
+                    FastCombKind::EqzAddConst(s, width.normalize(*c)),
+                    s.max_added_nodes() + 5 + stack_max,
+                )
+            }),
+            CandidateMotif::NegAddConst(u, c) => src(u).map(|s| {
+                (
+                    FastCombKind::NegAddConst(s, width.normalize(*c)),
+                    s.max_added_nodes() + 4 + stack_max,
+                )
+            }),
+            CandidateMotif::Neg(u) => {
+                src(u).map(|s| (FastCombKind::Neg(s), s.max_added_nodes() + 4 + stack_max))
+            }
+            CandidateMotif::ScaleEqz(u, c) => src(u).map(|s| {
+                (
+                    FastCombKind::ScaleEqz(s, width.normalize(*c)),
+                    s.max_added_nodes() + 5 + stack_max,
+                )
+            }),
+            CandidateMotif::AddPair(u1, u2) => src(u1).zip(src(u2)).map(|(s1, s2)| {
+                (
+                    FastCombKind::AddPair(s1, s2),
+                    s1.max_added_nodes() + s2.max_added_nodes() + 3 + stack_max,
+                )
+            }),
+            CandidateMotif::SubPair(u1, u2) => src(u1).zip(src(u2)).map(|(s1, s2)| {
+                (
+                    FastCombKind::SubPair(s1, s2),
+                    s1.max_added_nodes() + s2.max_added_nodes() + 3 + stack_max,
+                )
+            }),
+            CandidateMotif::MulPair(u1, u2) => src(u1).zip(src(u2)).map(|(s1, s2)| {
+                (
+                    FastCombKind::MulPair(s1, s2),
+                    s1.max_added_nodes() + s2.max_added_nodes() + 3 + stack_max,
+                )
+            }),
+            CandidateMotif::AddEqz(u1, u2) => src(u1).zip(src(u2)).map(|(s1, s2)| {
+                (
+                    FastCombKind::AddEqz(s1, s2),
+                    s1.max_added_nodes() + s2.max_added_nodes() + 4 + stack_max,
+                )
+            }),
+            CandidateMotif::MulEqz(u1, u2) => src(u1).zip(src(u2)).map(|(s1, s2)| {
+                (
+                    FastCombKind::MulEqz(s1, s2),
+                    s1.max_added_nodes() + s2.max_added_nodes() + 4 + stack_max,
+                )
+            }),
+            CandidateMotif::MulEqzPair(u1, u2) => src(u1).zip(src(u2)).map(|(s1, s2)| {
+                (
+                    FastCombKind::MulEqzPair(s1, s2),
+                    s1.max_added_nodes() + s2.max_added_nodes() + 5 + stack_max,
+                )
+            }),
+        }) else {
+            return FastCombPrep::Fallback;
+        };
+        let _ = min_added;
+        if base_nodes.saturating_add(max_added) > max_nodes {
+            return FastCombPrep::Fallback;
+        }
+        FastCombPrep::Plan(Self { kind, is_epoch_1 })
+    }
+
+    fn exceeds_error_upper(
+        &self,
+        baseline: &BaselineReplayMetrics,
+        width: Width,
+        e_cand_upper: isize,
+    ) -> bool {
+        let mut e_cand = 0usize;
+        for i in baseline.eval_offset..baseline.w_replay {
+            let p_cand = match self.kind {
+                FastCombKind::ConstLoop(c) => {
+                    if self.is_epoch_1 {
+                        c
+                    } else {
+                        width.add(baseline.out_pred_trace[i], c)
+                    }
+                }
+                FastCombKind::Identity(u) => {
+                    let v = u.eval_at(i, width, baseline);
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::Eqz(u) => {
+                    let v = width.eqz(u.eval_at(i, width, baseline));
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::AddSelf(u) => {
+                    let uv = u.eval_at(i, width, baseline);
+                    let v = width.add(uv, uv);
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::AddConst(u, c) => {
+                    let v = width.add(u.eval_at(i, width, baseline), c);
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::EqzAddConst(u, c) => {
+                    let v = width.eqz(width.add(u.eval_at(i, width, baseline), c));
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::NegAddConst(u, c) => {
+                    let v = width.sub(c, u.eval_at(i, width, baseline));
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::Neg(u) => {
+                    let uv = u.eval_at(i, width, baseline);
+                    if self.is_epoch_1 {
+                        width.sub(0, uv)
+                    } else {
+                        width.sub(baseline.out_pred_trace[i], uv)
+                    }
+                }
+                FastCombKind::ScaleEqz(u, c) => {
+                    let eq = width.eqz(u.eval_at(i, width, baseline));
+                    if self.is_epoch_1 {
+                        width.mul(eq, c)
+                    } else {
+                        width.add(baseline.out_pred_trace[i], width.mul(eq, c))
+                    }
+                }
+                FastCombKind::AddPair(u1, u2) => {
+                    let v = width.add(
+                        u1.eval_at(i, width, baseline),
+                        u2.eval_at(i, width, baseline),
+                    );
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::SubPair(u1, u2) => {
+                    let v = width.sub(
+                        u1.eval_at(i, width, baseline),
+                        u2.eval_at(i, width, baseline),
+                    );
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::MulPair(u1, u2) => {
+                    let v = width.mul(
+                        u1.eval_at(i, width, baseline),
+                        u2.eval_at(i, width, baseline),
+                    );
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::AddEqz(u1, u2) => {
+                    let v = width.add(
+                        u1.eval_at(i, width, baseline),
+                        width.eqz(u2.eval_at(i, width, baseline)),
+                    );
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::MulEqz(u1, u2) => {
+                    let v = width.mul(
+                        u1.eval_at(i, width, baseline),
+                        width.eqz(u2.eval_at(i, width, baseline)),
+                    );
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+                FastCombKind::MulEqzPair(u1, u2) => {
+                    let v = width.mul(
+                        width.eqz(u1.eval_at(i, width, baseline)),
+                        width.eqz(u2.eval_at(i, width, baseline)),
+                    );
+                    if self.is_epoch_1 {
+                        v
+                    } else {
+                        width.add(baseline.out_pred_trace[i], v)
+                    }
+                }
+            };
+            if p_cand != baseline.out_truth_trace[i] {
+                e_cand += 1;
+                if (e_cand as isize) > e_cand_upper {
+                    return true;
+                }
+            }
+        }
+        (e_cand as isize) > e_cand_upper
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_sprout_motif(
     editable: &EditableCircuit,
@@ -1875,17 +2343,64 @@ fn evaluate_sprout_motif(
     is_epoch_1: bool,
     allow_epoch1_1op_bypass: bool,
     baseline: &BaselineReplayMetrics,
-    budget: Option<&mut TickBudget>,
+    mut budget: Option<&mut TickBudget>,
     mut telemetry: Option<&mut SproutTelemetry>,
 ) -> SproutMotifOutcome {
     let w_diag = growth_config.diagnostic_window;
+    let width = editable.circuit().width();
+    let max_nodes = effective_max_nodes(editable.circuit().num_inputs(), growth_config);
+    let is_epoch1_non_const = is_epoch_1 && !matches!(motif, CandidateMotif::ConstLoop(_));
+    let is_binary_eqz_scaffold = is_epoch1_non_const
+        && width == Width::BITS_1
+        && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(c)) if *c == out_port);
+    let e_cand_upper: isize = {
+        let base = (baseline.e_curr as isize) - (growth_config.min_match_gain as isize);
+        if is_epoch1_non_const {
+            let const_lim = if is_binary_eqz_scaffold {
+                baseline.e_const_mode.saturating_add(1) as isize
+            } else {
+                (baseline.e_const_mode as isize) - (growth_config.min_match_gain as isize)
+            };
+            base.min(const_lim)
+        } else {
+            base
+        }
+    };
+
+    let mut budget_consumed = false;
+    match FastCombPlan::prepare(
+        editable.circuit(),
+        motif,
+        baseline,
+        out_port,
+        is_epoch_1,
+        max_nodes,
+    ) {
+        FastCombPrep::BlockedMaxNodes => return SproutMotifOutcome::BlockedMaxNodes,
+        FastCombPrep::Plan(plan) => {
+            if let Some(b) = budget.as_deref_mut()
+                && !b.try_consume(baseline.w_replay as u64)
+            {
+                if let Some(tel) = telemetry.as_deref_mut() {
+                    tel.sprout_budget_exhausted += 1;
+                }
+                return SproutMotifOutcome::OutOfBudget;
+            }
+            budget_consumed = true;
+            if plan.exceeds_error_upper(baseline, width, e_cand_upper) {
+                return SproutMotifOutcome::Rejected;
+            }
+        }
+        FastCombPrep::Fallback => {}
+    }
+
     let mut staged = editable.circuit().clone();
     materialize_candidate(&mut staged, motif, out_port);
-    let max_nodes = effective_max_nodes(editable.circuit().num_inputs(), growth_config);
     if staged.nodes().len() > max_nodes {
         return SproutMotifOutcome::BlockedMaxNodes;
     }
-    if let Some(b) = budget
+    if !budget_consumed
+        && let Some(b) = budget
         && !b.try_consume(baseline.w_replay as u64)
     {
         if let Some(tel) = telemetry.as_deref_mut() {
@@ -1944,24 +2459,6 @@ fn evaluate_sprout_motif(
     } else {
         trace_heap.resize(baseline.w_replay, 0);
         &mut trace_heap
-    };
-
-    let is_epoch1_non_const = is_epoch_1 && !matches!(motif, CandidateMotif::ConstLoop(_));
-    let is_binary_eqz_scaffold = is_epoch1_non_const
-        && staged.width() == Width::BITS_1
-        && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(c)) if *c == out_port);
-    let e_cand_upper: isize = {
-        let base = (baseline.e_curr as isize) - (growth_config.min_match_gain as isize);
-        if is_epoch1_non_const {
-            let const_lim = if is_binary_eqz_scaffold {
-                baseline.e_const_mode.saturating_add(1) as isize
-            } else {
-                (baseline.e_const_mode as isize) - (growth_config.min_match_gain as isize)
-            };
-            base.min(const_lim)
-        } else {
-            base
-        }
     };
 
     let out_idx = usize::from(out_port);
@@ -2110,6 +2607,35 @@ fn evaluate_sprout_motif(
     }
 }
 
+fn for_each_u1_deeper_motif(
+    u1: &SourceFeature,
+    width: Width,
+    mut f: impl FnMut(CandidateMotif) -> bool,
+) -> bool {
+    if f(CandidateMotif::Identity(u1.clone())) || f(CandidateMotif::Eqz(u1.clone())) {
+        return true;
+    }
+    if width.bits() > 1 && f(CandidateMotif::AddSelf(u1.clone())) {
+        return true;
+    }
+    let max_c = width.mask().min(SMALL_CONST_CANDIDATE_CAP);
+    for k in 1..=max_c {
+        if f(CandidateMotif::AddConst(u1.clone(), k)) {
+            return true;
+        }
+        if width.bits() > 1
+            && (f(CandidateMotif::EqzAddConst(u1.clone(), k))
+                || f(CandidateMotif::NegAddConst(u1.clone(), k)))
+        {
+            return true;
+        }
+        if width.bits() > 1 && k > 1 && f(CandidateMotif::ScaleEqz(u1.clone(), k)) {
+            return true;
+        }
+    }
+    f(CandidateMotif::Neg(u1.clone()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn has_admissible_deeper_lag(
     editable: &EditableCircuit,
@@ -2156,17 +2682,8 @@ fn has_admissible_deeper_lag(
                     channel: c as u16,
                     tau: tau as u8,
                 };
-                for motif in
-                    generate_candidate_motifs(&u1, None, width, None, is_epoch_1, num_channels)
-                {
-                    let uses_deeper_lag = motif_any_source(&motif, |sf| {
-                        source_feature_lag(sf) > max_tau
-                            && (!cross_only || source_is_cross_channel(sf, out_port))
-                    });
-                    if !uses_deeper_lag {
-                        continue;
-                    }
-                    if matches!(
+                if for_each_u1_deeper_motif(&u1, width, |motif| {
+                    matches!(
                         evaluate_sprout_motif(
                             editable,
                             obs_window,
@@ -2181,9 +2698,9 @@ fn has_admissible_deeper_lag(
                             None,
                         ),
                         SproutMotifOutcome::Accepted { .. }
-                    ) {
-                        return true;
-                    }
+                    )
+                }) {
+                    return true;
                 }
             }
         }
@@ -2680,12 +3197,7 @@ pub struct AutonomousRingProposal {
     pub template: Vec<u64>,
 }
 
-fn build_autonomous_ring_circuit(
-    base: &Circuit,
-    period: usize,
-    mu: &[u64],
-    out_port: u16,
-) -> (Circuit, Vec<Option<NodeId>>, Vec<NodeId>) {
+fn strip_circuit_for_ring(base: &Circuit, out_port: u16) -> (Circuit, Vec<Option<NodeId>>) {
     let (target_cone, _) = port_upstream_cone_and_edges(base, out_port);
     let mut protected_nodes = BTreeSet::new();
     for q in 0..base.num_outputs() {
@@ -2699,18 +3211,17 @@ fn build_autonomous_ring_circuit(
         .filter(|node| !protected_nodes.contains(node))
         .collect();
 
-    let mut staged = base.clone();
-    let old_out_edges: Vec<(SignalSource, SignalSink)> = staged
+    let mut stripped = base.clone();
+    let old_out_edges: Vec<(SignalSource, SignalSink)> = stripped
         .edges()
         .iter()
         .filter_map(|e| (e.dst == SignalSink::BoundaryOut(out_port)).then_some((e.src, e.dst)))
         .collect();
     for (src, dst) in old_out_edges {
-        staged.disconnect(src, dst);
+        stripped.disconnect(src, dst);
     }
-    let old_to_new = staged.remove_nodes(&removed);
-    let (delays, _split) = build_autonomous_ring(&mut staged, period, mu, out_port);
-    (staged, old_to_new, delays)
+    let old_to_new = stripped.remove_nodes(&removed);
+    (stripped, old_to_new)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2885,9 +3396,16 @@ enum RingPeriodOutcome {
     OutOfBudget,
 }
 
+struct RingEvalPrecomp<'a> {
+    stripped: &'a Circuit,
+    old_to_new: &'a [Option<NodeId>],
+    obs_out: &'a [u64],
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_ring_period(
     editable: &EditableCircuit,
+    pre: &RingEvalPrecomp<'_>,
     obs_window: &ObservationWindow,
     growth_config: &GrowthConfig,
     economy_config: &EconomyConfig,
@@ -2902,8 +3420,13 @@ fn evaluate_ring_period(
 ) -> RingPeriodOutcome {
     let w_replay = obs_window.len();
     let out_idx = usize::from(out_port);
-    let bits = editable.circuit().width().bits();
+    let width = editable.circuit().width();
+    let bits = width.bits();
+    let start_tick = obs_window.start_tick();
+    let start_mod = (start_tick as usize) % p;
     let mut mu = vec![0u64; p];
+    let mut matched = 0usize;
+    let mut exact_fast_counts = false;
     if bits <= 4 {
         let card = 1usize << bits;
         let needed = p * card;
@@ -2915,12 +3438,15 @@ fn evaluate_ring_period(
             heap_counts.resize(needed, 0);
             &mut heap_counts
         };
-        for (i, frame) in obs_window.frames().iter().enumerate() {
-            let global_t = obs_window.start_tick() + (i as u64);
-            let r = (global_t as usize) % p;
-            counts[r * card + (frame[out_idx] as usize)] += 1;
+        let mut r = start_mod;
+        for &sym in pre.obs_out {
+            counts[r * card + (sym as usize)] += 1;
+            r += 1;
+            if r == p {
+                r = 0;
+            }
         }
-        for r in 0..p {
+        for (r, mu_slot) in mu.iter_mut().enumerate() {
             let row = &counts[r * card..(r + 1) * card];
             let mut best_sym = 0u64;
             let mut best_cnt = row[0];
@@ -2930,14 +3456,19 @@ fn evaluate_ring_period(
                     best_sym = sym as u64;
                 }
             }
-            mu[r] = best_sym;
+            *mu_slot = best_sym;
+            matched += best_cnt;
         }
+        exact_fast_counts = true;
     } else {
         let mut residue_counts = vec![BTreeMap::<u64, usize>::new(); p];
-        for (i, frame) in obs_window.frames().iter().enumerate() {
-            let global_t = obs_window.start_tick() + (i as u64);
-            let r = (global_t as usize) % p;
-            *residue_counts[r].entry(frame[out_idx]).or_default() += 1;
+        let mut r = start_mod;
+        for &sym in pre.obs_out {
+            *residue_counts[r].entry(sym).or_default() += 1;
+            r += 1;
+            if r == p {
+                r = 0;
+            }
         }
         for (r, counts) in residue_counts.iter().enumerate() {
             let mode = counts
@@ -2952,10 +3483,8 @@ fn evaluate_ring_period(
         return RingPeriodOutcome::Rejected;
     }
 
-    let (staged, old_to_new, ring_delay_nodes) =
-        build_autonomous_ring_circuit(editable.circuit(), p, &mu, out_port);
     let max_nodes = effective_max_nodes(editable.circuit().num_inputs(), growth_config);
-    if staged.nodes().len() > max_nodes {
+    if pre.stripped.nodes().len() + p + 1 > max_nodes {
         if let Some(tel) = telemetry {
             tel.sprout_blocked_max_nodes += 1;
         }
@@ -2969,6 +3498,37 @@ fn evaluate_ring_period(
         }
         return RingPeriodOutcome::OutOfBudget;
     }
+
+    let e_ring_upper = (e_curr as isize) - (growth_config.min_match_gain as isize);
+    if exact_fast_counts {
+        let e_ring_est = w_replay - matched;
+        if (e_ring_est as isize) > e_ring_upper {
+            return RingPeriodOutcome::Rejected;
+        }
+        let mut scorer = PointForecastScorer::new(width, economy_config.null_model);
+        let mut flux_ring = 0.0;
+        let mut r = start_mod;
+        for &truth_sym in pre.obs_out {
+            flux_ring += score_with_reward_mode(
+                &mut scorer,
+                economy_config.reward_mode,
+                width,
+                mu[r],
+                truth_sym,
+            );
+            r += 1;
+            if r == p {
+                r = 0;
+            }
+        }
+        if flux_ring <= flux_curr {
+            return RingPeriodOutcome::Rejected;
+        }
+    }
+
+    let mut staged = pre.stripped.clone();
+    let (ring_delay_nodes, _split) = build_autonomous_ring(&mut staged, p, &mu, out_port);
+    let old_to_new = pre.old_to_new.to_vec();
 
     let Ok(staged_compiled) = staged.compile() else {
         return RingPeriodOutcome::Rejected;
@@ -2994,7 +3554,6 @@ fn evaluate_ring_period(
             }
         }
     }
-    let start_tick = obs_window.start_tick();
     let mut reg_map_ok = true;
     for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
         let Some(reg_idx) = explicit_delay_register_index(&staged, delay_node) else {
@@ -3011,7 +3570,6 @@ fn evaluate_ring_period(
     let mut e_ring_diag = 0usize;
     let w_diag = growth_config.diagnostic_window.max(1);
     let diag_start = w_replay.saturating_sub(w_diag);
-    let e_ring_upper = (e_curr as isize) - (growth_config.min_match_gain as isize);
 
     let num_outputs = usize::from(staged_compiled.num_outputs());
     let mut pred_stack = [0u64; 16];
@@ -3219,11 +3777,20 @@ pub fn propose_autonomous_delay_ring_scored_with_telemetry(
     let j_curr =
         l_curr + facts_code_bits(editable.circuit().width(), w_replay as u64, e_curr as u64);
 
+    let (stripped_base, old_to_new_base) = strip_circuit_for_ring(editable.circuit(), out_port);
+    let obs_out: Vec<u64> = obs_window.frames().iter().map(|f| f[out_idx]).collect();
+    let ring_pre = RingEvalPrecomp {
+        stripped: &stripped_base,
+        old_to_new: &old_to_new_base,
+        obs_out: &obs_out,
+    };
+
     let mut best_ring: Option<(AutonomousRingProposal, f64, usize, f64)> = None;
 
     for p in growth_config.min_ring_period..=growth_config.max_ring_period {
         match evaluate_ring_period(
             editable,
+            &ring_pre,
             obs_window,
             growth_config,
             economy_config,
@@ -3261,6 +3828,7 @@ pub fn propose_autonomous_delay_ring_scored_with_telemetry(
         {
             if let RingPeriodOutcome::Accepted { .. } = evaluate_ring_period(
                 editable,
+                &ring_pre,
                 obs_window,
                 growth_config,
                 economy_config,
