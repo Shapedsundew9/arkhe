@@ -11,6 +11,10 @@ pub enum BudgetAccountingMode {
     CandidateHistoryReplay,
     /// Analytical or Bayesian online baseline with zero candidate-replay tick deductions.
     AnalyticalUnmetered,
+    /// Interleaved context-tree depth steps metered per frame in `observe()`.
+    ContextTreeDepthSteps,
+    /// Online truncated BPTT unroll steps metered per frame in `observe()`.
+    BpttUnrollSteps,
 }
 
 /// Per-channel evaluation breakdown emitted alongside [`Scorecard`] for multi-channel environments ($K \ge 1$).

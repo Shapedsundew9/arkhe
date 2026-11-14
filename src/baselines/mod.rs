@@ -12,14 +12,19 @@
 
 pub mod bm_predictor;
 pub mod cgp;
+pub mod cross_ctw;
 pub mod ctw;
 pub mod exhaustive;
 pub mod random_search;
+pub mod rnn;
 
 use std::collections::HashMap;
 
 pub use bm_predictor::ReedsSloaneBaseline;
 pub use cgp::CgpBaseline;
+pub use cross_ctw::{
+    CrossChannelCtwBaseline, DEFAULT_CROSS_CTW_SYMBOL_DEPTH, MAX_INTERLEAVED_BIT_DEPTH,
+};
 pub use ctw::CtwBaseline;
 pub use exhaustive::{
     DEFAULT_MAX_CERTIFY_JOINT_STEPS, ExhaustiveBaseline, SynthesisCertStatus,
@@ -28,6 +33,10 @@ pub use exhaustive::{
     exact_synthesize_clean_circuit,
 };
 pub use random_search::{RandomSearchBaseline, sample_random_valid_circuit};
+pub use rnn::{
+    DEFAULT_RNN_BPTT_LEN, DEFAULT_RNN_HIDDEN_SIZE, DEFAULT_RNN_LEARNING_RATE,
+    MAX_RNN_ONE_HOT_WIDTH_BITS, RnnBaseline, RnnError,
+};
 
 use crate::env::{
     EpsilonMachineSummary, FiniteStateGenerator, NoisyEnvironment,

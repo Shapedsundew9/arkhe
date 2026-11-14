@@ -38,13 +38,13 @@ impl CtwNode {
 }
 
 #[derive(Clone, Debug)]
-struct BinaryCtwTree {
+pub(crate) struct BinaryCtwTree {
     depth: usize,
     nodes: Vec<CtwNode>,
 }
 
 impl BinaryCtwTree {
-    fn new(depth: usize) -> Self {
+    pub(crate) fn new(depth: usize) -> Self {
         Self {
             depth,
             nodes: vec![CtwNode::default()],
@@ -53,7 +53,7 @@ impl BinaryCtwTree {
 
     /// Computes exact predictive probability $\Pr(B = 1 \mid \text{context})$ in `(0.0, 1.0)`
     /// without mutating the arena.
-    fn predict_prob_one(&self, context_recent_first: &[u8]) -> f64 {
+    pub(crate) fn predict_prob_one(&self, context_recent_first: &[u8]) -> f64 {
         let log2_pw_before = self.nodes[0].log2_pw;
         let log2_pw_after_one = self.hypothetical_root_log2_pw(0, 0, context_recent_first, 1);
         (2.0f64.powf(log2_pw_after_one - log2_pw_before)).clamp(1e-15, 1.0 - 1e-15)
@@ -105,7 +105,7 @@ impl BinaryCtwTree {
     }
 
     /// Updates counts and weighted log-probabilities along `context_recent_first` with `actual_bit`.
-    fn update(&mut self, context_recent_first: &[u8], actual_bit: u8) {
+    pub(crate) fn update(&mut self, context_recent_first: &[u8], actual_bit: u8) {
         self.update_rec(0, 0, context_recent_first, actual_bit);
     }
 

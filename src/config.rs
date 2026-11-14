@@ -5,8 +5,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::baselines::{
-    CgpBaseline, CtwBaseline, DEFAULT_MAX_CERTIFY_JOINT_STEPS, ExhaustiveBaseline,
-    PredictorBaseline, RandomSearchBaseline, ReedsSloaneBaseline, SynthesisCertStatus,
+    CgpBaseline, CrossChannelCtwBaseline, CtwBaseline, DEFAULT_CROSS_CTW_SYMBOL_DEPTH,
+    DEFAULT_MAX_CERTIFY_JOINT_STEPS, DEFAULT_RNN_BPTT_LEN, DEFAULT_RNN_HIDDEN_SIZE,
+    DEFAULT_RNN_LEARNING_RATE, ExhaustiveBaseline, PredictorBaseline, RandomSearchBaseline,
+    ReedsSloaneBaseline, RnnBaseline, RnnError, SynthesisCertStatus,
     exact_synthesize_certified_circuit, run_prequential_harness,
 };
 use crate::env::{
@@ -80,6 +82,8 @@ pub enum ConfigRunError {
     Noise(NoiseError),
     /// Growth or diagnostics operation failed.
     Growth(GrowthError),
+    /// RNN baseline configuration failed validation.
+    Rnn(RnnError),
     /// TOML/JSON serialisation error.
     Serialization(String),
 }
@@ -100,6 +104,7 @@ impl fmt::Display for ConfigRunError {
             Self::Generator(e) => write!(f, "generator error: {e}"),
             Self::Noise(e) => write!(f, "noise error: {e}"),
             Self::Growth(e) => write!(f, "growth error: {e:?}"),
+            Self::Rnn(e) => write!(f, "rnn error: {e}"),
             Self::Serialization(e) => write!(f, "serialization error: {e}"),
         }
     }
@@ -122,6 +127,12 @@ impl From<NoiseError> for ConfigRunError {
 impl From<GrowthError> for ConfigRunError {
     fn from(value: GrowthError) -> Self {
         Self::Growth(value)
+    }
+}
+
+impl From<RnnError> for ConfigRunError {
+    fn from(value: RnnError) -> Self {
+        Self::Rnn(value)
     }
 }
 
@@ -182,6 +193,20 @@ pub enum BaselineConfig {
         #[serde(default = "default_ctw_depth")]
         context_depth: usize,
     },
+    /// Joint cross-channel interleaved bit-decomposed Context-Tree Weighting predictor.
+    CrossChannelCtw {
+        #[serde(default = "default_cross_ctw_symbol_depth")]
+        symbol_context_depth: usize,
+    },
+    /// 1-layer `tanh` Elman RNN trained online with truncated BPTT.
+    RnnBptt {
+        #[serde(default = "default_rnn_hidden_size")]
+        hidden_size: usize,
+        #[serde(default = "default_rnn_bptt_len")]
+        bptt_len: usize,
+        #[serde(default = "default_rnn_learning_rate")]
+        learning_rate: f64,
+    },
     /// Online prequential Reeds–Sloane / Berlekamp–Massey linear recurrence synthesizer.
     ReedsSloane,
     /// Canonical size-ordered small-circuit exhaustive enumerator.
@@ -214,6 +239,18 @@ const fn default_cgp_genes() -> usize {
 }
 const fn default_ctw_depth() -> usize {
     12
+}
+const fn default_cross_ctw_symbol_depth() -> usize {
+    DEFAULT_CROSS_CTW_SYMBOL_DEPTH
+}
+const fn default_rnn_hidden_size() -> usize {
+    DEFAULT_RNN_HIDDEN_SIZE
+}
+const fn default_rnn_bptt_len() -> usize {
+    DEFAULT_RNN_BPTT_LEN
+}
+const fn default_rnn_learning_rate() -> f64 {
+    DEFAULT_RNN_LEARNING_RATE
 }
 const fn default_exhaustive_nodes() -> usize {
     3
@@ -563,6 +600,25 @@ pub fn execute_experiment(config: &ExperimentConfig) -> Result<RunReport, Config
         BaselineConfig::Ctw { context_depth } => {
             Box::new(CtwBaseline::new(width, channels, *context_depth))
         }
+        BaselineConfig::CrossChannelCtw {
+            symbol_context_depth,
+        } => Box::new(CrossChannelCtwBaseline::new(
+            width,
+            channels,
+            *symbol_context_depth,
+        )),
+        BaselineConfig::RnnBptt {
+            hidden_size,
+            bptt_len,
+            learning_rate,
+        } => Box::new(RnnBaseline::new(
+            width,
+            channels,
+            *hidden_size,
+            *bptt_len,
+            *learning_rate,
+            seeds,
+        )?),
         BaselineConfig::ReedsSloane => Box::new(ReedsSloaneBaseline::new(width, channels)),
         BaselineConfig::Exhaustive {
             max_nodes,
@@ -604,4 +660,123 @@ pub fn execute_experiment(config: &ExperimentConfig) -> Result<RunReport, Config
         discovered_circuit,
         m1_telemetry,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::baselines::{MAX_RNN_ONE_HOT_WIDTH_BITS, RnnError};
+    use crate::env::{GeneratorConfig, LfsrStage, NoiseModel};
+    use crate::metrics::BudgetAccountingMode;
+    use crate::substrate::{Width, WireDelayMode};
+
+    fn multi_channel_experiment_config(
+        width_bits: u8,
+        baseline: BaselineConfig,
+    ) -> ExperimentConfig {
+        ExperimentConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            master_seed: 42,
+            substrate: SubstrateConfig {
+                width_bits: Width::new(width_bits).expect("valid width"),
+                wire_delay: WireDelayMode::Combinational,
+            },
+            environment: EnvironmentConfig {
+                generator: GeneratorConfig::T2_DelayedAffine {
+                    driver: LfsrStage {
+                        taps: vec![1, 0, 0, 1],
+                        init: vec![0, 0, 0, 1],
+                    },
+                    lag: 2,
+                    mul_a: 1,
+                    add_b: 1,
+                },
+                horizon_ticks: 80,
+                transient_warmup_ticks: 16,
+                noise: NoiseModel::None,
+            },
+            budget: BudgetConfig {
+                max_eval_ticks: 1_000_000,
+            },
+            baseline,
+        }
+    }
+
+    #[test]
+    fn cross_channel_ctw_and_rnn_execute_experiment_determinism_and_budget_modes() {
+        let cfg_ctw = multi_channel_experiment_config(
+            1,
+            BaselineConfig::CrossChannelCtw {
+                symbol_context_depth: DEFAULT_CROSS_CTW_SYMBOL_DEPTH,
+            },
+        );
+        let rep_ctw_a = execute_experiment(&cfg_ctw).expect("cross_ctw run A succeeds");
+        let rep_ctw_b = execute_experiment(&cfg_ctw).expect("cross_ctw run B succeeds");
+        assert_eq!(rep_ctw_a.scorecard, rep_ctw_b.scorecard);
+        assert_eq!(
+            rep_ctw_a.scorecard.budget_accounting_mode,
+            BudgetAccountingMode::ContextTreeDepthSteps
+        );
+        // 80 steps * bit_depth (9 * 2 * 1 = 18) = 1440 ticks
+        assert_eq!(rep_ctw_a.scorecard.candidate_replay_ticks_consumed, 80 * 18);
+
+        let cfg_rnn = multi_channel_experiment_config(
+            2,
+            BaselineConfig::RnnBptt {
+                hidden_size: DEFAULT_RNN_HIDDEN_SIZE,
+                bptt_len: DEFAULT_RNN_BPTT_LEN,
+                learning_rate: DEFAULT_RNN_LEARNING_RATE,
+            },
+        );
+        let rep_rnn_a = execute_experiment(&cfg_rnn).expect("rnn run A succeeds");
+        let rep_rnn_b = execute_experiment(&cfg_rnn).expect("rnn run B succeeds");
+        assert_eq!(rep_rnn_a.scorecard, rep_rnn_b.scorecard);
+        assert_eq!(
+            rep_rnn_a.scorecard.budget_accounting_mode,
+            BudgetAccountingMode::BpttUnrollSteps
+        );
+        assert!(rep_rnn_a.scorecard.candidate_replay_ticks_consumed > 0);
+    }
+
+    #[test]
+    fn rnn_bptt_rejects_width_exceeding_one_hot_guard() {
+        let cfg = multi_channel_experiment_config(
+            16,
+            BaselineConfig::RnnBptt {
+                hidden_size: DEFAULT_RNN_HIDDEN_SIZE,
+                bptt_len: DEFAULT_RNN_BPTT_LEN,
+                learning_rate: DEFAULT_RNN_LEARNING_RATE,
+            },
+        );
+        let err = execute_experiment(&cfg).expect_err("k=16 should fail width guard");
+        match err {
+            ConfigRunError::Rnn(RnnError::UnsupportedWidth { bits, max_bits }) => {
+                assert_eq!(bits, 16);
+                assert_eq!(max_bits, MAX_RNN_ONE_HOT_WIDTH_BITS);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_config_toml_defaults_deserialize() {
+        let ctw_cfg: BaselineConfig =
+            toml::from_str("kind = \"CrossChannelCtw\"\n").expect("CrossChannelCtw TOML");
+        assert_eq!(
+            ctw_cfg,
+            BaselineConfig::CrossChannelCtw {
+                symbol_context_depth: DEFAULT_CROSS_CTW_SYMBOL_DEPTH,
+            }
+        );
+
+        let rnn_cfg: BaselineConfig = toml::from_str("kind = \"RnnBptt\"\n").expect("RnnBptt TOML");
+        assert_eq!(
+            rnn_cfg,
+            BaselineConfig::RnnBptt {
+                hidden_size: DEFAULT_RNN_HIDDEN_SIZE,
+                bptt_len: DEFAULT_RNN_BPTT_LEN,
+                learning_rate: DEFAULT_RNN_LEARNING_RATE,
+            }
+        );
+    }
 }
