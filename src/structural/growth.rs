@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::baselines::{ObservationWindow, TickBudget};
+use crate::metrics::mdl::StrippedRingCodeBase;
 use crate::metrics::{PointForecastScorer, circuit_code_bits_with_tax, facts_code_bits};
 use crate::rng::SeedBank;
 use crate::structural::economy::{EconomyConfig, EconomyState, score_with_reward_mode};
@@ -3400,6 +3401,7 @@ struct RingEvalPrecomp<'a> {
     stripped: &'a Circuit,
     old_to_new: &'a [Option<NodeId>],
     obs_out: &'a [u64],
+    ring_mdl: &'a StrippedRingCodeBase,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3503,6 +3505,11 @@ fn evaluate_ring_period(
     if exact_fast_counts {
         let e_ring_est = w_replay - matched;
         if (e_ring_est as isize) > e_ring_upper {
+            return RingPeriodOutcome::Rejected;
+        }
+        let l_ring_est = pre.ring_mdl.code_bits_for_ring(&mu);
+        let j_ring_est = l_ring_est + facts_code_bits(width, w_replay as u64, e_ring_est as u64);
+        if j_ring_est >= j_curr {
             return RingPeriodOutcome::Rejected;
         }
         let mut scorer = PointForecastScorer::new(width, economy_config.null_model);
@@ -3778,11 +3785,13 @@ pub fn propose_autonomous_delay_ring_scored_with_telemetry(
         l_curr + facts_code_bits(editable.circuit().width(), w_replay as u64, e_curr as u64);
 
     let (stripped_base, old_to_new_base) = strip_circuit_for_ring(editable.circuit(), out_port);
+    let ring_mdl = StrippedRingCodeBase::new(&stripped_base, economy_config.split_code_tax);
     let obs_out: Vec<u64> = obs_window.frames().iter().map(|f| f[out_idx]).collect();
     let ring_pre = RingEvalPrecomp {
         stripped: &stripped_base,
         old_to_new: &old_to_new_base,
         obs_out: &obs_out,
+        ring_mdl: &ring_mdl,
     };
 
     let mut best_ring: Option<(AutonomousRingProposal, f64, usize, f64)> = None;

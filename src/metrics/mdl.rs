@@ -181,6 +181,107 @@ pub fn circuit_code_bits_with_tax(
     header_bits + node_bits + wiring_bits
 }
 
+/// Precomputed prefix statistics of a stripped base circuit for fast bit-exact ring MDL updates.
+#[derive(Clone, Debug)]
+pub(crate) struct StrippedRingCodeBase {
+    k_bits: f64,
+    base_n: usize,
+    base_m: usize,
+    base_node_bits: f64,
+    palette_node_bits: f64,
+    base_src_ports: usize,
+    base_dst_ports: usize,
+    base_counted_wires: usize,
+    split_code_tax: bool,
+}
+
+impl StrippedRingCodeBase {
+    #[must_use]
+    pub(crate) fn new(stripped: &Circuit, split_code_tax: bool) -> Self {
+        let base_n = stripped.node_count();
+        let base_m = stripped.edges().len();
+        let palette_card = Primitive::PALETTE_SIZE as f64;
+        let palette_node_bits = palette_card.log2();
+        let k_bits = f64::from(stripped.width().bits());
+
+        let mut base_node_bits = 0.0;
+        for &prim in stripped.nodes() {
+            if !split_code_tax && prim == Primitive::Split {
+                continue;
+            }
+            base_node_bits += palette_node_bits;
+            if let Primitive::Delay { init } = prim {
+                base_node_bits += if init == 0 { 1.0 } else { 1.0 + k_bits };
+            }
+        }
+
+        let base_src_ports = usize::from(stripped.num_inputs())
+            + stripped
+                .nodes()
+                .iter()
+                .map(|p| usize::from(p.output_arity()))
+                .sum::<usize>();
+        let base_dst_ports = usize::from(stripped.num_outputs())
+            + stripped
+                .nodes()
+                .iter()
+                .map(|p| usize::from(p.input_arity()))
+                .sum::<usize>();
+
+        let mut base_counted_wires = 0usize;
+        for edge in stripped.edges() {
+            let is_split_port1 = !split_code_tax
+                && matches!(edge.src, SignalSource::NodeOut { node, port: 1 } if stripped.nodes()[node.index()] == Primitive::Split);
+            if !is_split_port1 {
+                base_counted_wires += 1;
+            }
+        }
+
+        Self {
+            k_bits,
+            base_n,
+            base_m,
+            base_node_bits,
+            palette_node_bits,
+            base_src_ports,
+            base_dst_ports,
+            base_counted_wires,
+            split_code_tax,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn code_bits_for_ring(&self, mu: &[u64]) -> f64 {
+        let p = mu.len();
+        let n = self.base_n + p + 1;
+        let m = self.base_m + p + 2;
+        let header_bits = elias_gamma_bits(n) + elias_gamma_bits(m);
+
+        let mut node_bits = self.base_node_bits;
+        for j in 0..p {
+            let init = mu[(p - 1 - j) % p];
+            node_bits += self.palette_node_bits;
+            node_bits += if init == 0 { 1.0 } else { 1.0 + self.k_bits };
+        }
+        if self.split_code_tax {
+            node_bits += self.palette_node_bits;
+        }
+
+        let src_ports = self.base_src_ports + p + 2;
+        let dst_ports = self.base_dst_ports + p + 1;
+        let pairs = (src_ports.max(1) * dst_ports.max(1)) as f64;
+        let bit_per_wire = pairs.log2();
+
+        let total_wires = self.base_counted_wires + (p + 1) + usize::from(self.split_code_tax);
+        let mut wiring_bits = 0.0;
+        for _ in 0..total_wires {
+            wiring_bits += bit_per_wire;
+        }
+
+        header_bits + node_bits + wiring_bits
+    }
+}
+
 /// Decomposed allocation of circuit description length among nodes and unowned wires.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CircuitDescriptionAllocation {
