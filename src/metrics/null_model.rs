@@ -22,6 +22,7 @@ pub struct NullModel {
     width: Width,
     kind: NullModelKind,
     steps: u64,
+    small_counts: [u64; 16],
     counts: BTreeMap<u64, u64>,
     last_symbol: Option<u64>,
     repeat_matches: u64,
@@ -35,6 +36,7 @@ impl NullModel {
             width,
             kind,
             steps: 0,
+            small_counts: [0; 16],
             counts: BTreeMap::new(),
             last_symbol: None,
             repeat_matches: 0,
@@ -44,6 +46,7 @@ impl NullModel {
     /// Resets running statistics.
     pub fn reset(&mut self) {
         self.steps = 0;
+        self.small_counts = [0; 16];
         self.counts.clear();
         self.last_symbol = None;
         self.repeat_matches = 0;
@@ -70,7 +73,12 @@ impl NullModel {
 
         match self.kind {
             NullModelKind::LaplaceFrequency => {
-                let count = self.counts.get(&sym).copied().unwrap_or(0) as f64;
+                let raw_count = if k <= 4 {
+                    self.small_counts[sym as usize]
+                } else {
+                    self.counts.get(&sym).copied().unwrap_or(0)
+                };
+                let count = raw_count as f64;
                 // KT prior: (N_x + 0.5) / (t + 0.5 * 2^k).
                 let denom = (self.steps as f64) + 0.5 * card_f64;
                 (count + 0.5) / denom
@@ -108,7 +116,11 @@ impl NullModel {
             self.repeat_matches += 1;
         }
         self.last_symbol = Some(sym);
-        *self.counts.entry(sym).or_insert(0) += 1;
+        if self.width.bits() <= 4 {
+            self.small_counts[sym as usize] += 1;
+        } else {
+            *self.counts.entry(sym).or_insert(0) += 1;
+        }
         self.steps += 1;
 
         surprisal
