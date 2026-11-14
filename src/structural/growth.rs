@@ -1919,15 +1919,55 @@ fn evaluate_sprout_motif(
         let _ = state.set_registers(&staged_compiled, &staged_regs);
     }
     let num_outputs = usize::from(staged_compiled.num_outputs());
-    let mut pred = vec![0u64; num_outputs];
-    let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
+    let mut pred_stack = [0u64; 16];
+    let mut pred_heap = Vec::new();
+    let pred: &mut [u64] = if num_outputs <= pred_stack.len() {
+        &mut pred_stack[..num_outputs]
+    } else {
+        pred_heap.resize(num_outputs, 0);
+        &mut pred_heap
+    };
 
+    let mut e_port_stack = [0usize; 16];
+    let mut e_port_heap = Vec::new();
+    let e_cand_by_port: &mut [usize] = if num_outputs <= e_port_stack.len() {
+        &mut e_port_stack[..num_outputs]
+    } else {
+        e_port_heap.resize(num_outputs, 0);
+        &mut e_port_heap
+    };
+
+    let mut trace_stack = [0u64; 256];
+    let mut trace_heap = Vec::new();
+    let p_cand_trace: &mut [u64] = if baseline.w_replay <= trace_stack.len() {
+        &mut trace_stack[..baseline.w_replay]
+    } else {
+        trace_heap.resize(baseline.w_replay, 0);
+        &mut trace_heap
+    };
+
+    let is_epoch1_non_const = is_epoch_1 && !matches!(motif, CandidateMotif::ConstLoop(_));
+    let is_binary_eqz_scaffold = is_epoch1_non_const
+        && staged.width() == Width::BITS_1
+        && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(c)) if *c == out_port);
+    let e_cand_upper: isize = {
+        let base = (baseline.e_curr as isize) - (growth_config.min_match_gain as isize);
+        if is_epoch1_non_const {
+            let const_lim = if is_binary_eqz_scaffold {
+                baseline.e_const_mode.saturating_add(1) as isize
+            } else {
+                (baseline.e_const_mode as isize) - (growth_config.min_match_gain as isize)
+            };
+            base.min(const_lim)
+        } else {
+            base
+        }
+    };
+
+    let out_idx = usize::from(out_port);
     let mut e_cand = 0usize;
-    let mut e_cand_by_port = vec![0usize; num_outputs];
-    let mut flux_cand = 0.0;
-    let mut pos_flux_cand = 0.0;
 
-    for i in 0..baseline.w_replay {
+    for (i, trace_slot) in p_cand_trace.iter_mut().enumerate() {
         let idx = baseline.start_idx + i;
         let input = if idx == 0 {
             obs_window.prior_frame()
@@ -1935,11 +1975,38 @@ fn evaluate_sprout_motif(
             &obs_window.frames()[idx - 1]
         };
         let truth = &obs_window.frames()[idx];
-        if state.step(&staged_compiled, input, &mut pred).is_err() {
+        if state.step(&staged_compiled, input, pred).is_err() {
             return SproutMotifOutcome::Rejected;
         }
-        let p_cand = pred[usize::from(out_port)];
-        let p_truth = truth[usize::from(out_port)];
+        let p_cand = pred[out_idx];
+        *trace_slot = p_cand;
+        if idx >= baseline.eval_start_idx {
+            for (q, e_port) in e_cand_by_port.iter_mut().enumerate() {
+                if q < truth.len() && pred[q] != truth[q] {
+                    *e_port += 1;
+                    if q != out_idx
+                        && baseline.driven_ports.get(q).copied().unwrap_or(false)
+                        && *e_port > baseline.e_curr_by_port[q]
+                    {
+                        return SproutMotifOutcome::Rejected;
+                    }
+                }
+            }
+            if p_cand != truth[out_idx] {
+                e_cand += 1;
+            }
+            if (e_cand as isize) > e_cand_upper {
+                return SproutMotifOutcome::Rejected;
+            }
+        }
+    }
+
+    let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
+    let mut flux_cand = 0.0;
+    let mut pos_flux_cand = 0.0;
+    for (i, &p_cand) in p_cand_trace.iter().enumerate() {
+        let idx = baseline.start_idx + i;
+        let p_truth = obs_window.frames()[idx][out_idx];
         let reward = score_with_reward_mode(
             &mut scorer,
             economy_config.reward_mode,
@@ -1948,40 +2015,8 @@ fn evaluate_sprout_motif(
             p_truth,
         );
         if idx >= baseline.eval_start_idx {
-            for (q, e_port) in e_cand_by_port.iter_mut().enumerate() {
-                if q < truth.len() && pred[q] != truth[q] {
-                    *e_port += 1;
-                }
-            }
-            if p_cand != p_truth {
-                e_cand += 1;
-            }
             flux_cand += reward;
             pos_flux_cand += reward.max(0.0);
-        }
-    }
-
-    for (q, &e_port) in e_cand_by_port.iter().enumerate() {
-        if q != usize::from(out_port)
-            && baseline.driven_ports.get(q).copied().unwrap_or(false)
-            && e_port > baseline.e_curr_by_port[q]
-        {
-            return SproutMotifOutcome::Rejected;
-        }
-    }
-
-    if e_cand + growth_config.min_match_gain > baseline.e_curr {
-        return SproutMotifOutcome::Rejected;
-    }
-    if is_epoch_1 && !matches!(motif, CandidateMotif::ConstLoop(_)) {
-        let is_binary_eqz_scaffold = staged.width() == Width::BITS_1
-            && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(c)) if *c == out_port);
-        if is_binary_eqz_scaffold {
-            if e_cand > baseline.e_const_mode.saturating_add(1) {
-                return SproutMotifOutcome::Rejected;
-            }
-        } else if e_cand + growth_config.min_match_gain > baseline.e_const_mode {
-            return SproutMotifOutcome::Rejected;
         }
     }
 
@@ -2280,9 +2315,39 @@ pub fn propose_sprout_band_scored_with_telemetry(
     max_tau: u8,
     telemetry: &mut SproutTelemetry,
 ) -> Result<Option<ScoredSproutProposal>, GrowthError> {
+    propose_sprout_band_scored_internal(
+        editable,
+        obs_window,
+        diag,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        min_tau,
+        max_tau,
+        telemetry,
+        true,
+    )
+    .map(|(proposal, _)| proposal)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn propose_sprout_band_scored_internal(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    min_tau: u8,
+    max_tau: u8,
+    telemetry: &mut SproutTelemetry,
+    compute_lag_bound: bool,
+) -> Result<(Option<ScoredSproutProposal>, bool), GrowthError> {
     let len = diag.len();
     if len < growth_config.diagnostic_window {
-        return Ok(None);
+        return Ok((None, false));
     }
     let residuals: Vec<u64> = diag
         .residuals
@@ -2317,7 +2382,7 @@ pub fn propose_sprout_band_scored_with_telemetry(
         telemetry.candidate_list_truncated += 1;
     }
     if diagnostics.zero_error {
-        return Ok(None);
+        return Ok((None, false));
     }
 
     let baseline = replay_current_baseline(
@@ -2330,6 +2395,9 @@ pub fn propose_sprout_band_scored_with_telemetry(
     );
 
     if !diagnostics.growth_criterion_met {
+        if !compute_lag_bound {
+            return Ok((None, true));
+        }
         if has_admissible_deeper_lag(
             editable,
             obs_window,
@@ -2343,7 +2411,7 @@ pub fn propose_sprout_band_scored_with_telemetry(
         ) {
             telemetry.lag_horizon_bound += 1;
         }
-        return Ok(None);
+        return Ok((None, false));
     }
 
     let mut feature_pairs: Vec<(SourceFeature, Option<SourceFeature>)> = Vec::new();
@@ -2419,7 +2487,7 @@ pub fn propose_sprout_band_scored_with_telemetry(
         if !feature_pairs.is_empty() {
             telemetry.lag_horizon_bound += 1;
         }
-        return Ok(None);
+        return Ok((None, false));
     }
 
     let mut best_same: Option<(Circuit, usize, f64, f64, bool)> = None;
@@ -2532,9 +2600,12 @@ pub fn propose_sprout_band_scored_with_telemetry(
         })
     };
 
+    let mut pending_deeper_check = false;
     if best_proposal.is_none() {
         if blocked_by_max_nodes > 0 {
             telemetry.sprout_blocked_max_nodes += 1;
+        } else if !compute_lag_bound {
+            pending_deeper_check = true;
         } else if has_admissible_deeper_lag(
             editable,
             obs_window,
@@ -2550,7 +2621,48 @@ pub fn propose_sprout_band_scored_with_telemetry(
         }
     }
 
-    Ok(best_proposal)
+    Ok((best_proposal, pending_deeper_check))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_deeper_lag_for_port(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    out_port: u16,
+    max_tau: u8,
+) -> bool {
+    let residuals: Vec<u64> = diag
+        .residuals
+        .iter()
+        .map(|f| f[usize::from(out_port)])
+        .collect();
+    let is_epoch_1 = !editable
+        .circuit()
+        .edges()
+        .iter()
+        .any(|edge| edge.dst == SignalSink::BoundaryOut(out_port));
+    let baseline = replay_current_baseline(
+        editable,
+        obs_window,
+        growth_config,
+        economy_config,
+        out_port,
+        is_epoch_1,
+    );
+    has_admissible_deeper_lag(
+        editable,
+        obs_window,
+        &residuals,
+        max_tau,
+        growth_config,
+        economy_config,
+        out_port,
+        is_epoch_1,
+        &baseline,
+    )
 }
 
 /// Autonomous delay ring proposal under channel noise (§4.5).
@@ -2790,20 +2902,51 @@ fn evaluate_ring_period(
 ) -> RingPeriodOutcome {
     let w_replay = obs_window.len();
     let out_idx = usize::from(out_port);
-    let mut residue_counts = vec![BTreeMap::<u64, usize>::new(); p];
-    for (i, frame) in obs_window.frames().iter().enumerate() {
-        let global_t = obs_window.start_tick() + (i as u64);
-        let r = (global_t as usize) % p;
-        *residue_counts[r].entry(frame[out_idx]).or_default() += 1;
-    }
+    let bits = editable.circuit().width().bits();
     let mut mu = vec![0u64; p];
-    for (r, counts) in residue_counts.iter().enumerate() {
-        let mode = counts
-            .iter()
-            .max_by(|(s1, c1), (s2, c2)| c1.cmp(c2).then_with(|| s2.cmp(s1)))
-            .map(|(&s, _)| s)
-            .unwrap_or(0);
-        mu[r] = mode;
+    if bits <= 4 {
+        let card = 1usize << bits;
+        let needed = p * card;
+        let mut stack_counts = [0usize; 32 * 16];
+        let mut heap_counts = Vec::new();
+        let counts: &mut [usize] = if needed <= stack_counts.len() {
+            &mut stack_counts[..needed]
+        } else {
+            heap_counts.resize(needed, 0);
+            &mut heap_counts
+        };
+        for (i, frame) in obs_window.frames().iter().enumerate() {
+            let global_t = obs_window.start_tick() + (i as u64);
+            let r = (global_t as usize) % p;
+            counts[r * card + (frame[out_idx] as usize)] += 1;
+        }
+        for r in 0..p {
+            let row = &counts[r * card..(r + 1) * card];
+            let mut best_sym = 0u64;
+            let mut best_cnt = row[0];
+            for (sym, &cnt) in row.iter().enumerate().skip(1) {
+                if cnt > best_cnt {
+                    best_cnt = cnt;
+                    best_sym = sym as u64;
+                }
+            }
+            mu[r] = best_sym;
+        }
+    } else {
+        let mut residue_counts = vec![BTreeMap::<u64, usize>::new(); p];
+        for (i, frame) in obs_window.frames().iter().enumerate() {
+            let global_t = obs_window.start_tick() + (i as u64);
+            let r = (global_t as usize) % p;
+            *residue_counts[r].entry(frame[out_idx]).or_default() += 1;
+        }
+        for (r, counts) in residue_counts.iter().enumerate() {
+            let mode = counts
+                .iter()
+                .max_by(|(s1, c1), (s2, c2)| c1.cmp(c2).then_with(|| s2.cmp(s1)))
+                .map(|(&s, _)| s)
+                .unwrap_or(0);
+            mu[r] = mode;
+        }
     }
     if mu.iter().all(|&v| v == mu[0]) {
         return RingPeriodOutcome::Rejected;
@@ -2864,13 +3007,30 @@ fn evaluate_ring_period(
         return RingPeriodOutcome::Rejected;
     }
 
-    let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
     let mut e_ring = 0usize;
     let mut e_ring_diag = 0usize;
     let w_diag = growth_config.diagnostic_window.max(1);
     let diag_start = w_replay.saturating_sub(w_diag);
-    let mut flux_ring = 0.0;
-    let mut pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
+    let e_ring_upper = (e_curr as isize) - (growth_config.min_match_gain as isize);
+
+    let num_outputs = usize::from(staged_compiled.num_outputs());
+    let mut pred_stack = [0u64; 16];
+    let mut pred_heap = Vec::new();
+    let pred: &mut [u64] = if num_outputs <= pred_stack.len() {
+        &mut pred_stack[..num_outputs]
+    } else {
+        pred_heap.resize(num_outputs, 0);
+        &mut pred_heap
+    };
+
+    let mut trace_stack = [0u64; 256];
+    let mut trace_heap = Vec::new();
+    let p_ring_trace: &mut [u64] = if w_replay <= trace_stack.len() {
+        &mut trace_stack[..w_replay]
+    } else {
+        trace_heap.resize(w_replay, 0);
+        &mut trace_heap
+    };
 
     for (i, frame) in obs_window.frames().iter().enumerate() {
         let input = if i == 0 {
@@ -2878,26 +3038,35 @@ fn evaluate_ring_period(
         } else {
             &obs_window.frames()[i - 1]
         };
-        if state.step(&staged_compiled, input, &mut pred).is_err() {
+        if state.step(&staged_compiled, input, pred).is_err() {
             return RingPeriodOutcome::Rejected;
         }
-        if pred[out_idx] != frame[out_idx] {
+        let p_pred = pred[out_idx];
+        p_ring_trace[i] = p_pred;
+        if p_pred != frame[out_idx] {
             e_ring += 1;
             if i >= diag_start {
                 e_ring_diag += 1;
             }
+            if (e_ring as isize) > e_ring_upper {
+                return RingPeriodOutcome::Rejected;
+            }
         }
+    }
+    if (e_ring as isize) > e_ring_upper {
+        return RingPeriodOutcome::Rejected;
+    }
+
+    let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
+    let mut flux_ring = 0.0;
+    for (i, &p_pred) in p_ring_trace.iter().enumerate() {
         flux_ring += score_with_reward_mode(
             &mut scorer,
             economy_config.reward_mode,
             staged.width(),
-            pred[out_idx],
-            frame[out_idx],
+            p_pred,
+            obs_window.frames()[i][out_idx],
         );
-    }
-
-    if e_ring + growth_config.min_match_gain > e_curr {
-        return RingPeriodOutcome::Rejected;
     }
     if flux_ring <= flux_curr {
         return RingPeriodOutcome::Rejected;

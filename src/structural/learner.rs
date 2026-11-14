@@ -10,9 +10,9 @@ use crate::rng::SeedBank;
 use crate::structural::economy::EconomyConfig;
 use crate::structural::growth::{
     AutonomousRingProposal, DiagnosticBuffer, GrowthConfig, GrowthError, ScoredSproutProposal,
-    SproutTelemetry, diagnose_residual, effective_juvenile_ticks, port_cone_register_depth,
-    propose_autonomous_delay_ring_scored_with_telemetry, propose_sprout_band_scored_with_telemetry,
-    propose_sprout_scored_with_telemetry,
+    SproutTelemetry, check_deeper_lag_for_port, diagnose_residual, effective_juvenile_ticks,
+    port_cone_register_depth, propose_autonomous_delay_ring_scored_with_telemetry,
+    propose_sprout_band_scored_internal,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
@@ -784,7 +784,12 @@ impl PredictorBaseline for ArkheLearner {
 
             let mut sprouted = false;
             let mut stage0_tel = SproutTelemetry::default();
-            let stage0_res = propose_sprout_scored_with_telemetry(
+            let can_potentially_deepen = num_ports > 1
+                && !port_zero_error
+                && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
+                && port_budget.remaining() > 0;
+            let mut deferred_lag_bound_tau: Option<u8> = None;
+            let (stage0_res, stage0_pending_bound) = match propose_sprout_band_scored_internal(
                 &self.editable,
                 &self.obs_window,
                 &self.port_states[p].diagnostic_buffer,
@@ -792,9 +797,17 @@ impl PredictorBaseline for ArkheLearner {
                 &self.economy_config,
                 &mut port_budget,
                 port_u16,
+                1,
                 self.growth_config.max_reactive_lag,
                 &mut stage0_tel,
-            );
+                !can_potentially_deepen,
+            ) {
+                Ok((prop, pending)) => (Ok(prop), pending),
+                Err(e) => (Err(e), false),
+            };
+            if stage0_pending_bound {
+                deferred_lag_bound_tau = Some(self.growth_config.max_reactive_lag);
+            }
             let can_deepen_eligible = num_ports > 1
                 && !port_zero_error
                 && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
@@ -853,13 +866,16 @@ impl PredictorBaseline for ArkheLearner {
                     bands.push((prev_max + 1, self.growth_config.deepening_max_lag));
                 }
 
-                for (min_tau, max_tau) in bands {
+                let num_bands = bands.len();
+                for (band_idx, &(min_tau, max_tau)) in bands.iter().enumerate() {
                     if port_budget.remaining() == 0 {
                         break;
                     }
                     self.lag_deepening_steps += 1;
+                    deferred_lag_bound_tau = None;
                     let mut band_tel = SproutTelemetry::default();
-                    let band_res = propose_sprout_band_scored_with_telemetry(
+                    let is_last_band = band_idx + 1 == num_bands;
+                    let (band_res, band_pending_bound) = match propose_sprout_band_scored_internal(
                         &self.editable,
                         &self.obs_window,
                         &self.port_states[p].diagnostic_buffer,
@@ -870,7 +886,14 @@ impl PredictorBaseline for ArkheLearner {
                         min_tau,
                         max_tau,
                         &mut band_tel,
-                    );
+                        is_last_band,
+                    ) {
+                        Ok((prop, pending)) => (Ok(prop), pending),
+                        Err(e) => (Err(e), false),
+                    };
+                    if band_pending_bound {
+                        deferred_lag_bound_tau = Some(max_tau);
+                    }
                     band_blocked += band_tel.sprout_blocked_max_nodes;
                     band_exhausted += band_tel.sprout_budget_exhausted;
                     let band_stopped = band_tel.sprout_blocked_max_nodes > 0
@@ -924,7 +947,21 @@ impl PredictorBaseline for ArkheLearner {
             self.candidate_list_truncated +=
                 bound_tel.candidate_list_truncated + ring_tel.candidate_list_truncated;
             if !sprouted {
-                self.lag_horizon_bound += bound_tel.lag_horizon_bound + ring_tel.lag_horizon_bound;
+                let mut bound = bound_tel.lag_horizon_bound + ring_tel.lag_horizon_bound;
+                if let Some(tau_max) = deferred_lag_bound_tau
+                    && check_deeper_lag_for_port(
+                        &self.editable,
+                        &self.obs_window,
+                        &self.port_states[p].diagnostic_buffer,
+                        &self.growth_config,
+                        &self.economy_config,
+                        port_u16,
+                        tau_max,
+                    )
+                {
+                    bound += 1;
+                }
+                self.lag_horizon_bound += bound;
             }
 
             if sprouted {

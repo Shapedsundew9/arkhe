@@ -238,26 +238,63 @@ pub fn assemble_causal_ancestry(
         }
     }
 
-    let mut port_shares = vec![vec![0.0; node_count]; compiled.output_drivers().len()];
+    let num_outputs = compiled.output_drivers().len();
+    let mut port_shares = vec![vec![0.0; node_count]; num_outputs];
+    let mut next_register_eligibility = vec![vec![0.0; node_count]; register_count];
+    if node_count == 0 {
+        return Ok(CausalAncestry {
+            port_shares,
+            next_register_eligibility,
+        });
+    }
+
+    let mut out_wire_to_node = vec![usize::MAX; wire_count];
+    let mut wire_source_nodes = vec![None; wire_count];
+    for (idx, primitive) in circuit.nodes().iter().enumerate() {
+        let base = node_out_base[idx];
+        let node_id = NodeId(u32::try_from(idx).expect("node index fits in u32"));
+        for port in 0..usize::from(primitive.output_arity()) {
+            out_wire_to_node[base + port] = idx;
+            wire_source_nodes[base + port] = Some(node_id);
+        }
+    }
+    if circuit.wire_delay() == crate::substrate::WireDelayMode::TicksPerHop {
+        for (edge_idx, edge) in circuit.edges().iter().enumerate() {
+            if let Some(slot) = wire_source_nodes.get_mut(next_wire + edge_idx)
+                && let SignalSource::NodeOut { node, .. } = edge.src
+            {
+                *slot = Some(node);
+            }
+        }
+    }
+
+    let mut wire_ancestry = vec![0.0; wire_count * node_count];
+    let mut node_ancestry = vec![0.0; node_count];
+    let wire_values = state.wire_values();
+
     for (port, shares) in port_shares.iter_mut().enumerate() {
-        let wire_ancestry = ancestry_for_target(
+        ancestry_for_target(
             circuit,
             compiled,
-            state,
+            wire_values,
             sensitivity,
             activity,
             register_eligibility,
             trace_discount,
             &node_out_base,
+            &out_wire_to_node,
+            &wire_source_nodes,
             &delay_register_of_node,
+            wire_count,
             Target::Output(port),
+            &mut wire_ancestry,
+            &mut node_ancestry,
         )?;
         if let Some(driver) = compiled.output_drivers()[port] {
-            shares.copy_from_slice(&wire_ancestry[driver]);
+            shares.copy_from_slice(&wire_ancestry[driver * node_count..(driver + 1) * node_count]);
         }
     }
 
-    let mut next_register_eligibility = vec![vec![0.0; node_count]; register_count];
     let mut register_input_wires = vec![None; register_count];
     for &(register, input_wire) in compiled.delay_latches() {
         register_input_wires[register] = Some(input_wire);
@@ -273,23 +310,30 @@ pub fn assemble_causal_ancestry(
             }
         }
     }
-    for register in 0..register_count {
-        let Some(input_wire) = register_input_wires[register] else {
+    for (register, input_wire_opt) in register_input_wires.iter().enumerate() {
+        let Some(input_wire) = *input_wire_opt else {
             continue;
         };
-        let wire_ancestry = ancestry_for_target(
+        ancestry_for_target(
             circuit,
             compiled,
-            state,
+            wire_values,
             sensitivity,
             activity,
             register_eligibility,
             trace_discount,
             &node_out_base,
+            &out_wire_to_node,
+            &wire_source_nodes,
             &delay_register_of_node,
+            wire_count,
             Target::Register(register),
+            &mut wire_ancestry,
+            &mut node_ancestry,
         )?;
-        next_register_eligibility[register].copy_from_slice(&wire_ancestry[input_wire]);
+        next_register_eligibility[register].copy_from_slice(
+            &wire_ancestry[input_wire * node_count..(input_wire + 1) * node_count],
+        );
     }
 
     Ok(CausalAncestry {
@@ -308,20 +352,26 @@ enum Target {
 fn ancestry_for_target(
     circuit: &Circuit,
     compiled: &CompiledCircuit,
-    state: &ScalarState,
+    wire_values: &[u64],
     sensitivity: &SensitivitySnapshot,
     activity: &[NodeActivity],
     register_eligibility: &[Vec<f64>],
     trace_discount: f64,
     node_out_base: &[usize],
+    out_wire_to_node: &[usize],
+    wire_source_nodes: &[Option<NodeId>],
     delay_register_of_node: &[Option<usize>],
+    wire_count: usize,
     target: Target,
-) -> Result<Vec<Vec<f64>>, SensitivityError> {
+    wire_ancestry: &mut [f64],
+    node_ancestry: &mut [f64],
+) -> Result<(), SensitivityError> {
     let node_count = circuit.node_count();
-    let mut wire_ancestry = vec![vec![0.0; node_count]; state.wire_values().len()];
+    wire_ancestry.fill(0.0);
     for &(register, wire) in compiled.delay_reads() {
         if let Some(trace) = register_eligibility.get(register) {
-            for (dst, &value) in wire_ancestry[wire].iter_mut().zip(trace) {
+            let dst_slice = &mut wire_ancestry[wire * node_count..(wire + 1) * node_count];
+            for (dst, &value) in dst_slice.iter_mut().zip(trace) {
                 *dst = trace_discount * value;
             }
         }
@@ -336,74 +386,81 @@ fn ancestry_for_target(
         };
         let coefficient = target_sensitivity(sensitivity, node, target)?;
         let wire = node_out_base[node];
-        for ancestor in 0..node_count {
-            let inherited = trace_discount * register_eligibility[register][ancestor];
+        let dst_slice = &mut wire_ancestry[wire * node_count..(wire + 1) * node_count];
+        let reg_elig = &register_eligibility[register];
+        for (ancestor, (dst, &elig)) in dst_slice.iter_mut().zip(reg_elig).enumerate() {
+            let inherited = trace_discount * elig;
             let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
-            wire_ancestry[wire][ancestor] = coefficient * raw.min(1.0);
+            *dst = coefficient * raw.min(1.0);
         }
     }
 
+    debug_assert_eq!(wire_ancestry.len(), wire_count * node_count);
     for operation in compiled.comb_ops() {
-        let (node, output_wires) = match *operation {
+        let (first_out, out_count, out_pair) = match *operation {
             CombOp::Add { out, .. }
             | CombOp::Sub { out, .. }
             | CombOp::Mul { out, .. }
-            | CombOp::Eqz { out, .. } => {
-                let node = node_out_base
-                    .iter()
-                    .position(|&base| base == out)
-                    .ok_or(SensitivityError::DimensionMismatch)?;
-                (node, vec![out])
-            }
-            CombOp::Split { out0, out1, .. } => {
-                let node = node_out_base
-                    .iter()
-                    .position(|&base| base == out0)
-                    .ok_or(SensitivityError::DimensionMismatch)?;
-                (node, vec![out0, out1])
-            }
+            | CombOp::Eqz { out, .. } => (out, 1usize, [out, 0]),
+            CombOp::Split { out0, out1, .. } => (out0, 2usize, [out0, out1]),
         };
+        let node = *out_wire_to_node
+            .get(first_out)
+            .filter(|&&idx| idx != usize::MAX)
+            .ok_or(SensitivityError::DimensionMismatch)?;
         let coefficient = target_sensitivity(sensitivity, node, target)?;
         let input_wires = &compiled.node_input_wires()[node];
-        let input_values: Vec<u64> = input_wires
-            .iter()
-            .map(|&wire| state.wire_values()[wire])
-            .collect();
-        let is_mul_consumer = matches!(circuit.nodes()[node], Primitive::Mul);
-        let input_active: Vec<f64> = input_wires
-            .iter()
-            .map(|&wire| {
-                source_node_for_wire(circuit, wire).map_or(0.0, |source| {
-                    let act = activity[source.index()];
-                    if is_mul_consumer {
-                        act.non_one_weight
-                    } else {
-                        act.nonzero_weight
-                    }
-                })
-            })
-            .collect();
-        let weights = ring_identity_input_weights(
-            circuit.nodes()[node],
-            &input_values,
-            &input_active,
-            compiled.width(),
-        );
-        let mut node_ancestry = vec![0.0; node_count];
+        let arity = input_wires.len();
+        let prim = circuit.nodes()[node];
+        let is_mul_consumer = matches!(prim, Primitive::Mul);
+
+        let mut in_vals_stack = [0u64; 2];
+        let mut in_act_stack = [0.0f64; 2];
+        let mut in_vals_heap = Vec::new();
+        let mut in_act_heap = Vec::new();
+        let (in_vals, in_act): (&mut [u64], &mut [f64]) = if arity <= 2 {
+            (&mut in_vals_stack[..arity], &mut in_act_stack[..arity])
+        } else {
+            in_vals_heap.resize(arity, 0);
+            in_act_heap.resize(arity, 0.0);
+            (&mut in_vals_heap, &mut in_act_heap)
+        };
+        for (i, &wire) in input_wires.iter().enumerate() {
+            in_vals[i] = wire_values[wire];
+            in_act[i] = wire_source_nodes[wire].map_or(0.0, |source| {
+                let act = activity[source.index()];
+                if is_mul_consumer {
+                    act.non_one_weight
+                } else {
+                    act.nonzero_weight
+                }
+            });
+        }
+        let w_stack = if arity == 1 {
+            [1.0, 0.0]
+        } else {
+            ring_identity_input_weights_pair(
+                prim,
+                [in_vals[0], in_vals[1]],
+                [in_act[0], in_act[1]],
+                compiled.width(),
+            )
+        };
+        let weights = &w_stack[..arity];
         for (ancestor, value) in node_ancestry.iter_mut().enumerate() {
-            let inherited: f64 = input_wires
-                .iter()
-                .zip(&weights)
-                .map(|(&wire, &weight)| weight * wire_ancestry[wire][ancestor])
-                .sum();
+            let mut inherited = 0.0;
+            for (&wire, &weight) in input_wires.iter().zip(weights) {
+                inherited += weight * wire_ancestry[wire * node_count + ancestor];
+            }
             let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
             *value = coefficient * raw.min(1.0);
         }
-        for wire in output_wires {
-            wire_ancestry[wire].copy_from_slice(&node_ancestry);
+        for &wire in &out_pair[..out_count] {
+            wire_ancestry[wire * node_count..(wire + 1) * node_count]
+                .copy_from_slice(node_ancestry);
         }
     }
-    Ok(wire_ancestry)
+    Ok(())
 }
 
 fn target_sensitivity(
@@ -487,23 +544,12 @@ fn evaluate_counterfactual_cone(
     }
 }
 
-/// Returns normalised ring-identity-aware input weights for one primitive.
-///
-/// `input_active[j]` is the recency weight in `[0.0, 1.0]` for the source of input `j` (M1a redesign D4).
-#[must_use]
-pub fn ring_identity_input_weights(
+fn ring_identity_input_weights_pair(
     primitive: Primitive,
-    inputs: &[u64],
-    input_active: &[f64],
+    inputs: [u64; 2],
+    input_active: [f64; 2],
     width: Width,
-) -> Vec<f64> {
-    let arity = usize::from(primitive.input_arity());
-    if inputs.len() != arity || input_active.len() != arity {
-        return vec![0.0; arity];
-    }
-    if arity == 1 {
-        return vec![1.0];
-    }
+) -> [f64; 2] {
     let values = [width.normalize(inputs[0]), width.normalize(inputs[1])];
     let mut raw = [1.0, 1.0];
     match primitive {
@@ -547,10 +593,36 @@ pub fn ring_identity_input_weights(
     }
     let total = raw[0] + raw[1];
     if total == 0.0 {
-        vec![0.0, 0.0]
+        [0.0, 0.0]
     } else {
-        vec![raw[0] / total, raw[1] / total]
+        [raw[0] / total, raw[1] / total]
     }
+}
+
+/// Returns normalised ring-identity-aware input weights for one primitive.
+///
+/// `input_active[j]` is the recency weight in `[0.0, 1.0]` for the source of input `j` (M1a redesign D4).
+#[must_use]
+pub fn ring_identity_input_weights(
+    primitive: Primitive,
+    inputs: &[u64],
+    input_active: &[f64],
+    width: Width,
+) -> Vec<f64> {
+    let arity = usize::from(primitive.input_arity());
+    if inputs.len() != arity || input_active.len() != arity {
+        return vec![0.0; arity];
+    }
+    if arity == 1 {
+        return vec![1.0];
+    }
+    ring_identity_input_weights_pair(
+        primitive,
+        [inputs[0], inputs[1]],
+        [input_active[0], input_active[1]],
+        width,
+    )
+    .to_vec()
 }
 
 /// Returns the source node for a compiled wire, where applicable.
