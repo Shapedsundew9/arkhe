@@ -348,41 +348,61 @@ fn diagnose_residual_with_band(
         .map(|&value| width.normalize(value))
         .collect();
     let zero_error = residuals.iter().all(|&value| value == 0);
-    let residual_entropy_bits = entropy(residuals.iter().copied());
-    let counts = frequencies(residuals.iter().copied());
-    let zero_count = counts.get(&0).copied().unwrap_or(0);
-    let constant_offset = counts
-        .iter()
-        .filter(|(symbol, _)| **symbol != 0)
-        .max_by(|(symbol_a, count_a), (symbol_b, count_b)| {
-            count_a.cmp(count_b).then_with(|| symbol_b.cmp(symbol_a))
-        })
-        .and_then(|(&symbol, &count)| {
-            (count.saturating_sub(zero_count) >= config.min_match_gain)
-                .then_some((symbol, count.saturating_sub(zero_count)))
-        });
+    let res_ctx = ResidualContext::new(&residuals, width, config.min_match_gain);
+    let residual_entropy_bits = res_ctx.entropy_bits;
+    let constant_offset = res_ctx.constant_offset;
 
     let filter_band = min_tau > 1;
-    let in_band = |idx: usize| -> bool {
-        let lag = feature_lag(&features[idx]);
-        lag >= min_tau
-            && lag <= max_tau
-            && SourceFeature::parse(&features[idx].name)
-                .is_some_and(|sf| source_is_cross_channel(&sf, out_port))
-    };
+    let mut in_band_flags = vec![false; features.len()];
+    if filter_band {
+        for (idx, feat) in features.iter().enumerate() {
+            let lag = feature_lag(feat);
+            in_band_flags[idx] = lag >= min_tau
+                && lag <= max_tau
+                && SourceFeature::parse(&feat.name)
+                    .is_some_and(|sf| source_is_cross_channel(&sf, out_port));
+        }
+    }
 
-    let mut scores = Vec::new();
+    let len = residuals.len();
+    let mut norm_pool = vec![0u64; features.len() * len];
+    for (idx, feat) in features.iter().enumerate() {
+        let dst = &mut norm_pool[idx * len..(idx + 1) * len];
+        for (slot, &val) in dst.iter_mut().zip(&feat.values) {
+            *slot = width.normalize(val);
+        }
+    }
+
+    let mut scratch_1: Vec<(u64, u64)> = Vec::new();
+    let mut scratch_2: Vec<(u64, u64, u64)> = Vec::new();
+    let mut scores = Vec::with_capacity(if filter_band {
+        features.len() * 8
+    } else {
+        features.len() * (features.len() + 1) / 2
+    });
     for first in 0..features.len() {
-        if !filter_band || in_band(first) {
-            scores.push(score_feature_group(&residuals, features, &[first], width));
+        let first_slice = &norm_pool[first * len..(first + 1) * len];
+        let first_in_band = in_band_flags[first];
+        if !filter_band || first_in_band {
+            scores.push(score_singleton_normalized(
+                &res_ctx,
+                &residuals,
+                first,
+                first_slice,
+                &mut scratch_1,
+            ));
         }
         for second in (first + 1)..features.len() {
-            if !filter_band || in_band(first) || in_band(second) {
-                scores.push(score_feature_group(
+            if !filter_band || first_in_band || in_band_flags[second] {
+                let second_slice = &norm_pool[second * len..(second + 1) * len];
+                scores.push(score_pair_normalized(
+                    &res_ctx,
                     &residuals,
-                    features,
-                    &[first, second],
-                    width,
+                    first,
+                    second,
+                    first_slice,
+                    second_slice,
+                    &mut scratch_2,
                 ));
             }
         }
@@ -424,10 +444,15 @@ fn diagnose_residual_with_band(
         if count == 0 {
             lagged_mutual_information_bits.push(0.0);
         } else {
-            lagged_mutual_information_bits.push(mutual_information(
+            let sub_ctx = ResidualContext::new(&residuals[lag..], width, config.min_match_gain);
+            let sub = score_singleton_normalized(
+                &sub_ctx,
                 &residuals[lag..],
-                &[residuals[..count].to_vec()],
-            ));
+                0,
+                &residuals[..count],
+                &mut scratch_1,
+            );
+            lagged_mutual_information_bits.push(sub.mutual_information_bits);
         }
     }
     let passing_candidates = scores.iter().filter(|s| {
@@ -462,106 +487,348 @@ fn diagnose_residual_with_band(
     })
 }
 
-fn score_feature_group(
-    residuals: &[u64],
-    features: &[ResidualFeature],
-    indices: &[usize],
+struct ResidualContext {
     width: Width,
+    len: usize,
+    n_f64: f64,
+    alphabet_size: usize,
+    entropy_bits: f64,
+    constant_offset: Option<(u64, usize)>,
+    small_p_res: [f64; 16],
+    sorted_counts: Vec<(u64, usize)>,
+}
+
+impl ResidualContext {
+    fn new(residuals: &[u64], width: Width, min_match_gain: usize) -> Self {
+        let len = residuals.len();
+        let n_f64 = len as f64;
+        let bits = width.bits();
+        let mut small_p_res = [0.0f64; 16];
+        let mut sorted_counts: Vec<(u64, usize)>;
+        let mut entropy_bits = 0.0f64;
+        let mut alphabet_size = 0usize;
+        let zero_count;
+        let mut best_const: Option<(u64, usize)> = None;
+
+        if bits <= 4 {
+            let mut counts = [0usize; 16];
+            let card = 1usize << bits;
+            for &r in residuals {
+                counts[r as usize] += 1;
+            }
+            zero_count = counts[0];
+            sorted_counts = Vec::new();
+            for (sym, &count) in counts.iter().enumerate().take(card) {
+                if count > 0 {
+                    alphabet_size += 1;
+                    let prob = count as f64 / n_f64;
+                    small_p_res[sym] = prob;
+                    entropy_bits += -prob * prob.log2();
+                    if sym != 0 && best_const.is_none_or(|(_, prev_cnt)| count > prev_cnt) {
+                        best_const = Some((sym as u64, count));
+                    }
+                }
+            }
+        } else {
+            let mut tmp = residuals.to_vec();
+            tmp.sort_unstable();
+            sorted_counts = Vec::with_capacity(tmp.len().min(64));
+            let mut i = 0;
+            let mut zc = 0usize;
+            while i < tmp.len() {
+                let sym = tmp[i];
+                let start = i;
+                while i < tmp.len() && tmp[i] == sym {
+                    i += 1;
+                }
+                let count = i - start;
+                sorted_counts.push((sym, count));
+                alphabet_size += 1;
+                let prob = count as f64 / n_f64;
+                entropy_bits += -prob * prob.log2();
+                if sym == 0 {
+                    zc = count;
+                } else if best_const.is_none_or(|(_, prev_cnt)| count > prev_cnt) {
+                    best_const = Some((sym, count));
+                }
+            }
+            zero_count = zc;
+        }
+
+        let constant_offset = best_const.and_then(|(symbol, count)| {
+            let gain = count.saturating_sub(zero_count);
+            (gain >= min_match_gain).then_some((symbol, gain))
+        });
+
+        Self {
+            width,
+            len,
+            n_f64,
+            alphabet_size,
+            entropy_bits,
+            constant_offset,
+            small_p_res,
+            sorted_counts,
+        }
+    }
+
+    #[inline]
+    fn res_p(&self, r: u64) -> f64 {
+        if self.width.bits() <= 4 {
+            self.small_p_res[r as usize]
+        } else {
+            let idx = self
+                .sorted_counts
+                .binary_search_by_key(&r, |(s, _)| *s)
+                .expect("residual present in context");
+            self.sorted_counts[idx].1 as f64 / self.n_f64
+        }
+    }
+}
+
+fn score_singleton_normalized(
+    res_ctx: &ResidualContext,
+    residuals: &[u64],
+    feature_idx: usize,
+    f0: &[u64],
+    scratch: &mut Vec<(u64, u64)>,
 ) -> FeatureScore {
-    let feature_values: Vec<Vec<u64>> = indices
-        .iter()
-        .map(|&index| {
-            features[index]
-                .values
-                .iter()
-                .map(|&value| width.normalize(value))
-                .collect()
-        })
-        .collect();
-    let mutual_information_bits = mutual_information(residuals, &feature_values);
-    let alphabet_size = joint_frequencies(&feature_values).len();
-    let residual_alphabet_size = frequencies(residuals.iter().copied()).len();
-    let correction = (alphabet_size.saturating_sub(1) as f64)
-        * (residual_alphabet_size.saturating_sub(1) as f64)
-        / (2.0 * std::f64::consts::LN_2 * residuals.len() as f64);
-    let corrected_mutual_information_bits = mutual_information_bits - correction;
-    let match_gain = match_gain(residuals, &feature_values);
-    let direct_matches = if indices.len() == 1 {
-        residuals
-            .iter()
-            .zip(&feature_values[0])
-            .filter(|&(r, v)| *r == *v)
-            .count()
+    let bits = res_ctx.width.bits();
+    let n = res_ctx.n_f64;
+    let mut information = 0.0f64;
+    let mut alphabet_size = 0usize;
+    let mut gain = 0usize;
+    let mut direct_matches = 0usize;
+
+    if bits <= 3 {
+        let m = 1usize << bits;
+        let mut feat = [0u32; 8];
+        let mut joint = [0u32; 64];
+        for (&v0, &r) in f0.iter().zip(residuals) {
+            let vi = v0 as usize;
+            let ri = r as usize;
+            feat[vi] += 1;
+            joint[(vi << bits) | ri] += 1;
+            direct_matches += usize::from(v0 == r);
+        }
+        for (fv, &f_cnt) in feat.iter().enumerate().take(m) {
+            if f_cnt == 0 {
+                continue;
+            }
+            alphabet_size += 1;
+            let p_feature = f64::from(f_cnt) / n;
+            let base = fv << bits;
+            let zero_cnt = joint[base];
+            let mut max_sym = 0u32;
+            for (rv, &p_res) in res_ctx.small_p_res.iter().enumerate().take(m) {
+                let cnt = joint[base | rv];
+                if cnt > 0 {
+                    if cnt > max_sym {
+                        max_sym = cnt;
+                    }
+                    let p_joint = f64::from(cnt) / n;
+                    information += p_joint * (p_joint / (p_feature * p_res)).log2();
+                }
+            }
+            gain += max_sym.saturating_sub(zero_cnt) as usize;
+        }
     } else {
-        0
-    };
+        scratch.clear();
+        scratch.reserve(res_ctx.len.saturating_sub(scratch.capacity()));
+        for (&v0, &r) in f0.iter().zip(residuals) {
+            direct_matches += usize::from(v0 == r);
+            scratch.push((v0, r));
+        }
+        scratch.sort_unstable();
+        let len = scratch.len();
+        let mut i = 0;
+        while i < len {
+            let fv = scratch[i].0;
+            let mut f_end = i + 1;
+            while f_end < len && scratch[f_end].0 == fv {
+                f_end += 1;
+            }
+            let f_cnt = f_end - i;
+            alphabet_size += 1;
+            let p_feature = f_cnt as f64 / n;
+            let mut max_sym = 0usize;
+            let mut zero_cnt = 0usize;
+            let mut j = i;
+            while j < f_end {
+                let rv = scratch[j].1;
+                let r_start = j;
+                while j < f_end && scratch[j].1 == rv {
+                    j += 1;
+                }
+                let cnt = j - r_start;
+                if cnt > max_sym {
+                    max_sym = cnt;
+                }
+                if rv == 0 {
+                    zero_cnt = cnt;
+                }
+                let p_joint = cnt as f64 / n;
+                let p_res = res_ctx.res_p(rv);
+                information += p_joint * (p_joint / (p_feature * p_res)).log2();
+            }
+            gain += max_sym.saturating_sub(zero_cnt);
+            i = f_end;
+        }
+    }
+
+    finalize_feature_score(
+        res_ctx,
+        vec![feature_idx],
+        information,
+        alphabet_size,
+        gain,
+        direct_matches,
+    )
+}
+
+fn score_pair_normalized(
+    res_ctx: &ResidualContext,
+    residuals: &[u64],
+    first: usize,
+    second: usize,
+    f0: &[u64],
+    f1: &[u64],
+    scratch: &mut Vec<(u64, u64, u64)>,
+) -> FeatureScore {
+    let bits = res_ctx.width.bits();
+    let n = res_ctx.n_f64;
+    let mut information = 0.0f64;
+    let mut alphabet_size = 0usize;
+    let mut gain = 0usize;
+
+    if bits == 1 {
+        let mut feat = [0u32; 4];
+        let mut joint = [0u32; 8];
+        for ((&v0, &v1), &r) in f0.iter().zip(f1).zip(residuals) {
+            let fk = ((v0 as usize) << 1) | (v1 as usize);
+            feat[fk] += 1;
+            joint[(fk << 1) | (r as usize)] += 1;
+        }
+        for (fk, &f_cnt) in feat.iter().enumerate() {
+            if f_cnt == 0 {
+                continue;
+            }
+            alphabet_size += 1;
+            let p_feature = f64::from(f_cnt) / n;
+            let base = fk << 1;
+            let c0 = joint[base];
+            let c1 = joint[base | 1];
+            if c0 > 0 {
+                let p_joint = f64::from(c0) / n;
+                information += p_joint * (p_joint / (p_feature * res_ctx.small_p_res[0])).log2();
+            }
+            if c1 > 0 {
+                let p_joint = f64::from(c1) / n;
+                information += p_joint * (p_joint / (p_feature * res_ctx.small_p_res[1])).log2();
+            }
+            gain += c0.max(c1).saturating_sub(c0) as usize;
+        }
+    } else if bits == 2 {
+        let mut feat = [0u32; 16];
+        let mut joint = [0u32; 64];
+        for ((&v0, &v1), &r) in f0.iter().zip(f1).zip(residuals) {
+            let fk = ((v0 as usize) << 2) | (v1 as usize);
+            feat[fk] += 1;
+            joint[(fk << 2) | (r as usize)] += 1;
+        }
+        for (fk, &f_cnt) in feat.iter().enumerate() {
+            if f_cnt == 0 {
+                continue;
+            }
+            alphabet_size += 1;
+            let p_feature = f64::from(f_cnt) / n;
+            let base = fk << 2;
+            let zero_cnt = joint[base];
+            let mut max_sym = 0u32;
+            for (rv, &p_res) in res_ctx.small_p_res.iter().enumerate().take(4) {
+                let cnt = joint[base | rv];
+                if cnt > 0 {
+                    if cnt > max_sym {
+                        max_sym = cnt;
+                    }
+                    let p_joint = f64::from(cnt) / n;
+                    information += p_joint * (p_joint / (p_feature * p_res)).log2();
+                }
+            }
+            gain += max_sym.saturating_sub(zero_cnt) as usize;
+        }
+    } else {
+        scratch.clear();
+        scratch.reserve(res_ctx.len.saturating_sub(scratch.capacity()));
+        for ((&v0, &v1), &r) in f0.iter().zip(f1).zip(residuals) {
+            scratch.push((v0, v1, r));
+        }
+        scratch.sort_unstable();
+        let len = scratch.len();
+        let mut i = 0;
+        while i < len {
+            let (v0, v1, _) = scratch[i];
+            let mut f_end = i + 1;
+            while f_end < len && scratch[f_end].0 == v0 && scratch[f_end].1 == v1 {
+                f_end += 1;
+            }
+            let f_cnt = f_end - i;
+            alphabet_size += 1;
+            let p_feature = f_cnt as f64 / n;
+            let mut max_sym = 0usize;
+            let mut zero_cnt = 0usize;
+            let mut j = i;
+            while j < f_end {
+                let rv = scratch[j].2;
+                let r_start = j;
+                while j < f_end && scratch[j].2 == rv {
+                    j += 1;
+                }
+                let cnt = j - r_start;
+                if cnt > max_sym {
+                    max_sym = cnt;
+                }
+                if rv == 0 {
+                    zero_cnt = cnt;
+                }
+                let p_joint = cnt as f64 / n;
+                let p_res = res_ctx.res_p(rv);
+                information += p_joint * (p_joint / (p_feature * p_res)).log2();
+            }
+            gain += max_sym.saturating_sub(zero_cnt);
+            i = f_end;
+        }
+    }
+
+    finalize_feature_score(
+        res_ctx,
+        vec![first, second],
+        information,
+        alphabet_size,
+        gain,
+        0,
+    )
+}
+
+fn finalize_feature_score(
+    res_ctx: &ResidualContext,
+    feature_indices: Vec<usize>,
+    information: f64,
+    alphabet_size: usize,
+    match_gain: usize,
+    direct_matches: usize,
+) -> FeatureScore {
+    let mutual_information_bits = information.max(0.0);
+    let correction = (alphabet_size.saturating_sub(1) as f64)
+        * (res_ctx.alphabet_size.saturating_sub(1) as f64)
+        / (2.0 * std::f64::consts::LN_2 * res_ctx.n_f64);
     FeatureScore {
-        feature_indices: indices.to_vec(),
+        feature_indices,
         mutual_information_bits,
-        corrected_mutual_information_bits,
+        corrected_mutual_information_bits: mutual_information_bits - correction,
         match_gain,
         direct_matches,
     }
-}
-
-fn mutual_information(residuals: &[u64], features: &[Vec<u64>]) -> f64 {
-    let feature_counts = joint_frequencies(features);
-    let residual_counts = frequencies(residuals.iter().copied());
-    let mut joint = BTreeMap::<(Vec<u64>, u64), usize>::new();
-    for index in 0..residuals.len() {
-        let key = (
-            features
-                .iter()
-                .map(|feature| feature[index])
-                .collect::<Vec<_>>(),
-            residuals[index],
-        );
-        *joint.entry(key).or_default() += 1;
-    }
-    let n = residuals.len() as f64;
-    let mut information = 0.0;
-    for ((feature_values, residual), count) in joint {
-        let p_joint = count as f64 / n;
-        let p_feature = feature_counts[&feature_values] as f64 / n;
-        let p_residual = residual_counts[&residual] as f64 / n;
-        information += p_joint * (p_joint / (p_feature * p_residual)).log2();
-    }
-    information.max(0.0)
-}
-
-fn match_gain(residuals: &[u64], features: &[Vec<u64>]) -> usize {
-    let mut counts = BTreeMap::<Vec<u64>, BTreeMap<u64, usize>>::new();
-    for (index, &residual) in residuals.iter().enumerate() {
-        let key = features
-            .iter()
-            .map(|feature| feature[index])
-            .collect::<Vec<_>>();
-        *counts.entry(key).or_default().entry(residual).or_default() += 1;
-    }
-    counts
-        .values()
-        .map(|symbols| {
-            symbols
-                .values()
-                .copied()
-                .max()
-                .unwrap_or(0)
-                .saturating_sub(symbols.get(&0).copied().unwrap_or(0))
-        })
-        .sum()
-}
-
-fn joint_frequencies(features: &[Vec<u64>]) -> BTreeMap<Vec<u64>, usize> {
-    let sample_count = features.first().map_or(0, Vec::len);
-    let mut counts = BTreeMap::new();
-    for index in 0..sample_count {
-        let key = features
-            .iter()
-            .map(|feature| feature[index])
-            .collect::<Vec<_>>();
-        *counts.entry(key).or_default() += 1;
-    }
-    counts
 }
 
 fn frequencies(values: impl IntoIterator<Item = u64>) -> BTreeMap<u64, usize> {
@@ -570,18 +837,6 @@ fn frequencies(values: impl IntoIterator<Item = u64>) -> BTreeMap<u64, usize> {
         *counts.entry(value).or_default() += 1;
     }
     counts
-}
-
-fn entropy(values: impl IntoIterator<Item = u64>) -> f64 {
-    let counts = frequencies(values);
-    let total = counts.values().sum::<usize>() as f64;
-    counts
-        .values()
-        .map(|&count| {
-            let probability = count as f64 / total;
-            -probability * probability.log2()
-        })
-        .sum()
 }
 
 /// A causal signal source considered for residual prediction.
@@ -947,14 +1202,16 @@ impl DiagnosticBuffer {
     }
 }
 
-fn lagged_boundary_values(
+fn fill_lagged_boundary_values(
     obs_window: &ObservationWindow,
     start_in_window: usize,
     len: usize,
     channel: usize,
     tau: usize,
-) -> Vec<u64> {
-    let mut values = Vec::with_capacity(len);
+    values: &mut Vec<u64>,
+) {
+    values.clear();
+    values.reserve(len.saturating_sub(values.capacity()));
     for t in 0..len {
         let win_idx = start_in_window + t;
         let lag_t = (win_idx as isize) - 1 - (tau as isize);
@@ -970,6 +1227,17 @@ fn lagged_boundary_values(
         };
         values.push(val);
     }
+}
+
+fn lagged_boundary_values(
+    obs_window: &ObservationWindow,
+    start_in_window: usize,
+    len: usize,
+    channel: usize,
+    tau: usize,
+) -> Vec<u64> {
+    let mut values = Vec::with_capacity(len);
+    fill_lagged_boundary_values(obs_window, start_in_window, len, channel, tau, &mut values);
     values
 }
 #[must_use]
@@ -1828,6 +2096,9 @@ fn has_admissible_deeper_lag(
     }
     let width = editable.circuit().width();
     let norm_residuals: Vec<u64> = residuals.iter().map(|&v| width.normalize(v)).collect();
+    let res_ctx = ResidualContext::new(&norm_residuals, width, growth_config.min_match_gain);
+    let mut val_buf = Vec::with_capacity(norm_residuals.len());
+    let mut scratch_1: Vec<(u64, u64)> = Vec::new();
     let len = norm_residuals.len();
     let start_in_window = obs_window.len().saturating_sub(len);
     let num_channels = editable.circuit().num_inputs();
@@ -1837,12 +2108,12 @@ fn has_admissible_deeper_lag(
             if cross_only && c == usize::from(out_port) {
                 continue;
             }
-            let values = lagged_boundary_values(obs_window, start_in_window, len, c, tau);
-            let feat = [ResidualFeature {
-                name: String::new(),
-                values,
-            }];
-            let score = score_feature_group(&norm_residuals, &feat, &[0], width);
+            fill_lagged_boundary_values(obs_window, start_in_window, len, c, tau, &mut val_buf);
+            for slot in &mut val_buf {
+                *slot = width.normalize(*slot);
+            }
+            let score =
+                score_singleton_normalized(&res_ctx, &norm_residuals, 0, &val_buf, &mut scratch_1);
             if score.corrected_mutual_information_bits > growth_config.mi_threshold_bits
                 && score.match_gain >= growth_config.min_match_gain
             {
