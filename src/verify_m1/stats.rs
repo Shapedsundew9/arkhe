@@ -3,7 +3,19 @@
 //! Provides exact one-sided Clopper–Pearson binomial confidence bounds and Pearson's
 //! $\chi^2$ homogeneity tests for cross-bank distributional stability.
 
+use rand_chacha::ChaCha8Rng;
+use rand_core::SeedableRng;
 use serde::{Deserialize, Serialize};
+
+use crate::env::noise::uniform_u64_below;
+
+/// Minimum expected cell count per bank required for Pearson's asymptotic $\chi^2$
+/// approximation (Cochran's criterion); below this, exact conditional permutation is used.
+const COCHRAN_MIN_EXPECTED_CELL_COUNT: f64 = 5.0;
+
+/// Replicates for the deterministic conditional permutation homogeneity test when Cochran's rule
+/// does not hold (`min_expected < 5.0`).
+const CONDITIONAL_PERMUTATION_REPLICATES: usize = 100_000;
 
 /// Natural logarithm of the Gamma function $\ln \Gamma(z)$ via Lanczos approximation.
 pub fn ln_gamma(z: f64) -> f64 {
@@ -342,7 +354,8 @@ pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> Multi
         rates[p05_idx]
     };
 
-    // Chi-squared homogeneity test
+    // Chi-squared homogeneity test (with exact conditional permutation fallback when Cochran's
+    // cell-expectation criterion `E >= 5` fails, e.g. rare failures across 20-seed banks).
     let df = bank_count - 1;
     let (chi_squared, p_value, passes_homogeneity) = if pooled_rate <= 0.0 || pooled_rate >= 1.0 {
         // All 0% or all 100%: perfect homogeneity
@@ -351,6 +364,7 @@ pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> Multi
         let var_denom = pooled_rate * (1.0 - pooled_rate);
         let chi2: f64 = banks
             .iter()
+            .filter(|b| b.trials > 0)
             .map(|b| {
                 let n = b.trials as f64;
                 let k = b.successes as f64;
@@ -359,7 +373,26 @@ pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> Multi
                 (diff * diff) / (n * var_denom)
             })
             .sum();
-        let p = chi_squared_p_value(df, chi2);
+        let min_expected = banks
+            .iter()
+            .filter(|b| b.trials > 0)
+            .map(|b| {
+                let n = b.trials as f64;
+                (n * pooled_rate).min(n * (1.0 - pooled_rate))
+            })
+            .fold(f64::INFINITY, f64::min);
+        let p = if min_expected >= COCHRAN_MIN_EXPECTED_CELL_COUNT {
+            chi_squared_p_value(df, chi2)
+        } else {
+            conditional_permutation_chi2_p_value(
+                banks,
+                total_trials,
+                total_successes,
+                pooled_rate,
+                var_denom,
+                chi2,
+            )
+        };
         let passes = p >= 0.01;
         (chi2, p, passes)
     };
@@ -381,6 +414,79 @@ pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> Multi
         distribution,
         passed,
     }
+}
+
+/// Evaluates the exact conditional permutation upper-tail $p$-value for Pearson's $\chi^2$
+/// fixing bank trial counts `[b.trials]` and total successes `total_successes`.
+fn conditional_permutation_chi2_p_value(
+    banks: &[BankSample],
+    total_trials: usize,
+    total_successes: usize,
+    pooled_rate: f64,
+    var_denom: f64,
+    observed_chi2: f64,
+) -> f64 {
+    let total_failures = total_trials.saturating_sub(total_successes);
+    let count_failures = total_failures <= total_successes;
+    let minority_count = if count_failures {
+        total_failures
+    } else {
+        total_successes
+    };
+    if total_trials == 0 || minority_count == 0 {
+        return 1.0;
+    }
+
+    let mut bank_n = Vec::with_capacity(banks.len());
+    let mut bank_expected_k = Vec::with_capacity(banks.len());
+    let mut bank_denom = Vec::with_capacity(banks.len());
+    let mut slot_bank = Vec::with_capacity(total_trials);
+
+    for b in banks {
+        if b.trials == 0 {
+            continue;
+        }
+        let active_idx = bank_n.len();
+        let n_f = b.trials as f64;
+        bank_n.push(n_f);
+        bank_expected_k.push(n_f * pooled_rate);
+        bank_denom.push(n_f * var_denom);
+        slot_bank.resize(slot_bank.len() + b.trials, active_idx);
+    }
+
+    let num_active = bank_n.len();
+    if num_active <= 1 {
+        return 1.0;
+    }
+
+    let mut rng = ChaCha8Rng::seed_from_u64(0);
+    let mut minority_counts = vec![0usize; num_active];
+    let mut ge_count = 0usize;
+
+    for _ in 0..CONDITIONAL_PERMUTATION_REPLICATES {
+        minority_counts.fill(0);
+        // Partial Fisher-Yates draws an exact uniform subset of size `minority_count`
+        // without replacement from the current multiset permutation in `slot_bank`.
+        for i in 0..minority_count {
+            let j = i + (uniform_u64_below(&mut rng, (total_trials - i) as u64) as usize);
+            slot_bank.swap(i, j);
+            minority_counts[slot_bank[i]] += 1;
+        }
+
+        let mut perm_chi2 = 0.0f64;
+        for b_idx in 0..num_active {
+            let m = minority_counts[b_idx] as f64;
+            let k = if count_failures { bank_n[b_idx] - m } else { m };
+            let diff = k - bank_expected_k[b_idx];
+            perm_chi2 += (diff * diff) / bank_denom[b_idx];
+        }
+
+        if perm_chi2 + 1e-12 >= observed_chi2 {
+            ge_count += 1;
+        }
+    }
+
+    (ge_count as f64) / (CONDITIONAL_PERMUTATION_REPLICATES as f64)
 }
 
 #[cfg(test)]
@@ -445,5 +551,37 @@ mod tests {
             !res_clustered.passed,
             "overall gate must fail when homogeneity is rejected"
         );
+    }
+
+    #[test]
+    fn cochran_rare_failure_permutation_fallback_handles_sparse_and_clustered_banks() {
+        // Reproduces 983/1000 across 50 banks of 20 seeds (38x20, 9x19, 1x18, 2x17):
+        // E_fail = 0.34 < 5.0 triggers conditional permutation (exact tail p >= 0.01).
+        let mut banks = Vec::with_capacity(50);
+        banks.extend((0..38).map(|_| BankSample::new(20, 20)));
+        banks.extend((0..9).map(|_| BankSample::new(19, 20)));
+        banks.push(BankSample::new(18, 20));
+        banks.extend((0..2).map(|_| BankSample::new(17, 20)));
+        let res_rare = evaluate_multi_bank_gate(&banks, 0.85);
+        assert!(res_rare.pooled.passes_pooled);
+        assert!(
+            res_rare.distribution.passes_homogeneity,
+            "expected conditional permutation p >= 0.01, got chi2={} p={}",
+            res_rare.distribution.chi_squared, res_rare.distribution.p_value
+        );
+        assert!(res_rare.passed);
+
+        // Truly clustered rare failures: 48x(20/20) + 1x(19/20) + 1x(4/20) = 983/1000.
+        let mut clustered_rare = Vec::with_capacity(50);
+        clustered_rare.extend((0..48).map(|_| BankSample::new(20, 20)));
+        clustered_rare.push(BankSample::new(19, 20));
+        clustered_rare.push(BankSample::new(4, 20));
+        let res_clustered_rare = evaluate_multi_bank_gate(&clustered_rare, 0.85);
+        assert!(
+            !res_clustered_rare.distribution.passes_homogeneity,
+            "severely clustered rare failures must still fail homogeneity (p={})",
+            res_clustered_rare.distribution.p_value
+        );
+        assert!(!res_clustered_rare.passed);
     }
 }

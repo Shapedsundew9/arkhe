@@ -220,3 +220,39 @@ fn multi_channel_lock_time_ratio_measurement() {
         }
     }
 }
+
+#[test]
+fn cli_verify_m2a_refuses_holdout_ranges_without_flag() {
+    for seed_offset in ["10000", "30000", "40000"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_arkhe"))
+            .args(["verify-m2a", "--seed-offset", seed_offset, "--seeds", "20"])
+            .output()
+            .expect("spawn arkhe verify-m2a on holdout");
+
+        assert!(
+            !output.status.success(),
+            "verify-m2a must refuse seed_offset={seed_offset}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("overlaps pre-registered holdout range"),
+            "stderr for {seed_offset} must mention holdout refusal, got: {stderr}"
+        );
+    }
+
+    let bank_out = std::process::Command::new(env!("CARGO_BIN_EXE_arkhe"))
+        .args([
+            "verify-m2a",
+            "--banks",
+            "5",
+            "--seed-offset",
+            "29920",
+            "--seeds",
+            "20",
+        ])
+        .output()
+        .expect("spawn arkhe verify-m2a --banks overlapping holdout");
+    assert!(!bank_out.status.success());
+    let stderr = String::from_utf8_lossy(&bank_out.stderr);
+    assert!(stderr.contains("overlaps pre-registered holdout range"));
+}
