@@ -10,7 +10,9 @@ use crate::rng::SeedBank;
 use crate::structural::economy::EconomyConfig;
 use crate::structural::growth::{
     DiagnosticBuffer, GrowthConfig, GrowthError, SproutTelemetry, diagnose_residual,
-    propose_autonomous_delay_ring_with_telemetry, propose_sprout_with_telemetry,
+    effective_juvenile_ticks, port_cone_register_depth,
+    propose_autonomous_delay_ring_with_telemetry, propose_sprout_band_with_telemetry,
+    propose_sprout_with_telemetry,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
@@ -49,6 +51,7 @@ pub struct PortDevelopmentalState {
     pub ticks_since_last_check: u64,
     pub port_sprout_events: u64,
     pub epoch_snapshots: Vec<GrowthEpochSnapshot>,
+    pub replay_ticks_consumed: u64,
 }
 
 impl PortDevelopmentalState {
@@ -59,6 +62,7 @@ impl PortDevelopmentalState {
             ticks_since_last_check: 0,
             port_sprout_events: 0,
             epoch_snapshots: Vec::new(),
+            replay_ticks_consumed: 0,
         }
     }
 }
@@ -92,6 +96,9 @@ pub struct ArkheLearner {
     candidate_list_truncated: u64,
     lag_horizon_bound: u64,
     ring_period_bound: u64,
+    lag_deepening_steps: u64,
+    sprout_budget_exhausted: u64,
+    total_budget_seen: Option<u64>,
 }
 
 impl ArkheLearner {
@@ -171,6 +178,9 @@ impl ArkheLearner {
             candidate_list_truncated: 0,
             lag_horizon_bound: 0,
             ring_period_bound: 0,
+            lag_deepening_steps: 0,
+            sprout_budget_exhausted: 0,
+            total_budget_seen: None,
         })
     }
 
@@ -326,6 +336,99 @@ impl ArkheLearner {
         &mut self.ledger
     }
 
+    fn is_port_zero_error(&self, port_idx: usize) -> bool {
+        let buf = &self.port_states[port_idx].diagnostic_buffer;
+        let width = self.editable.circuit().width();
+        buf.len() >= self.growth_config.diagnostic_window
+            && buf
+                .residuals
+                .iter()
+                .all(|frame| width.normalize(frame[port_idx]) == 0)
+    }
+
+    fn port_budget_allowance(&self, port_idx: usize, global_budget: &TickBudget) -> u64 {
+        let num_ports = self.port_states.len();
+        if num_ports <= 1 {
+            return global_budget.remaining();
+        }
+        let total_budget = self.total_budget_seen.unwrap_or_else(|| {
+            global_budget
+                .remaining()
+                .saturating_add(global_budget.consumed())
+        });
+        let base_share = total_budget / (num_ports as u64);
+        let mut idle_pool = 0u64;
+        let mut active_ports = 0usize;
+        for q in 0..num_ports {
+            if self.is_port_zero_error(q) {
+                idle_pool += base_share.saturating_sub(self.port_states[q].replay_ticks_consumed);
+            } else {
+                active_ports += 1;
+            }
+        }
+        let extra = if active_ports > 0 && !self.is_port_zero_error(port_idx) {
+            idle_pool / (active_ports as u64)
+        } else {
+            0
+        };
+        let cap = base_share.saturating_add(extra);
+        cap.saturating_sub(self.port_states[port_idx].replay_ticks_consumed)
+            .min(global_budget.remaining())
+    }
+
+    fn commit_sprout(&mut self, port_idx: usize, sprout_circ: Circuit) -> bool {
+        let port_sprouts = self.port_states[port_idx].port_sprout_events;
+        if port_sprouts == 0 || port_sprouts == 1 {
+            self.record_epoch_snapshot(port_idx, port_sprouts as usize, true);
+        }
+        let pre_sprout_circuit = self.editable.circuit().clone();
+        let old_to_new: Vec<Option<NodeId>> = (0..self.editable.circuit().node_count())
+            .map(|i| Some(NodeId(i as u32)))
+            .collect();
+        if self
+            .editable
+            .recompile_preserving_state(sprout_circ, &old_to_new)
+            .is_ok()
+        {
+            let d_cone = port_cone_register_depth(self.editable.circuit(), port_idx as u16);
+            if d_cone > usize::from(self.growth_config.max_reactive_lag) {
+                let eff_juv =
+                    effective_juvenile_ticks(d_cone, &self.economy_config, &self.growth_config);
+                let mut surviving = vec![false; self.editable.circuit().node_count()];
+                for new_id in old_to_new.iter().flatten() {
+                    if let Some(slot) = surviving.get_mut(new_id.index()) {
+                        *slot = true;
+                    }
+                }
+                for (idx, node) in self
+                    .editable
+                    .economy_mut()
+                    .nodes_mut()
+                    .iter_mut()
+                    .enumerate()
+                {
+                    if !surviving[idx] {
+                        node.juvenile_ticks = eff_juv;
+                    }
+                }
+            }
+            self.ledger.on_sprout(
+                self.editable.circuit(),
+                self.economy_config.split_code_tax,
+                &old_to_new,
+            );
+            self.editable
+                .economy_mut()
+                .assign_sprout_debts(&self.ledger.node_debts);
+            self.reset_changed_ports(&pre_sprout_circuit, &old_to_new);
+            self.port_states[port_idx].port_sprout_events += 1;
+            self.sprout_events += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Assembles current M1 telemetry summary.
     #[must_use]
     pub fn telemetry(&self) -> ArkheM1Telemetry {
@@ -387,6 +490,8 @@ impl ArkheLearner {
             lag_horizon_bound: self.lag_horizon_bound,
             ring_period_bound: self.ring_period_bound,
             reserve_mismatch_floored: self.reserve_mismatch_floored,
+            lag_deepening_steps: self.lag_deepening_steps,
+            sprout_budget_exhausted: self.sprout_budget_exhausted,
         }
     }
 }
@@ -437,6 +542,9 @@ impl PredictorBaseline for ArkheLearner {
     }
 
     fn observe(&mut self, truth: &[u64], budget: &mut TickBudget) -> Option<f64> {
+        if self.total_budget_seen.is_none() {
+            self.total_budget_seen = Some(budget.remaining().saturating_add(budget.consumed()));
+        }
         let (predictions, ancestry, snapshot, pre_epoch, pre_registers) = self
             .pending_prediction
             .take()
@@ -610,60 +718,41 @@ impl PredictorBaseline for ArkheLearner {
                 self.record_epoch_snapshot(p, 2, false);
             }
 
-            // 2a. Candidate motif sprouting (up to GrowthConfig::max_reactive_lag)
+            let port_zero_error = self.is_port_zero_error(p);
+            let mut port_budget = if num_ports == 1 {
+                *budget
+            } else {
+                TickBudget::new(self.port_budget_allowance(p, budget))
+            };
+
+            // 2a. Stage 0 candidate motif sprouting (up to GrowthConfig::max_reactive_lag)
             let mut sprouted = false;
-            let mut sprout_tel = SproutTelemetry::default();
+            let mut stage0_tel = SproutTelemetry::default();
             if let Ok(Some(sprout_circ)) = propose_sprout_with_telemetry(
                 &self.editable,
                 &self.obs_window,
                 &self.port_states[p].diagnostic_buffer,
                 &self.growth_config,
                 &self.economy_config,
-                budget,
+                &mut port_budget,
                 port_u16,
                 self.growth_config.max_reactive_lag,
-                &mut sprout_tel,
+                &mut stage0_tel,
             ) {
-                // Diagnostic snapshot for G1B.1 before committing sprout
-                let port_sprouts = self.port_states[p].port_sprout_events;
-                if port_sprouts == 0 || port_sprouts == 1 {
-                    self.record_epoch_snapshot(p, port_sprouts as usize, true);
-                }
-
-                let pre_sprout_circuit = self.editable.circuit().clone();
-                let old_to_new: Vec<Option<NodeId>> = (0..self.editable.circuit().node_count())
-                    .map(|i| Some(NodeId(i as u32)))
-                    .collect();
-                if self
-                    .editable
-                    .recompile_preserving_state(sprout_circ, &old_to_new)
-                    .is_ok()
-                {
-                    self.ledger.on_sprout(
-                        self.editable.circuit(),
-                        self.economy_config.split_code_tax,
-                        &old_to_new,
-                    );
-                    self.editable
-                        .economy_mut()
-                        .assign_sprout_debts(&self.ledger.node_debts);
-                    self.reset_changed_ports(&pre_sprout_circuit, &old_to_new);
-                    self.port_states[p].port_sprout_events += 1;
-                    self.sprout_events += 1;
-                    sprouted = true;
-                }
+                sprouted = self.commit_sprout(p, sprout_circ);
             }
 
-            // 2b. Autonomous delay ring proposal under noise
+            // 2b. Autonomous delay ring proposal under noise (checked BEFORE lag deepening per C2-a)
+            let mut ring_tel = SproutTelemetry::default();
             if !sprouted
                 && let Some(ring_prop) = propose_autonomous_delay_ring_with_telemetry(
                     &self.editable,
                     &self.obs_window,
                     &self.growth_config,
                     &self.economy_config,
-                    budget,
+                    &mut port_budget,
                     port_u16,
-                    &mut sprout_tel,
+                    &mut ring_tel,
                 )
             {
                 let pre_ring_circuit = self.editable.circuit().clone();
@@ -706,11 +795,83 @@ impl PredictorBaseline for ArkheLearner {
                 }
             }
 
-            self.sprout_blocked_max_nodes += sprout_tel.sprout_blocked_max_nodes;
-            self.candidate_undecidable += sprout_tel.candidate_undecidable;
-            self.candidate_list_truncated += sprout_tel.candidate_list_truncated;
-            self.lag_horizon_bound += sprout_tel.lag_horizon_bound;
-            self.ring_period_bound += sprout_tel.ring_period_bound;
+            // 2c. Progressive lag-deepening incremental bands (3..=6], (6..=12] per C2-a
+            let mut last_band_tel: Option<SproutTelemetry> = None;
+            let can_deepen = num_ports > 1
+                && !sprouted
+                && !port_zero_error
+                && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
+                && stage0_tel.sprout_blocked_max_nodes == 0
+                && stage0_tel.sprout_budget_exhausted == 0
+                && port_budget.remaining() > 0;
+
+            if can_deepen {
+                let mut bands = Vec::new();
+                let mut prev_max = self.growth_config.max_reactive_lag;
+                for &cap in &[6u8, 12u8] {
+                    let band_max = cap.min(self.growth_config.deepening_max_lag);
+                    if band_max > prev_max {
+                        bands.push((prev_max + 1, band_max));
+                        prev_max = band_max;
+                    }
+                }
+                if self.growth_config.deepening_max_lag > prev_max {
+                    bands.push((prev_max + 1, self.growth_config.deepening_max_lag));
+                }
+
+                for (min_tau, max_tau) in bands {
+                    if port_budget.remaining() == 0 {
+                        break;
+                    }
+                    self.lag_deepening_steps += 1;
+                    let mut band_tel = SproutTelemetry::default();
+                    let band_res = propose_sprout_band_with_telemetry(
+                        &self.editable,
+                        &self.obs_window,
+                        &self.port_states[p].diagnostic_buffer,
+                        &self.growth_config,
+                        &self.economy_config,
+                        &mut port_budget,
+                        port_u16,
+                        min_tau,
+                        max_tau,
+                        &mut band_tel,
+                    );
+                    self.sprout_blocked_max_nodes += band_tel.sprout_blocked_max_nodes;
+                    self.sprout_budget_exhausted += band_tel.sprout_budget_exhausted;
+                    last_band_tel = Some(band_tel);
+
+                    if let Ok(Some(sprout_circ)) = band_res {
+                        sprouted = self.commit_sprout(p, sprout_circ);
+                        break;
+                    }
+                    if band_tel.sprout_blocked_max_nodes > 0 || band_tel.sprout_budget_exhausted > 0
+                    {
+                        break;
+                    }
+                }
+            }
+
+            if num_ports == 1 {
+                *budget = port_budget;
+            } else {
+                let spent = port_budget.consumed();
+                let _ = budget.try_consume(spent);
+                self.port_states[p].replay_ticks_consumed += spent;
+            }
+
+            self.sprout_blocked_max_nodes +=
+                stage0_tel.sprout_blocked_max_nodes + ring_tel.sprout_blocked_max_nodes;
+            self.sprout_budget_exhausted +=
+                stage0_tel.sprout_budget_exhausted + ring_tel.sprout_budget_exhausted;
+            self.ring_period_bound += ring_tel.ring_period_bound;
+
+            let bound_tel = last_band_tel.as_ref().unwrap_or(&stage0_tel);
+            self.candidate_undecidable +=
+                bound_tel.candidate_undecidable + ring_tel.candidate_undecidable;
+            self.candidate_list_truncated +=
+                bound_tel.candidate_list_truncated + ring_tel.candidate_list_truncated;
+            self.lag_horizon_bound += bound_tel.lag_horizon_bound + ring_tel.lag_horizon_bound;
 
             if sprouted {
                 break;
@@ -883,6 +1044,426 @@ mod tests {
         assert_eq!(
             ch1_tail_matches, 400,
             "channel 1 ring must lock phase cleanly"
+        );
+    }
+
+    #[test]
+    fn s3a_neg_add_const_solves_three_x_plus_one_t2_delayed_affine_k2() {
+        use crate::env::LfsrStage;
+        use crate::substrate::Primitive;
+
+        let driver = LfsrStage {
+            taps: vec![0, 1, 0, 0, 1], // x^5 + x^2 + 1 primitive
+            init: vec![1, 0, 1, 1, 0],
+        };
+        let mut generator = GeneratorConfig::T2_DelayedAffine {
+            driver,
+            lag: 1,
+            mul_a: 3,
+            add_b: 1,
+        }
+        .build(Width::BITS_2)
+        .unwrap();
+
+        let mut learner = ArkheLearner::new(
+            Width::BITS_2,
+            2,
+            WireDelayMode::Combinational,
+            GrowthConfig::default(),
+            SeedBank::new(5),
+        )
+        .unwrap();
+        let mut budget = TickBudget::new(200_000);
+        let mut truth = [0u64, 0];
+        let mut ch1_tail_matches = 0usize;
+        for t in 0..1200 {
+            let pred = learner.predict(&mut budget);
+            generator.next_clean_frame(&mut truth);
+            if t >= 700 && pred[1] == truth[1] {
+                ch1_tail_matches += 1;
+            }
+            learner.observe(&truth, &mut budget);
+        }
+        assert_eq!(ch1_tail_matches, 500);
+        let has_sub = learner
+            .best_circuit()
+            .unwrap()
+            .nodes()
+            .iter()
+            .any(|node| matches!(node, Primitive::Sub));
+        assert!(
+            has_sub,
+            "expected NegAddConst to materialize Primitive::Sub"
+        );
+    }
+
+    #[test]
+    fn tph_arm_offset_alignment_solves_all_five_m2a_tasks() {
+        use crate::env::{CrossLinearOp, CrossNonlinearOp, LfsrStage};
+
+        let d0 = LfsrStage {
+            taps: vec![0, 1, 0, 0, 1], // deg 5 primitive
+            init: vec![1, 1, 0, 1, 0],
+        };
+        let d1 = LfsrStage {
+            taps: vec![1, 0, 0, 1], // deg 4 primitive
+            init: vec![1, 0, 1, 1],
+        };
+
+        let cases: Vec<(Width, &str, usize, GeneratorConfig)> = vec![
+            (
+                Width::BITS_2,
+                "DelayedAffine(d=3)",
+                2,
+                GeneratorConfig::T2_DelayedAffine {
+                    driver: d0.clone(),
+                    lag: 3,
+                    mul_a: 3,
+                    add_b: 1,
+                },
+            ),
+            (
+                Width::BITS_2,
+                "CrossSum(d=3,3)",
+                3,
+                GeneratorConfig::T2_CrossLinear {
+                    driver_0: d0.clone(),
+                    driver_1: d1.clone(),
+                    lag_0: 3,
+                    lag_1: 3,
+                    op: CrossLinearOp::Add,
+                },
+            ),
+            (
+                Width::BITS_2,
+                "CrossSum(d=3,5)",
+                3,
+                GeneratorConfig::T2_CrossLinear {
+                    driver_0: d0.clone(),
+                    driver_1: d1.clone(),
+                    lag_0: 3,
+                    lag_1: 5,
+                    op: CrossLinearOp::Add,
+                },
+            ),
+            (
+                Width::BITS_2,
+                "AddEqz(d=3,4)",
+                3,
+                GeneratorConfig::T2_CrossNonlinear {
+                    driver_0: d0.clone(),
+                    driver_1: d1.clone(),
+                    lag_0: 3,
+                    lag_1: 4,
+                    op: CrossNonlinearOp::AddEqz,
+                },
+            ),
+            (
+                Width::BITS_2,
+                "MulEqz(d=3,4)",
+                3,
+                GeneratorConfig::T2_CrossNonlinear {
+                    driver_0: d0.clone(),
+                    driver_1: d1.clone(),
+                    lag_0: 3,
+                    lag_1: 4,
+                    op: CrossNonlinearOp::MulEqz,
+                },
+            ),
+            (
+                Width::BITS_1,
+                "MulEqzPair(d=4,4)",
+                3,
+                GeneratorConfig::T2_CrossNonlinear {
+                    driver_0: d0,
+                    driver_1: d1,
+                    lag_0: 4,
+                    lag_1: 4,
+                    op: CrossNonlinearOp::MulEqzPair,
+                },
+            ),
+        ];
+
+        for (width, label, k_ports, gen_cfg) in cases {
+            let mut generator = gen_cfg.build(width).unwrap();
+            let mut learner = ArkheLearner::new(
+                width,
+                k_ports as u16,
+                WireDelayMode::TicksPerHop,
+                GrowthConfig::default(),
+                SeedBank::new(13),
+            )
+            .unwrap();
+            let mut budget = TickBudget::new(250_000);
+            let mut truth = vec![0u64; k_ports];
+            let target_port = k_ports - 1;
+            let mut tail_matches = 0usize;
+            for t in 0..1600 {
+                let pred = learner.predict(&mut budget);
+                generator.next_clean_frame(&mut truth);
+                if t >= 1100 && pred[target_port] == truth[target_port] {
+                    tail_matches += 1;
+                }
+                learner.observe(&truth, &mut budget);
+            }
+            let circuit = learner.best_circuit().unwrap();
+            assert!(
+                circuit.edges().iter().all(|e| e.hops == 1),
+                "{label}: every edge in TicksPerHop must have edge.hops == 1"
+            );
+            assert_eq!(
+                tail_matches, 500,
+                "{label}: expected 500/500 tail matches, got {tail_matches}"
+            );
+        }
+    }
+
+    #[test]
+    fn c1a_epoch1_cross_channel_selection_solves_nonlinear_mul_eqz() {
+        use crate::env::{CrossNonlinearOp, LfsrStage};
+
+        let d0 = LfsrStage {
+            taps: vec![0, 1, 0, 0, 1],
+            init: vec![1, 0, 1, 1, 0],
+        };
+        let d1 = LfsrStage {
+            taps: vec![1, 0, 0, 1],
+            init: vec![1, 1, 0, 1],
+        };
+        let mut generator = GeneratorConfig::T2_CrossNonlinear {
+            driver_0: d0,
+            driver_1: d1,
+            lag_0: 1,
+            lag_1: 2,
+            op: CrossNonlinearOp::MulEqz,
+        }
+        .build(Width::BITS_2)
+        .unwrap();
+
+        let mut learner = ArkheLearner::new(
+            Width::BITS_2,
+            3,
+            WireDelayMode::Combinational,
+            GrowthConfig::default(),
+            SeedBank::new(17),
+        )
+        .unwrap();
+        let mut budget = TickBudget::new(200_000);
+        let mut truth = [0u64; 3];
+        let mut tail_matches = 0usize;
+        for t in 0..1200 {
+            let pred = learner.predict(&mut budget);
+            generator.next_clean_frame(&mut truth);
+            if t >= 700 && pred[2] == truth[2] {
+                tail_matches += 1;
+            }
+            learner.observe(&truth, &mut budget);
+        }
+        assert!(learner.sprout_events() >= 1);
+        assert_eq!(tail_matches, 500);
+    }
+
+    #[test]
+    fn c2a_ring_before_deepening_closes_ring_first_and_locks_deep_lags() {
+        use crate::env::LfsrStage;
+
+        // 1. Rare-event period-5 ring closes via C2-a Stage 0 -> Ring BEFORE any deepening step.
+        let mut ring_learner = ArkheLearner::new(
+            Width::BITS_1,
+            1,
+            WireDelayMode::Combinational,
+            GrowthConfig::default(),
+            SeedBank::new(11),
+        )
+        .unwrap();
+        let mut ring_gen = GeneratorConfig::T1_PeriodicMotif {
+            motif: vec![0, 0, 0, 0, 1],
+        }
+        .build(Width::BITS_1)
+        .unwrap();
+        let mut ring_budget = TickBudget::new(200_000);
+        let mut truth1 = [0u64];
+        let mut ring_tail = 0usize;
+        for t in 0..800 {
+            let pred = ring_learner.predict(&mut ring_budget);
+            ring_gen.next_clean_frame(&mut truth1);
+            if t >= 400 && pred[0] == truth1[0] {
+                ring_tail += 1;
+            }
+            ring_learner.observe(&truth1, &mut ring_budget);
+        }
+        let ring_tel = ring_learner.telemetry();
+        assert!(ring_tel.ring_closure_events >= 1);
+        assert_eq!(
+            ring_tel.lag_deepening_steps, 0,
+            "ring closure must run before progressive lag deepening"
+        );
+        assert_eq!(ring_tail, 400);
+
+        // 2. Non-aliasing deep T2 tasks (d = 5, 6, 8) lock via progressive deepening.
+        let driver = LfsrStage {
+            taps: vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1], // x^11 + x^9 + 1 primitive (taps at lags 9, 11)
+            init: vec![1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+        };
+        for width in [Width::BITS_1, Width::BITS_2] {
+            for lag in [5usize, 6, 8] {
+                let mut gen_deep = GeneratorConfig::T2_DelayedAffine {
+                    driver: driver.clone(),
+                    lag,
+                    mul_a: 1,
+                    add_b: 1,
+                }
+                .build(width)
+                .unwrap();
+                let mut learner = ArkheLearner::new(
+                    width,
+                    2,
+                    WireDelayMode::Combinational,
+                    GrowthConfig::default(),
+                    SeedBank::new(19 + lag as u64),
+                )
+                .unwrap();
+                let mut budget = TickBudget::new(200_000);
+                let mut truth = [0u64; 2];
+                let mut tail = 0usize;
+                for t in 0..1600 {
+                    let pred = learner.predict(&mut budget);
+                    gen_deep.next_clean_frame(&mut truth);
+                    if t >= 1100 && pred[1] == truth[1] {
+                        tail += 1;
+                    }
+                    learner.observe(&truth, &mut budget);
+                }
+                let tel = learner.telemetry();
+                assert!(
+                    tel.lag_deepening_steps >= 1,
+                    "k={} lag={lag}: expected lag_deepening_steps >= 1",
+                    width.bits()
+                );
+                assert_eq!(
+                    tail,
+                    500,
+                    "k={} lag={lag}: expected 500/500 tail matches, got {tail}",
+                    width.bits()
+                );
+            }
+        }
+
+        // 3. Unreachable deep lag (d = 15 > deepening_max_lag = 12) at Width::BITS_1 with
+        //    default GrowthConfig emits lag_horizon_bound at most once per multi-band check.
+        let mut gen_unreach = GeneratorConfig::T2_DelayedAffine {
+            driver,
+            lag: 15,
+            mul_a: 1,
+            add_b: 0,
+        }
+        .build(Width::BITS_1)
+        .unwrap();
+        let mut learner_unreach = ArkheLearner::new(
+            Width::BITS_1,
+            2,
+            WireDelayMode::Combinational,
+            GrowthConfig::default(),
+            SeedBank::new(41),
+        )
+        .unwrap();
+        let mut budget_unreach = TickBudget::new(200_000);
+        let mut truth_u = [0u64; 2];
+        for _ in 0..180 {
+            let _ = learner_unreach.predict(&mut budget_unreach);
+            gen_unreach.next_clean_frame(&mut truth_u);
+            learner_unreach.observe(&truth_u, &mut budget_unreach);
+        }
+        let tel_u = learner_unreach.telemetry();
+        assert!(tel_u.lag_deepening_steps >= 2);
+        assert!(tel_u.lag_horizon_bound >= 1);
+    }
+
+    #[test]
+    fn s2_per_port_tick_budget_fairness_prevents_starvation_and_redistributes_idle_share() {
+        use crate::env::LfsrStage;
+
+        // 1. Noisy unlearnable channel 0 must not starve learnable channel 1.
+        let mut noisy_ch0 = NoisyEnvironment::new(
+            GeneratorConfig::T1_Constant { value: 0 }
+                .build(Width::BITS_2)
+                .unwrap(),
+            NoiseModel::IndependentSubstitution {
+                epsilon: 0.75,
+                channels: vec![0],
+            },
+            SeedBank::new(71),
+        )
+        .unwrap();
+        let mut alt_ch1 = GeneratorConfig::T1_Alternating { a: 0, b: 1 }
+            .build(Width::BITS_2)
+            .unwrap();
+        let mut learner = ArkheLearner::new(
+            Width::BITS_2,
+            2,
+            WireDelayMode::Combinational,
+            GrowthConfig::default(),
+            SeedBank::new(73),
+        )
+        .unwrap();
+        let mut budget = TickBudget::new(100_000);
+        let mut c0 = [0u64];
+        let mut o0 = [0u64];
+        let mut c1 = [0u64];
+        let mut ch1_tail = 0usize;
+        for t in 0..900 {
+            let pred = learner.predict(&mut budget);
+            noisy_ch0.step_frame(&mut c0, &mut o0);
+            alt_ch1.next_clean_frame(&mut c1);
+            if t >= 400 && pred[1] == c1[0] {
+                ch1_tail += 1;
+            }
+            learner.observe(&[o0[0], c1[0]], &mut budget);
+        }
+        assert_eq!(
+            ch1_tail, 500,
+            "learnable channel 1 must lock despite noisy channel 0 consuming its port share"
+        );
+
+        // 2. Idle zero_error port 0 redistributes its unused share to deep active port 1.
+        let mut gen_deep = GeneratorConfig::T2_DelayedAffine {
+            driver: LfsrStage {
+                taps: vec![1, 0, 0, 0, 0, 0, 1],
+                init: vec![1, 0, 1, 1, 0, 1, 0],
+            },
+            lag: 15,
+            mul_a: 1,
+            add_b: 1,
+        }
+        .build(Width::BITS_2)
+        .unwrap();
+        let mut const0 = GeneratorConfig::T1_Constant { value: 0 }
+            .build(Width::BITS_2)
+            .unwrap();
+        let mut idle_learner = ArkheLearner::new(
+            Width::BITS_2,
+            2,
+            WireDelayMode::Combinational,
+            GrowthConfig::default(),
+            SeedBank::new(79),
+        )
+        .unwrap();
+        let total_budget = 20_000u64;
+        let mut idle_budget = TickBudget::new(total_budget);
+        let mut f0 = [0u64];
+        let mut f_deep = [0u64; 2];
+        for _ in 0..500 {
+            let _ = idle_learner.predict(&mut idle_budget);
+            const0.next_clean_frame(&mut f0);
+            gen_deep.next_clean_frame(&mut f_deep);
+            idle_learner.observe(&[f0[0], f_deep[1]], &mut idle_budget);
+        }
+        assert_eq!(idle_learner.port_states[0].replay_ticks_consumed, 0);
+        assert!(
+            idle_learner.port_states[1].replay_ticks_consumed > total_budget / 2,
+            "active port 1 ({}) should inherit unused budget beyond base_share ({})",
+            idle_learner.port_states[1].replay_ticks_consumed,
+            total_budget / 2
         );
     }
 }

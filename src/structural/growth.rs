@@ -35,6 +35,85 @@ pub const fn observation_horizon(economy: &EconomyConfig, growth: &GrowthConfig)
     (economy.juvenile_ticks as usize).saturating_add(growth.diagnostic_window.saturating_mul(2))
 }
 
+/// Derived causal-depth-scaled juvenile maturation horizon (`d2-A`, §4.3).
+///
+/// Reduces identically to `economy_config.juvenile_ticks` when `juvenile_ticks == 0` or
+/// `d_cone <= max_reactive_lag`. For deeper register chains, compensates for `d_cone` ticks of
+/// pipeline fill, retrograde discount $\gamma^{-(d_{\text{cone}} - \tau_{\max})}$, and chain-sum
+/// normalization $\frac{1 - \gamma^{d_{\text{cone}}}}{1 - \gamma^{\tau_{\max}}}$.
+#[must_use]
+pub fn effective_juvenile_ticks(
+    d_cone: usize,
+    economy_config: &EconomyConfig,
+    growth_config: &GrowthConfig,
+) -> u32 {
+    let tau_max = usize::from(growth_config.max_reactive_lag);
+    if economy_config.juvenile_ticks == 0 || d_cone <= tau_max {
+        return economy_config.juvenile_ticks;
+    }
+    let gamma = economy_config.trace_discount;
+    let discount_factor = gamma.powi(-((d_cone - tau_max) as i32));
+    let chain_sum_ratio = (1.0 - gamma.powi(d_cone as i32)) / (1.0 - gamma.powi(tau_max as i32));
+    let scaled = (d_cone as f64)
+        + (f64::from(economy_config.juvenile_ticks) * discount_factor * chain_sum_ratio).ceil();
+    scaled.min(f64::from(u32::MAX)) as u32
+}
+
+fn port_cone_register_depth_rec(circuit: &Circuit, node: NodeId, on_path: &mut [bool]) -> usize {
+    if on_path[node.index()] {
+        return 0;
+    }
+    on_path[node.index()] = true;
+    let self_reg = usize::from(matches!(
+        circuit.nodes()[node.index()],
+        Primitive::Delay { .. }
+    ));
+    let is_tph = circuit.wire_delay() == WireDelayMode::TicksPerHop;
+    let mut max_upstream = 0usize;
+    for edge in circuit.edges() {
+        if let SignalSink::NodeIn { node: dst_node, .. } = edge.dst
+            && dst_node == node
+        {
+            let hop_regs = if is_tph { usize::from(edge.hops) } else { 0 };
+            let upstream = match edge.src {
+                SignalSource::BoundaryIn(_) => hop_regs,
+                SignalSource::NodeOut { node: src_node, .. } => {
+                    if on_path[src_node.index()] {
+                        0
+                    } else {
+                        hop_regs + port_cone_register_depth_rec(circuit, src_node, on_path)
+                    }
+                }
+            };
+            max_upstream = max_upstream.max(upstream);
+        }
+    }
+    on_path[node.index()] = false;
+    self_reg + max_upstream
+}
+
+/// Computes the maximum number of synchronous registers (`Primitive::Delay`, plus `edge.hops` in
+/// `WireDelayMode::TicksPerHop`) along any simple path in `out_port`'s upstream cone.
+#[must_use]
+pub fn port_cone_register_depth(circuit: &Circuit, out_port: u16) -> usize {
+    let is_tph = circuit.wire_delay() == WireDelayMode::TicksPerHop;
+    let mut on_path = vec![false; circuit.node_count()];
+    let mut max_depth = 0usize;
+    for edge in circuit.edges() {
+        if edge.dst == SignalSink::BoundaryOut(out_port) {
+            let hop_regs = if is_tph { usize::from(edge.hops) } else { 0 };
+            let depth = match edge.src {
+                SignalSource::BoundaryIn(_) => hop_regs,
+                SignalSource::NodeOut { node, .. } => {
+                    hop_regs + port_cone_register_depth_rec(circuit, node, &mut on_path)
+                }
+            };
+            max_depth = max_depth.max(depth);
+        }
+    }
+    max_depth
+}
+
 /// Growth thresholds and resource bounds used by an online M1 learner.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -51,6 +130,8 @@ pub struct GrowthConfig {
     pub max_nodes: usize,
     /// Pre-registered upper bound on reactive causal input/output lags $\tau_{\max}$.
     pub max_reactive_lag: u8,
+    /// Pre-registered upper bound on progressive deepening lag search (default `12`).
+    pub deepening_max_lag: u8,
     /// Pre-registered cap on ranked passing candidate feature groups evaluated per sprout.
     pub candidate_feature_cap: usize,
     /// Pre-registered minimum autonomous delay-ring period.
@@ -70,6 +151,7 @@ impl Default for GrowthConfig {
             min_match_gain: 4,
             max_nodes: 32,
             max_reactive_lag: 3,
+            deepening_max_lag: 12,
             candidate_feature_cap: 6,
             min_ring_period: 2,
             max_ring_period: 6,
@@ -89,6 +171,8 @@ impl GrowthConfig {
             && self.min_match_gain > 0
             && self.max_nodes > 0
             && self.max_reactive_lag >= 1
+            && self.deepening_max_lag >= self.max_reactive_lag
+            && usize::from(self.deepening_max_lag) <= self.diagnostic_window / 2
             && self.candidate_feature_cap >= 1
             && self.min_ring_period >= 2
             && self.max_ring_period >= self.min_ring_period
@@ -158,6 +242,10 @@ pub struct SproutTelemetry {
     pub lag_horizon_bound: u64,
     /// Count of autonomous ring checks where `max_ring_period` excluded an MDL-improving longer ring.
     pub ring_period_bound: u64,
+    /// Count of progressive lag-deepening band evaluations entered.
+    pub lag_deepening_steps: u64,
+    /// Count of replay evaluation proposals stopped because `TickBudget` ran out.
+    pub sprout_budget_exhausted: u64,
 }
 
 /// Invalid or dimensionally inconsistent residual diagnostics input.
@@ -185,12 +273,43 @@ impl std::fmt::Display for GrowthError {
 
 impl std::error::Error for GrowthError {}
 
+fn feature_lag(feature: &ResidualFeature) -> u8 {
+    match SourceFeature::parse(&feature.name) {
+        Some(
+            SourceFeature::LagIn { tau, .. }
+            | SourceFeature::LagYhat { tau, .. }
+            | SourceFeature::LagRes { tau, .. },
+        ) => tau,
+        _ => 0,
+    }
+}
+
 /// Computes plug-in information, Miller–Madow bias correction, and match gain for residuals.
 pub fn diagnose_residual(
     width: Width,
     residuals: &[u64],
     features: &[ResidualFeature],
     config: GrowthConfig,
+) -> Result<ResidualDiagnostics, GrowthError> {
+    diagnose_residual_with_band(
+        width,
+        residuals,
+        features,
+        config,
+        1,
+        config.max_reactive_lag,
+        0,
+    )
+}
+
+fn diagnose_residual_with_band(
+    width: Width,
+    residuals: &[u64],
+    features: &[ResidualFeature],
+    config: GrowthConfig,
+    min_tau: u8,
+    max_tau: u8,
+    out_port: u16,
 ) -> Result<ResidualDiagnostics, GrowthError> {
     if !config.is_valid() {
         return Err(GrowthError::InvalidConfig);
@@ -223,16 +342,29 @@ pub fn diagnose_residual(
                 .then_some((symbol, count.saturating_sub(zero_count)))
         });
 
+    let filter_band = min_tau > 1;
+    let in_band = |idx: usize| -> bool {
+        let lag = feature_lag(&features[idx]);
+        lag >= min_tau
+            && lag <= max_tau
+            && SourceFeature::parse(&features[idx].name)
+                .is_some_and(|sf| source_is_cross_channel(&sf, out_port))
+    };
+
     let mut scores = Vec::new();
     for first in 0..features.len() {
-        scores.push(score_feature_group(&residuals, features, &[first], width));
+        if !filter_band || in_band(first) {
+            scores.push(score_feature_group(&residuals, features, &[first], width));
+        }
         for second in (first + 1)..features.len() {
-            scores.push(score_feature_group(
-                &residuals,
-                features,
-                &[first, second],
-                width,
-            ));
+            if !filter_band || in_band(first) || in_band(second) {
+                scores.push(score_feature_group(
+                    &residuals,
+                    features,
+                    &[first, second],
+                    width,
+                ));
+            }
         }
     }
     scores.sort_by(|left, right| {
@@ -290,7 +422,7 @@ pub fn diagnose_residual(
     let candidate_list_truncated = total_passing > config.candidate_feature_cap;
 
     let growth_criterion_met = !zero_error
-        && (constant_offset.is_some()
+        && ((min_tau <= 1 && constant_offset.is_some())
             || best_feature.as_ref().is_some_and(|score| {
                 score.corrected_mutual_information_bits > config.mi_threshold_bits
                     && score.match_gain >= config.min_match_gain
@@ -502,12 +634,70 @@ pub enum CandidateMotif {
     ConstLoop(u64),
     AddConst(SourceFeature, u64),
     EqzAddConst(SourceFeature, u64),
+    NegAddConst(SourceFeature, u64),
     Neg(SourceFeature),
     ScaleEqz(SourceFeature, u64),
     // 4. Nonlinear Interaction Motifs
     AddEqz(SourceFeature, SourceFeature),
     MulEqz(SourceFeature, SourceFeature),
     MulEqzPair(SourceFeature, SourceFeature),
+}
+
+fn source_is_cross_channel(source: &SourceFeature, out_port: u16) -> bool {
+    match source {
+        SourceFeature::BoundaryIn(c) | SourceFeature::LagIn { channel: c, .. } => *c != out_port,
+        SourceFeature::LagYhat { port, .. } | SourceFeature::LagRes { port, .. } => {
+            *port != out_port
+        }
+        SourceFeature::NodeOut { .. } => false,
+    }
+}
+
+fn source_feature_lag(source: &SourceFeature) -> u8 {
+    match source {
+        SourceFeature::LagIn { tau, .. }
+        | SourceFeature::LagYhat { tau, .. }
+        | SourceFeature::LagRes { tau, .. } => *tau,
+        SourceFeature::BoundaryIn(_) | SourceFeature::NodeOut { .. } => 0,
+    }
+}
+
+fn motif_any_source(motif: &CandidateMotif, mut pred: impl FnMut(&SourceFeature) -> bool) -> bool {
+    match motif {
+        CandidateMotif::ConstLoop(_) => false,
+        CandidateMotif::Identity(u)
+        | CandidateMotif::Eqz(u)
+        | CandidateMotif::AddSelf(u)
+        | CandidateMotif::AddConst(u, _)
+        | CandidateMotif::EqzAddConst(u, _)
+        | CandidateMotif::NegAddConst(u, _)
+        | CandidateMotif::Neg(u)
+        | CandidateMotif::ScaleEqz(u, _) => pred(u),
+        CandidateMotif::AddPair(u1, u2)
+        | CandidateMotif::SubPair(u1, u2)
+        | CandidateMotif::MulPair(u1, u2)
+        | CandidateMotif::AddEqz(u1, u2)
+        | CandidateMotif::MulEqz(u1, u2)
+        | CandidateMotif::MulEqzPair(u1, u2) => pred(u1) || pred(u2),
+    }
+}
+
+/// Returns `true` iff any [`SourceFeature`] referenced by `motif` belongs to a channel `c != out_port`.
+#[must_use]
+pub fn motif_is_cross_channel(motif: &CandidateMotif, out_port: u16) -> bool {
+    motif_any_source(motif, |u| source_is_cross_channel(u, out_port))
+}
+
+fn motif_has_band_cross_feature(
+    motif: &CandidateMotif,
+    out_port: u16,
+    min_tau: u8,
+    max_tau: u8,
+) -> bool {
+    motif_any_source(motif, |u| {
+        let lag = source_feature_lag(u);
+        source_is_cross_channel(u, out_port) && lag >= min_tau && lag <= max_tau
+    })
 }
 
 /// Rolling buffer of post-juvenile frames for residual diagnosis and feature extraction.
@@ -829,6 +1019,7 @@ pub fn generate_candidate_motifs(
         candidates.push(CandidateMotif::AddConst(u1.clone(), c));
         if width.bits() > 1 {
             candidates.push(CandidateMotif::EqzAddConst(u1.clone(), c));
+            candidates.push(CandidateMotif::NegAddConst(u1.clone(), c));
         }
         if width.bits() > 1 && c > 1 {
             candidates.push(CandidateMotif::ScaleEqz(u1.clone(), c));
@@ -850,10 +1041,37 @@ pub fn generate_candidate_motifs(
     candidates
 }
 
-fn materialize_source(
+fn lag_in_delay_count(
+    wire_delay: WireDelayMode,
+    tau: u8,
+    h_arm: usize,
+    is_unconnected_identity: bool,
+) -> usize {
+    let tau_usize = usize::from(tau);
+    match wire_delay {
+        WireDelayMode::Combinational => tau_usize,
+        WireDelayMode::TicksPerHop => {
+            if is_unconnected_identity {
+                if tau == 2 {
+                    0
+                } else if tau == 1 {
+                    1
+                } else {
+                    tau_usize.saturating_sub(1) / 2
+                }
+            } else {
+                tau_usize.saturating_sub(h_arm) / 2
+            }
+        }
+    }
+}
+
+fn materialize_source_aligned(
     circuit: &mut Circuit,
     source: &SourceFeature,
     _out_port: u16,
+    h_arm: usize,
+    is_unconnected_identity: bool,
 ) -> SignalSource {
     match source {
         SourceFeature::BoundaryIn(c) => SignalSource::BoundaryIn(*c),
@@ -862,8 +1080,10 @@ fn materialize_source(
             port: *port,
         },
         SourceFeature::LagIn { channel, tau } => {
+            let n_delay =
+                lag_in_delay_count(circuit.wire_delay(), *tau, h_arm, is_unconnected_identity);
             let mut curr = tap_source(circuit, SignalSource::BoundaryIn(*channel));
-            for _ in 0..*tau {
+            for _ in 0..n_delay {
                 let delay = circuit.add_node(Primitive::Delay { init: 0 });
                 circuit.connect(
                     curr,
@@ -999,23 +1219,57 @@ fn materialize_source(
     }
 }
 
-fn materialize_motif(circuit: &mut Circuit, motif: &CandidateMotif, out_port: u16) -> SignalSource {
+fn materialize_eqz_tap(
+    circuit: &mut Circuit,
+    source: &SourceFeature,
+    out_port: u16,
+    h_arm: usize,
+) -> SignalSource {
+    let eqz = circuit.add_node(Primitive::Eqz);
+    let src = materialize_source_aligned(circuit, source, out_port, h_arm, false);
+    let tapped = tap_source(circuit, src);
+    circuit.connect(tapped, SignalSink::NodeIn { node: eqz, port: 0 });
+    SignalSource::NodeOut { node: eqz, port: 0 }
+}
+
+fn materialize_add_const_with_hops(
+    circuit: &mut Circuit,
+    source: &SourceFeature,
+    c: u64,
+    out_port: u16,
+    h_arm: usize,
+) -> SignalSource {
+    let add = circuit.add_node(Primitive::Add);
+    let u_src = materialize_source_aligned(circuit, source, out_port, h_arm, false);
+    let u_tap = tap_source(circuit, u_src);
+    circuit.connect(u_tap, SignalSink::NodeIn { node: add, port: 0 });
+    let c_src = materialize_const_loop(circuit, c);
+    circuit.connect(c_src, SignalSink::NodeIn { node: add, port: 1 });
+    SignalSource::NodeOut { node: add, port: 0 }
+}
+
+fn materialize_motif_with_stack(
+    circuit: &mut Circuit,
+    motif: &CandidateMotif,
+    out_port: u16,
+    is_driven: bool,
+) -> SignalSource {
+    let stack_offset = usize::from(is_driven);
+    let arm_hops = |motif_hops: usize| -> usize { motif_hops + 1 + stack_offset };
     match motif {
         CandidateMotif::Identity(u) => {
-            let src = materialize_source(circuit, u, out_port);
+            let src = if !is_driven {
+                materialize_source_aligned(circuit, u, out_port, 0, true)
+            } else {
+                materialize_source_aligned(circuit, u, out_port, arm_hops(0), false)
+            };
             tap_source(circuit, src)
         }
-        CandidateMotif::Eqz(u) => {
-            let eqz = circuit.add_node(Primitive::Eqz);
-            let src = materialize_source(circuit, u, out_port);
-            let tapped = tap_source(circuit, src);
-            circuit.connect(tapped, SignalSink::NodeIn { node: eqz, port: 0 });
-            SignalSource::NodeOut { node: eqz, port: 0 }
-        }
+        CandidateMotif::Eqz(u) => materialize_eqz_tap(circuit, u, out_port, arm_hops(1)),
         CandidateMotif::AddSelf(u) => {
             let add = circuit.add_node(Primitive::Add);
             let split = circuit.add_node(Primitive::Split);
-            let src = materialize_source(circuit, u, out_port);
+            let src = materialize_source_aligned(circuit, u, out_port, arm_hops(2), false);
             let tapped = tap_source(circuit, src);
             circuit.connect(
                 tapped,
@@ -1040,58 +1294,50 @@ fn materialize_motif(circuit: &mut Circuit, motif: &CandidateMotif, out_port: u1
             );
             SignalSource::NodeOut { node: add, port: 0 }
         }
-        CandidateMotif::AddPair(u1, u2) => {
-            let add = circuit.add_node(Primitive::Add);
-            let s1 = materialize_source(circuit, u1, out_port);
+        CandidateMotif::AddPair(u1, u2)
+        | CandidateMotif::SubPair(u1, u2)
+        | CandidateMotif::MulPair(u1, u2) => {
+            let prim = match motif {
+                CandidateMotif::AddPair(_, _) => Primitive::Add,
+                CandidateMotif::SubPair(_, _) => Primitive::Sub,
+                CandidateMotif::MulPair(_, _) => Primitive::Mul,
+                _ => unreachable!(),
+            };
+            let op = circuit.add_node(prim);
+            let h = arm_hops(1);
+            let s1 = materialize_source_aligned(circuit, u1, out_port, h, false);
             let t1 = tap_source(circuit, s1);
-            circuit.connect(t1, SignalSink::NodeIn { node: add, port: 0 });
-            let s2 = materialize_source(circuit, u2, out_port);
+            circuit.connect(t1, SignalSink::NodeIn { node: op, port: 0 });
+            let s2 = materialize_source_aligned(circuit, u2, out_port, h, false);
             let t2 = tap_source(circuit, s2);
-            circuit.connect(t2, SignalSink::NodeIn { node: add, port: 1 });
-            SignalSource::NodeOut { node: add, port: 0 }
-        }
-        CandidateMotif::SubPair(u1, u2) => {
-            let sub = circuit.add_node(Primitive::Sub);
-            let s1 = materialize_source(circuit, u1, out_port);
-            let t1 = tap_source(circuit, s1);
-            circuit.connect(t1, SignalSink::NodeIn { node: sub, port: 0 });
-            let s2 = materialize_source(circuit, u2, out_port);
-            let t2 = tap_source(circuit, s2);
-            circuit.connect(t2, SignalSink::NodeIn { node: sub, port: 1 });
-            SignalSource::NodeOut { node: sub, port: 0 }
-        }
-        CandidateMotif::MulPair(u1, u2) => {
-            let mul = circuit.add_node(Primitive::Mul);
-            let s1 = materialize_source(circuit, u1, out_port);
-            let t1 = tap_source(circuit, s1);
-            circuit.connect(t1, SignalSink::NodeIn { node: mul, port: 0 });
-            let s2 = materialize_source(circuit, u2, out_port);
-            let t2 = tap_source(circuit, s2);
-            circuit.connect(t2, SignalSink::NodeIn { node: mul, port: 1 });
-            SignalSource::NodeOut { node: mul, port: 0 }
+            circuit.connect(t2, SignalSink::NodeIn { node: op, port: 1 });
+            SignalSource::NodeOut { node: op, port: 0 }
         }
         CandidateMotif::ConstLoop(c) => materialize_const_loop(circuit, *c),
         CandidateMotif::AddConst(u, c) => {
-            let add = circuit.add_node(Primitive::Add);
-            let u_src = materialize_source(circuit, u, out_port);
-            let u_tap = tap_source(circuit, u_src);
-            circuit.connect(u_tap, SignalSink::NodeIn { node: add, port: 0 });
-            let c_src = materialize_const_loop(circuit, *c);
-            circuit.connect(c_src, SignalSink::NodeIn { node: add, port: 1 });
-            SignalSource::NodeOut { node: add, port: 0 }
+            materialize_add_const_with_hops(circuit, u, *c, out_port, arm_hops(1))
         }
         CandidateMotif::EqzAddConst(u, c) => {
             let eqz = circuit.add_node(Primitive::Eqz);
-            let add_src =
-                materialize_motif(circuit, &CandidateMotif::AddConst(u.clone(), *c), out_port);
+            let add_src = materialize_add_const_with_hops(circuit, u, *c, out_port, arm_hops(2));
             circuit.connect(add_src, SignalSink::NodeIn { node: eqz, port: 0 });
             SignalSource::NodeOut { node: eqz, port: 0 }
         }
+        CandidateMotif::NegAddConst(u, c) => {
+            let sub = circuit.add_node(Primitive::Sub);
+            let c_src = materialize_const_loop(circuit, *c);
+            circuit.connect(c_src, SignalSink::NodeIn { node: sub, port: 0 });
+            let u_src = materialize_source_aligned(circuit, u, out_port, arm_hops(1), false);
+            let u_tap = tap_source(circuit, u_src);
+            circuit.connect(u_tap, SignalSink::NodeIn { node: sub, port: 1 });
+            SignalSource::NodeOut { node: sub, port: 0 }
+        }
         CandidateMotif::Neg(u) => {
+            let h = arm_hops(1);
             if circuit.width().bits() > 1 {
                 let mult = (1u64 << circuit.width().bits()) - 1;
                 let mul = circuit.add_node(Primitive::Mul);
-                let u_src = materialize_source(circuit, u, out_port);
+                let u_src = materialize_source_aligned(circuit, u, out_port, h, false);
                 let u_tap = tap_source(circuit, u_src);
                 circuit.connect(u_tap, SignalSink::NodeIn { node: mul, port: 0 });
                 let c_src = materialize_const_loop(circuit, mult);
@@ -1099,7 +1345,7 @@ fn materialize_motif(circuit: &mut Circuit, motif: &CandidateMotif, out_port: u1
                 SignalSource::NodeOut { node: mul, port: 0 }
             } else {
                 let sub = circuit.add_node(Primitive::Sub);
-                let u_src = materialize_source(circuit, u, out_port);
+                let u_src = materialize_source_aligned(circuit, u, out_port, h, false);
                 let u_tap = tap_source(circuit, u_src);
                 circuit.connect(u_tap, SignalSink::NodeIn { node: sub, port: 1 });
                 let zero_src = materialize_const_loop(circuit, 0);
@@ -1109,84 +1355,33 @@ fn materialize_motif(circuit: &mut Circuit, motif: &CandidateMotif, out_port: u1
         }
         CandidateMotif::ScaleEqz(u, c) => {
             let mul = circuit.add_node(Primitive::Mul);
-            let eqz = circuit.add_node(Primitive::Eqz);
-            let u_src = materialize_source(circuit, u, out_port);
-            let u_tap = tap_source(circuit, u_src);
-            circuit.connect(u_tap, SignalSink::NodeIn { node: eqz, port: 0 });
-            circuit.connect(
-                SignalSource::NodeOut { node: eqz, port: 0 },
-                SignalSink::NodeIn { node: mul, port: 0 },
-            );
+            let eqz_src = materialize_eqz_tap(circuit, u, out_port, arm_hops(2));
+            circuit.connect(eqz_src, SignalSink::NodeIn { node: mul, port: 0 });
             let c_src = materialize_const_loop(circuit, *c);
             circuit.connect(c_src, SignalSink::NodeIn { node: mul, port: 1 });
             SignalSource::NodeOut { node: mul, port: 0 }
         }
-        CandidateMotif::AddEqz(u1, u2) => {
-            let add = circuit.add_node(Primitive::Add);
-            let s1 = materialize_source(circuit, u1, out_port);
+        CandidateMotif::AddEqz(u1, u2) | CandidateMotif::MulEqz(u1, u2) => {
+            let prim = match motif {
+                CandidateMotif::AddEqz(_, _) => Primitive::Add,
+                CandidateMotif::MulEqz(_, _) => Primitive::Mul,
+                _ => unreachable!(),
+            };
+            let op = circuit.add_node(prim);
+            let s1 = materialize_source_aligned(circuit, u1, out_port, arm_hops(1), false);
             let t1 = tap_source(circuit, s1);
-            circuit.connect(t1, SignalSink::NodeIn { node: add, port: 0 });
-            let eqz = circuit.add_node(Primitive::Eqz);
-            let s2 = materialize_source(circuit, u2, out_port);
-            let t2 = tap_source(circuit, s2);
-            circuit.connect(t2, SignalSink::NodeIn { node: eqz, port: 0 });
-            circuit.connect(
-                SignalSource::NodeOut { node: eqz, port: 0 },
-                SignalSink::NodeIn { node: add, port: 1 },
-            );
-            SignalSource::NodeOut { node: add, port: 0 }
-        }
-        CandidateMotif::MulEqz(u1, u2) => {
-            let mul = circuit.add_node(Primitive::Mul);
-            let s1 = materialize_source(circuit, u1, out_port);
-            let t1 = tap_source(circuit, s1);
-            circuit.connect(t1, SignalSink::NodeIn { node: mul, port: 0 });
-            let eqz = circuit.add_node(Primitive::Eqz);
-            let s2 = materialize_source(circuit, u2, out_port);
-            let t2 = tap_source(circuit, s2);
-            circuit.connect(t2, SignalSink::NodeIn { node: eqz, port: 0 });
-            circuit.connect(
-                SignalSource::NodeOut { node: eqz, port: 0 },
-                SignalSink::NodeIn { node: mul, port: 1 },
-            );
-            SignalSource::NodeOut { node: mul, port: 0 }
+            circuit.connect(t1, SignalSink::NodeIn { node: op, port: 0 });
+            let eqz_src = materialize_eqz_tap(circuit, u2, out_port, arm_hops(2));
+            circuit.connect(eqz_src, SignalSink::NodeIn { node: op, port: 1 });
+            SignalSource::NodeOut { node: op, port: 0 }
         }
         CandidateMotif::MulEqzPair(u1, u2) => {
             let mul = circuit.add_node(Primitive::Mul);
-            let eqz1 = circuit.add_node(Primitive::Eqz);
-            let s1 = materialize_source(circuit, u1, out_port);
-            let t1 = tap_source(circuit, s1);
-            circuit.connect(
-                t1,
-                SignalSink::NodeIn {
-                    node: eqz1,
-                    port: 0,
-                },
-            );
-            circuit.connect(
-                SignalSource::NodeOut {
-                    node: eqz1,
-                    port: 0,
-                },
-                SignalSink::NodeIn { node: mul, port: 0 },
-            );
-            let eqz2 = circuit.add_node(Primitive::Eqz);
-            let s2 = materialize_source(circuit, u2, out_port);
-            let t2 = tap_source(circuit, s2);
-            circuit.connect(
-                t2,
-                SignalSink::NodeIn {
-                    node: eqz2,
-                    port: 0,
-                },
-            );
-            circuit.connect(
-                SignalSource::NodeOut {
-                    node: eqz2,
-                    port: 0,
-                },
-                SignalSink::NodeIn { node: mul, port: 1 },
-            );
+            let h = arm_hops(2);
+            let eqz1_src = materialize_eqz_tap(circuit, u1, out_port, h);
+            circuit.connect(eqz1_src, SignalSink::NodeIn { node: mul, port: 0 });
+            let eqz2_src = materialize_eqz_tap(circuit, u2, out_port, h);
+            circuit.connect(eqz2_src, SignalSink::NodeIn { node: mul, port: 1 });
             SignalSource::NodeOut { node: mul, port: 0 }
         }
     }
@@ -1204,23 +1399,15 @@ pub fn materialize_candidate(
         .any(|edge| edge.dst == SignalSink::BoundaryOut(out_port));
     match motif {
         CandidateMotif::Neg(u) if is_driven => {
-            let u_src = materialize_source(circuit, u, out_port);
+            let u_src = materialize_source_aligned(circuit, u, out_port, 2, false);
             stack_output_binary_op(circuit, Primitive::Sub, out_port, u_src)
         }
         CandidateMotif::ScaleEqz(u, c) if is_driven && *c == circuit.width().mask() => {
-            let eqz = circuit.add_node(Primitive::Eqz);
-            let u_src = materialize_source(circuit, u, out_port);
-            let u_tap = tap_source(circuit, u_src);
-            circuit.connect(u_tap, SignalSink::NodeIn { node: eqz, port: 0 });
-            stack_output_binary_op(
-                circuit,
-                Primitive::Sub,
-                out_port,
-                SignalSource::NodeOut { node: eqz, port: 0 },
-            )
+            let eqz_src = materialize_eqz_tap(circuit, u, out_port, 3);
+            stack_output_binary_op(circuit, Primitive::Sub, out_port, eqz_src)
         }
         _ => {
-            let motif_src = materialize_motif(circuit, motif, out_port);
+            let motif_src = materialize_motif_with_stack(circuit, motif, out_port, is_driven);
             stack_output_binary_op(circuit, Primitive::Add, out_port, motif_src)
         }
     }
@@ -1377,6 +1564,7 @@ fn evaluate_sprout_motif(
     out_port: u16,
     motif: &CandidateMotif,
     is_epoch_1: bool,
+    allow_epoch1_1op_bypass: bool,
     baseline: &BaselineReplayMetrics,
     budget: Option<&mut TickBudget>,
     mut telemetry: Option<&mut SproutTelemetry>,
@@ -1393,6 +1581,9 @@ fn evaluate_sprout_motif(
     if let Some(b) = budget
         && !b.try_consume(baseline.w_replay as u64)
     {
+        if let Some(tel) = telemetry.as_deref_mut() {
+            tel.sprout_budget_exhausted += 1;
+        }
         return SproutMotifOutcome::OutOfBudget;
     }
     let Ok(staged_compiled) = staged.compile() else {
@@ -1461,7 +1652,7 @@ fn evaluate_sprout_motif(
     }
     if is_epoch_1 && !matches!(motif, CandidateMotif::ConstLoop(_)) {
         let is_binary_eqz_scaffold = staged.width() == Width::BITS_1
-            && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(_)));
+            && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(c)) if *c == out_port);
         if is_binary_eqz_scaffold {
             if e_cand > baseline.e_const_mode.saturating_add(1) {
                 return SproutMotifOutcome::Rejected;
@@ -1477,18 +1668,40 @@ fn evaluate_sprout_motif(
     let is_1_op = is_epoch_1
         && matches!(
             motif,
-            CandidateMotif::Identity(SourceFeature::BoundaryIn(_))
-                | CandidateMotif::Eqz(SourceFeature::BoundaryIn(_))
+            CandidateMotif::Identity(SourceFeature::BoundaryIn(c))
+                | CandidateMotif::Eqz(SourceFeature::BoundaryIn(c))
+                if *c == out_port
         );
 
     if economy_config.juvenile_ticks > 0 && delta_l_sprout > 0.0 {
-        let projected_survival = economy_config.initial_energy
-            + (economy_config.juvenile_ticks as f64 / w_diag as f64) * pos_flux_cand;
+        let d_cone = port_cone_register_depth(&staged, out_port);
+        let eff_juv = effective_juvenile_ticks(d_cone, economy_config, growth_config);
+        let (projected_survival, horizon_limit) = if d_cone
+            <= usize::from(growth_config.max_reactive_lag)
+        {
+            (
+                economy_config.initial_energy
+                    + (f64::from(economy_config.juvenile_ticks) / w_diag as f64) * pos_flux_cand,
+                obs_window.capacity(),
+            )
+        } else {
+            let new_nodes = staged
+                .node_count()
+                .saturating_sub(editable.circuit().node_count())
+                .max(1);
+            let endowment = (new_nodes as f64) * economy_config.initial_energy;
+            let scaled_flux = (f64::from(eff_juv) / w_diag as f64) * pos_flux_cand;
+            (
+                endowment + scaled_flux,
+                observation_horizon(economy_config, growth_config)
+                    .max((eff_juv as usize).saturating_add(2 * w_diag)),
+            )
+        };
         if projected_survival <= delta_l_sprout {
             let delta_i_hat = pos_flux_cand / (w_diag as f64);
             if delta_i_hat > 0.0 {
                 let w_star = delta_l_sprout / delta_i_hat;
-                if w_star > (obs_window.capacity() as f64)
+                if w_star > (horizon_limit as f64)
                     && let Some(tel) = telemetry
                 {
                     tel.candidate_undecidable += 1;
@@ -1500,7 +1713,7 @@ fn evaluate_sprout_motif(
 
     let allow_eqz_scaffold_zero_flux = is_1_op
         && staged.width() == Width::BITS_1
-        && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(_)))
+        && matches!(motif, CandidateMotif::Eqz(SourceFeature::BoundaryIn(c)) if *c == out_port)
         && pos_flux_cand > delta_l_sprout;
     if delta_flux <= 0.0 && !allow_eqz_scaffold_zero_flux {
         return SproutMotifOutcome::Rejected;
@@ -1508,7 +1721,11 @@ fn evaluate_sprout_motif(
 
     let j_cand = l_cand + facts_code_bits(staged.width(), w_diag as u64, e_cand as u64);
 
-    if !is_epoch_1 && j_cand >= baseline.j_curr && e_cand > 0 {
+    let num_channels = editable.circuit().num_inputs();
+    let epoch1_scaffold_bypass = is_epoch_1
+        && !motif_is_cross_channel(motif, out_port)
+        && (num_channels == 1 || (is_1_op && allow_epoch1_1op_bypass));
+    if !epoch1_scaffold_bypass && j_cand >= baseline.j_curr && e_cand > 0 {
         return SproutMotifOutcome::Rejected;
     }
 
@@ -1545,8 +1762,12 @@ fn has_admissible_deeper_lag(
     let len = norm_residuals.len();
     let start_in_window = obs_window.len().saturating_sub(len);
     let num_channels = editable.circuit().num_inputs();
+    let cross_only = max_tau > growth_config.max_reactive_lag;
     for tau in start_tau..=probe_max {
         for c in 0..usize::from(num_channels) {
+            if cross_only && c == usize::from(out_port) {
+                continue;
+            }
             let values = lagged_boundary_values(obs_window, start_in_window, len, c, tau);
             let feat = [ResidualFeature {
                 name: String::new(),
@@ -1563,6 +1784,13 @@ fn has_admissible_deeper_lag(
                 for motif in
                     generate_candidate_motifs(&u1, None, width, None, is_epoch_1, num_channels)
                 {
+                    let uses_deeper_lag = motif_any_source(&motif, |sf| {
+                        source_feature_lag(sf) > max_tau
+                            && (!cross_only || source_is_cross_channel(sf, out_port))
+                    });
+                    if !uses_deeper_lag {
+                        continue;
+                    }
                     if matches!(
                         evaluate_sprout_motif(
                             editable,
@@ -1572,6 +1800,7 @@ fn has_admissible_deeper_lag(
                             out_port,
                             &motif,
                             is_epoch_1,
+                            num_channels == 1,
                             baseline,
                             None,
                             None,
@@ -1587,6 +1816,10 @@ fn has_admissible_deeper_lag(
     false
 }
 
+fn is_better_mdl(j_cand: f64, delta_flux: f64, prev_j: f64, prev_flux: f64) -> bool {
+    j_cand < prev_j || ((j_cand - prev_j).abs() < MDL_TIE_BREAK_EPS && delta_flux > prev_flux)
+}
+
 /// Evaluates candidates from $\mathcal{K}(u_1, u_2)$ on `obs_window` with telemetry collection.
 #[allow(clippy::too_many_arguments)]
 pub fn propose_sprout_with_telemetry(
@@ -1597,6 +1830,38 @@ pub fn propose_sprout_with_telemetry(
     economy_config: &EconomyConfig,
     budget: &mut TickBudget,
     out_port: u16,
+    max_tau: u8,
+    telemetry: &mut SproutTelemetry,
+) -> Result<Option<Circuit>, GrowthError> {
+    propose_sprout_band_with_telemetry(
+        editable,
+        obs_window,
+        diag,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        1,
+        max_tau,
+        telemetry,
+    )
+}
+
+/// Evaluates candidates whose lag features lie in incremental band `min_tau..=max_tau` (C2-a).
+///
+/// When `min_tau <= 1`, evaluates all reactive features `1..=max_tau` identically to
+/// [`propose_sprout_with_telemetry`]. When `min_tau > 1`, builds the signal pool up to `max_tau`
+/// and scores only singletons inside `min_tau..=max_tau` and pairs with at least one member in `min_tau..=max_tau`.
+#[allow(clippy::too_many_arguments)]
+pub fn propose_sprout_band_with_telemetry(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    min_tau: u8,
     max_tau: u8,
     telemetry: &mut SproutTelemetry,
 ) -> Result<Option<Circuit>, GrowthError> {
@@ -1624,11 +1889,14 @@ pub fn propose_sprout_with_telemetry(
         .iter()
         .any(|edge| edge.dst == SignalSink::BoundaryOut(out_port));
 
-    let diagnostics = diagnose_residual(
+    let diagnostics = diagnose_residual_with_band(
         editable.circuit().width(),
         &residuals,
         &features,
         *growth_config,
+        min_tau,
+        max_tau,
+        out_port,
     )?;
     if diagnostics.candidate_list_truncated {
         telemetry.candidate_list_truncated += 1;
@@ -1696,9 +1964,16 @@ pub fn propose_sprout_with_telemetry(
     }
 
     let num_channels = editable.circuit().num_inputs();
+    let boundary_in_diagnosed = feature_pairs.iter().any(|(u1, u2)| {
+        *u1 == SourceFeature::BoundaryIn(out_port)
+            || u2.as_ref() == Some(&SourceFeature::BoundaryIn(out_port))
+    });
+    let allow_epoch1_1op_bypass = num_channels == 1 || boundary_in_diagnosed;
     let mut candidates = Vec::new();
     if feature_pairs.is_empty() {
-        if let Some((c_off, _)) = diagnostics.constant_offset {
+        if min_tau <= 1
+            && let Some((c_off, _)) = diagnostics.constant_offset
+        {
             let norm_c = editable.circuit().width().normalize(c_off);
             if norm_c != 0 {
                 candidates.push(CandidateMotif::ConstLoop(norm_c));
@@ -1715,6 +1990,9 @@ pub fn propose_sprout_with_telemetry(
                 num_channels,
             );
             for c in cands {
+                if min_tau > 1 && !motif_has_band_cross_feature(&c, out_port, min_tau, max_tau) {
+                    continue;
+                }
                 if !candidates.contains(&c) {
                     candidates.push(c);
                 }
@@ -1729,7 +2007,9 @@ pub fn propose_sprout_with_telemetry(
         return Ok(None);
     }
 
-    let mut best_proposal: Option<(Circuit, usize, f64, f64, bool)> = None;
+    let mut best_same: Option<(Circuit, usize, f64, f64, bool)> = None;
+    let mut best_cross: Option<(Circuit, usize, f64, f64)> = None;
+    let mut best_other: Option<(Circuit, usize, f64, f64)> = None;
     let mut blocked_by_max_nodes = 0u64;
     for motif in &candidates {
         match evaluate_sprout_motif(
@@ -1740,6 +2020,7 @@ pub fn propose_sprout_with_telemetry(
             out_port,
             motif,
             is_epoch_1,
+            allow_epoch1_1op_bypass,
             &baseline,
             Some(budget),
             Some(telemetry),
@@ -1751,28 +2032,44 @@ pub fn propose_sprout_with_telemetry(
                 delta_flux,
                 is_1_op,
             } => {
-                let is_better = match &best_proposal {
-                    None => true,
-                    Some((_, _, prev_j, prev_flux, prev_1_op)) => {
-                        if is_epoch_1 {
-                            if is_1_op && !prev_1_op {
-                                true
-                            } else if !is_1_op && *prev_1_op {
-                                false
-                            } else {
-                                j_cand < *prev_j
-                                    || ((j_cand - *prev_j).abs() < MDL_TIE_BREAK_EPS
-                                        && delta_flux > *prev_flux)
+                if is_epoch_1 {
+                    if motif_is_cross_channel(motif, out_port) {
+                        let is_better = match &best_cross {
+                            None => true,
+                            Some((_, _, prev_j, prev_flux)) => {
+                                is_better_mdl(j_cand, delta_flux, *prev_j, *prev_flux)
                             }
-                        } else {
-                            j_cand < *prev_j
-                                || ((j_cand - *prev_j).abs() < MDL_TIE_BREAK_EPS
-                                    && delta_flux > *prev_flux)
+                        };
+                        if is_better {
+                            best_cross = Some((staged, e_cand, j_cand, delta_flux));
+                        }
+                    } else {
+                        let is_better = match &best_same {
+                            None => true,
+                            Some((_, _, prev_j, prev_flux, prev_1_op)) => {
+                                if is_1_op && !prev_1_op {
+                                    true
+                                } else if !is_1_op && *prev_1_op {
+                                    false
+                                } else {
+                                    is_better_mdl(j_cand, delta_flux, *prev_j, *prev_flux)
+                                }
+                            }
+                        };
+                        if is_better {
+                            best_same = Some((staged, e_cand, j_cand, delta_flux, is_1_op));
                         }
                     }
-                };
-                if is_better {
-                    best_proposal = Some((staged, e_cand, j_cand, delta_flux, is_1_op));
+                } else {
+                    let is_better = match &best_other {
+                        None => true,
+                        Some((_, _, prev_j, prev_flux)) => {
+                            is_better_mdl(j_cand, delta_flux, *prev_j, *prev_flux)
+                        }
+                    };
+                    if is_better {
+                        best_other = Some((staged, e_cand, j_cand, delta_flux));
+                    }
                 }
             }
             SproutMotifOutcome::BlockedMaxNodes => {
@@ -1783,7 +2080,24 @@ pub fn propose_sprout_with_telemetry(
         }
     }
 
-    if best_proposal.is_none()
+    let best_circuit = if is_epoch_1 {
+        match (best_same, best_cross) {
+            (None, None) => None,
+            (Some(same), None) => Some(same.0),
+            (None, Some(cross)) => Some(cross.0),
+            (Some(same), Some(cross)) => {
+                if is_better_mdl(cross.2, cross.3, same.2, same.3) {
+                    Some(cross.0)
+                } else {
+                    Some(same.0)
+                }
+            }
+        }
+    } else {
+        best_other.map(|(lat, _, _, _)| lat)
+    };
+
+    if best_circuit.is_none()
         && blocked_by_max_nodes == 0
         && has_admissible_deeper_lag(
             editable,
@@ -1800,7 +2114,7 @@ pub fn propose_sprout_with_telemetry(
         telemetry.lag_horizon_bound += 1;
     }
 
-    Ok(best_proposal.map(|(lat, _, _, _, _)| lat))
+    Ok(best_circuit)
 }
 
 /// Autonomous delay ring proposal under channel noise (§4.5).
@@ -2065,6 +2379,9 @@ fn evaluate_ring_period(
     if let Some(b) = budget
         && !b.try_consume(w_replay as u64)
     {
+        if let Some(tel) = telemetry {
+            tel.sprout_budget_exhausted += 1;
+        }
         return RingPeriodOutcome::OutOfBudget;
     }
 
@@ -2812,6 +3129,7 @@ mod tests {
             min_match_gain: 4,
             mi_threshold_bits: 0.01,
             max_nodes: 1,
+            deepening_max_lag: 8,
             ..GrowthConfig::default()
         };
         let initial_budget = 500u64;
@@ -2868,5 +3186,99 @@ mod tests {
         // Periods 2, 3, 4 each yield a non-constant template and require p + 1 >= 3 nodes (> max_nodes = 2).
         assert_eq!(tel_ring.sprout_blocked_max_nodes, 3);
         assert_eq!(ring_budget.remaining(), initial_budget);
+    }
+
+    #[test]
+    fn s3a_neg_add_const_synthesizes_and_detects_cross_channel() {
+        use crate::substrate::WireDelayMode;
+
+        // S3-A: NegAddConst(u, 1) computes (1 - u) mod 4 == 3*u + 1 mod 4 at Width::BITS_2.
+        let mut circuit = Circuit::new(Width::BITS_2, 2, 2, WireDelayMode::Combinational);
+        let motif = CandidateMotif::NegAddConst(SourceFeature::BoundaryIn(0), 1);
+        materialize_candidate(&mut circuit, &motif, 1);
+        let compiled = circuit.compile().unwrap();
+        let mut state = ScalarState::new(&compiled);
+        let mut out = [0u64, 0u64];
+        for x in 0..4u64 {
+            state.step(&compiled, &[x, 0], &mut out).unwrap();
+            let expected = (3 * x + 1) % 4;
+            assert_eq!(out[1], expected, "1 - {x} mod 4 must equal {expected}");
+        }
+
+        // Cross-channel motif helper detects channel mismatch and matches same-channel motifs.
+        assert!(motif_is_cross_channel(&motif, 1));
+        assert!(!motif_is_cross_channel(&motif, 0));
+        assert!(motif_is_cross_channel(
+            &CandidateMotif::AddEqz(
+                SourceFeature::BoundaryIn(1),
+                SourceFeature::LagIn { channel: 0, tau: 2 },
+            ),
+            1,
+        ));
+        assert!(!motif_is_cross_channel(
+            &CandidateMotif::AddEqz(
+                SourceFeature::BoundaryIn(1),
+                SourceFeature::LagYhat { port: 1, tau: 1 },
+            ),
+            1,
+        ));
+    }
+
+    #[test]
+    fn d2a_effective_juvenile_ticks_and_port_cone_register_depth() {
+        use crate::substrate::WireDelayMode;
+
+        let growth = GrowthConfig::default();
+        let econ_zero = EconomyConfig {
+            juvenile_ticks: 0,
+            ..EconomyConfig::default()
+        };
+        assert_eq!(effective_juvenile_ticks(8, &econ_zero, &growth), 0);
+
+        let econ = EconomyConfig::default();
+        for d in 0..=3 {
+            assert_eq!(
+                effective_juvenile_ticks(d, &econ, &growth),
+                econ.juvenile_ticks
+            );
+        }
+        let d4 = effective_juvenile_ticks(4, &econ, &growth);
+        let d5 = effective_juvenile_ticks(5, &econ, &growth);
+        let d8 = effective_juvenile_ticks(8, &econ, &growth);
+        assert_eq!(d4, 185);
+        assert_eq!(d5, 244);
+        assert!(d8 > d5 && d5 > d4 && d4 > econ.juvenile_ticks);
+
+        // Unconnected port -> depth 0; 5-delay chain in Combinational -> depth 5.
+        let mut circ_comb = Circuit::new(Width::BITS_1, 2, 2, WireDelayMode::Combinational);
+        assert_eq!(port_cone_register_depth(&circ_comb, 1), 0);
+        materialize_candidate(
+            &mut circ_comb,
+            &CandidateMotif::Identity(SourceFeature::LagIn { channel: 0, tau: 5 }),
+            1,
+        );
+        assert_eq!(port_cone_register_depth(&circ_comb, 1), 5);
+
+        // AddConst with ConstLoop cycle does not recurse endlessly and measures the delay arm.
+        let mut circ_const = Circuit::new(Width::BITS_2, 2, 2, WireDelayMode::Combinational);
+        materialize_candidate(
+            &mut circ_const,
+            &CandidateMotif::AddConst(SourceFeature::LagIn { channel: 0, tau: 2 }, 1),
+            1,
+        );
+        assert_eq!(port_cone_register_depth(&circ_const, 1), 2);
+
+        // TicksPerHop AddPair(LagIn(0, 3), LagIn(1, 5)):
+        // arm 1 has BoundaryIn(1) -[1 hop]-> Delay(1 reg) -[1 hop]-> Add -[1 hop]-> Out(2) => depth 4.
+        let mut circ_tph = Circuit::new(Width::BITS_2, 3, 3, WireDelayMode::TicksPerHop);
+        materialize_candidate(
+            &mut circ_tph,
+            &CandidateMotif::AddPair(
+                SourceFeature::LagIn { channel: 0, tau: 3 },
+                SourceFeature::LagIn { channel: 1, tau: 5 },
+            ),
+            2,
+        );
+        assert_eq!(port_cone_register_depth(&circ_tph, 2), 4);
     }
 }

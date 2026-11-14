@@ -571,6 +571,14 @@ pub fn source_node_for_wire(circuit: &Circuit, wire: usize) -> Option<NodeId> {
         }
         next_wire = end;
     }
+    if circuit.wire_delay() == crate::substrate::WireDelayMode::TicksPerHop {
+        let edge_idx = wire - next_wire;
+        if let Some(edge) = circuit.edges().get(edge_idx)
+            && let SignalSource::NodeOut { node, .. } = edge.src
+        {
+            return Some(node);
+        }
+    }
     None
 }
 

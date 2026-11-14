@@ -159,8 +159,102 @@ pub fn stack_output_binary_op(
     }
 }
 
-/// Materializes a constant generator loop (`Delay` <-> `Split` feedback cycle).
+fn materialize_zero_loop_tph(circuit: &mut Circuit) -> SignalSource {
+    let split = circuit.add_node(Primitive::Split);
+    circuit.connect(
+        SignalSource::NodeOut {
+            node: split,
+            port: 0,
+        },
+        SignalSink::NodeIn {
+            node: split,
+            port: 0,
+        },
+    );
+    SignalSource::NodeOut {
+        node: split,
+        port: 1,
+    }
+}
+
+fn materialize_one_tph(circuit: &mut Circuit) -> SignalSource {
+    let zero = materialize_zero_loop_tph(circuit);
+    let eqz = circuit.add_node(Primitive::Eqz);
+    circuit.connect(zero, SignalSink::NodeIn { node: eqz, port: 0 });
+    SignalSource::NodeOut { node: eqz, port: 0 }
+}
+
+/// Materializes a constant generator loop (`Delay` <-> `Split` feedback cycle in
+/// `Combinational` mode, or settled `zero_loop`/`Eqz`/`Sub`/`Add` constant in `TicksPerHop`).
 pub fn materialize_const_loop(circuit: &mut Circuit, c: u64) -> SignalSource {
+    use crate::substrate::WireDelayMode;
+
+    if circuit.wire_delay() == WireDelayMode::TicksPerHop {
+        let c_norm = circuit.width().normalize(c);
+        if c_norm == 0 {
+            return materialize_zero_loop_tph(circuit);
+        }
+        if c_norm == 1 {
+            return materialize_one_tph(circuit);
+        }
+        if c_norm == circuit.width().mask() {
+            let sub = circuit.add_node(Primitive::Sub);
+            let zero = materialize_zero_loop_tph(circuit);
+            let one = materialize_one_tph(circuit);
+            circuit.connect(zero, SignalSink::NodeIn { node: sub, port: 0 });
+            circuit.connect(one, SignalSink::NodeIn { node: sub, port: 1 });
+            return SignalSource::NodeOut { node: sub, port: 0 };
+        }
+        let add = circuit.add_node(Primitive::Add);
+        let one = materialize_one_tph(circuit);
+        let split = circuit.add_node(Primitive::Split);
+        circuit.connect(
+            one,
+            SignalSink::NodeIn {
+                node: split,
+                port: 0,
+            },
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: split,
+                port: 0,
+            },
+            SignalSink::NodeIn { node: add, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: split,
+                port: 1,
+            },
+            SignalSink::NodeIn { node: add, port: 1 },
+        );
+        let mut acc = SignalSource::NodeOut { node: add, port: 0 };
+        for _ in 2..c_norm {
+            let next_add = circuit.add_node(Primitive::Add);
+            let extra_one = materialize_one_tph(circuit);
+            circuit.connect(
+                acc,
+                SignalSink::NodeIn {
+                    node: next_add,
+                    port: 0,
+                },
+            );
+            circuit.connect(
+                extra_one,
+                SignalSink::NodeIn {
+                    node: next_add,
+                    port: 1,
+                },
+            );
+            acc = SignalSource::NodeOut {
+                node: next_add,
+                port: 0,
+            };
+        }
+        return acc;
+    }
+
     let split = circuit.add_node(Primitive::Split);
     let delay = circuit.add_node(Primitive::Delay { init: c });
     circuit.connect(

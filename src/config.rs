@@ -288,6 +288,10 @@ pub struct ArkheM1Telemetry {
     pub ring_period_bound: u64,
     #[serde(default)]
     pub reserve_mismatch_floored: u64,
+    #[serde(default)]
+    pub lag_deepening_steps: u64,
+    #[serde(default)]
+    pub sprout_budget_exhausted: u64,
 }
 
 /// Aggregated cliff, bound, and guardrail telemetry across one or more learner runs (§B3).
@@ -301,6 +305,10 @@ pub struct CliffCountersSummary {
     pub candidate_list_truncated: u64,
     pub lag_horizon_bound: u64,
     pub ring_period_bound: u64,
+    #[serde(default)]
+    pub lag_deepening_steps: u64,
+    #[serde(default)]
+    pub sprout_budget_exhausted: u64,
 }
 
 impl From<&ArkheM1Telemetry> for CliffCountersSummary {
@@ -314,6 +322,8 @@ impl From<&ArkheM1Telemetry> for CliffCountersSummary {
             candidate_list_truncated: telemetry.candidate_list_truncated,
             lag_horizon_bound: telemetry.lag_horizon_bound,
             ring_period_bound: telemetry.ring_period_bound,
+            lag_deepening_steps: telemetry.lag_deepening_steps,
+            sprout_budget_exhausted: telemetry.sprout_budget_exhausted,
         }
     }
 }
@@ -329,6 +339,8 @@ impl CliffCountersSummary {
         self.candidate_list_truncated += other.candidate_list_truncated;
         self.lag_horizon_bound += other.lag_horizon_bound;
         self.ring_period_bound += other.ring_period_bound;
+        self.lag_deepening_steps += other.lag_deepening_steps;
+        self.sprout_budget_exhausted += other.sprout_budget_exhausted;
     }
 
     /// Returns whether the hard compute guardrail (`max_nodes`) bound during execution.
