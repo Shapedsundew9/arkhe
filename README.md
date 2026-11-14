@@ -1,17 +1,17 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), historical Milestone 0–1 sign-off records plus pre-Milestone 2 readiness verification live in [doc/research_record.md](doc/research_record.md), and the approved Stage M2a pre-registration plan lives in [doc/milestone_2a_plan.md](doc/milestone_2a_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, and **Milestone 2a (`M2a — Cross-channel predictive coupling`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), historical Milestone 0–2a sign-off records plus pre-Milestone 2 readiness verification live in [doc/research_record.md](doc/research_record.md), and the ratified Stage M2b pre-registration plan lives in [doc/milestone_2b_plan.md](doc/milestone_2b_plan.md).
 
 ## Overview
 
 Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k}$ ($1 \le k \le 64$) with:
 
 - **`substrate`**: Exact $\mathbb{Z}_{2^k}$ ring arithmetic, Level-0 primitives (`ADD`, `SUB`, `MUL`, `EQZ`, `SPLIT`, `DELAY`), Charter §2.5 structural invariant checks, scalar evaluator (`ScalarState`), and 64-lane bit-parallel evaluator (`BitParallel64State` at $k = 1$).
-- **`structural`**: Coordinate-free graph editing over `substrate::Circuit`, metabolic reserves and retrograde sensitivity, state-preserving live surgery, and finite-ring residual diagnostics.
-- **`env`**: Finite-state benchmark generators (`T1`, `T3b`, `T3c`), declared channel substitution noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
-- **`metrics`**: Surprisal null models, Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
-- **`baselines`**: Compute-matched prequential baseline harness (`RandomSearch`, `(1+λ) CGP`, `CTW`, `ReedsSloane`, and certified small-circuit `Exhaustive` synthesis) over phase-exact sliding observation windows.
-- **`rng`, `config`, `verify`, & `verify_m1`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, M0/M1a/M1b verification batteries, pooled Clopper–Pearson + $\chi^2$ homogeneity bank statistics, and `profile-compute` scaling/counter profiling.
+- **`structural`**: Coordinate-free graph editing over `substrate::Circuit`, metabolic reserves and retrograde sensitivity, state-preserving live surgery, and finite-ring residual diagnostics with progressive lag deepening.
+- **`env`**: Finite-state benchmark generators (`T1`, `T2`, `T3b`, `T3c`), declared channel substitution noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
+- **`metrics`**: Surprisal null models, Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests (with per-channel breakdowns) separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
+- **`baselines`**: Compute-matched prequential baseline harness (`RandomSearch`, `(1+λ) CGP`, `CTW`, `CrossChannelCtw`, BPTT `Rnn`, `ReedsSloane`, and certified small-circuit `Exhaustive` synthesis) over phase-exact sliding observation windows.
+- **`rng`, `config`, `verify`, `verify_m1`, & `verify_m2a`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, M0/M1a/M1b/M2a verification batteries, pooled Clopper–Pearson + $\chi^2$/permutation homogeneity bank statistics, and `profile-compute` scaling/counter profiling.
 
 ## Project Structure
 
@@ -24,7 +24,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   │   ├── blocker_report.md
 │   │   └── milestone_plan_template.md
 │   ├── foundational_research_charter_v3.md
-│   ├── milestone_2a_plan.md
+│   ├── milestone_2b_plan.md
 │   ├── parameter_inventory.md
 │   └── research_record.md
 ├── scripts/
@@ -38,6 +38,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   ├── structural/
 │   ├── substrate/
 │   ├── verify_m1/
+│   ├── verify_m2a/
 │   ├── config.rs
 │   ├── lib.rs
 │   ├── main.rs
@@ -91,6 +92,13 @@ cargo run --locked --release -- verify-m1 --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m1b --banks 100 --seed-offset 20 --seeds 20
 cargo run --locked --release -- verify-m1 --banks 100 --seed-offset 20 --seeds 20
 cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdout
+```
+
+1. Run the Milestone 2a cross-channel predictive coupling verification suite (`G2A.1`–`G2A.5`):
+
+```bash
+cargo run --locked --release -- verify-m2a --seed-offset 0 --seeds 20
+cargo run --locked --release -- verify-m2a --banks 50 --seed-offset 20 --seeds 20
 ```
 
 1. Run the Phase 0 / readiness compute and cliff-counter profiler:
