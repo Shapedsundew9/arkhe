@@ -15,4 +15,4 @@ pub use mdl::{
 };
 pub use null_model::{NullModel, NullModelKind};
 pub use point_forecast::PointForecastScorer;
-pub use scorecard::{BudgetAccountingMode, Scorecard};
+pub use scorecard::{BudgetAccountingMode, ChannelScorecard, Scorecard};

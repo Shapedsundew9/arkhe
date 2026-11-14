@@ -13,6 +13,35 @@ pub enum BudgetAccountingMode {
     AnalyticalUnmetered,
 }
 
+/// Per-channel evaluation breakdown emitted alongside [`Scorecard`] for multi-channel environments ($K \ge 1$).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelScorecard {
+    /// Zero-based channel index `0..K`.
+    pub channel: u16,
+    /// Number of post-warmup mismatches against observed emissions on this channel.
+    pub post_transient_observed_mismatches: u64,
+    /// Number of post-warmup mismatches against clean ground-truth emissions on this channel.
+    pub post_transient_clean_mismatches: u64,
+    /// Fraction of post-warmup ticks matching observed emissions on this channel (`[0.0, 1.0]`).
+    pub post_transient_observed_match_rate: f64,
+    /// Fraction of post-warmup ticks matching clean emissions on this channel (`[0.0, 1.0]`).
+    pub post_transient_clean_match_rate: f64,
+    /// Sequential Krichevsky–Trofimov point-prediction residual code length (bits/symbol) on this channel.
+    pub prequential_kt_residual_bits_per_symbol: f64,
+    /// Declared substitution noise entropy $H(\varepsilon_c)$ on this channel (bits/symbol).
+    pub declared_noise_h_bits_per_symbol: f64,
+    /// `prequential_kt_residual_bits_per_symbol - declared_noise_h_bits_per_symbol`.
+    pub excess_residual_bits_over_h_mu: f64,
+    /// Realized clean-state Bayes channel oracle loss on this channel (`None` if unavailable).
+    pub realized_oracle_bits_per_symbol: Option<f64>,
+    /// `prequential_kt_residual_bits_per_symbol - realized_oracle_bits_per_symbol` (`None` if unavailable).
+    pub paired_residual_regret_bits_per_symbol: Option<f64>,
+    /// Mean circular discrepancy $\min(d, 2^k - d)$ per symbol on this channel over the post-warmup window.
+    pub mean_circular_discrepancy: f64,
+    /// Earliest tick $t^*$ from which every subsequent prediction on this channel matched clean ground truth.
+    pub ticks_to_clean_solution: Option<u64>,
+}
+
 /// Standardised evaluation metrics emitted for every baseline or learner run (Charter §8).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scorecard {
@@ -72,4 +101,7 @@ pub struct Scorecard {
     pub budget_accounting_mode: BudgetAccountingMode,
     /// Total candidate-replay evaluation ticks deducted from [`crate::baselines::TickBudget`].
     pub candidate_replay_ticks_consumed: u64,
+    /// Per-channel breakdown across `0..K` channels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_channel: Vec<ChannelScorecard>,
 }

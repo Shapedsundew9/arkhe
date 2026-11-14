@@ -195,7 +195,9 @@ pub fn solve_epsilon_machine(spec: &FiniteStateSpec, noise: &NoiseModel) -> Epsi
     }
 }
 
-fn per_channel_epsilon(noise: &NoiseModel, num_channels: usize) -> Vec<f64> {
+/// Extracts per-channel symmetric substitution rate $\varepsilon_c$ from `noise`.
+#[must_use]
+pub fn per_channel_epsilon(noise: &NoiseModel, num_channels: usize) -> Vec<f64> {
     let mut channel_eps = vec![0.0f64; num_channels];
     if let NoiseModel::IndependentSubstitution { epsilon, channels } = noise {
         for &ch in channels {
@@ -239,6 +241,36 @@ pub fn channel_substitution_entropy_bits(eps: f64, k_bits: u8) -> f64 {
     h_binary + eps * log2_alternatives(k_bits)
 }
 
+/// Effective symbol error rate for a $k$-bit target computed from `num_noisy_inputs`
+/// driver symbols and 1 target observation, each under independent $\varepsilon$-substitution noise.
+///
+/// For alphabet cardinality $M = 2^k$, composes $m + 1$ symmetric channels via eigenvalue
+/// contraction: $\varepsilon_{\text{eff}} = \frac{M - 1}{M}\left(1 - \left(1 - \frac{M}{M - 1}\varepsilon\right)^{m + 1}\right)$.
+#[must_use]
+pub fn compound_reactive_error_rate(eps: f64, num_noisy_inputs: usize, k_bits: u8) -> f64 {
+    if eps <= 0.0 || k_bits == 0 {
+        return 0.0;
+    }
+    let power = i32::try_from(num_noisy_inputs.saturating_add(1)).unwrap_or(i32::MAX);
+    if k_bits >= 64 {
+        let p_keep = (1.0 - eps).max(0.0);
+        return (1.0 - p_keep.powi(power)).clamp(0.0, 1.0);
+    }
+    let card = (1u128 << k_bits) as f64;
+    let uniform_eps = (card - 1.0) / card;
+    let eigenvalue = 1.0 - (card / (card - 1.0)) * eps;
+    (uniform_eps * (1.0 - eigenvalue.powi(power))).clamp(0.0, 1.0)
+}
+
+/// Conditional Shannon entropy (bits/symbol) corresponding to [`compound_reactive_error_rate`].
+#[must_use]
+pub fn compound_reactive_entropy_bits(eps: f64, num_noisy_inputs: usize, k_bits: u8) -> f64 {
+    channel_substitution_entropy_bits(
+        compound_reactive_error_rate(eps, num_noisy_inputs, k_bits),
+        k_bits,
+    )
+}
+
 /// Analytical conditional channel-noise entropy per symbol declared by `noise` (even when $|S|$ exceeds export caps).
 #[must_use]
 pub fn declared_noise_entropy_bits_per_symbol(
@@ -258,6 +290,29 @@ pub fn declared_noise_entropy_bits_per_symbol(
     total / (n_ch as f64)
 }
 
+/// Exact single-channel conditional log-loss $-\log_2 \Pr(Y_{t,c} = \text{observed} \mid X_{t,c} = \text{clean})$
+/// under symmetric substitution noise $\varepsilon$.
+#[must_use]
+pub fn realized_oracle_channel_step_bits(
+    eps: f64,
+    width: Width,
+    clean_sym: u64,
+    observed_sym: u64,
+) -> Option<f64> {
+    let matched = width.normalize(clean_sym) == width.normalize(observed_sym);
+    if eps <= 0.0 {
+        matched.then_some(0.0)
+    } else if eps < 1.0 {
+        if matched {
+            Some(-(1.0 - eps).log2())
+        } else {
+            Some(-eps.log2() + log2_alternatives(width.bits()))
+        }
+    } else {
+        None
+    }
+}
+
 /// Exact single-tick conditional log-loss $-\log_2 \Pr(Y_t = \text{observed} \mid X_t = \text{clean})$
 /// incurred by the clean-phase Bayes-optimal oracle on a realized `(clean_frame, observed_frame)` pair.
 ///
@@ -273,28 +328,10 @@ pub fn realized_oracle_step_bits(
     if clean_frame.len() != observed_frame.len() {
         return None;
     }
-    let n_ch = clean_frame.len();
-    let k_bits = width.bits();
-    let channel_eps = per_channel_epsilon(noise, n_ch);
-    let alt_bits = log2_alternatives(k_bits);
-
+    let channel_eps = per_channel_epsilon(noise, clean_frame.len());
     let mut bits = 0.0f64;
-    for ch in 0..n_ch {
-        let eps = channel_eps[ch];
-        let matched = width.normalize(clean_frame[ch]) == width.normalize(observed_frame[ch]);
-        if eps <= 0.0 {
-            if !matched {
-                return None;
-            }
-        } else if eps < 1.0 {
-            if matched {
-                bits += -(1.0 - eps).log2();
-            } else {
-                bits += -eps.log2() + alt_bits;
-            }
-        } else {
-            return None;
-        }
+    for (ch, &eps) in channel_eps.iter().enumerate() {
+        bits += realized_oracle_channel_step_bits(eps, width, clean_frame[ch], observed_frame[ch])?;
     }
     Some(bits)
 }

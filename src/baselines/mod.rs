@@ -31,9 +31,12 @@ pub use random_search::{RandomSearchBaseline, sample_random_valid_circuit};
 
 use crate::env::{
     EpsilonMachineSummary, FiniteStateGenerator, NoisyEnvironment,
-    declared_noise_entropy_bits_per_symbol, realized_oracle_step_bits,
+    channel_substitution_entropy_bits, declared_noise_entropy_bits_per_symbol, per_channel_epsilon,
+    realized_oracle_channel_step_bits, realized_oracle_step_bits,
 };
-use crate::metrics::{BudgetAccountingMode, Scorecard, compute_mdl_with_tax, facts_code_bits};
+use crate::metrics::{
+    BudgetAccountingMode, ChannelScorecard, Scorecard, compute_mdl_with_tax, facts_code_bits,
+};
 use crate::substrate::{Circuit, CompiledCircuit, ScalarState};
 
 const WINDOW_EVICT_CHUNK: usize = 16;
@@ -410,6 +413,14 @@ pub fn run_prequential_harness<G: FiniteStateGenerator>(
     let mut has_oracle_bits = true;
     let mut last_clean_mismatch_tick: Option<u64> = None;
 
+    let channel_eps = per_channel_epsilon(env.noise(), channels);
+    let mut ch_post_obs_mismatches = vec![0u64; channels];
+    let mut ch_post_clean_mismatches = vec![0u64; channels];
+    let mut ch_post_circular_sum = vec![0u128; channels];
+    let mut ch_last_clean_mismatch_tick = vec![None::<u64>; channels];
+    let mut ch_post_oracle_bits = vec![0.0f64; channels];
+    let mut ch_has_oracle_bits = vec![true; channels];
+
     for tick in 0..horizon_ticks {
         let pred = baseline.predict(&mut budget);
         env.step_frame(&mut clean_frame, &mut observed_frame);
@@ -422,16 +433,31 @@ pub fn run_prequential_harness<G: FiniteStateGenerator>(
                 total_obs_mismatches += 1;
                 if tick >= warmup_ticks {
                     post_obs_mismatches += 1;
+                    ch_post_obs_mismatches[ch] += 1;
                 }
             }
             if p != clean_frame[ch] {
                 clean_ok = false;
+                ch_last_clean_mismatch_tick[ch] = Some(tick);
                 if tick >= warmup_ticks {
                     post_clean_mismatches += 1;
+                    ch_post_clean_mismatches[ch] += 1;
                 }
             }
             if tick >= warmup_ticks {
                 post_circular_sum += u128::from(width.circular_distance(p, observed_frame[ch]));
+                ch_post_circular_sum[ch] +=
+                    u128::from(width.circular_distance(p, observed_frame[ch]));
+                if let Some(ch_ob) = realized_oracle_channel_step_bits(
+                    channel_eps[ch],
+                    width,
+                    clean_frame[ch],
+                    observed_frame[ch],
+                ) {
+                    ch_post_oracle_bits[ch] += ch_ob;
+                } else {
+                    ch_has_oracle_bits[ch] = false;
+                }
             }
         }
 
@@ -551,6 +577,37 @@ pub fn run_prequential_harness<G: FiniteStateGenerator>(
         )
     });
 
+    let per_channel: Vec<ChannelScorecard> = (0..channels)
+        .map(|ch| {
+            let obs_mis = ch_post_obs_mismatches[ch];
+            let clean_mis = ch_post_clean_mismatches[ch];
+            let eval_f = evaluated_ticks as f64;
+            let ch_kt = facts_code_bits(width, evaluated_ticks, obs_mis) / eval_f;
+            let ch_declared_h = channel_substitution_entropy_bits(channel_eps[ch], width.bits());
+            let ch_oracle = ch_has_oracle_bits[ch].then_some(ch_post_oracle_bits[ch] / eval_f);
+            let ch_regret = ch_oracle.map(|oracle| ch_kt - oracle);
+            let ch_lock = match ch_last_clean_mismatch_tick[ch] {
+                None => Some(0),
+                Some(last_bad) if last_bad + 1 < horizon_ticks => Some(last_bad + 1),
+                Some(_) => None,
+            };
+            ChannelScorecard {
+                channel: ch as u16,
+                post_transient_observed_mismatches: obs_mis,
+                post_transient_clean_mismatches: clean_mis,
+                post_transient_observed_match_rate: ((evaluated_ticks - obs_mis) as f64) / eval_f,
+                post_transient_clean_match_rate: ((evaluated_ticks - clean_mis) as f64) / eval_f,
+                prequential_kt_residual_bits_per_symbol: ch_kt,
+                declared_noise_h_bits_per_symbol: ch_declared_h,
+                excess_residual_bits_over_h_mu: ch_kt - ch_declared_h,
+                realized_oracle_bits_per_symbol: ch_oracle,
+                paired_residual_regret_bits_per_symbol: ch_regret,
+                mean_circular_discrepancy: (ch_post_circular_sum[ch] as f64) / eval_f,
+                ticks_to_clean_solution: ch_lock,
+            }
+        })
+        .collect();
+
     Scorecard {
         horizon_ticks,
         warmup_ticks,
@@ -580,5 +637,85 @@ pub fn run_prequential_harness<G: FiniteStateGenerator>(
         mdl,
         budget_accounting_mode: baseline.budget_accounting_mode(),
         candidate_replay_ticks_consumed: budget.consumed(),
+        per_channel,
+    }
+}
+
+#[cfg(test)]
+mod per_channel_tests {
+    use super::*;
+    use crate::env::{GeneratorConfig, LfsrStage, NoiseModel};
+    use crate::rng::SeedBank;
+    use crate::substrate::Width;
+
+    struct PerfectChannelZeroPredictor {
+        channels: usize,
+        last: Vec<u64>,
+    }
+
+    impl PredictorBaseline for PerfectChannelZeroPredictor {
+        fn name(&self) -> &str {
+            "TestCh0Oracle"
+        }
+
+        fn predict(&mut self, _budget: &mut TickBudget) -> Vec<u64> {
+            self.last.clone()
+        }
+
+        fn observe(&mut self, truth: &[u64], _budget: &mut TickBudget) -> Option<f64> {
+            // Predicts constant 0 on ch0 (wrong ~half the time), delayed A0(t-1) on ch1 after lag 1.
+            self.last = vec![0; self.channels];
+            if self.channels >= 2 {
+                self.last[1] = truth[0];
+            }
+            None
+        }
+
+        fn best_circuit(&self) -> Option<&Circuit> {
+            None
+        }
+
+        fn budget_accounting_mode(&self) -> BudgetAccountingMode {
+            BudgetAccountingMode::AnalyticalUnmetered
+        }
+    }
+
+    #[test]
+    fn scorecard_populates_per_channel_metrics() {
+        let generator = GeneratorConfig::T2_DelayedAffine {
+            driver: LfsrStage {
+                taps: vec![1, 0, 0, 1],
+                init: vec![0, 0, 0, 1],
+            },
+            lag: 1,
+            mul_a: 1,
+            add_b: 0,
+        }
+        .build(Width::BITS_1)
+        .unwrap();
+        let noise = NoiseModel::IndependentSubstitution {
+            epsilon: 0.05,
+            channels: vec![1],
+        };
+        let mut env = NoisyEnvironment::new(generator, noise, SeedBank::new(7)).unwrap();
+        let mut pred = PerfectChannelZeroPredictor {
+            channels: 2,
+            last: vec![0, 1],
+        };
+        let sc = run_prequential_harness(&mut env, &mut pred, 500, 100, 10_000, None, None);
+        assert_eq!(sc.per_channel.len(), 2);
+        assert_eq!(sc.per_channel[0].channel, 0);
+        assert_eq!(sc.per_channel[1].channel, 1);
+        // Channel 1 predicts A0(t - 1) cleanly on every tick after t = 0.
+        assert_eq!(sc.per_channel[1].post_transient_clean_mismatches, 0);
+        assert!((sc.per_channel[1].post_transient_clean_match_rate - 1.0).abs() < 1e-12);
+        assert_eq!(sc.per_channel[1].ticks_to_clean_solution, Some(1));
+        assert!(sc.per_channel[1].realized_oracle_bits_per_symbol.is_some());
+        assert!(
+            sc.per_channel[1]
+                .paired_residual_regret_bits_per_symbol
+                .unwrap()
+                < 0.05
+        );
     }
 }
