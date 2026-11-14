@@ -59,6 +59,26 @@ pub fn effective_juvenile_ticks(
     scaled.min(f64::from(u32::MAX)) as u32
 }
 
+/// Derives the coordinate-free per-circuit node guardrail scaled linearly by channel count.
+///
+/// Reduces identically to `growth_config.max_nodes` when `num_channels <= 1`. For multi-channel
+/// circuits (`num_channels > 1`), guarantees at least `2 * deepening_max_lag + 8` nodes per
+/// channel so concurrent ports can evaluate lag-deepened binary pairings without starving siblings.
+#[must_use]
+pub const fn effective_max_nodes(num_channels: u16, growth_config: &GrowthConfig) -> usize {
+    if num_channels <= 1 {
+        return growth_config.max_nodes;
+    }
+    let tau_deep = growth_config.deepening_max_lag as usize;
+    let floor = 2 * tau_deep + 8;
+    let per_channel = if growth_config.max_nodes > floor {
+        growth_config.max_nodes
+    } else {
+        floor
+    };
+    (num_channels as usize).saturating_mul(per_channel)
+}
+
 fn port_cone_register_depth_rec(circuit: &Circuit, node: NodeId, on_path: &mut [bool]) -> usize {
     if on_path[node.index()] {
         return 0;
@@ -1443,7 +1463,9 @@ struct BaselineReplayMetrics {
     e_const_mode: usize,
     flux_curr: f64,
     l_curr: f64,
-    j_curr: f64,
+    facts_curr: f64,
+    driven_ports: Vec<bool>,
+    e_curr_by_port: Vec<usize>,
     start_idx: usize,
     eval_start_idx: usize,
     w_replay: usize,
@@ -1482,7 +1504,19 @@ fn replay_current_baseline(
     {
         let _ = curr_state.set_registers(editable.compiled(), snap_regs);
     }
-    let mut curr_pred = vec![0u64; usize::from(editable.compiled().num_outputs())];
+    let num_outputs = usize::from(editable.compiled().num_outputs());
+    let driven_ports: Vec<bool> = (0..num_outputs)
+        .map(|q| {
+            let port_u16 = u16::try_from(q).expect("output port fits in u16");
+            editable
+                .circuit()
+                .edges()
+                .iter()
+                .any(|edge| edge.dst == SignalSink::BoundaryOut(port_u16))
+        })
+        .collect();
+    let mut curr_pred = vec![0u64; num_outputs];
+    let mut e_curr_by_port = vec![0usize; num_outputs];
     let mut curr_scorer =
         PointForecastScorer::new(editable.circuit().width(), economy_config.null_model);
 
@@ -1516,6 +1550,11 @@ fn replay_current_baseline(
             )
         };
         if idx >= eval_start_idx {
+            for (q, e_port) in e_curr_by_port.iter_mut().enumerate() {
+                if driven_ports[q] && q < truth.len() && curr_pred[q] != truth[q] {
+                    *e_port += 1;
+                }
+            }
             if p_curr != p_truth {
                 e_curr += 1;
             }
@@ -1524,7 +1563,7 @@ fn replay_current_baseline(
     }
 
     let l_curr = circuit_code_bits_with_tax(editable.circuit(), 0, economy_config.split_code_tax);
-    let j_curr = l_curr + facts_code_bits(editable.circuit().width(), w_diag as u64, e_curr as u64);
+    let facts_curr = facts_code_bits(editable.circuit().width(), w_diag as u64, e_curr as u64);
     let survivor_map: Vec<Option<NodeId>> = (0..editable.circuit().node_count())
         .map(|i| Some(NodeId(i as u32)))
         .collect();
@@ -1534,7 +1573,9 @@ fn replay_current_baseline(
         e_const_mode,
         flux_curr,
         l_curr,
-        j_curr,
+        facts_curr,
+        driven_ports,
+        e_curr_by_port,
         start_idx,
         eval_start_idx,
         w_replay,
@@ -1572,10 +1613,8 @@ fn evaluate_sprout_motif(
     let w_diag = growth_config.diagnostic_window;
     let mut staged = editable.circuit().clone();
     materialize_candidate(&mut staged, motif, out_port);
-    if staged.nodes().len() > growth_config.max_nodes {
-        if let Some(tel) = telemetry.as_deref_mut() {
-            tel.sprout_blocked_max_nodes += 1;
-        }
+    let max_nodes = effective_max_nodes(editable.circuit().num_inputs(), growth_config);
+    if staged.nodes().len() > max_nodes {
         return SproutMotifOutcome::BlockedMaxNodes;
     }
     if let Some(b) = budget
@@ -1611,10 +1650,12 @@ fn evaluate_sprout_motif(
         }
         let _ = state.set_registers(&staged_compiled, &staged_regs);
     }
-    let mut pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
+    let num_outputs = usize::from(staged_compiled.num_outputs());
+    let mut pred = vec![0u64; num_outputs];
     let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
 
     let mut e_cand = 0usize;
+    let mut e_cand_by_port = vec![0usize; num_outputs];
     let mut flux_cand = 0.0;
     let mut pos_flux_cand = 0.0;
 
@@ -1639,11 +1680,25 @@ fn evaluate_sprout_motif(
             p_truth,
         );
         if idx >= baseline.eval_start_idx {
+            for (q, e_port) in e_cand_by_port.iter_mut().enumerate() {
+                if q < truth.len() && pred[q] != truth[q] {
+                    *e_port += 1;
+                }
+            }
             if p_cand != p_truth {
                 e_cand += 1;
             }
             flux_cand += reward;
             pos_flux_cand += reward.max(0.0);
+        }
+    }
+
+    for (q, &e_port) in e_cand_by_port.iter().enumerate() {
+        if q != usize::from(out_port)
+            && baseline.driven_ports.get(q).copied().unwrap_or(false)
+            && e_port > baseline.e_curr_by_port[q]
+        {
+            return SproutMotifOutcome::Rejected;
         }
     }
 
@@ -1673,9 +1728,10 @@ fn evaluate_sprout_motif(
                 if *c == out_port
         );
 
+    let d_cone = port_cone_register_depth(&staged, out_port);
+    let eff_juv = effective_juvenile_ticks(d_cone, economy_config, growth_config);
+
     if economy_config.juvenile_ticks > 0 && delta_l_sprout > 0.0 {
-        let d_cone = port_cone_register_depth(&staged, out_port);
-        let eff_juv = effective_juvenile_ticks(d_cone, economy_config, growth_config);
         let (projected_survival, horizon_limit) = if d_cone
             <= usize::from(growth_config.max_reactive_lag)
         {
@@ -1719,14 +1775,31 @@ fn evaluate_sprout_motif(
         return SproutMotifOutcome::Rejected;
     }
 
-    let j_cand = l_cand + facts_code_bits(staged.width(), w_diag as u64, e_cand as u64);
-
     let num_channels = editable.circuit().num_inputs();
+    let facts_cand = facts_code_bits(staged.width(), w_diag as u64, e_cand as u64);
+    let rank_scale = if economy_config.juvenile_ticks > 0 && num_channels > 1 {
+        (f64::from(economy_config.juvenile_ticks) / (w_diag as f64)).max(1.0)
+    } else {
+        1.0
+    };
+    let j_cand = l_cand + rank_scale * facts_cand;
+
     let epoch1_scaffold_bypass = is_epoch_1
         && !motif_is_cross_channel(motif, out_port)
         && (num_channels == 1 || (is_1_op && allow_epoch1_1op_bypass));
-    if !epoch1_scaffold_bypass && j_cand >= baseline.j_curr && e_cand > 0 {
-        return SproutMotifOutcome::Rejected;
+    if !epoch1_scaffold_bypass && e_cand > 0 {
+        let amort_scale = if economy_config.juvenile_ticks > 0
+            && (num_channels > 1 || d_cone > usize::from(growth_config.max_reactive_lag))
+        {
+            (f64::from(economy_config.juvenile_ticks) / (w_diag as f64)).max(1.0)
+        } else {
+            1.0
+        };
+        let j_mat_cand = l_cand + amort_scale * facts_cand;
+        let j_mat_curr = baseline.l_curr + amort_scale * baseline.facts_curr;
+        if j_mat_cand >= j_mat_curr {
+            return SproutMotifOutcome::Rejected;
+        }
     }
 
     SproutMotifOutcome::Accepted {
@@ -2097,9 +2170,10 @@ pub fn propose_sprout_band_with_telemetry(
         best_other.map(|(lat, _, _, _)| lat)
     };
 
-    if best_circuit.is_none()
-        && blocked_by_max_nodes == 0
-        && has_admissible_deeper_lag(
+    if best_circuit.is_none() {
+        if blocked_by_max_nodes > 0 {
+            telemetry.sprout_blocked_max_nodes += 1;
+        } else if has_admissible_deeper_lag(
             editable,
             obs_window,
             &residuals,
@@ -2109,9 +2183,9 @@ pub fn propose_sprout_band_with_telemetry(
             out_port,
             is_epoch_1,
             &baseline,
-        )
-    {
-        telemetry.lag_horizon_bound += 1;
+        ) {
+            telemetry.lag_horizon_bound += 1;
+        }
     }
 
     Ok(best_circuit)
@@ -2370,7 +2444,8 @@ fn evaluate_ring_period(
 
     let (staged, old_to_new, ring_delay_nodes) =
         build_autonomous_ring_circuit(editable.circuit(), p, &mu, out_port);
-    if staged.nodes().len() > growth_config.max_nodes {
+    let max_nodes = effective_max_nodes(editable.circuit().num_inputs(), growth_config);
+    if staged.nodes().len() > max_nodes {
         if let Some(tel) = telemetry {
             tel.sprout_blocked_max_nodes += 1;
         }
@@ -3280,5 +3355,129 @@ mod tests {
             2,
         );
         assert_eq!(port_cone_register_depth(&circ_tph, 2), 4);
+    }
+
+    #[test]
+    fn effective_max_nodes_and_mixed_candidate_loop_telemetry() {
+        let growth = GrowthConfig::default();
+        assert_eq!(effective_max_nodes(0, &growth), growth.max_nodes);
+        assert_eq!(effective_max_nodes(1, &growth), growth.max_nodes);
+        assert_eq!(effective_max_nodes(2, &growth), 64);
+        assert_eq!(effective_max_nodes(4, &growth), 128);
+
+        let small_growth = GrowthConfig {
+            max_nodes: 8,
+            deepening_max_lag: 12,
+            ..GrowthConfig::default()
+        };
+        assert_eq!(effective_max_nodes(1, &small_growth), 8);
+        // floor = 2 * 12 + 8 = 32 > max_nodes (8) => K * 32.
+        assert_eq!(effective_max_nodes(3, &small_growth), 96);
+
+        // Mixed loop: Eqz(BoundaryIn(0)) / Identity(LagIn(0, 2)) fit within max_nodes = 1 while
+        // Eqz(LagIn(0, 2)) requires 2 nodes (BlockedMaxNodes). Proposal-level counter stays 0.
+        let mixed_growth = GrowthConfig {
+            diagnostic_window: 16,
+            min_match_gain: 4,
+            mi_threshold_bits: 0.01,
+            max_nodes: 1,
+            max_reactive_lag: 3,
+            deepening_max_lag: 3,
+            ..GrowthConfig::default()
+        };
+        let econ = EconomyConfig::default();
+        let mut obs = ObservationWindow::new(1, 32);
+        let mut diag = DiagnosticBuffer::new(16);
+        for t in 0..32u64 {
+            let x = t & 1;
+            let prev_x = (t.wrapping_sub(1)) & 1;
+            obs.push_frame(&[x]);
+            if t >= 16 {
+                diag.push_frame(&[prev_x], &[x], &[0], &[x], &[], &[]);
+            }
+        }
+        let empty = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+        let editable = EditableCircuit::new(empty, econ).unwrap();
+        let mut budget = TickBudget::new(50_000);
+        let mut tel = SproutTelemetry::default();
+        let prop = propose_sprout_with_telemetry(
+            &editable,
+            &obs,
+            &diag,
+            &mixed_growth,
+            &econ,
+            &mut budget,
+            0,
+            mixed_growth.max_reactive_lag,
+            &mut tel,
+        )
+        .unwrap();
+        assert!(prop.is_some());
+        assert_eq!(tel.sprout_blocked_max_nodes, 0);
+    }
+
+    #[test]
+    fn shared_wire_tph_sibling_regression_is_rejected() {
+        use crate::substrate::WireDelayMode;
+
+        // ch1 cleanly learns d = 3 delay of ch0: BoundaryIn(0) -[1]-> Delay -[1]-> Out(1).
+        let econ = EconomyConfig::default();
+        let growth = GrowthConfig {
+            diagnostic_window: 32,
+            min_match_gain: 4,
+            mi_threshold_bits: 0.01,
+            ..GrowthConfig::default()
+        };
+        let mut base = Circuit::new(Width::BITS_1, 2, 2, WireDelayMode::TicksPerHop);
+        let d = base.add_node(Primitive::delay_zero());
+        base.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: d, port: 0 },
+        );
+        base.connect(
+            SignalSource::NodeOut { node: d, port: 0 },
+            SignalSink::BoundaryOut(1),
+        );
+        let editable = EditableCircuit::new(base, econ).unwrap();
+
+        let mut obs = ObservationWindow::new(2, 128);
+        let mut diag = DiagnosticBuffer::new(32);
+        let mut lfsr = 0x15u64;
+        let mut seq = Vec::new();
+        for _ in 0..96 {
+            let bit = lfsr & 1;
+            let fb = (lfsr ^ (lfsr >> 2)) & 1;
+            lfsr = (lfsr >> 1) | (fb << 4);
+            seq.push(bit);
+        }
+        for t in 4..96usize {
+            let cur = [seq[t], seq[t - 4]];
+            obs.push_frame(&cur);
+            if t >= 64 {
+                let prev = [seq[t - 1], seq[t - 5]];
+                let pred = [0, seq[t - 4]];
+                let res = [cur[0], 0];
+                diag.push_frame(&prev, &cur, &pred, &res, &[], &[]);
+            }
+        }
+        let baseline = replay_current_baseline(&editable, &obs, &growth, &econ, 0, true);
+        assert_eq!(baseline.driven_ports, vec![false, true]);
+        assert_eq!(baseline.e_curr_by_port[1], 0);
+
+        // Splicing BoundaryIn(0) for port 0 via tap_source adds a Split hop and shifts port 1 from d=3 to d=4.
+        let outcome = evaluate_sprout_motif(
+            &editable,
+            &obs,
+            &growth,
+            &econ,
+            0,
+            &CandidateMotif::Eqz(SourceFeature::BoundaryIn(0)),
+            true,
+            true,
+            &baseline,
+            None,
+            None,
+        );
+        assert!(matches!(outcome, SproutMotifOutcome::Rejected));
     }
 }

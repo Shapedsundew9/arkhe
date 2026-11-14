@@ -508,22 +508,17 @@ pub fn ring_identity_input_weights(
     let mut raw = [1.0, 1.0];
     match primitive {
         Primitive::Add => {
-            if values[0] == 0 && values[1] != 0 {
-                raw[0] = 0.0;
-            } else if values[1] == 0 && values[0] != 0 {
-                raw[1] = 0.0;
-            } else if values[0] == 0 && values[1] == 0 {
-                raw[0] = input_active[0];
-                raw[1] = input_active[1];
+            for j in 0..2 {
+                if values[j] == 0 {
+                    raw[j] = input_active[j];
+                }
             }
         }
         Primitive::Sub => {
             if values[1] == 0 {
-                if values[0] != 0 {
-                    raw[1] = 0.0;
-                } else {
+                raw[1] = input_active[1];
+                if values[0] == 0 {
                     raw[0] = input_active[0];
-                    raw[1] = input_active[1];
                 }
             }
         }
@@ -660,6 +655,31 @@ mod tests {
             ring_identity_input_weights(Primitive::Add, &[0, 0], &[0.0, 1.0], Width::BITS_2),
             vec![0.0, 1.0]
         );
+    }
+
+    #[test]
+    fn ring_identity_gates_preserve_credit_for_active_zero_inputs() {
+        assert_eq!(
+            ring_identity_input_weights(Primitive::Add, &[3, 0], &[1.0, 1.0], Width::BITS_2),
+            vec![0.5, 0.5]
+        );
+        assert_eq!(
+            ring_identity_input_weights(Primitive::Add, &[0, 3], &[1.0, 1.0], Width::BITS_2),
+            vec![0.5, 0.5]
+        );
+        assert_eq!(
+            ring_identity_input_weights(Primitive::Sub, &[1, 0], &[1.0, 1.0], Width::BITS_2),
+            vec![0.5, 0.5]
+        );
+        assert_eq!(
+            ring_identity_input_weights(Primitive::Sub, &[0, 0], &[1.0, 1.0], Width::BITS_2),
+            vec![0.5, 0.5]
+        );
+        // Partially inactive zero input preserves recency weighting.
+        let weighted =
+            ring_identity_input_weights(Primitive::Add, &[3, 0], &[1.0, 0.25], Width::BITS_2);
+        assert!((weighted[0] - 0.8).abs() < 1e-12);
+        assert!((weighted[1] - 0.2).abs() < 1e-12);
     }
 
     #[test]

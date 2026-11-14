@@ -150,6 +150,8 @@ pub struct NodeEconomy {
     pub description_debt: f64,
     /// Whether this node has paid its lump-sum maturity debt upon graduation.
     pub debt_paid: bool,
+    /// Smoothed effective mismatch drain rate for `ReserveCap::HorizonDerived` reserve stability.
+    pub smoothed_drain_rate: f64,
 }
 
 /// Error returned by invalid economy configuration or incompatible tick data.
@@ -245,6 +247,7 @@ impl EconomyState {
             activity: NodeActivity::default(),
             description_debt: 0.0,
             debt_paid: false,
+            smoothed_drain_rate: 0.0,
         };
         Ok(Self {
             config,
@@ -525,6 +528,7 @@ impl EconomyState {
 
         let mut starved_nodes = Vec::new();
         let mut next_energies = Vec::with_capacity(self.nodes.len());
+        let mut next_smoothed_drains = Vec::with_capacity(self.nodes.len());
         let mut clipped_nodes = 0usize;
         let mut clipped_bits = 0.0f64;
         let mut mismatch_floored_nodes = 0usize;
@@ -534,12 +538,12 @@ impl EconomyState {
                 return Err(EconomyError::InvalidTickData);
             }
             let mut node_floored = false;
-            let (next_energy, clipped) = if node.juvenile_ticks > 0 {
-                (unclipped, 0.0)
+            let (next_energy, clipped, next_smoothed_drain) = if node.juvenile_ticks > 0 {
+                (unclipped, 0.0, node.smoothed_drain_rate)
             } else {
-                let maybe_cap = match self.config.reserve_cap {
-                    ReserveCap::Uncapped => None,
-                    ReserveCap::Fixed(cap) => Some(cap),
+                let (maybe_cap, next_smoothed_drain) = match self.config.reserve_cap {
+                    ReserveCap::Uncapped => (None, node.smoothed_drain_rate),
+                    ReserveCap::Fixed(cap) => (Some(cap), node.smoothed_drain_rate),
                     ReserveCap::HorizonDerived => {
                         let w_obs = self.observation_horizon as f64;
                         let mut drain_rate = 0.0;
@@ -566,17 +570,22 @@ impl EconomyState {
                                 }
                             }
                         }
-                        Some((w_obs * drain_rate).max(self.config.initial_energy))
+                        let effective_drain =
+                            drain_rate.max(self.config.trace_discount * node.smoothed_drain_rate);
+                        (
+                            Some((w_obs * effective_drain).max(self.config.initial_energy)),
+                            effective_drain,
+                        )
                     }
                 };
                 if let Some(cap) = maybe_cap {
                     if unclipped > cap {
-                        (cap, unclipped - cap)
+                        (cap, unclipped - cap, next_smoothed_drain)
                     } else {
-                        (unclipped, 0.0)
+                        (unclipped, 0.0, next_smoothed_drain)
                     }
                 } else {
-                    (unclipped, 0.0)
+                    (unclipped, 0.0, next_smoothed_drain)
                 }
             };
             if node_floored {
@@ -587,10 +596,18 @@ impl EconomyState {
                 clipped_bits += clipped;
             }
             next_energies.push(next_energy);
+            next_smoothed_drains.push(next_smoothed_drain);
         }
-        for (index, (node, next_energy)) in self.nodes.iter_mut().zip(next_energies).enumerate() {
+        for (index, ((node, next_energy), next_smoothed_drain)) in self
+            .nodes
+            .iter_mut()
+            .zip(next_energies)
+            .zip(next_smoothed_drains)
+            .enumerate()
+        {
             let previous_energy = node.energy;
             node.energy = next_energy;
+            node.smoothed_drain_rate = next_smoothed_drain;
             if node.juvenile_ticks > 0 {
                 node.juvenile_ticks -= 1;
             } else if node.energy <= 0.0 {
@@ -937,5 +954,41 @@ mod tests {
             ..GrowthConfig::default()
         };
         assert_eq!(observation_horizon(&config, &custom_growth), 64);
+    }
+
+    #[test]
+    fn horizon_derived_reserve_cap_retains_smoothed_share_across_transient_dropouts() {
+        let config = EconomyConfig {
+            initial_energy: 4.0,
+            juvenile_ticks: 0,
+            trace_discount: 0.9,
+            reserve_cap: ReserveCap::HorizonDerived,
+            ..EconomyConfig::default()
+        };
+        let horizon = test_obs_horizon(&config);
+        let mut economy = EconomyState::new(config, Width::BITS_1, 2, 1, 0, horizon).unwrap();
+        for _ in 0..10 {
+            let _ = economy.port_scorer_mut(0).observe(1, 1);
+        }
+        let q = economy.scorers()[0].q_hat();
+        let drain_loss = ((1.0 - 0.5f64) / (1.0 - q)).log2();
+        let w_obs = horizon as f64;
+        let full_cap = (w_obs * 0.5 * drain_loss).max(config.initial_energy);
+
+        // Tick 0: both nodes split share [0.5, 0.5], building reserve to full_cap.
+        let tick0 = economy
+            .apply_tick(&[1000.0], &[vec![0.5, 0.5]], &[0.0, 0.0])
+            .unwrap();
+        assert_eq!(tick0.clipped_nodes, 2);
+        assert!((economy.nodes()[1].energy - full_cap).abs() < 1e-6);
+
+        // Tick 1: node 1 has zero instantaneous share; cap must decay by trace_discount, not snap to 4.0.
+        let decayed_cap =
+            (w_obs * config.trace_discount * 0.5 * drain_loss).max(config.initial_energy);
+        assert!(decayed_cap > config.initial_energy * 2.0);
+        let _ = economy
+            .apply_tick(&[0.0], &[vec![1.0, 0.0]], &[0.0, 0.0])
+            .unwrap();
+        assert!((economy.nodes()[1].energy - decayed_cap).abs() < 1e-6);
     }
 }
