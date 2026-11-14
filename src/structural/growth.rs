@@ -1777,11 +1777,7 @@ fn evaluate_sprout_motif(
 
     let num_channels = editable.circuit().num_inputs();
     let facts_cand = facts_code_bits(staged.width(), w_diag as u64, e_cand as u64);
-    let rank_scale = if economy_config.juvenile_ticks > 0 && num_channels > 1 {
-        (f64::from(economy_config.juvenile_ticks) / (w_diag as f64)).max(1.0)
-    } else {
-        1.0
-    };
+    let rank_scale = sprout_rank_scale(num_channels, w_diag, economy_config);
     let j_cand = l_cand + rank_scale * facts_cand;
 
     let epoch1_scaffold_bypass = is_epoch_1
@@ -1889,6 +1885,25 @@ fn has_admissible_deeper_lag(
     false
 }
 
+fn sprout_rank_scale(num_channels: u16, w_diag: usize, economy_config: &EconomyConfig) -> f64 {
+    if economy_config.juvenile_ticks > 0 && num_channels > 1 {
+        (f64::from(economy_config.juvenile_ticks) / (w_diag as f64)).max(1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Accepted candidate circuit paired with its diagnostic-window mismatch count and ranking score.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoredSproutProposal {
+    /// Staged circuit containing the proposed motif.
+    pub circuit: Circuit,
+    /// Replay mismatch count on `out_port` over the diagnostic window.
+    pub e_cand: usize,
+    /// Uniform horizon-adjusted MDL ranking score (`l_cand + rank_scale * facts_cand`).
+    pub j_cand: f64,
+}
+
 fn is_better_mdl(j_cand: f64, delta_flux: f64, prev_j: f64, prev_flux: f64) -> bool {
     j_cand < prev_j || ((j_cand - prev_j).abs() < MDL_TIE_BREAK_EPS && delta_flux > prev_flux)
 }
@@ -1906,7 +1921,34 @@ pub fn propose_sprout_with_telemetry(
     max_tau: u8,
     telemetry: &mut SproutTelemetry,
 ) -> Result<Option<Circuit>, GrowthError> {
-    propose_sprout_band_with_telemetry(
+    propose_sprout_scored_with_telemetry(
+        editable,
+        obs_window,
+        diag,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        max_tau,
+        telemetry,
+    )
+    .map(|opt| opt.map(|p| p.circuit))
+}
+
+/// Evaluates candidates up to `max_tau` and returns the winning proposal with `(e_cand, j_cand)`.
+#[allow(clippy::too_many_arguments)]
+pub fn propose_sprout_scored_with_telemetry(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    max_tau: u8,
+    telemetry: &mut SproutTelemetry,
+) -> Result<Option<ScoredSproutProposal>, GrowthError> {
+    propose_sprout_band_scored_with_telemetry(
         editable,
         obs_window,
         diag,
@@ -1938,6 +1980,35 @@ pub fn propose_sprout_band_with_telemetry(
     max_tau: u8,
     telemetry: &mut SproutTelemetry,
 ) -> Result<Option<Circuit>, GrowthError> {
+    propose_sprout_band_scored_with_telemetry(
+        editable,
+        obs_window,
+        diag,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        min_tau,
+        max_tau,
+        telemetry,
+    )
+    .map(|opt| opt.map(|p| p.circuit))
+}
+
+/// Evaluates candidates in incremental band `min_tau..=max_tau` and returns `(circuit, e_cand, j_cand)`.
+#[allow(clippy::too_many_arguments)]
+pub fn propose_sprout_band_scored_with_telemetry(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    min_tau: u8,
+    max_tau: u8,
+    telemetry: &mut SproutTelemetry,
+) -> Result<Option<ScoredSproutProposal>, GrowthError> {
     let len = diag.len();
     if len < growth_config.diagnostic_window {
         return Ok(None);
@@ -2153,24 +2224,44 @@ pub fn propose_sprout_band_with_telemetry(
         }
     }
 
-    let best_circuit = if is_epoch_1 {
+    let best_proposal = if is_epoch_1 {
         match (best_same, best_cross) {
             (None, None) => None,
-            (Some(same), None) => Some(same.0),
-            (None, Some(cross)) => Some(cross.0),
+            (Some(same), None) => Some(ScoredSproutProposal {
+                circuit: same.0,
+                e_cand: same.1,
+                j_cand: same.2,
+            }),
+            (None, Some(cross)) => Some(ScoredSproutProposal {
+                circuit: cross.0,
+                e_cand: cross.1,
+                j_cand: cross.2,
+            }),
             (Some(same), Some(cross)) => {
                 if is_better_mdl(cross.2, cross.3, same.2, same.3) {
-                    Some(cross.0)
+                    Some(ScoredSproutProposal {
+                        circuit: cross.0,
+                        e_cand: cross.1,
+                        j_cand: cross.2,
+                    })
                 } else {
-                    Some(same.0)
+                    Some(ScoredSproutProposal {
+                        circuit: same.0,
+                        e_cand: same.1,
+                        j_cand: same.2,
+                    })
                 }
             }
         }
     } else {
-        best_other.map(|(lat, _, _, _)| lat)
+        best_other.map(|(circuit, e_cand, j_cand, _)| ScoredSproutProposal {
+            circuit,
+            e_cand,
+            j_cand,
+        })
     };
 
-    if best_circuit.is_none() {
+    if best_proposal.is_none() {
         if blocked_by_max_nodes > 0 {
             telemetry.sprout_blocked_max_nodes += 1;
         } else if has_admissible_deeper_lag(
@@ -2188,7 +2279,7 @@ pub fn propose_sprout_band_with_telemetry(
         }
     }
 
-    Ok(best_circuit)
+    Ok(best_proposal)
 }
 
 /// Autonomous delay ring proposal under channel noise (§4.5).
@@ -2401,7 +2492,12 @@ pub fn propose_autonomous_delay_ring(
 }
 
 enum RingPeriodOutcome {
-    Accepted(AutonomousRingProposal, f64),
+    Accepted {
+        proposal: AutonomousRingProposal,
+        j_ring: f64,
+        e_ring_diag: usize,
+        j_ring_diag: f64,
+    },
     Rejected,
     OutOfBudget,
 }
@@ -2499,6 +2595,9 @@ fn evaluate_ring_period(
 
     let mut scorer = PointForecastScorer::new(staged.width(), economy_config.null_model);
     let mut e_ring = 0usize;
+    let mut e_ring_diag = 0usize;
+    let w_diag = growth_config.diagnostic_window.max(1);
+    let diag_start = w_replay.saturating_sub(w_diag);
     let mut flux_ring = 0.0;
     let mut pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
 
@@ -2513,6 +2612,9 @@ fn evaluate_ring_period(
         }
         if pred[out_idx] != frame[out_idx] {
             e_ring += 1;
+            if i >= diag_start {
+                e_ring_diag += 1;
+            }
         }
         flux_ring += score_with_reward_mode(
             &mut scorer,
@@ -2550,8 +2652,13 @@ fn evaluate_ring_period(
         return RingPeriodOutcome::Rejected;
     }
 
-    RingPeriodOutcome::Accepted(
-        AutonomousRingProposal {
+    let diag_eval = w_replay.min(w_diag);
+    let rank_scale = sprout_rank_scale(staged.num_inputs(), diag_eval, economy_config);
+    let j_ring_diag =
+        l_ring + rank_scale * facts_code_bits(staged.width(), diag_eval as u64, e_ring_diag as u64);
+
+    RingPeriodOutcome::Accepted {
+        proposal: AutonomousRingProposal {
             candidate_circuit: staged,
             old_to_new,
             ring_delay_nodes,
@@ -2559,7 +2666,9 @@ fn evaluate_ring_period(
             template: mu,
         },
         j_ring,
-    )
+        e_ring_diag,
+        j_ring_diag,
+    }
 }
 
 /// Evaluates autonomous delay-ring candidates with bound/guardrail telemetry (§4.5).
@@ -2572,6 +2681,28 @@ pub fn propose_autonomous_delay_ring_with_telemetry(
     out_port: u16,
     telemetry: &mut SproutTelemetry,
 ) -> Option<AutonomousRingProposal> {
+    propose_autonomous_delay_ring_scored_with_telemetry(
+        editable,
+        obs_window,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        telemetry,
+    )
+    .map(|(prop, _, _)| prop)
+}
+
+/// Evaluates autonomous delay-ring candidates and returns `(proposal, e_ring_diag, j_ring_diag)`.
+pub fn propose_autonomous_delay_ring_scored_with_telemetry(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    telemetry: &mut SproutTelemetry,
+) -> Option<(AutonomousRingProposal, usize, f64)> {
     if editable.circuit().wire_delay() != WireDelayMode::Combinational {
         return None;
     }
@@ -2648,7 +2779,7 @@ pub fn propose_autonomous_delay_ring_with_telemetry(
     let j_curr =
         l_curr + facts_code_bits(editable.circuit().width(), w_replay as u64, e_curr as u64);
 
-    let mut best_ring: Option<(AutonomousRingProposal, f64)> = None;
+    let mut best_ring: Option<(AutonomousRingProposal, f64, usize, f64)> = None;
 
     for p in growth_config.min_ring_period..=growth_config.max_ring_period {
         match evaluate_ring_period(
@@ -2665,12 +2796,17 @@ pub fn propose_autonomous_delay_ring_with_telemetry(
             Some(budget),
             Some(telemetry),
         ) {
-            RingPeriodOutcome::Accepted(prop, j_ring) => {
+            RingPeriodOutcome::Accepted {
+                proposal,
+                j_ring,
+                e_ring_diag,
+                j_ring_diag,
+            } => {
                 if best_ring
                     .as_ref()
-                    .is_none_or(|(_, best_j)| j_ring < *best_j)
+                    .is_none_or(|(_, best_j, _, _)| j_ring < *best_j)
                 {
-                    best_ring = Some((prop, j_ring));
+                    best_ring = Some((proposal, j_ring, e_ring_diag, j_ring_diag));
                 }
             }
             RingPeriodOutcome::Rejected => {}
@@ -2683,7 +2819,7 @@ pub fn propose_autonomous_delay_ring_with_telemetry(
         for p in (2..growth_config.min_ring_period)
             .chain((growth_config.max_ring_period + 1)..=probe_ceiling)
         {
-            if let RingPeriodOutcome::Accepted(..) = evaluate_ring_period(
+            if let RingPeriodOutcome::Accepted { .. } = evaluate_ring_period(
                 editable,
                 obs_window,
                 growth_config,
@@ -2703,7 +2839,7 @@ pub fn propose_autonomous_delay_ring_with_telemetry(
         }
     }
 
-    best_ring.map(|(prop, _)| prop)
+    best_ring.map(|(prop, _, e_diag, j_diag)| (prop, e_diag, j_diag))
 }
 
 #[cfg(test)]

@@ -18,9 +18,11 @@ pub use graph_edit::{
 pub use growth::{
     AutonomousRingProposal, FeatureScore, GrowthConfig, GrowthError, MDL_TIE_BREAK_EPS,
     RING_SIM_SENSITIVITY_SAMPLES, ResidualDiagnostics, ResidualFeature, SMALL_CONST_CANDIDATE_CAP,
-    SproutTelemetry, diagnose_residual, effective_juvenile_ticks, effective_max_nodes,
-    motif_is_cross_channel, observation_horizon, port_cone_register_depth,
-    propose_autonomous_delay_ring_with_telemetry, propose_sprout_band_with_telemetry,
+    ScoredSproutProposal, SproutTelemetry, diagnose_residual, effective_juvenile_ticks,
+    effective_max_nodes, motif_is_cross_channel, observation_horizon, port_cone_register_depth,
+    propose_autonomous_delay_ring_scored_with_telemetry,
+    propose_autonomous_delay_ring_with_telemetry, propose_sprout_band_scored_with_telemetry,
+    propose_sprout_band_with_telemetry,
 };
 pub use learner::{ArkheLearner, GrowthEpochSnapshot};
 pub use live::{

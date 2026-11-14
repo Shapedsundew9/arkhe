@@ -9,10 +9,10 @@ use crate::metrics::facts_code_bits;
 use crate::rng::SeedBank;
 use crate::structural::economy::EconomyConfig;
 use crate::structural::growth::{
-    DiagnosticBuffer, GrowthConfig, GrowthError, SproutTelemetry, diagnose_residual,
-    effective_juvenile_ticks, port_cone_register_depth,
-    propose_autonomous_delay_ring_with_telemetry, propose_sprout_band_with_telemetry,
-    propose_sprout_with_telemetry,
+    AutonomousRingProposal, DiagnosticBuffer, GrowthConfig, GrowthError, ScoredSproutProposal,
+    SproutTelemetry, diagnose_residual, effective_juvenile_ticks, port_cone_register_depth,
+    propose_autonomous_delay_ring_scored_with_telemetry, propose_sprout_band_scored_with_telemetry,
+    propose_sprout_scored_with_telemetry,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
@@ -429,6 +429,49 @@ impl ArkheLearner {
         }
     }
 
+    fn commit_ring_proposal(&mut self, ring_prop: AutonomousRingProposal) -> bool {
+        let pre_ring_circuit = self.editable.circuit().clone();
+        let old_to_new = ring_prop.old_to_new;
+        let ring_delay_nodes = ring_prop.ring_delay_nodes;
+        let period = ring_prop.period;
+        let template = ring_prop.template;
+        if self
+            .editable
+            .recompile_preserving_state(ring_prop.candidate_circuit, &old_to_new)
+            .is_ok()
+        {
+            self.ledger.on_sprout(
+                self.editable.circuit(),
+                self.economy_config.split_code_tax,
+                &old_to_new,
+            );
+            self.editable
+                .economy_mut()
+                .assign_sprout_debts(&self.ledger.node_debts);
+            let mut regs = self.editable.state().registers().to_vec();
+            let mut ok_regs = true;
+            for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
+                if let Some(reg_idx) =
+                    explicit_delay_register_index(self.editable.circuit(), delay_node)
+                {
+                    regs[reg_idx] =
+                        template[(((self.tick + 1) as usize) + (period - 1 - j)) % period];
+                } else {
+                    ok_regs = false;
+                    break;
+                }
+            }
+            if ok_regs {
+                let _ = self.editable.set_registers(&regs);
+            }
+            self.reset_changed_ports(&pre_ring_circuit, &old_to_new);
+            self.ring_closure_events += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Assembles current M1 telemetry summary.
     #[must_use]
     pub fn telemetry(&self) -> ArkheM1Telemetry {
@@ -726,9 +769,22 @@ impl PredictorBaseline for ArkheLearner {
             };
 
             // 2a. Stage 0 candidate motif sprouting (up to GrowthConfig::max_reactive_lag)
+            enum DeferredProposal {
+                Sprout(ScoredSproutProposal),
+                Ring(AutonomousRingProposal, f64),
+            }
+            impl DeferredProposal {
+                fn j_score(&self) -> f64 {
+                    match self {
+                        Self::Sprout(prop) => prop.j_cand,
+                        Self::Ring(_, j) => *j,
+                    }
+                }
+            }
+
             let mut sprouted = false;
             let mut stage0_tel = SproutTelemetry::default();
-            if let Ok(Some(sprout_circ)) = propose_sprout_with_telemetry(
+            let stage0_res = propose_sprout_scored_with_telemetry(
                 &self.editable,
                 &self.obs_window,
                 &self.port_states[p].diagnostic_buffer,
@@ -738,74 +794,52 @@ impl PredictorBaseline for ArkheLearner {
                 port_u16,
                 self.growth_config.max_reactive_lag,
                 &mut stage0_tel,
-            ) {
-                sprouted = self.commit_sprout(p, sprout_circ);
-            }
-
-            // 2b. Autonomous delay ring proposal under noise (checked BEFORE lag deepening per C2-a)
-            let mut ring_tel = SproutTelemetry::default();
-            if !sprouted
-                && let Some(ring_prop) = propose_autonomous_delay_ring_with_telemetry(
-                    &self.editable,
-                    &self.obs_window,
-                    &self.growth_config,
-                    &self.economy_config,
-                    &mut port_budget,
-                    port_u16,
-                    &mut ring_tel,
-                )
-            {
-                let pre_ring_circuit = self.editable.circuit().clone();
-                let old_to_new = ring_prop.old_to_new;
-                let ring_delay_nodes = ring_prop.ring_delay_nodes;
-                let period = ring_prop.period;
-                let template = ring_prop.template;
-                if self
-                    .editable
-                    .recompile_preserving_state(ring_prop.candidate_circuit, &old_to_new)
-                    .is_ok()
-                {
-                    self.ledger.on_sprout(
-                        self.editable.circuit(),
-                        self.economy_config.split_code_tax,
-                        &old_to_new,
-                    );
-                    self.editable
-                        .economy_mut()
-                        .assign_sprout_debts(&self.ledger.node_debts);
-                    let mut regs = self.editable.state().registers().to_vec();
-                    let mut ok_regs = true;
-                    for (j, &delay_node) in ring_delay_nodes.iter().enumerate() {
-                        if let Some(reg_idx) =
-                            explicit_delay_register_index(self.editable.circuit(), delay_node)
-                        {
-                            regs[reg_idx] =
-                                template[(((self.tick + 1) as usize) + (period - 1 - j)) % period];
-                        } else {
-                            ok_regs = false;
-                            break;
-                        }
-                    }
-                    if ok_regs {
-                        let _ = self.editable.set_registers(&regs);
-                    }
-                    self.reset_changed_ports(&pre_ring_circuit, &old_to_new);
-                    self.ring_closure_events += 1;
-                    sprouted = true;
-                }
-            }
-
-            // 2c. Progressive lag-deepening incremental bands (3..=6], (6..=12] per C2-a
-            let mut last_band_tel: Option<SproutTelemetry> = None;
-            let can_deepen = num_ports > 1
-                && !sprouted
+            );
+            let can_deepen_eligible = num_ports > 1
                 && !port_zero_error
                 && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
                 && stage0_tel.sprout_blocked_max_nodes == 0
                 && stage0_tel.sprout_budget_exhausted == 0
                 && port_budget.remaining() > 0;
 
-            if can_deepen {
+            let mut deferred_best: Option<DeferredProposal> = match stage0_res {
+                Ok(Some(prop)) if prop.e_cand == 0 || !can_deepen_eligible => {
+                    sprouted = self.commit_sprout(p, prop.circuit);
+                    None
+                }
+                Ok(Some(prop)) => Some(DeferredProposal::Sprout(prop)),
+                _ => None,
+            };
+
+            // 2b. Autonomous delay ring proposal under noise (checked BEFORE lag deepening per C2-a)
+            let mut ring_tel = SproutTelemetry::default();
+            if !sprouted
+                && let Some((ring_prop, e_ring_diag, j_ring_diag)) =
+                    propose_autonomous_delay_ring_scored_with_telemetry(
+                        &self.editable,
+                        &self.obs_window,
+                        &self.growth_config,
+                        &self.economy_config,
+                        &mut port_budget,
+                        port_u16,
+                        &mut ring_tel,
+                    )
+            {
+                if deferred_best.is_none() || e_ring_diag == 0 {
+                    sprouted = self.commit_ring_proposal(ring_prop);
+                } else if deferred_best
+                    .as_ref()
+                    .is_none_or(|prev| j_ring_diag < prev.j_score())
+                {
+                    deferred_best = Some(DeferredProposal::Ring(ring_prop, j_ring_diag));
+                }
+            }
+
+            // 2c. Progressive lag-deepening incremental bands (3..=6], (6..=12] per C2-a
+            let mut last_band_tel: Option<SproutTelemetry> = None;
+            let mut band_blocked = 0u64;
+            let mut band_exhausted = 0u64;
+            if !sprouted && can_deepen_eligible {
                 let mut bands = Vec::new();
                 let mut prev_max = self.growth_config.max_reactive_lag;
                 for &cap in &[6u8, 12u8] {
@@ -825,7 +859,7 @@ impl PredictorBaseline for ArkheLearner {
                     }
                     self.lag_deepening_steps += 1;
                     let mut band_tel = SproutTelemetry::default();
-                    let band_res = propose_sprout_band_with_telemetry(
+                    let band_res = propose_sprout_band_scored_with_telemetry(
                         &self.editable,
                         &self.obs_window,
                         &self.port_states[p].diagnostic_buffer,
@@ -837,19 +871,35 @@ impl PredictorBaseline for ArkheLearner {
                         max_tau,
                         &mut band_tel,
                     );
-                    self.sprout_blocked_max_nodes += band_tel.sprout_blocked_max_nodes;
-                    self.sprout_budget_exhausted += band_tel.sprout_budget_exhausted;
+                    band_blocked += band_tel.sprout_blocked_max_nodes;
+                    band_exhausted += band_tel.sprout_budget_exhausted;
+                    let band_stopped = band_tel.sprout_blocked_max_nodes > 0
+                        || band_tel.sprout_budget_exhausted > 0;
                     last_band_tel = Some(band_tel);
 
-                    if let Ok(Some(sprout_circ)) = band_res {
-                        sprouted = self.commit_sprout(p, sprout_circ);
-                        break;
+                    if let Ok(Some(band_prop)) = band_res {
+                        if band_prop.e_cand == 0 {
+                            sprouted = self.commit_sprout(p, band_prop.circuit);
+                            break;
+                        }
+                        if deferred_best
+                            .as_ref()
+                            .is_none_or(|prev| band_prop.j_cand < prev.j_score())
+                        {
+                            deferred_best = Some(DeferredProposal::Sprout(band_prop));
+                        }
                     }
-                    if band_tel.sprout_blocked_max_nodes > 0 || band_tel.sprout_budget_exhausted > 0
-                    {
+                    if band_stopped {
                         break;
                     }
                 }
+            }
+
+            if !sprouted && let Some(winner) = deferred_best {
+                sprouted = match winner {
+                    DeferredProposal::Sprout(prop) => self.commit_sprout(p, prop.circuit),
+                    DeferredProposal::Ring(ring_prop, _) => self.commit_ring_proposal(ring_prop),
+                };
             }
 
             if num_ports == 1 {
@@ -860,10 +910,12 @@ impl PredictorBaseline for ArkheLearner {
                 self.port_states[p].replay_ticks_consumed += spent;
             }
 
-            self.sprout_blocked_max_nodes +=
-                stage0_tel.sprout_blocked_max_nodes + ring_tel.sprout_blocked_max_nodes;
-            self.sprout_budget_exhausted +=
-                stage0_tel.sprout_budget_exhausted + ring_tel.sprout_budget_exhausted;
+            self.sprout_blocked_max_nodes += stage0_tel.sprout_blocked_max_nodes
+                + ring_tel.sprout_blocked_max_nodes
+                + if sprouted { 0 } else { band_blocked };
+            self.sprout_budget_exhausted += stage0_tel.sprout_budget_exhausted
+                + ring_tel.sprout_budget_exhausted
+                + if sprouted { 0 } else { band_exhausted };
             self.ring_period_bound += ring_tel.ring_period_bound;
 
             let bound_tel = last_band_tel.as_ref().unwrap_or(&stage0_tel);
@@ -871,7 +923,9 @@ impl PredictorBaseline for ArkheLearner {
                 bound_tel.candidate_undecidable + ring_tel.candidate_undecidable;
             self.candidate_list_truncated +=
                 bound_tel.candidate_list_truncated + ring_tel.candidate_list_truncated;
-            self.lag_horizon_bound += bound_tel.lag_horizon_bound + ring_tel.lag_horizon_bound;
+            if !sprouted {
+                self.lag_horizon_bound += bound_tel.lag_horizon_bound + ring_tel.lag_horizon_bound;
+            }
 
             if sprouted {
                 break;
@@ -1465,5 +1519,48 @@ mod tests {
             idle_learner.port_states[1].replay_ticks_consumed,
             total_budget / 2
         );
+    }
+
+    #[test]
+    fn deep_d6_exact_rule_beats_transient_lossy_stage0_correlation_at_t63() {
+        use crate::env::LfsrStage;
+
+        let mut gen_deep = GeneratorConfig::T2_DelayedAffine {
+            driver: LfsrStage {
+                taps: vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1],
+                init: vec![1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+            },
+            lag: 6,
+            mul_a: 1,
+            add_b: 1,
+        }
+        .build(Width::BITS_1)
+        .unwrap();
+        let mut learner = ArkheLearner::new(
+            Width::BITS_1,
+            2,
+            WireDelayMode::Combinational,
+            GrowthConfig::default(),
+            SeedBank::new(0),
+        )
+        .unwrap();
+        let mut budget = TickBudget::new(200_000);
+        let mut truth = [0u64; 2];
+        let mut mismatches_after_70 = 0usize;
+        for t in 0..800 {
+            let pred = learner.predict(&mut budget);
+            gen_deep.next_clean_frame(&mut truth);
+            if t >= 70 && pred[1] != truth[1] {
+                mismatches_after_70 += 1;
+            }
+            learner.observe(&truth, &mut budget);
+        }
+        let tel = learner.telemetry();
+        assert_eq!(
+            mismatches_after_70, 0,
+            "deep d=6 must immediately lock after t=63 without stalling on transient Stage-0 correlation"
+        );
+        assert!(tel.lag_deepening_steps >= 1);
+        assert_eq!(tel.starvation_prune_events, 0);
     }
 }
