@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use crate::metrics::{NullModelKind, PointForecastScorer};
+use crate::metrics::{NullModel, NullModelKind, PointForecastScorer};
 use crate::substrate::{Circuit, Primitive, SignalSink, SignalSource, Width};
 
 /// Decomposed Minimum Description Length (MDL) accounting in bits (§3.4).
@@ -25,6 +25,21 @@ pub struct MdlBreakdown {
 pub enum NullCalibratedMdlError {
     /// Observed facts and predictions have different lengths.
     LengthMismatch { facts: usize, predictions: usize },
+    /// Port trace count does not match `circuit.num_outputs()`.
+    PortCountMismatch { expected: usize, actual: usize },
+    /// Phase sequence length does not match observed trace length.
+    PhaseLengthMismatch { phases: usize, ticks: usize },
+    /// Comparator targets an output port outside `0..circuit.num_outputs()`.
+    ComparatorTargetOutOfRange {
+        target_port: usize,
+        num_outputs: usize,
+    },
+    /// Comparator prediction slice length does not match trace length.
+    ComparatorTraceLengthMismatch {
+        comparator: usize,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for NullCalibratedMdlError {
@@ -33,6 +48,28 @@ impl fmt::Display for NullCalibratedMdlError {
             Self::LengthMismatch { facts, predictions } => write!(
                 f,
                 "facts and predictions length mismatch: {facts} != {predictions}"
+            ),
+            Self::PortCountMismatch { expected, actual } => write!(
+                f,
+                "output port count mismatch: expected {expected}, got {actual}"
+            ),
+            Self::PhaseLengthMismatch { phases, ticks } => {
+                write!(f, "phase trace length mismatch: {phases} != {ticks}")
+            }
+            Self::ComparatorTargetOutOfRange {
+                target_port,
+                num_outputs,
+            } => write!(
+                f,
+                "comparator target port {target_port} exceeds num_outputs {num_outputs}"
+            ),
+            Self::ComparatorTraceLengthMismatch {
+                comparator,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "comparator {comparator} trace length mismatch: expected {expected}, got {actual}"
             ),
         }
     }
@@ -479,6 +516,260 @@ pub fn null_calibrated_mdl_delta(
     Ok(palette_bits + circuit_code_bits(circuit, extra_palette_entries) - net_reward)
 }
 
+/// Execution phase on one tick for epistemic MDL accounting (Charter DR #40).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EpistemicTickPhase {
+    /// Supervised wake phase: boundary outputs and comparators score against external ground truth.
+    Wake,
+    /// Unsupervised sleep/loopback phase: boundary rewards are zero; comparators score internal
+    /// agreement against each target port's frozen wake null model.
+    Sleep,
+}
+
+/// Per-comparator prediction traces used to evaluate [`epistemic_null_calibrated_mdl_delta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpistemicComparatorTrace<'a> {
+    /// Target boundary output port $p$ supplying the calibrated wake null model $P_{\text{null}}^{(p)}$.
+    pub target_port: usize,
+    /// Tick index when this comparator became active (`0` if present from tick 0).
+    pub registered_at_tick: usize,
+    /// Source-channel bitmask of the primary derivation (`sub_node.in(0)`).
+    pub primary_channel_mask: u64,
+    /// Source-channel bitmask of the alternative derivation (`sub_node.in(1)`).
+    pub alt_channel_mask: u64,
+    /// Primary derivation outputs (`sub_node.in(0)`) at each tick `0..T`.
+    pub primary_predictions: &'a [u64],
+    /// Alternative derivation outputs (`sub_node.in(1)`) at each tick `0..T`.
+    pub alt_predictions: &'a [u64],
+}
+
+/// Source-channel independence weight $\iota(a, b) = \frac{1}{|C_a \cap C_b| + 1}$
+/// applied to positive internal agreement in sleep (Charter §1.3 & §3.1.4, DR #40).
+#[must_use]
+pub fn channel_independence_weight(primary_channel_mask: u64, alt_channel_mask: u64) -> f64 {
+    let shared_channels = (primary_channel_mask & alt_channel_mask).count_ones();
+    1.0 / (f64::from(shared_channels) + 1.0)
+}
+
+fn frozen_sleep_scorer(width: Width, frozen_null: &NullModel) -> PointForecastScorer {
+    let mut scorer = PointForecastScorer::new(width, frozen_null.kind());
+    *scorer.null_model_mut() = frozen_null.clone();
+    scorer
+}
+
+/// Scores one Sleep tick using a frozen wake null model without mutating `frozen_null`.
+fn score_sleep_step_frozen(
+    sleep_scorer: &mut PointForecastScorer,
+    width: Width,
+    alt_val: u64,
+    primary_val: u64,
+    iota: f64,
+) -> f64 {
+    let frozen_null = sleep_scorer.null_model().clone();
+    let raw_reward = sleep_scorer.observe(alt_val, primary_val);
+    *sleep_scorer.null_model_mut() = frozen_null;
+    if width.normalize(alt_val) == width.normalize(primary_val) {
+        raw_reward * iota
+    } else {
+        raw_reward
+    }
+}
+
+/// Computes epistemic null-calibrated MDL delta $\Delta L_{\text{null}}^{\text{epistemic}}(T)$
+/// with default `split_code_tax = true` (Charter §3.4, DR #40).
+///
+/// With `juvenile_ticks = 0` and `ReserveCap::Uncapped`, $-\Delta L_{\text{null}}^{\text{epistemic}}(T)$
+/// equals total live metabolic reserve change $\Delta E(T) = F_{\text{boundary}}(T) + F_{\text{comparators}}(T) - L(C)$
+/// across both Wake and Sleep segments. Reduces bit-identically to [`null_calibrated_mdl_delta`]
+/// when `comparators` is empty, `num_outputs == 1`, and every tick is [`EpistemicTickPhase::Wake`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Matches epistemic MDL specification inputs directly"
+)]
+pub fn epistemic_null_calibrated_mdl_delta(
+    circuit: &Circuit,
+    palette_bits: f64,
+    extra_palette_entries: usize,
+    port_facts: &[&[u64]],
+    port_predictions: &[&[u64]],
+    phases: &[EpistemicTickPhase],
+    comparators: &[EpistemicComparatorTrace<'_>],
+    null_model_kind: NullModelKind,
+) -> Result<f64, NullCalibratedMdlError> {
+    epistemic_null_calibrated_mdl_delta_with_tax(
+        circuit,
+        palette_bits,
+        extra_palette_entries,
+        port_facts,
+        port_predictions,
+        phases,
+        comparators,
+        null_model_kind,
+        true,
+    )
+}
+
+/// Variant of [`epistemic_null_calibrated_mdl_delta`] with configurable `split_code_tax`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit specification of trace inputs preserves exact bit equivalence with null_calibrated_mdl_delta"
+)]
+pub fn epistemic_null_calibrated_mdl_delta_with_tax(
+    circuit: &Circuit,
+    palette_bits: f64,
+    extra_palette_entries: usize,
+    port_facts: &[&[u64]],
+    port_predictions: &[&[u64]],
+    phases: &[EpistemicTickPhase],
+    comparators: &[EpistemicComparatorTrace<'_>],
+    null_model_kind: NullModelKind,
+    split_code_tax: bool,
+) -> Result<f64, NullCalibratedMdlError> {
+    let num_outputs = usize::from(circuit.num_outputs());
+    if port_facts.len() != num_outputs {
+        return Err(NullCalibratedMdlError::PortCountMismatch {
+            expected: num_outputs,
+            actual: port_facts.len(),
+        });
+    }
+    if port_predictions.len() != num_outputs {
+        return Err(NullCalibratedMdlError::PortCountMismatch {
+            expected: num_outputs,
+            actual: port_predictions.len(),
+        });
+    }
+
+    let total_ticks = phases.len();
+    for (facts, predictions) in port_facts.iter().zip(port_predictions) {
+        if facts.len() != predictions.len() {
+            return Err(NullCalibratedMdlError::LengthMismatch {
+                facts: facts.len(),
+                predictions: predictions.len(),
+            });
+        }
+        if facts.len() != total_ticks {
+            return Err(NullCalibratedMdlError::PhaseLengthMismatch {
+                phases: total_ticks,
+                ticks: facts.len(),
+            });
+        }
+    }
+    for (idx, comp) in comparators.iter().enumerate() {
+        if comp.target_port >= num_outputs {
+            return Err(NullCalibratedMdlError::ComparatorTargetOutOfRange {
+                target_port: comp.target_port,
+                num_outputs,
+            });
+        }
+        if comp.primary_predictions.len() != total_ticks {
+            return Err(NullCalibratedMdlError::ComparatorTraceLengthMismatch {
+                comparator: idx,
+                expected: total_ticks,
+                actual: comp.primary_predictions.len(),
+            });
+        }
+        if comp.alt_predictions.len() != total_ticks {
+            return Err(NullCalibratedMdlError::ComparatorTraceLengthMismatch {
+                comparator: idx,
+                expected: total_ticks,
+                actual: comp.alt_predictions.len(),
+            });
+        }
+    }
+
+    let width = circuit.width();
+    let mut port_scorers: Vec<PointForecastScorer> = (0..num_outputs)
+        .map(|_| PointForecastScorer::new(width, null_model_kind))
+        .collect();
+    let mut comp_wake_scorers: Vec<Option<PointForecastScorer>> = vec![None; comparators.len()];
+    let mut comp_sleep_scorers: Vec<Option<PointForecastScorer>> = vec![None; comparators.len()];
+
+    let mut net_reward = 0.0;
+    let mut prev_phase: Option<EpistemicTickPhase> = None;
+
+    for (tick, &phase) in phases.iter().enumerate() {
+        let entering_sleep =
+            phase == EpistemicTickPhase::Sleep && prev_phase != Some(EpistemicTickPhase::Sleep);
+        let entering_wake =
+            phase == EpistemicTickPhase::Wake && prev_phase == Some(EpistemicTickPhase::Sleep);
+
+        if entering_wake {
+            comp_sleep_scorers.fill(None);
+        }
+        if entering_sleep {
+            for ((comp, wake_slot), sleep_slot) in comparators
+                .iter()
+                .zip(comp_wake_scorers.iter())
+                .zip(comp_sleep_scorers.iter_mut())
+            {
+                if wake_slot.is_some() {
+                    let frozen_null = port_scorers[comp.target_port].null_model();
+                    *sleep_slot = Some(frozen_sleep_scorer(width, frozen_null));
+                }
+            }
+        }
+
+        for ((comp, wake_slot), sleep_slot) in comparators
+            .iter()
+            .zip(comp_wake_scorers.iter_mut())
+            .zip(comp_sleep_scorers.iter_mut())
+        {
+            if comp.registered_at_tick == tick && wake_slot.is_none() {
+                let frozen_null = port_scorers[comp.target_port].null_model();
+                *wake_slot = Some(frozen_sleep_scorer(width, frozen_null));
+                if phase == EpistemicTickPhase::Sleep {
+                    *sleep_slot = Some(frozen_sleep_scorer(width, frozen_null));
+                }
+            }
+        }
+
+        match phase {
+            EpistemicTickPhase::Wake => {
+                let mut tick_reward = 0.0;
+                for (port, scorer) in port_scorers.iter_mut().enumerate() {
+                    tick_reward +=
+                        scorer.observe(port_predictions[port][tick], port_facts[port][tick]);
+                }
+                for (comp, wake_slot) in comparators.iter().zip(comp_wake_scorers.iter_mut()) {
+                    if let Some(scorer) = wake_slot.as_mut() {
+                        tick_reward += scorer.observe(
+                            comp.alt_predictions[tick],
+                            port_facts[comp.target_port][tick],
+                        );
+                    }
+                }
+                net_reward += tick_reward;
+            }
+            EpistemicTickPhase::Sleep => {
+                let mut tick_reward = 0.0;
+                for (comp, sleep_slot) in comparators.iter().zip(comp_sleep_scorers.iter_mut()) {
+                    if let Some(sleep_scorer) = sleep_slot.as_mut() {
+                        let iota = channel_independence_weight(
+                            comp.primary_channel_mask,
+                            comp.alt_channel_mask,
+                        );
+                        tick_reward += score_sleep_step_frozen(
+                            sleep_scorer,
+                            width,
+                            comp.alt_predictions[tick],
+                            comp.primary_predictions[tick],
+                            iota,
+                        );
+                    }
+                }
+                net_reward += tick_reward;
+            }
+        }
+
+        prev_phase = Some(phase);
+    }
+
+    Ok(
+        palette_bits + circuit_code_bits_with_tax(circuit, extra_palette_entries, split_code_tax)
+            - net_reward,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,5 +959,137 @@ mod tests {
         assert!(cost_taxed > cost_untaxed);
         let sum_untaxed = alloc_untaxed.node_debts.iter().sum::<f64>() + alloc_untaxed.unowned_bits;
         assert!((sum_untaxed - cost_untaxed).abs() < 1e-12);
+    }
+
+    #[test]
+    fn channel_independence_weight_matches_overlap_law() {
+        assert!((channel_independence_weight(0b01, 0b10) - 1.0).abs() < 1e-15);
+        assert!((channel_independence_weight(0b00, 0b01) - 1.0).abs() < 1e-15);
+        assert!((channel_independence_weight(0b01, 0b01) - 0.5).abs() < 1e-15);
+        assert!((channel_independence_weight(0b11, 0b11) - (1.0 / 3.0)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn epistemic_mdl_reduces_bit_identically_when_comparators_empty() {
+        let mut circuit = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let d = circuit.add_node(Primitive::Delay { init: 0 });
+        circuit.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: d, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: d, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+
+        let facts: Vec<u64> = (0..80).map(|t| (t * 3 + 1) % 4).collect();
+        let preds: Vec<u64> = (0..80)
+            .map(|t| if t % 7 == 0 { 0 } else { (t * 3 + 1) % 4 })
+            .collect();
+        let phases = vec![EpistemicTickPhase::Wake; facts.len()];
+
+        for kind in [NullModelKind::LaplaceFrequency, NullModelKind::RepeatLast] {
+            let legacy = null_calibrated_mdl_delta(&circuit, 1.5, 2, &facts, &preds, kind).unwrap();
+            let epistemic = epistemic_null_calibrated_mdl_delta(
+                &circuit,
+                1.5,
+                2,
+                &[facts.as_slice()],
+                &[preds.as_slice()],
+                &phases,
+                &[],
+                kind,
+            )
+            .unwrap();
+            assert_eq!(
+                epistemic.to_bits(),
+                legacy.to_bits(),
+                "epistemic MDL must be bit-identical when comparators are empty ({kind:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn epistemic_mdl_sleep_uses_iota_only_on_agreement_and_freezes_null() {
+        let circuit = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+        let wake_len = 64usize;
+        let sleep_len = 32usize;
+        let total = wake_len + sleep_len;
+        let facts: Vec<u64> = (0..total).map(|t| (t % 2) as u64).collect();
+        let boundary_preds = facts.clone();
+        let pri_preds = facts.clone();
+        let alt_preds = facts.clone();
+        let mut phases = vec![EpistemicTickPhase::Wake; wake_len];
+        phases.extend(std::iter::repeat_n(EpistemicTickPhase::Sleep, sleep_len));
+
+        let wake_only_delta = epistemic_null_calibrated_mdl_delta(
+            &circuit,
+            0.0,
+            0,
+            &[&facts[..wake_len]],
+            &[&boundary_preds[..wake_len]],
+            &phases[..wake_len],
+            &[],
+            NullModelKind::LaplaceFrequency,
+        )
+        .unwrap();
+
+        let comp_disjoint = EpistemicComparatorTrace {
+            target_port: 0,
+            registered_at_tick: 0,
+            primary_channel_mask: 0b01,
+            alt_channel_mask: 0b10,
+            primary_predictions: &pri_preds,
+            alt_predictions: &alt_preds,
+        };
+        let comp_shared = EpistemicComparatorTrace {
+            primary_channel_mask: 0b01,
+            alt_channel_mask: 0b01,
+            ..comp_disjoint
+        };
+
+        let delta_no_comp_wake_sleep = epistemic_null_calibrated_mdl_delta(
+            &circuit,
+            0.0,
+            0,
+            &[facts.as_slice()],
+            &[boundary_preds.as_slice()],
+            &phases,
+            &[],
+            NullModelKind::LaplaceFrequency,
+        )
+        .unwrap();
+        // Boundary rewards are disabled during Sleep, so M=0 MDL matches Wake-only.
+        assert_eq!(
+            delta_no_comp_wake_sleep.to_bits(),
+            wake_only_delta.to_bits()
+        );
+
+        let delta_disjoint = epistemic_null_calibrated_mdl_delta(
+            &circuit,
+            0.0,
+            0,
+            &[facts.as_slice()],
+            &[boundary_preds.as_slice()],
+            &phases,
+            &[comp_disjoint],
+            NullModelKind::LaplaceFrequency,
+        )
+        .unwrap();
+        let delta_shared = epistemic_null_calibrated_mdl_delta(
+            &circuit,
+            0.0,
+            0,
+            &[facts.as_slice()],
+            &[boundary_preds.as_slice()],
+            &phases,
+            &[comp_shared],
+            NullModelKind::LaplaceFrequency,
+        )
+        .unwrap();
+
+        // Both gain extra Wake and Sleep comparator reward, and disjoint Sleep agreement pays 2x shared.
+        assert!(delta_disjoint < delta_shared);
+        assert!(delta_shared < delta_no_comp_wake_sleep);
     }
 }

@@ -9,8 +9,9 @@ pub mod tiers;
 pub use epsilon_machine::{
     EpsilonMachineSummary, MspSyncStatus, channel_substitution_entropy_bits,
     compound_reactive_entropy_bits, compound_reactive_error_rate,
-    declared_noise_entropy_bits_per_symbol, per_channel_epsilon, realized_oracle_channel_step_bits,
-    realized_oracle_step_bits, solve_epsilon_machine,
+    declared_noise_entropy_bits_per_symbol, per_channel_epsilon, per_channel_epsilon_at,
+    realized_oracle_channel_step_bits, realized_oracle_step_bits, realized_oracle_step_bits_at,
+    solve_epsilon_machine,
 };
 pub use generator::{
     DEFAULT_MAX_EXPORT_STATES, EpsilonMachineScope, FiniteStateGenerator, FiniteStateSpec,
@@ -20,7 +21,8 @@ pub use noise::{NoiseError, NoiseModel, NoisyEnvironment};
 pub use reeds_sloane::{ReedsSloaneSynthesizer, odd_inverse_mod_pow2};
 pub use tiers::{
     CrossLinearOp, CrossNonlinearOp, GeneratorConfig, GeneratorError, LfsrStage,
-    MultiChannelProductGenerator, TargetChannelGenerator, TierGenerator,
+    MultiChannelProductGenerator, MultiViewDriver, MultiViewTarget, MultiViewTransform,
+    TargetChannelGenerator, TierGenerator,
 };
 
 #[cfg(test)]

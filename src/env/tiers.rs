@@ -9,6 +9,7 @@ use crate::env::generator::{
     DEFAULT_MAX_EXPORT_STATES, EpsilonMachineScope, FiniteStateGenerator, FiniteStateSpec,
     SpecExportError,
 };
+use crate::env::reeds_sloane::odd_inverse_mod_pow2;
 use crate::substrate::Width;
 
 /// Error returned when validating a [`GeneratorConfig`].
@@ -28,6 +29,16 @@ pub enum GeneratorError {
     InvalidCrossLag { lag: usize },
     /// Multi-channel composition requires at least one generator and matching symbol widths.
     InvalidChannelComposition,
+    /// `T2_MultiViewCoupled` view multipliers must be odd so each view is invertible mod $2^k$.
+    NonInvertibleViewMultiplier { channel: u16, mul_a: u64 },
+    /// `T2_MultiViewCoupled` views on channels 0 and 1 must be distinct after width normalization.
+    DuplicateViewTransform,
+    /// `T2_MultiViewCoupled` target lag must be strictly greater than both view delays for causal prediction.
+    NonCausalMultiViewLag {
+        channel: u16,
+        view_delay: usize,
+        target_lag: usize,
+    },
 }
 
 impl fmt::Display for GeneratorError {
@@ -67,6 +78,22 @@ impl fmt::Display for GeneratorError {
                     "multi-channel generator composition requires non-empty channels with matching widths"
                 )
             }
+            Self::NonInvertibleViewMultiplier { channel, mul_a } => write!(
+                f,
+                "T2_MultiViewCoupled view_{channel} mul_a={mul_a} must be odd to be invertible mod 2^k"
+            ),
+            Self::DuplicateViewTransform => write!(
+                f,
+                "T2_MultiViewCoupled requires distinct normalized views on ch0 and ch1"
+            ),
+            Self::NonCausalMultiViewLag {
+                channel,
+                view_delay,
+                target_lag,
+            } => write!(
+                f,
+                "T2_MultiViewCoupled target lag {target_lag} must exceed view_{channel}.delay ({view_delay})"
+            ),
         }
     }
 }
@@ -102,6 +129,186 @@ pub struct LfsrStage {
     pub taps: Vec<u64>,
     /// Initial seed symbols $[s(0), \dots, s(L - 1)]$.
     pub init: Vec<u64>,
+}
+
+/// Latent driver specification $Z(t)$ for [`GeneratorConfig::T2_MultiViewCoupled`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum MultiViewDriver {
+    /// Linear feedback shift register $Z(t) = \sum_{i=1}^L c_i Z(t - i) \bmod 2^k$.
+    Lfsr { stage: LfsrStage },
+    /// Fixed periodic motif $Z(t) = \text{motif}[t \bmod P] \bmod 2^k$ (for autonomous loopback).
+    PeriodicMotif { motif: Vec<u64> },
+    /// Single-register affine recurrence $Z(t + 1) = a \cdot Z(t) + b \bmod 2^k$.
+    AffineLag1 { mul_a: u64, add_b: u64, init: u64 },
+}
+
+/// Invertible affine-delayed view mapping latent driver $Z$ onto channel 0 or 1 in
+/// [`GeneratorConfig::T2_MultiViewCoupled`].
+///
+/// Emits $\text{ch}_i(t) = a_i \cdot Z(t - v_i) + b_i \bmod 2^k$ ($Z(u) = 0$ for $u < 0$),
+/// with odd $a_i$ so $Z(t - v_i)$ is uniquely recoverable from $\text{ch}_i(t)$.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiViewTransform {
+    /// Non-negative observation delay $v_i \ge 0$ relative to $Z(t)$.
+    pub delay: usize,
+    /// Odd invertible multiplier $a_i$ (`mul_a & 1 == 1`) modulo $2^k$.
+    pub mul_a: u64,
+    /// Additive offset $b_i \bmod 2^k$.
+    pub add_b: u64,
+}
+
+impl MultiViewTransform {
+    /// Returns a copy with `mul_a` and `add_b` masked to `width`.
+    #[must_use]
+    pub const fn normalized(self, width: Width) -> Self {
+        Self {
+            delay: self.delay,
+            mul_a: width.normalize(self.mul_a),
+            add_b: width.normalize(self.add_b),
+        }
+    }
+
+    /// Evaluates $a_i \cdot z + b_i \bmod 2^k$.
+    #[must_use]
+    pub const fn eval(self, width: Width, z_delayed: u64) -> u64 {
+        width.add(width.mul(self.mul_a, z_delayed), self.add_b)
+    }
+
+    /// Inverts an observed view symbol back to $z \in \mathbb{Z}_{2^k}$ if `mul_a` is odd.
+    #[must_use]
+    pub const fn try_invert_z(self, width: Width, view_sym: u64) -> Option<u64> {
+        let a = width.normalize(self.mul_a);
+        if (a & 1) == 0 {
+            return None;
+        }
+        let inv_a = odd_inverse_mod_pow2(a, width);
+        Some(width.mul(inv_a, width.sub(view_sym, self.add_b)))
+    }
+
+    /// Inverts an observed view symbol back to $z \in \mathbb{Z}_{2^k}$.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.mul_a` is even mod $2^k$.
+    #[must_use]
+    pub const fn invert_z(self, width: Width, view_sym: u64) -> u64 {
+        self.try_invert_z(width, view_sym)
+            .expect("MultiViewTransform requires odd mul_a")
+    }
+}
+
+/// Target coupling on channel 2 from delayed latent driver $Z$ in [`GeneratorConfig::T2_MultiViewCoupled`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum MultiViewTarget {
+    /// $a \cdot Z(t - d) + b \bmod 2^k$.
+    Affine { lag: usize, mul_a: u64, add_b: u64 },
+    /// $\mathrm{Eqz}(Z(t - d) + b) \bmod 2^k$.
+    Eqz {
+        lag: usize,
+        #[serde(default)]
+        add_b: u64,
+    },
+    /// $Z(t - d_a) + \mathrm{Eqz}(Z(t - d_b)) \bmod 2^k$.
+    AddEqz { lag_a: usize, lag_b: usize },
+    /// $Z(t - d_a) \cdot \mathrm{Eqz}(Z(t - d_b)) \bmod 2^k$.
+    MulEqz { lag_a: usize, lag_b: usize },
+    /// $\mathrm{Eqz}(Z(t - d_a)) \cdot \mathrm{Eqz}(Z(t - d_b)) \bmod 2^k$.
+    MulEqzPair { lag_a: usize, lag_b: usize },
+}
+
+impl MultiViewTarget {
+    /// Minimum driver lag referenced by this target rule.
+    #[must_use]
+    pub const fn min_lag(self) -> usize {
+        match self {
+            Self::Affine { lag, .. } | Self::Eqz { lag, .. } => lag,
+            Self::AddEqz { lag_a, lag_b }
+            | Self::MulEqz { lag_a, lag_b }
+            | Self::MulEqzPair { lag_a, lag_b } => {
+                if lag_a < lag_b {
+                    lag_a
+                } else {
+                    lag_b
+                }
+            }
+        }
+    }
+
+    /// Maximum driver lag referenced by this target rule.
+    #[must_use]
+    pub const fn max_lag(self) -> usize {
+        match self {
+            Self::Affine { lag, .. } | Self::Eqz { lag, .. } => lag,
+            Self::AddEqz { lag_a, lag_b }
+            | Self::MulEqz { lag_a, lag_b }
+            | Self::MulEqzPair { lag_a, lag_b } => {
+                if lag_a > lag_b {
+                    lag_a
+                } else {
+                    lag_b
+                }
+            }
+        }
+    }
+
+    /// Returns a copy with constant operands masked to `width`.
+    #[must_use]
+    pub const fn normalized(self, width: Width) -> Self {
+        match self {
+            Self::Affine { lag, mul_a, add_b } => Self::Affine {
+                lag,
+                mul_a: width.normalize(mul_a),
+                add_b: width.normalize(add_b),
+            },
+            Self::Eqz { lag, add_b } => Self::Eqz {
+                lag,
+                add_b: width.normalize(add_b),
+            },
+            other => other,
+        }
+    }
+
+    /// Evaluates the target symbol from delayed latent samples `(z_a, z_b)`.
+    ///
+    /// Unary variants (`Affine`, `Eqz`) use `z_a` and ignore `z_b`.
+    #[must_use]
+    pub const fn eval(self, width: Width, z_a: u64, z_b: u64) -> u64 {
+        match self {
+            Self::Affine { mul_a, add_b, .. } => width.add(width.mul(mul_a, z_a), add_b),
+            Self::Eqz { add_b, .. } => width.eqz(width.add(z_a, add_b)),
+            Self::AddEqz { .. } => width.add(z_a, width.eqz(z_b)),
+            Self::MulEqz { .. } => width.mul(z_a, width.eqz(z_b)),
+            Self::MulEqzPair { .. } => width.mul(width.eqz(z_a), width.eqz(z_b)),
+        }
+    }
+
+    /// Predicts channel 2 strictly causally from a single view channel's past history `channel_history[0..t]`.
+    #[must_use]
+    pub fn predict_from_view_history(
+        self,
+        width: Width,
+        view: MultiViewTransform,
+        channel_history: &[u64],
+    ) -> u64 {
+        let recover = |lag: usize| -> u64 {
+            let Some(tau) = lag.checked_sub(view.delay) else {
+                return 0;
+            };
+            if tau == 0 || channel_history.len() < tau {
+                0
+            } else {
+                view.invert_z(width, channel_history[channel_history.len() - tau])
+            }
+        };
+        match self {
+            Self::Affine { lag, .. } | Self::Eqz { lag, .. } => self.eval(width, recover(lag), 0),
+            Self::AddEqz { lag_a, lag_b }
+            | Self::MulEqz { lag_a, lag_b }
+            | Self::MulEqzPair { lag_a, lag_b } => self.eval(width, recover(lag_a), recover(lag_b)),
+        }
+    }
 }
 
 /// Serializable specification for all M0 benchmark generators (Tiers T1, T3b, T3c).
@@ -158,6 +365,20 @@ pub enum GeneratorConfig {
         lag_0: usize,
         lag_1: usize,
         op: CrossNonlinearOp,
+    },
+    /// T2 ($K = 3$): Multi-view coupled system where latent driver $Z(t)$ feeds two distinct
+    /// invertible affine-delayed views on channels 0 and 1, and a causal target coupling on
+    /// channel 2 so channel 2 is an exact causal deterministic target of channel 0 alone and
+    /// of channel 1 alone.
+    T2_MultiViewCoupled {
+        /// Latent driver process $Z(t)$.
+        driver: MultiViewDriver,
+        /// Invertible view mapping $Z$ onto channel 0.
+        view_0: MultiViewTransform,
+        /// Distinct invertible view mapping $Z$ onto channel 1.
+        view_1: MultiViewTransform,
+        /// Causal target rule emitted on channel 2.
+        target: MultiViewTarget,
     },
 }
 
@@ -330,6 +551,12 @@ impl GeneratorConfig {
                 *lag_1,
                 T2DualOp::Nonlinear(*op),
             )?,
+            Self::T2_MultiViewCoupled {
+                driver,
+                view_0,
+                view_1,
+                target,
+            } => Self::build_t2_multiview(width, driver, *view_0, *view_1, *target)?,
         };
 
         Ok(TierGenerator {
@@ -380,6 +607,50 @@ impl GeneratorConfig {
         })
     }
 
+    fn build_t2_multiview(
+        width: Width,
+        driver: &MultiViewDriver,
+        view_0: MultiViewTransform,
+        view_1: MultiViewTransform,
+        target: MultiViewTarget,
+    ) -> Result<RuntimeKind, GeneratorError> {
+        let runtime_driver = MultiViewRuntimeDriver::from_config(width, driver)?;
+        let v0 = view_0.normalized(width);
+        let v1 = view_1.normalized(width);
+        for (channel, view) in [(0u16, v0), (1u16, v1)] {
+            if (view.mul_a & 1) == 0 {
+                return Err(GeneratorError::NonInvertibleViewMultiplier {
+                    channel,
+                    mul_a: view.mul_a,
+                });
+            }
+        }
+        if v0 == v1 {
+            return Err(GeneratorError::DuplicateViewTransform);
+        }
+        let target_norm = target.normalized(width);
+        let min_lag = target_norm.min_lag();
+        for (channel, view) in [(0u16, v0), (1u16, v1)] {
+            if min_lag <= view.delay {
+                return Err(GeneratorError::NonCausalMultiViewLag {
+                    channel,
+                    view_delay: view.delay,
+                    target_lag: min_lag,
+                });
+            }
+        }
+        let max_delay = target_norm.max_lag().max(v0.delay).max(v1.delay);
+        debug_assert!(max_delay >= 1);
+        Ok(RuntimeKind::T2MultiViewCoupled {
+            driver: runtime_driver,
+            view_0: v0,
+            view_1: v1,
+            target: target_norm,
+            max_delay,
+            hist: VecDeque::from(vec![0u64; max_delay]),
+        })
+    }
+
     fn default_label(&self) -> String {
         match self {
             Self::T1_Constant { value } => format!("T1_Constant({value})"),
@@ -403,6 +674,31 @@ impl GeneratorConfig {
             Self::T2_CrossNonlinear {
                 lag_0, lag_1, op, ..
             } => format!("T2_CrossNonlinear({op:?},d0={lag_0},d1={lag_1})"),
+            Self::T2_MultiViewCoupled {
+                driver,
+                view_0,
+                view_1,
+                target,
+            } => {
+                let d_tag = match driver {
+                    MultiViewDriver::Lfsr { stage } => format!("Lfsr(L={})", stage.taps.len()),
+                    MultiViewDriver::PeriodicMotif { motif } => {
+                        format!("Periodic(P={})", motif.len())
+                    }
+                    MultiViewDriver::AffineLag1 { mul_a, add_b, .. } => {
+                        format!("Affine1({mul_a}x+{add_b})")
+                    }
+                };
+                format!(
+                    "T2_MultiViewCoupled({d_tag},v0=({},{}x+{}),v1=({},{}x+{}),tgt={target:?})",
+                    view_0.delay,
+                    view_0.mul_a,
+                    view_0.add_b,
+                    view_1.delay,
+                    view_1.mul_a,
+                    view_1.add_b
+                )
+            }
         }
     }
 
@@ -441,6 +737,103 @@ impl T2DualOp {
             Self::Nonlinear(CrossNonlinearOp::AddEqz) => width.add(a0, width.eqz(a1)),
             Self::Nonlinear(CrossNonlinearOp::MulEqzPair) => {
                 width.mul(width.eqz(a0), width.eqz(a1))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum MultiViewRuntimeDriver {
+    Lfsr {
+        taps: Vec<u64>,
+        init: Vec<u64>,
+        window: Vec<u64>,
+    },
+    PeriodicMotif {
+        motif: Vec<u64>,
+        idx: usize,
+    },
+    AffineLag1 {
+        mul_a: u64,
+        add_b: u64,
+        init: u64,
+        state: u64,
+    },
+}
+
+impl MultiViewRuntimeDriver {
+    fn from_config(width: Width, driver: &MultiViewDriver) -> Result<Self, GeneratorError> {
+        match driver {
+            MultiViewDriver::Lfsr { stage } => {
+                if stage.taps.is_empty() || stage.taps.len() != stage.init.len() {
+                    return Err(GeneratorError::InvalidLfsrLengths {
+                        taps_len: stage.taps.len(),
+                        init_len: stage.init.len(),
+                    });
+                }
+                let taps: Vec<u64> = stage.taps.iter().map(|&c| width.normalize(c)).collect();
+                let init: Vec<u64> = stage.init.iter().map(|&x| width.normalize(x)).collect();
+                Ok(Self::Lfsr {
+                    taps,
+                    window: init.clone(),
+                    init,
+                })
+            }
+            MultiViewDriver::PeriodicMotif { motif } => {
+                if motif.is_empty() {
+                    return Err(GeneratorError::EmptyMotif);
+                }
+                let norm: Vec<u64> = motif.iter().map(|&x| width.normalize(x)).collect();
+                Ok(Self::PeriodicMotif {
+                    motif: norm,
+                    idx: 0,
+                })
+            }
+            MultiViewDriver::AffineLag1 { mul_a, add_b, init } => {
+                let init_norm = width.normalize(*init);
+                Ok(Self::AffineLag1 {
+                    mul_a: width.normalize(*mul_a),
+                    add_b: width.normalize(*add_b),
+                    init: init_norm,
+                    state: init_norm,
+                })
+            }
+        }
+    }
+
+    fn state_key_vec(&self) -> Vec<u64> {
+        match self {
+            Self::Lfsr { window, .. } => window.clone(),
+            Self::PeriodicMotif { idx, .. } => vec![*idx as u64],
+            Self::AffineLag1 { state, .. } => vec![*state],
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Lfsr { init, window, .. } => window.copy_from_slice(init),
+            Self::PeriodicMotif { idx, .. } => *idx = 0,
+            Self::AffineLag1 { init, state, .. } => *state = *init,
+        }
+    }
+
+    fn step(&mut self, width: Width) -> u64 {
+        match self {
+            Self::Lfsr { taps, window, .. } => TierGenerator::step_lfsr_window(width, taps, window),
+            Self::PeriodicMotif { motif, idx } => {
+                let sym = motif[*idx];
+                *idx = (*idx + 1) % motif.len();
+                sym
+            }
+            Self::AffineLag1 {
+                mul_a,
+                add_b,
+                state,
+                ..
+            } => {
+                let sym = *state;
+                *state = width.add(width.mul(*mul_a, *state), *add_b);
+                sym
             }
         }
     }
@@ -520,6 +913,14 @@ enum RuntimeKind {
         hist_1: VecDeque<u64>,
         op: T2DualOp,
     },
+    T2MultiViewCoupled {
+        driver: MultiViewRuntimeDriver,
+        view_0: MultiViewTransform,
+        view_1: MultiViewTransform,
+        target: MultiViewTarget,
+        max_delay: usize,
+        hist: VecDeque<u64>,
+    },
 }
 
 /// Concrete single-channel runtime instance of a [`GeneratorConfig`].
@@ -564,6 +965,12 @@ impl TierGenerator {
                 window_1: window_1.clone(),
                 hist_0: hist_0.clone(),
                 hist_1: hist_1.clone(),
+            }),
+            RuntimeKind::T2MultiViewCoupled { driver, hist, .. } => Some(T2StateKey {
+                window_0: driver.state_key_vec(),
+                window_1: Vec::new(),
+                hist_0: hist.clone(),
+                hist_1: VecDeque::new(),
             }),
             _ => None,
         }
@@ -626,7 +1033,7 @@ impl FiniteStateGenerator for TierGenerator {
     fn channels(&self) -> u16 {
         match &self.kind {
             RuntimeKind::T2DelayedAffine { .. } => 2,
-            RuntimeKind::T2DualDriver { .. } => 3,
+            RuntimeKind::T2DualDriver { .. } | RuntimeKind::T2MultiViewCoupled { .. } => 3,
             _ => 1,
         }
     }
@@ -680,6 +1087,16 @@ impl FiniteStateGenerator for TierGenerator {
                 hist_1.clear();
                 hist_1.resize(*lag_1, 0);
             }
+            RuntimeKind::T2MultiViewCoupled {
+                driver,
+                max_delay,
+                hist,
+                ..
+            } => {
+                driver.reset();
+                hist.clear();
+                hist.resize(*max_delay, 0);
+            }
         }
     }
 
@@ -720,6 +1137,39 @@ impl FiniteStateGenerator for TierGenerator {
                 out[0] = a0;
                 out[1] = a1;
                 out[2] = op.eval(w, d0, d1);
+            }
+            RuntimeKind::T2MultiViewCoupled {
+                driver,
+                view_0,
+                view_1,
+                target,
+                max_delay,
+                hist,
+            } => {
+                let z_now = driver.step(w);
+                let z_at = |lag: usize| -> u64 {
+                    if lag == 0 {
+                        z_now
+                    } else {
+                        hist[*max_delay - lag]
+                    }
+                };
+                out[0] = view_0.eval(w, z_at(view_0.delay));
+                out[1] = view_1.eval(w, z_at(view_1.delay));
+                out[2] = match *target {
+                    MultiViewTarget::Affine { lag, .. } | MultiViewTarget::Eqz { lag, .. } => {
+                        target.eval(w, z_at(lag), 0)
+                    }
+                    MultiViewTarget::AddEqz { lag_a, lag_b }
+                    | MultiViewTarget::MulEqz { lag_a, lag_b }
+                    | MultiViewTarget::MulEqzPair { lag_a, lag_b } => {
+                        target.eval(w, z_at(lag_a), z_at(lag_b))
+                    }
+                };
+                if *max_delay > 0 {
+                    hist.pop_front();
+                    hist.push_back(z_now);
+                }
             }
             other => {
                 out[0] = match other {
@@ -775,7 +1225,9 @@ impl FiniteStateGenerator for TierGenerator {
                         }
                         sym
                     }
-                    RuntimeKind::T2DelayedAffine { .. } | RuntimeKind::T2DualDriver { .. } => {
+                    RuntimeKind::T2DelayedAffine { .. }
+                    | RuntimeKind::T2DualDriver { .. }
+                    | RuntimeKind::T2MultiViewCoupled { .. } => {
                         unreachable!("handled above")
                     }
                 };
@@ -966,9 +1418,9 @@ impl FiniteStateGenerator for TierGenerator {
                 };
                 Ok(spec)
             }
-            RuntimeKind::T2DelayedAffine { .. } | RuntimeKind::T2DualDriver { .. } => {
-                self.export_t2_finite_state_spec()
-            }
+            RuntimeKind::T2DelayedAffine { .. }
+            | RuntimeKind::T2DualDriver { .. }
+            | RuntimeKind::T2MultiViewCoupled { .. } => self.export_t2_finite_state_spec(),
         }
     }
 }
@@ -1190,5 +1642,450 @@ impl<G: FiniteStateGenerator> FiniteStateGenerator for MultiChannelProductGenera
             transitions,
             scope,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::{NoiseModel, NoisyEnvironment, solve_epsilon_machine};
+    use crate::rng::SeedBank;
+
+    fn assert_spec_and_single_view_parity(
+        cfg: &GeneratorConfig,
+        width: Width,
+        ticks: usize,
+        verify_spec: bool,
+    ) {
+        let mut generator = cfg.build(width).expect("valid T2_MultiViewCoupled");
+        assert_eq!(generator.channels(), 3);
+        let (view_0, view_1, target) = match cfg {
+            GeneratorConfig::T2_MultiViewCoupled {
+                view_0,
+                view_1,
+                target,
+                ..
+            } => (
+                view_0.normalized(width),
+                view_1.normalized(width),
+                target.normalized(width),
+            ),
+            other => panic!("expected T2_MultiViewCoupled, got {other:?}"),
+        };
+
+        let mut ch0_hist = Vec::with_capacity(ticks);
+        let mut ch1_hist = Vec::with_capacity(ticks);
+        let mut observed = Vec::with_capacity(ticks);
+        let mut frame = [0u64; 3];
+
+        for t in 0..ticks {
+            generator.next_clean_frame(&mut frame);
+            let pred_from_ch0 = target.predict_from_view_history(width, view_0, &ch0_hist);
+            let pred_from_ch1 = target.predict_from_view_history(width, view_1, &ch1_hist);
+            assert_eq!(
+                pred_from_ch0, frame[2],
+                "tick {t}: ch0 single-view prediction mismatch"
+            );
+            assert_eq!(
+                pred_from_ch1, frame[2],
+                "tick {t}: ch1 single-view prediction mismatch"
+            );
+            ch0_hist.push(frame[0]);
+            ch1_hist.push(frame[1]);
+            observed.push(frame.to_vec());
+        }
+
+        // Verify reset() determinism.
+        generator.reset();
+        for (t, expected) in observed.iter().enumerate() {
+            generator.next_clean_frame(&mut frame);
+            assert_eq!(&frame[..], &expected[..], "reset mismatch at tick {t}");
+        }
+
+        if verify_spec {
+            let spec = generator.to_finite_state_spec().expect("finite state spec");
+            assert_eq!(spec.channels, 3);
+            assert_eq!(spec.width, width);
+            let mut state = spec.initial_state;
+            for (t, expected) in observed.iter().enumerate() {
+                let (next_state, emission) = &spec.transitions[state];
+                assert_eq!(
+                    emission, expected,
+                    "FiniteStateSpec emission mismatch at tick {t}"
+                );
+                state = *next_state;
+            }
+            let clean_summary = solve_epsilon_machine(&spec, &NoiseModel::None);
+            assert_eq!(clean_summary.h_mu_bits_per_tick, 0.0);
+            assert!(clean_summary.causal_state_count >= 1);
+        }
+    }
+
+    #[test]
+    fn multiview_validation_rejects_non_invertible_duplicate_and_non_causal_configs() {
+        let w1 = Width::new(1).expect("w1");
+        let w2 = Width::new(2).expect("w2");
+        let lfsr = MultiViewDriver::Lfsr {
+            stage: LfsrStage {
+                taps: vec![1, 1],
+                init: vec![0, 1],
+            },
+        };
+        let v0 = MultiViewTransform {
+            delay: 0,
+            mul_a: 1,
+            add_b: 0,
+        };
+        let v1 = MultiViewTransform {
+            delay: 1,
+            mul_a: 3,
+            add_b: 1,
+        };
+        let tgt = MultiViewTarget::Affine {
+            lag: 2,
+            mul_a: 1,
+            add_b: 0,
+        };
+
+        let even_ch0 = GeneratorConfig::T2_MultiViewCoupled {
+            driver: lfsr.clone(),
+            view_0: MultiViewTransform {
+                delay: 0,
+                mul_a: 2,
+                add_b: 0,
+            },
+            view_1: v1,
+            target: tgt,
+        };
+        assert_eq!(
+            even_ch0.build(w2).unwrap_err(),
+            GeneratorError::NonInvertibleViewMultiplier {
+                channel: 0,
+                mul_a: 2,
+            }
+        );
+
+        let even_ch1 = GeneratorConfig::T2_MultiViewCoupled {
+            driver: lfsr.clone(),
+            view_0: v0,
+            view_1: MultiViewTransform {
+                delay: 1,
+                mul_a: 0,
+                add_b: 1,
+            },
+            target: tgt,
+        };
+        assert_eq!(
+            even_ch1.build(w1).unwrap_err(),
+            GeneratorError::NonInvertibleViewMultiplier {
+                channel: 1,
+                mul_a: 0,
+            }
+        );
+
+        // Distinct raw add_b that collide modulo 2^k must be rejected as DuplicateViewTransform.
+        let dup_views = GeneratorConfig::T2_MultiViewCoupled {
+            driver: lfsr.clone(),
+            view_0: v0,
+            view_1: MultiViewTransform {
+                delay: 0,
+                mul_a: 5,
+                add_b: 4,
+            },
+            target: tgt,
+        };
+        assert_eq!(
+            dup_views.build(w2).unwrap_err(),
+            GeneratorError::DuplicateViewTransform
+        );
+
+        // Non-causal lag (lag == view_1.delay and lag_b <= view_1.delay).
+        let non_causal_equal = GeneratorConfig::T2_MultiViewCoupled {
+            driver: lfsr.clone(),
+            view_0: v0,
+            view_1: MultiViewTransform {
+                delay: 2,
+                mul_a: 1,
+                add_b: 1,
+            },
+            target: MultiViewTarget::Affine {
+                lag: 2,
+                mul_a: 1,
+                add_b: 0,
+            },
+        };
+        assert_eq!(
+            non_causal_equal.build(w2).unwrap_err(),
+            GeneratorError::NonCausalMultiViewLag {
+                channel: 1,
+                view_delay: 2,
+                target_lag: 2,
+            }
+        );
+
+        let non_causal_binary = GeneratorConfig::T2_MultiViewCoupled {
+            driver: lfsr,
+            view_0: v0,
+            view_1: MultiViewTransform {
+                delay: 2,
+                mul_a: 1,
+                add_b: 1,
+            },
+            target: MultiViewTarget::AddEqz { lag_a: 5, lag_b: 1 },
+        };
+        assert_eq!(
+            non_causal_binary.build(w2).unwrap_err(),
+            GeneratorError::NonCausalMultiViewLag {
+                channel: 1,
+                view_delay: 2,
+                target_lag: 1,
+            }
+        );
+
+        let empty_motif = GeneratorConfig::T2_MultiViewCoupled {
+            driver: MultiViewDriver::PeriodicMotif { motif: vec![] },
+            view_0: v0,
+            view_1: v1,
+            target: tgt,
+        };
+        assert_eq!(
+            empty_motif.build(w1).unwrap_err(),
+            GeneratorError::EmptyMotif
+        );
+
+        let bad_lfsr = GeneratorConfig::T2_MultiViewCoupled {
+            driver: MultiViewDriver::Lfsr {
+                stage: LfsrStage {
+                    taps: vec![1, 1],
+                    init: vec![1],
+                },
+            },
+            view_0: v0,
+            view_1: v1,
+            target: tgt,
+        };
+        assert_eq!(
+            bad_lfsr.build(w1).unwrap_err(),
+            GeneratorError::InvalidLfsrLengths {
+                taps_len: 2,
+                init_len: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn multiview_linear_and_nonlinear_targets_match_spec_and_single_view_across_widths() {
+        let small_lfsr = MultiViewDriver::Lfsr {
+            stage: LfsrStage {
+                taps: vec![1, 0, 1],
+                init: vec![1, 0, 1],
+            },
+        };
+        let periodic = MultiViewDriver::PeriodicMotif {
+            motif: vec![0, 1, 3, 2, 1],
+        };
+        let affine_lag1 = MultiViewDriver::AffineLag1 {
+            mul_a: 1,
+            add_b: 1,
+            init: 0,
+        };
+
+        let targets = [
+            MultiViewTarget::Affine {
+                lag: 3,
+                mul_a: 3,
+                add_b: 1,
+            },
+            MultiViewTarget::Eqz { lag: 3, add_b: 2 },
+            MultiViewTarget::AddEqz { lag_a: 3, lag_b: 4 },
+            MultiViewTarget::MulEqz { lag_a: 4, lag_b: 3 },
+            MultiViewTarget::MulEqzPair { lag_a: 3, lag_b: 4 },
+        ];
+
+        let view_0 = MultiViewTransform {
+            delay: 0,
+            mul_a: 1,
+            add_b: 0,
+        };
+        let view_1 = MultiViewTransform {
+            delay: 2,
+            mul_a: 3,
+            add_b: 1,
+        };
+
+        for k in [1u8, 2u8] {
+            let width = Width::new(k).expect("valid width");
+            for driver in [&small_lfsr, &periodic, &affine_lag1] {
+                for &target in &targets {
+                    let cfg = GeneratorConfig::T2_MultiViewCoupled {
+                        driver: driver.clone(),
+                        view_0,
+                        view_1,
+                        target,
+                    };
+                    assert_spec_and_single_view_parity(&cfg, width, 40, true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiview_high_degree_lfsr_and_serde_and_spec_bound() {
+        let w1 = Width::new(1).expect("w1");
+        let w2 = Width::new(2).expect("w2");
+        // Degree-11 primitive LFSR driver (matches G2B.2/G2B.5 high-degree driver scale).
+        let mut taps11 = vec![0u64; 11];
+        taps11[1] = 1;
+        taps11[10] = 1;
+        let mut init11 = vec![0u64; 11];
+        init11[0] = 1;
+        init11[5] = 1;
+        let cfg11 = GeneratorConfig::T2_MultiViewCoupled {
+            driver: MultiViewDriver::Lfsr {
+                stage: LfsrStage {
+                    taps: taps11,
+                    init: init11,
+                },
+            },
+            view_0: MultiViewTransform {
+                delay: 0,
+                mul_a: 1,
+                add_b: 0,
+            },
+            view_1: MultiViewTransform {
+                delay: 1,
+                mul_a: 3,
+                add_b: 2,
+            },
+            target: MultiViewTarget::AddEqz { lag_a: 5, lag_b: 6 },
+        };
+
+        // Serde roundtrip + label sanity.
+        let json = serde_json::to_string(&cfg11).expect("serialize T2_MultiViewCoupled");
+        let parsed: GeneratorConfig =
+            serde_json::from_str(&json).expect("deserialize T2_MultiViewCoupled");
+        assert_eq!(parsed, cfg11);
+        assert!(
+            cfg11
+                .build(w2)
+                .unwrap()
+                .name()
+                .starts_with("T2_MultiViewCoupled(")
+        );
+
+        // Verify single-view causal predictability on high-degree driver for k=1 and k=2.
+        assert_spec_and_single_view_parity(&cfg11, w1, 64, true);
+        assert_spec_and_single_view_parity(&cfg11, w2, 64, false);
+
+        // Exceeding DEFAULT_MAX_EXPORT_STATES returns StateSpaceTooLarge cleanly:
+        // x^17 + x^3 + 1 primitive LFSR over F_2 has period 2^17 - 1 = 131_071 > 65_536.
+        let mut taps17 = vec![0u64; 17];
+        taps17[2] = 1;
+        taps17[16] = 1;
+        let mut init17 = vec![0u64; 17];
+        init17[0] = 1;
+        let cfg17 = GeneratorConfig::T2_MultiViewCoupled {
+            driver: MultiViewDriver::Lfsr {
+                stage: LfsrStage {
+                    taps: taps17,
+                    init: init17,
+                },
+            },
+            view_0: MultiViewTransform {
+                delay: 0,
+                mul_a: 1,
+                add_b: 0,
+            },
+            view_1: MultiViewTransform {
+                delay: 0,
+                mul_a: 1,
+                add_b: 1,
+            },
+            target: MultiViewTarget::Affine {
+                lag: 2,
+                mul_a: 1,
+                add_b: 0,
+            },
+        };
+        let gen17 = cfg17.build(w1).expect("valid deg-17 multiview");
+        assert!(matches!(
+            gen17.to_finite_state_spec(),
+            Err(SpecExportError::StateSpaceTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn multiview_with_channel_fault_schedule_recovers_cleanly_from_surviving_view() {
+        let width = Width::new(2).expect("w2");
+        let cfg = GeneratorConfig::T2_MultiViewCoupled {
+            driver: MultiViewDriver::PeriodicMotif {
+                motif: vec![0, 3, 2, 1],
+            },
+            view_0: MultiViewTransform {
+                delay: 0,
+                mul_a: 1,
+                add_b: 0,
+            },
+            view_1: MultiViewTransform {
+                delay: 0,
+                mul_a: 3,
+                add_b: 1,
+            },
+            target: MultiViewTarget::Affine {
+                lag: 3,
+                mul_a: 1,
+                add_b: 0,
+            },
+        };
+        let view_1 = MultiViewTransform {
+            delay: 0,
+            mul_a: 3,
+            add_b: 1,
+        };
+        let target = MultiViewTarget::Affine {
+            lag: 3,
+            mul_a: 1,
+            add_b: 0,
+        };
+
+        let fault_tick = 100u64;
+        let noise = NoiseModel::ChannelFaultSchedule {
+            base_epsilon: 0.0,
+            base_channels: vec![],
+            fault_tick,
+            fault_epsilon: 0.75,
+            fault_channels: vec![0],
+        };
+        let mut env = NoisyEnvironment::new(
+            cfg.build(width).expect("valid config"),
+            noise,
+            SeedBank::new(42),
+        )
+        .expect("valid fault schedule");
+
+        let mut ch1_hist = Vec::new();
+        let mut clean = [0u64; 3];
+        let mut obs = [0u64; 3];
+        let mut ch0_mismatches_post_fault = 0usize;
+
+        for t in 0..300u64 {
+            env.step_frame(&mut clean, &mut obs);
+            if t < fault_tick {
+                assert_eq!(obs, clean, "pre-fault frame must be clean at t={t}");
+            } else {
+                assert_eq!(obs[1], clean[1], "ch1 stays clean post-fault at t={t}");
+                assert_eq!(obs[2], clean[2], "ch2 stays clean post-fault at t={t}");
+                if obs[0] != clean[0] {
+                    ch0_mismatches_post_fault += 1;
+                }
+            }
+            let pred = target.predict_from_view_history(width, view_1, &ch1_hist);
+            assert_eq!(
+                pred, clean[2],
+                "ch1-only prediction must stay exact at t={t}"
+            );
+            ch1_hist.push(obs[1]);
+        }
+        assert!(ch0_mismatches_post_fault > 50);
     }
 }

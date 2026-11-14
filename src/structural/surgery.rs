@@ -4,7 +4,11 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::metrics::{allocate_circuit_description_bits, circuit_code_bits_with_tax};
+use crate::rng::SeedBank;
 use crate::structural::economy::{EconomyConfig, EconomyError, EconomyState};
+use crate::structural::sensitivity::{
+    ComparatorTarget, EXACT_SENSITIVITY_MAX_BITS, counterfactual_sensitivity_with_comparators,
+};
 use crate::substrate::{
     Circuit, CompiledCircuit, EvalError, NodeId, Primitive, ScalarState, SignalSink, SignalSource,
 };
@@ -160,6 +164,45 @@ impl EditableCircuit {
         &mut self.economy
     }
 
+    /// Registers an internal comparator `EQZ(SUB(primary, alt))` on this circuit and initializes
+    /// its wake scorer from `target_port`'s current wake null model.
+    pub fn register_comparator(
+        &mut self,
+        sub_node: NodeId,
+        eqz_node: NodeId,
+        target_port: u16,
+        primary_channel_mask: u64,
+        alt_channel_mask: u64,
+    ) -> Result<usize, SurgeryError> {
+        let valid_prims = matches!(
+            self.circuit.nodes().get(sub_node.index()),
+            Some(Primitive::Sub)
+        ) && matches!(
+            self.circuit.nodes().get(eqz_node.index()),
+            Some(Primitive::Eqz)
+        );
+        if !valid_prims {
+            return Err(SurgeryError::Economy(EconomyError::DimensionMismatch));
+        }
+        Ok(self.economy.register_comparator(
+            sub_node,
+            eqz_node,
+            target_port,
+            primary_channel_mask,
+            alt_channel_mask,
+        )?)
+    }
+
+    /// Returns the substrate `(sub_node, eqz_node)` pairs for all registered comparators.
+    #[must_use]
+    pub fn comparator_targets(&self) -> Vec<ComparatorTarget> {
+        self.economy
+            .comparators()
+            .iter()
+            .map(crate::structural::economy::ComparatorSite::target)
+            .collect()
+    }
+
     /// Applies a graph edit and installs the supplied exact old-to-new node mapping.
     ///
     /// The edit is transactional: any compilation or remapping failure leaves this
@@ -253,8 +296,9 @@ impl EditableCircuit {
         Ok(old_to_new)
     }
 
-    /// Excises causally idle mature nodes (zero counterfactual sensitivity over `W_diag`),
-    /// validating that outputs on `past_inputs` match `past_predictions` and code length does not increase (D1b.1).
+    /// Excises causally idle mature nodes (zero counterfactual sensitivity over `W_diag` to both
+    /// `BoundaryOut` and any registered `ComparatorSite::eqz_node`), validating that outputs and
+    /// comparator `eqz_node` trajectories on `past_inputs` are preserved and code length does not increase (D1b.1).
     pub fn prune_zero_sensitivity_mature_nodes(
         &mut self,
         idle_nodes: &BTreeSet<NodeId>,
@@ -262,34 +306,41 @@ impl EditableCircuit {
         past_predictions: &[Vec<u64>],
         split_code_tax: bool,
     ) -> Result<Vec<Option<NodeId>>, SurgeryError> {
-        if idle_nodes.is_empty() {
-            return Ok((0..self.circuit.node_count())
+        let identity_map = || -> Vec<Option<NodeId>> {
+            (0..self.circuit.node_count())
                 .map(|index| {
                     Some(NodeId(
                         u32::try_from(index).expect("node count fits in u32"),
                     ))
                 })
-                .collect());
+                .collect()
+        };
+        if idle_nodes.is_empty() {
+            return Ok(identity_map());
         }
 
-        let Ok((staged, old_to_new)) = self.build_pruned_circuit(idle_nodes) else {
-            return Ok((0..self.circuit.node_count())
-                .map(|index| {
-                    Some(NodeId(
-                        u32::try_from(index).expect("node count fits in u32"),
-                    ))
-                })
-                .collect());
+        let comp_targets = self.comparator_targets();
+        let filtered_idle: std::borrow::Cow<'_, BTreeSet<NodeId>> = if comp_targets.is_empty() {
+            std::borrow::Cow::Borrowed(idle_nodes)
+        } else {
+            let active = self.comparator_and_boundary_active_nodes(past_inputs, &comp_targets);
+            let retained: BTreeSet<NodeId> = idle_nodes
+                .iter()
+                .copied()
+                .filter(|node| !active.get(node.index()).copied().unwrap_or(false))
+                .collect();
+            if retained.is_empty() {
+                return Ok(identity_map());
+            }
+            std::borrow::Cow::Owned(retained)
+        };
+
+        let Ok((staged, old_to_new)) = self.build_pruned_circuit(filtered_idle.as_ref()) else {
+            return Ok(identity_map());
         };
 
         let Ok(staged_compiled) = staged.compile() else {
-            return Ok((0..self.circuit.node_count())
-                .map(|index| {
-                    Some(NodeId(
-                        u32::try_from(index).expect("node count fits in u32"),
-                    ))
-                })
-                .collect());
+            return Ok(identity_map());
         };
 
         let reg_map = register_mapping(
@@ -312,54 +363,138 @@ impl EditableCircuit {
             .set_registers(&staged_compiled, &staged_regs)
             .is_err()
         {
-            return Ok((0..self.circuit.node_count())
-                .map(|index| {
-                    Some(NodeId(
-                        u32::try_from(index).expect("node count fits in u32"),
-                    ))
-                })
-                .collect());
+            return Ok(identity_map());
         }
 
+        let surviving_eqz_wires: Vec<(usize, usize)> = if comp_targets.is_empty() {
+            Vec::new()
+        } else {
+            let orig_bases = node_out_bases(&self.circuit);
+            let staged_bases = node_out_bases(&staged);
+            comp_targets
+                .iter()
+                .filter_map(|target| {
+                    let mapped_eqz = old_to_new.get(target.eqz_node.index()).copied().flatten()?;
+                    Some((
+                        orig_bases[target.eqz_node.index()],
+                        staged_bases[mapped_eqz.index()],
+                    ))
+                })
+                .collect()
+        };
+
+        let mut orig_probe_state = if surviving_eqz_wires.is_empty() {
+            None
+        } else {
+            Some(self.state.clone())
+        };
+        let mut orig_pred_buf = vec![0u64; usize::from(self.circuit.num_outputs())];
         let mut staged_pred = vec![0u64; usize::from(staged.num_outputs())];
         for (frame_idx, input_frame) in past_inputs.iter().enumerate() {
             if staged_state
                 .step(&staged_compiled, input_frame, &mut staged_pred)
                 .is_err()
             {
-                return Ok((0..self.circuit.node_count())
-                    .map(|index| {
-                        Some(NodeId(
-                            u32::try_from(index).expect("node count fits in u32"),
-                        ))
-                    })
-                    .collect());
+                return Ok(identity_map());
             }
             if frame_idx < past_predictions.len() && staged_pred != past_predictions[frame_idx] {
-                return Ok((0..self.circuit.node_count())
-                    .map(|index| {
-                        Some(NodeId(
-                            u32::try_from(index).expect("node count fits in u32"),
-                        ))
-                    })
-                    .collect());
+                return Ok(identity_map());
+            }
+            if let Some(ref mut orig_state) = orig_probe_state {
+                if orig_state
+                    .step(&self.compiled, input_frame, &mut orig_pred_buf)
+                    .is_err()
+                {
+                    return Ok(identity_map());
+                }
+                for &(orig_wire, staged_wire) in &surviving_eqz_wires {
+                    if staged_state.wire_values()[staged_wire]
+                        != orig_state.wire_values()[orig_wire]
+                    {
+                        return Ok(identity_map());
+                    }
+                }
             }
         }
 
         let l_old = circuit_code_bits_with_tax(&self.circuit, 0, split_code_tax);
         let l_new = circuit_code_bits_with_tax(&staged, 0, split_code_tax);
         if l_new > l_old {
-            return Ok((0..self.circuit.node_count())
-                .map(|index| {
-                    Some(NodeId(
-                        u32::try_from(index).expect("node count fits in u32"),
-                    ))
-                })
-                .collect());
+            return Ok(identity_map());
         }
 
         self.recompile_preserving_state(staged, &old_to_new)?;
         Ok(old_to_new)
+    }
+
+    fn comparator_and_boundary_active_nodes(
+        &self,
+        past_inputs: &[Vec<u64>],
+        comp_targets: &[ComparatorTarget],
+    ) -> Vec<bool> {
+        let node_count = self.circuit.node_count();
+        let mut direct_active = vec![false; node_count];
+        let mut any_latch_active = vec![false; node_count];
+        let sample_count = usize::from(EXACT_SENSITIVITY_MAX_BITS) * 2;
+
+        let mut accumulate = |state: &ScalarState, tick_block: u64| {
+            if let Ok(snap) = counterfactual_sensitivity_with_comparators(
+                &self.circuit,
+                &self.compiled,
+                state,
+                SeedBank::new(0),
+                tick_block,
+                sample_count,
+                comp_targets,
+            ) {
+                for node in 0..node_count {
+                    if snap.base.output_by_node[node].iter().any(|&s| s > 0.0)
+                        || snap.comparator_eqz_by_node[node].iter().any(|&s| s > 0.0)
+                    {
+                        direct_active[node] = true;
+                    }
+                    if snap.base.latch_by_node[node].iter().any(|&s| s > 0.0) {
+                        any_latch_active[node] = true;
+                    }
+                }
+            }
+        };
+
+        accumulate(&self.state, 0);
+        if !past_inputs.is_empty() {
+            let mut probe_state = self.state.clone();
+            let mut pred_buf = vec![0u64; usize::from(self.circuit.num_outputs())];
+            for (idx, frame) in past_inputs.iter().enumerate() {
+                if probe_state
+                    .step(&self.compiled, frame, &mut pred_buf)
+                    .is_err()
+                {
+                    break;
+                }
+                accumulate(&probe_state, (idx + 1) as u64);
+            }
+        }
+
+        // Propagate backwards across synchronous latch/hop edges from directly active nodes.
+        let mut reverse_adj = vec![Vec::new(); node_count];
+        for edge in self.circuit.edges() {
+            if let (SignalSource::NodeOut { node: src, .. }, SignalSink::NodeIn { node: dst, .. }) =
+                (edge.src, edge.dst)
+            {
+                reverse_adj[dst.index()].push(src.index());
+            }
+        }
+        let mut active = direct_active.clone();
+        let mut stack: Vec<usize> = (0..node_count).filter(|&i| direct_active[i]).collect();
+        while let Some(node) = stack.pop() {
+            for &pred in &reverse_adj[node] {
+                if !active[pred] && (direct_active[pred] || any_latch_active[pred]) {
+                    active[pred] = true;
+                    stack.push(pred);
+                }
+            }
+        }
+        active
     }
 
     fn build_pruned_circuit(
@@ -403,6 +538,13 @@ impl EditableCircuit {
             }
         }
 
+        let protected_sub_nodes: BTreeSet<NodeId> = self
+            .economy
+            .comparators()
+            .iter()
+            .map(|comp| comp.sub_node)
+            .collect();
+
         for zero_node in inactive_zero_nodes.iter().copied() {
             let consumers: Vec<(NodeId, u8)> = logical_edges
                 .iter()
@@ -423,7 +565,7 @@ impl EditableCircuit {
                 })
                 .collect();
             for (consumer, port) in consumers {
-                if removed.contains(&consumer) {
+                if removed.contains(&consumer) || protected_sub_nodes.contains(&consumer) {
                     continue;
                 }
                 let Some(&primitive) = self.circuit.nodes().get(consumer.index()) else {
@@ -753,6 +895,16 @@ fn remap_sink(sink: SignalSink, mapping: &[Option<NodeId>]) -> Option<SignalSink
             port,
         }),
     }
+}
+
+fn node_out_bases(circuit: &Circuit) -> Vec<usize> {
+    let mut bases = Vec::with_capacity(circuit.node_count());
+    let mut next_wire = usize::from(circuit.num_inputs());
+    for primitive in circuit.nodes() {
+        bases.push(next_wire);
+        next_wire += usize::from(primitive.output_arity());
+    }
+    bases
 }
 
 pub(crate) fn explicit_delay_register_index(circuit: &Circuit, target: NodeId) -> Option<usize> {
@@ -1381,5 +1533,208 @@ mod tests {
             let exp = if x == 0 { 1 } else { 0 };
             assert_eq!(out[0], exp);
         }
+    }
+
+    #[test]
+    fn d1b1_retains_comparator_cone_and_prunes_truly_idle_node() {
+        let mut circuit = Circuit::new(Width::BITS_1, 3, 1, WireDelayMode::Combinational);
+        let p_d = circuit.add_node(Primitive::Delay { init: 0 });
+        let split_p = circuit.add_node(Primitive::Split);
+        let a_d1 = circuit.add_node(Primitive::Delay { init: 0 });
+        let a_d2 = circuit.add_node(Primitive::Delay { init: 0 });
+        let sub = circuit.add_node(Primitive::Sub);
+        let eqz = circuit.add_node(Primitive::Eqz);
+        let dead_idle = circuit.add_node(Primitive::Delay { init: 0 });
+
+        circuit.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: p_d, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: p_d, port: 0 },
+            SignalSink::NodeIn {
+                node: split_p,
+                port: 0,
+            },
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: split_p,
+                port: 0,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: split_p,
+                port: 1,
+            },
+            SignalSink::NodeIn { node: sub, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::BoundaryIn(1),
+            SignalSink::NodeIn {
+                node: a_d1,
+                port: 0,
+            },
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: a_d1,
+                port: 0,
+            },
+            SignalSink::NodeIn {
+                node: a_d2,
+                port: 0,
+            },
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: a_d2,
+                port: 0,
+            },
+            SignalSink::NodeIn { node: sub, port: 1 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: sub, port: 0 },
+            SignalSink::NodeIn { node: eqz, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::BoundaryIn(2),
+            SignalSink::NodeIn {
+                node: dead_idle,
+                port: 0,
+            },
+        );
+
+        let mut editable = EditableCircuit::new(circuit, EconomyConfig::default()).unwrap();
+        editable
+            .register_comparator(sub, eqz, 0, 0b01, 0b10)
+            .unwrap();
+
+        // Warm up Delay latches, then record an aligned periodic window so staged replay matches state.
+        let compiled_init = editable.compiled().clone();
+        for t in 0..4u64 {
+            let mut out = [0u64];
+            editable
+                .state_mut()
+                .step(&compiled_init, &[t % 2, (t + 1) % 2, t % 2], &mut out)
+                .unwrap();
+        }
+        let mut past_inputs = Vec::new();
+        let mut past_preds = Vec::new();
+        for t in 4..36u64 {
+            let x0 = t % 2;
+            let x1 = (t + 1) % 2;
+            let mut out = [0u64];
+            editable
+                .state_mut()
+                .step(&compiled_init, &[x0, x1, x0], &mut out)
+                .unwrap();
+            past_inputs.push(vec![x0, x1, x0]);
+            past_preds.push(out.to_vec());
+        }
+
+        // Simulate caller passing all non-boundary-sensitive nodes in idle_nodes.
+        let mut idle_nodes = BTreeSet::new();
+        idle_nodes.insert(a_d1);
+        idle_nodes.insert(a_d2);
+        idle_nodes.insert(sub);
+        idle_nodes.insert(eqz);
+        idle_nodes.insert(dead_idle);
+
+        let mapping = editable
+            .prune_zero_sensitivity_mature_nodes(&idle_nodes, &past_inputs, &past_preds, true)
+            .unwrap();
+
+        assert_eq!(mapping[dead_idle.index()], None);
+        let new_sub = mapping[sub.index()].expect("sub_node must survive D1b.1");
+        let new_eqz = mapping[eqz.index()].expect("eqz_node must survive D1b.1");
+        assert!(
+            mapping[a_d1.index()].is_some(),
+            "alt delay 1 must survive D1b.1"
+        );
+        assert!(
+            mapping[a_d2.index()].is_some(),
+            "alt delay 2 must survive D1b.1"
+        );
+        assert_eq!(editable.economy().comparators().len(), 1);
+        assert_eq!(editable.economy().comparators()[0].sub_node, new_sub);
+        assert_eq!(editable.economy().comparators()[0].eqz_node, new_eqz);
+    }
+
+    #[test]
+    fn inactive_zero_alt_does_not_bypass_registered_comparator_sub_node() {
+        let mut circuit = Circuit::new(Width::BITS_1, 2, 1, WireDelayMode::Combinational);
+        let p_d = circuit.add_node(Primitive::Delay { init: 0 });
+        let split_p = circuit.add_node(Primitive::Split);
+        let zero_alt = circuit.add_node(Primitive::Delay { init: 0 });
+        let sub = circuit.add_node(Primitive::Sub);
+        let eqz = circuit.add_node(Primitive::Eqz);
+
+        circuit.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: p_d, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: p_d, port: 0 },
+            SignalSink::NodeIn {
+                node: split_p,
+                port: 0,
+            },
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: split_p,
+                port: 0,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: split_p,
+                port: 1,
+            },
+            SignalSink::NodeIn { node: sub, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::BoundaryIn(1),
+            SignalSink::NodeIn {
+                node: zero_alt,
+                port: 0,
+            },
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: zero_alt,
+                port: 0,
+            },
+            SignalSink::NodeIn { node: sub, port: 1 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: sub, port: 0 },
+            SignalSink::NodeIn { node: eqz, port: 0 },
+        );
+
+        let config = EconomyConfig {
+            juvenile_ticks: 0,
+            ..EconomyConfig::default()
+        };
+        let mut editable = EditableCircuit::new(circuit, config).unwrap();
+        editable
+            .register_comparator(sub, eqz, 0, 0b01, 0b10)
+            .unwrap();
+
+        // Force zero_alt to starve while primary keeps positive energy (zero_alt never emitted non-zero).
+        editable.economy_mut().nodes_mut()[zero_alt.index()].energy = 0.0;
+        let mapping = editable.prune_starved_nodes().unwrap();
+
+        assert_eq!(mapping[zero_alt.index()], None);
+        assert_eq!(mapping[sub.index()], None);
+        assert_eq!(mapping[eqz.index()], None);
+        assert_eq!(mapping[split_p.index()], None);
+        assert!(mapping[p_d.index()].is_some());
+        assert!(editable.economy().comparators().is_empty());
+        assert_eq!(editable.circuit().node_count(), 1);
     }
 }

@@ -9,8 +9,9 @@ pub mod sensitivity;
 pub mod surgery;
 
 pub use economy::{
-    EconomyConfig, EconomyError, EconomyState, EconomyTick, NodeEconomy,
-    RESERVE_MISMATCH_DENOM_FLOOR, ReserveCap, RewardMode,
+    ComparatorObservation, ComparatorSite, EconomyConfig, EconomyError, EconomyState, EconomyTick,
+    ExecutionPhase, NodeEconomy, RESERVE_MISMATCH_DENOM_FLOOR, ReserveCap, RewardMode,
+    channel_independence_weight,
 };
 pub use graph_edit::{
     build_autonomous_ring, materialize_const_loop, stack_output_binary_op, tap_source,
@@ -30,8 +31,10 @@ pub use live::{
     well_mixed_wire_steps,
 };
 pub use sensitivity::{
-    CausalAncestry, EXACT_SENSITIVITY_MAX_BITS, NodeActivity, SensitivityError,
-    SensitivitySnapshot, assemble_causal_ancestry, counterfactual_sensitivity,
+    CausalAncestry, ComparatorCausalAncestry, ComparatorSensitivitySnapshot, ComparatorTarget,
+    EXACT_SENSITIVITY_MAX_BITS, NodeActivity, SensitivityError, SensitivitySnapshot,
+    assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
+    counterfactual_sensitivity, counterfactual_sensitivity_with_comparators,
     ring_identity_input_weights, source_node_for_wire,
 };
 pub use surgery::{EditableCircuit, MarginalDebtLedger, SurgeryError};

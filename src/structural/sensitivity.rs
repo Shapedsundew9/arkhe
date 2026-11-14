@@ -33,6 +33,37 @@ pub struct CausalAncestry {
     pub next_register_eligibility: Vec<Vec<f64>>,
 }
 
+/// Substrate nodes defining a registered comparator `EQZ(SUB(primary, alt))`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ComparatorTarget {
+    /// Difference node `SUB(primary, alt)` (`in(0)` = primary, `in(1)` = alt).
+    pub sub_node: NodeId,
+    /// Equality detector `EQZ(sub_node)`.
+    pub eqz_node: NodeId,
+}
+
+/// Sensitivity snapshot including counterfactual sensitivities to registered comparators.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComparatorSensitivitySnapshot {
+    /// Base boundary and latch sensitivities (`output_by_node`, `latch_by_node`).
+    pub base: SensitivitySnapshot,
+    /// `comparator_sub_by_node[node][m]` is the fraction of counterfactual node values changing
+    /// comparator `m`'s `sub_node` output (`SUB(primary, alt)`).
+    pub comparator_sub_by_node: Vec<Vec<f64>>,
+    /// `comparator_eqz_by_node[node][m]` is the fraction of counterfactual node values changing
+    /// comparator `m`'s `eqz_node` output (`EQZ(sub_node)`).
+    pub comparator_eqz_by_node: Vec<Vec<f64>>,
+}
+
+/// Causal ancestry across output ports, next-tick registers, and registered comparators.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComparatorCausalAncestry {
+    /// Base boundary port shares and next-tick register eligibility.
+    pub base: CausalAncestry,
+    /// Per-comparator causal ancestry shares (`comparator_shares[m][node]`).
+    pub comparator_shares: Vec<Vec<f64>>,
+}
+
 /// Per-node emission recency history used for ring-identity gating (M1a redesign D4).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeActivity {
@@ -91,6 +122,7 @@ impl std::error::Error for SensitivityError {}
 ///
 /// Widths through four bits enumerate every alternative value. Wider rings draw distinct
 /// alternatives from the isolated `SensitivityProbe` stream for the current tick block.
+/// Computes node-by-target counterfactual sensitivity across output ports and register latches.
 pub fn counterfactual_sensitivity(
     circuit: &Circuit,
     compiled: &CompiledCircuit,
@@ -99,6 +131,29 @@ pub fn counterfactual_sensitivity(
     tick_block: u64,
     sample_count: usize,
 ) -> Result<SensitivitySnapshot, SensitivityError> {
+    counterfactual_sensitivity_with_comparators(
+        circuit,
+        compiled,
+        state,
+        seed_bank,
+        tick_block,
+        sample_count,
+        &[],
+    )
+    .map(|snapshot| snapshot.base)
+}
+
+/// Computes node-by-target counterfactual sensitivity across output ports, register latches, and
+/// registered comparator targets (`sub_node`, `eqz_node`).
+pub fn counterfactual_sensitivity_with_comparators(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    seed_bank: SeedBank,
+    tick_block: u64,
+    sample_count: usize,
+    comparators: &[ComparatorTarget],
+) -> Result<ComparatorSensitivitySnapshot, SensitivityError> {
     let nodes = circuit.nodes();
     let wires = state.wire_values();
     if circuit.width() != compiled.width()
@@ -124,6 +179,20 @@ pub fn counterfactual_sensitivity(
         return Err(SensitivityError::DimensionMismatch);
     }
 
+    let mut comp_wires = Vec::with_capacity(comparators.len());
+    for comp in comparators {
+        let sub_idx = comp.sub_node.index();
+        let eqz_idx = comp.eqz_node.index();
+        if sub_idx >= nodes.len()
+            || eqz_idx >= nodes.len()
+            || !matches!(nodes[sub_idx], Primitive::Sub)
+            || !matches!(nodes[eqz_idx], Primitive::Eqz)
+        {
+            return Err(SensitivityError::DimensionMismatch);
+        }
+        comp_wires.push((node_out_base[sub_idx], node_out_base[eqz_idx]));
+    }
+
     let output_baseline: Vec<u64> = compiled
         .output_drivers()
         .iter()
@@ -140,6 +209,8 @@ pub fn counterfactual_sensitivity(
 
     let mut output_by_node = vec![vec![0.0; output_baseline.len()]; nodes.len()];
     let mut latch_by_node = vec![vec![0.0; latch_count]; nodes.len()];
+    let mut comparator_sub_by_node = vec![vec![0.0; comparators.len()]; nodes.len()];
+    let mut comparator_eqz_by_node = vec![vec![0.0; comparators.len()]; nodes.len()];
     let mut rng = seed_bank.stream(StreamDomain::SensitivityProbe { tick_block });
     let width = compiled.width();
     let mut scratch = wires.to_vec();
@@ -165,6 +236,14 @@ pub fn counterfactual_sensitivity(
                     latch_by_node[node_index][register] += 1.0;
                 }
             }
+            for (m, &(sub_wire, eqz_wire)) in comp_wires.iter().enumerate() {
+                if scratch[sub_wire] != wires[sub_wire] {
+                    comparator_sub_by_node[node_index][m] += 1.0;
+                }
+                if scratch[eqz_wire] != wires[eqz_wire] {
+                    comparator_eqz_by_node[node_index][m] += 1.0;
+                }
+            }
         }
         let denominator = candidates.len() as f64;
         if denominator > 0.0 {
@@ -174,12 +253,22 @@ pub fn counterfactual_sensitivity(
             for sensitivity in &mut latch_by_node[node_index] {
                 *sensitivity /= denominator;
             }
+            for sensitivity in &mut comparator_sub_by_node[node_index] {
+                *sensitivity /= denominator;
+            }
+            for sensitivity in &mut comparator_eqz_by_node[node_index] {
+                *sensitivity /= denominator;
+            }
         }
     }
 
-    Ok(SensitivitySnapshot {
-        output_by_node,
-        latch_by_node,
+    Ok(ComparatorSensitivitySnapshot {
+        base: SensitivitySnapshot {
+            output_by_node,
+            latch_by_node,
+        },
+        comparator_sub_by_node,
+        comparator_eqz_by_node,
     })
 }
 
@@ -193,6 +282,102 @@ pub fn assemble_causal_ancestry(
     register_eligibility: &[Vec<f64>],
     trace_discount: f64,
 ) -> Result<CausalAncestry, SensitivityError> {
+    let view = SensitivityView {
+        output_by_node: &sensitivity.output_by_node,
+        latch_by_node: &sensitivity.latch_by_node,
+        comparator_sub_by_node: &[],
+        comparator_eqz_by_node: &[],
+    };
+    assemble_causal_ancestry_core(
+        circuit,
+        compiled,
+        state,
+        view,
+        activity,
+        register_eligibility,
+        trace_discount,
+        &[],
+        false,
+    )
+    .map(|ancestry| ancestry.base)
+}
+
+/// Propagates counterfactual sensitivity backward through output ports, next-tick registers, and
+/// registered comparator cones under either Wake (alt-only isolation) or Sleep (symmetric) rules.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct extension of assemble_causal_ancestry with comparator targets and phase flag"
+)]
+pub fn assemble_causal_ancestry_with_comparators(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    sensitivity: &ComparatorSensitivitySnapshot,
+    activity: &[NodeActivity],
+    register_eligibility: &[Vec<f64>],
+    trace_discount: f64,
+    comparators: &[ComparatorTarget],
+    is_sleep: bool,
+) -> Result<ComparatorCausalAncestry, SensitivityError> {
+    let node_count = circuit.node_count();
+    if sensitivity.comparator_sub_by_node.len() != node_count
+        || sensitivity.comparator_eqz_by_node.len() != node_count
+        || sensitivity
+            .comparator_sub_by_node
+            .iter()
+            .any(|row| row.len() != comparators.len())
+        || sensitivity
+            .comparator_eqz_by_node
+            .iter()
+            .any(|row| row.len() != comparators.len())
+        || comparators
+            .iter()
+            .any(|comp| comp.sub_node.index() >= node_count || comp.eqz_node.index() >= node_count)
+    {
+        return Err(SensitivityError::DimensionMismatch);
+    }
+    let view = SensitivityView {
+        output_by_node: &sensitivity.base.output_by_node,
+        latch_by_node: &sensitivity.base.latch_by_node,
+        comparator_sub_by_node: &sensitivity.comparator_sub_by_node,
+        comparator_eqz_by_node: &sensitivity.comparator_eqz_by_node,
+    };
+    assemble_causal_ancestry_core(
+        circuit,
+        compiled,
+        state,
+        view,
+        activity,
+        register_eligibility,
+        trace_discount,
+        comparators,
+        is_sleep,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SensitivityView<'a> {
+    output_by_node: &'a [Vec<f64>],
+    latch_by_node: &'a [Vec<f64>],
+    comparator_sub_by_node: &'a [Vec<f64>],
+    comparator_eqz_by_node: &'a [Vec<f64>],
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared core for base and comparator causal ancestry propagation"
+)]
+fn assemble_causal_ancestry_core(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    sensitivity: SensitivityView<'_>,
+    activity: &[NodeActivity],
+    register_eligibility: &[Vec<f64>],
+    trace_discount: f64,
+    comparators: &[ComparatorTarget],
+    is_sleep: bool,
+) -> Result<ComparatorCausalAncestry, SensitivityError> {
     let node_count = circuit.node_count();
     let register_count = compiled.total_registers();
     if activity.len() != node_count
@@ -241,10 +426,14 @@ pub fn assemble_causal_ancestry(
     let num_outputs = compiled.output_drivers().len();
     let mut port_shares = vec![vec![0.0; node_count]; num_outputs];
     let mut next_register_eligibility = vec![vec![0.0; node_count]; register_count];
+    let mut comparator_shares = vec![vec![0.0; node_count]; comparators.len()];
     if node_count == 0 {
-        return Ok(CausalAncestry {
-            port_shares,
-            next_register_eligibility,
+        return Ok(ComparatorCausalAncestry {
+            base: CausalAncestry {
+                port_shares,
+                next_register_eligibility,
+            },
+            comparator_shares,
         });
     }
 
@@ -278,6 +467,7 @@ pub fn assemble_causal_ancestry(
             compiled,
             wire_values,
             sensitivity,
+            comparators,
             activity,
             register_eligibility,
             trace_discount,
@@ -319,6 +509,7 @@ pub fn assemble_causal_ancestry(
             compiled,
             wire_values,
             sensitivity,
+            comparators,
             activity,
             register_eligibility,
             trace_discount,
@@ -336,9 +527,41 @@ pub fn assemble_causal_ancestry(
         );
     }
 
-    Ok(CausalAncestry {
-        port_shares,
-        next_register_eligibility,
+    for (m, comp) in comparators.iter().enumerate() {
+        let target = if is_sleep {
+            Target::ComparatorSleep(m)
+        } else {
+            Target::ComparatorWake(m)
+        };
+        ancestry_for_target(
+            circuit,
+            compiled,
+            wire_values,
+            sensitivity,
+            comparators,
+            activity,
+            register_eligibility,
+            trace_discount,
+            &node_out_base,
+            &out_wire_to_node,
+            &wire_source_nodes,
+            &delay_register_of_node,
+            wire_count,
+            target,
+            &mut wire_ancestry,
+            &mut node_ancestry,
+        )?;
+        let eqz_wire = node_out_base[comp.eqz_node.index()];
+        comparator_shares[m]
+            .copy_from_slice(&wire_ancestry[eqz_wire * node_count..(eqz_wire + 1) * node_count]);
+    }
+
+    Ok(ComparatorCausalAncestry {
+        base: CausalAncestry {
+            port_shares,
+            next_register_eligibility,
+        },
+        comparator_shares,
     })
 }
 
@@ -346,6 +569,8 @@ pub fn assemble_causal_ancestry(
 enum Target {
     Output(usize),
     Register(usize),
+    ComparatorWake(usize),
+    ComparatorSleep(usize),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,7 +578,8 @@ fn ancestry_for_target(
     circuit: &Circuit,
     compiled: &CompiledCircuit,
     wire_values: &[u64],
-    sensitivity: &SensitivitySnapshot,
+    sensitivity: SensitivityView<'_>,
+    comparators: &[ComparatorTarget],
     activity: &[NodeActivity],
     register_eligibility: &[Vec<f64>],
     trace_discount: f64,
@@ -384,7 +610,7 @@ fn ancestry_for_target(
         let Some(register) = delay_register_of_node[node] else {
             return Err(SensitivityError::DimensionMismatch);
         };
-        let coefficient = target_sensitivity(sensitivity, node, target)?;
+        let coefficient = target_sensitivity(sensitivity, comparators, node, target)?;
         let wire = node_out_base[node];
         let dst_slice = &mut wire_ancestry[wire * node_count..(wire + 1) * node_count];
         let reg_elig = &register_eligibility[register];
@@ -408,7 +634,7 @@ fn ancestry_for_target(
             .get(first_out)
             .filter(|&&idx| idx != usize::MAX)
             .ok_or(SensitivityError::DimensionMismatch)?;
-        let coefficient = target_sensitivity(sensitivity, node, target)?;
+        let coefficient = target_sensitivity(sensitivity, comparators, node, target)?;
         let input_wires = &compiled.node_input_wires()[node];
         let arity = input_wires.len();
         let prim = circuit.nodes()[node];
@@ -436,15 +662,16 @@ fn ancestry_for_target(
                 }
             });
         }
-        let w_stack = if arity == 1 {
-            [1.0, 0.0]
-        } else {
-            ring_identity_input_weights_pair(
+        let w_stack = match target {
+            Target::ComparatorWake(m) if node == comparators[m].sub_node.index() => [0.0, 1.0],
+            Target::ComparatorSleep(m) if node == comparators[m].sub_node.index() => [0.5, 0.5],
+            _ if arity == 1 => [1.0, 0.0],
+            _ => ring_identity_input_weights_pair(
                 prim,
                 [in_vals[0], in_vals[1]],
                 [in_act[0], in_act[1]],
                 compiled.width(),
-            )
+            ),
         };
         let weights = &w_stack[..arity];
         for (ancestor, value) in node_ancestry.iter_mut().enumerate() {
@@ -464,7 +691,8 @@ fn ancestry_for_target(
 }
 
 fn target_sensitivity(
-    sensitivity: &SensitivitySnapshot,
+    sensitivity: SensitivityView<'_>,
+    comparators: &[ComparatorTarget],
     node: usize,
     target: Target,
 ) -> Result<f64, SensitivityError> {
@@ -478,6 +706,25 @@ fn target_sensitivity(
             .latch_by_node
             .get(node)
             .and_then(|values| values.get(register))
+            .copied(),
+        Target::ComparatorWake(m) => {
+            let comp = comparators
+                .get(m)
+                .ok_or(SensitivityError::DimensionMismatch)?;
+            if node == comp.eqz_node.index() {
+                Some(1.0)
+            } else {
+                sensitivity
+                    .comparator_sub_by_node
+                    .get(node)
+                    .and_then(|values| values.get(m))
+                    .copied()
+            }
+        }
+        Target::ComparatorSleep(m) => sensitivity
+            .comparator_eqz_by_node
+            .get(node)
+            .and_then(|values| values.get(m))
             .copied(),
     }
     .ok_or(SensitivityError::DimensionMismatch)
@@ -1069,5 +1316,139 @@ mod tests {
             }
             eligibility = ancestry.next_register_eligibility;
         }
+    }
+
+    #[test]
+    fn comparator_wake_isolation_and_sleep_symmetry() {
+        use crate::substrate::{SignalSink, WireDelayMode};
+
+        // Circuit: primary Delay(p_d), alt Delay(a_d), sub = SUB(p_d, a_d), eqz = EQZ(sub)
+        let mut circuit = Circuit::new(Width::BITS_1, 2, 1, WireDelayMode::Combinational);
+        let p_d = circuit.add_node(Primitive::Delay { init: 0 });
+        let a_d = circuit.add_node(Primitive::Delay { init: 0 });
+        let split_p = circuit.add_node(Primitive::Split);
+        let sub = circuit.add_node(Primitive::Sub);
+        let eqz = circuit.add_node(Primitive::Eqz);
+
+        circuit.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: p_d, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: p_d, port: 0 },
+            SignalSink::NodeIn {
+                node: split_p,
+                port: 0,
+            },
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: split_p,
+                port: 0,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        circuit.connect(
+            SignalSource::NodeOut {
+                node: split_p,
+                port: 1,
+            },
+            SignalSink::NodeIn { node: sub, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::BoundaryIn(1),
+            SignalSink::NodeIn { node: a_d, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: a_d, port: 0 },
+            SignalSink::NodeIn { node: sub, port: 1 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: sub, port: 0 },
+            SignalSink::NodeIn { node: eqz, port: 0 },
+        );
+
+        let compiled = circuit.compile().unwrap();
+        let mut state = ScalarState::new(&compiled);
+        let mut outputs = [0u64];
+        state.step(&compiled, &[1, 1], &mut outputs).unwrap();
+
+        let target = ComparatorTarget {
+            sub_node: sub,
+            eqz_node: eqz,
+        };
+        let legacy =
+            counterfactual_sensitivity(&circuit, &compiled, &state, SeedBank::new(3), 0, 8)
+                .unwrap();
+        let snap = counterfactual_sensitivity_with_comparators(
+            &circuit,
+            &compiled,
+            &state,
+            SeedBank::new(3),
+            0,
+            8,
+            &[target],
+        )
+        .unwrap();
+        assert_eq!(snap.base, legacy);
+
+        // Both Delay nodes and sub/eqz change eqz_node when perturbed on k=1.
+        assert!((snap.comparator_eqz_by_node[p_d.index()][0] - 1.0).abs() < 1e-12);
+        assert!((snap.comparator_eqz_by_node[a_d.index()][0] - 1.0).abs() < 1e-12);
+        assert!((snap.comparator_eqz_by_node[sub.index()][0] - 1.0).abs() < 1e-12);
+        assert!((snap.comparator_eqz_by_node[eqz.index()][0] - 1.0).abs() < 1e-12);
+        // Boundary output sensitivity ignores alt/sub/eqz.
+        assert_eq!(snap.base.output_by_node[a_d.index()][0], 0.0);
+        assert_eq!(snap.base.output_by_node[sub.index()][0], 0.0);
+        assert_eq!(snap.base.output_by_node[eqz.index()][0], 0.0);
+
+        let eligibility = vec![vec![0.0; circuit.node_count()]; compiled.total_registers()];
+        let activity = vec![
+            NodeActivity {
+                nonzero_weight: 0.0,
+                non_one_weight: 0.0,
+            };
+            circuit.node_count()
+        ];
+
+        // Wake: primary cone receives 0.0 from comparator even though p_d == 0 and a_d == 0.
+        let wake_ancestry = assemble_causal_ancestry_with_comparators(
+            &circuit,
+            &compiled,
+            &state,
+            &snap,
+            &activity,
+            &eligibility,
+            0.9,
+            &[target],
+            false,
+        )
+        .unwrap();
+        let wake_shares = &wake_ancestry.comparator_shares[0];
+        assert_eq!(wake_shares[p_d.index()], 0.0);
+        assert_eq!(wake_shares[split_p.index()], 0.0);
+        assert!((wake_shares[a_d.index()] - 1.0).abs() < 1e-12);
+        assert!((wake_shares[sub.index()] - 1.0).abs() < 1e-12);
+        assert!((wake_shares[eqz.index()] - 1.0).abs() < 1e-12);
+
+        // Sleep: symmetric 0.5 weights at sub_node share credit across primary and alt equally.
+        let sleep_ancestry = assemble_causal_ancestry_with_comparators(
+            &circuit,
+            &compiled,
+            &state,
+            &snap,
+            &activity,
+            &eligibility,
+            0.9,
+            &[target],
+            true,
+        )
+        .unwrap();
+        let sleep_shares = &sleep_ancestry.comparator_shares[0];
+        assert!((sleep_shares[p_d.index()] - 0.5).abs() < 1e-12);
+        assert!((sleep_shares[split_p.index()] - 0.5).abs() < 1e-12);
+        assert!((sleep_shares[a_d.index()] - 0.5).abs() < 1e-12);
+        assert!((sleep_shares[sub.index()] - 1.0).abs() < 1e-12);
+        assert!((sleep_shares[eqz.index()] - 1.0).abs() < 1e-12);
     }
 }

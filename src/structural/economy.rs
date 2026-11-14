@@ -2,9 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::metrics::mdl::channel_independence_weight;
 use crate::metrics::{NullModelKind, PointForecastScorer};
-use crate::structural::sensitivity::{CausalAncestry, NodeActivity};
-use crate::substrate::Width;
+use crate::structural::sensitivity::{
+    CausalAncestry, ComparatorCausalAncestry, ComparatorTarget, NodeActivity,
+};
+use crate::substrate::{NodeId, Width};
 
 /// Reward rule used to pay exact-match predictions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +168,8 @@ pub enum EconomyError {
     InvalidTickData,
     /// A non-zero reward has no causal ancestry to receive it.
     MissingAncestry { port: usize },
+    /// A non-zero comparator reward has no causal ancestry to receive it.
+    MissingComparatorAncestry { comparator: usize },
     /// The requested register index is outside the eligibility table.
     InvalidRegister { register: usize },
     /// A node or register remapping contains an out-of-range or duplicate destination.
@@ -179,6 +184,12 @@ impl std::fmt::Display for EconomyError {
             Self::InvalidTickData => write!(f, "economy tick data must be finite and non-negative"),
             Self::MissingAncestry { port } => {
                 write!(f, "reward on output port {port} has no causal ancestry")
+            }
+            Self::MissingComparatorAncestry { comparator } => {
+                write!(
+                    f,
+                    "reward on comparator {comparator} has no causal ancestry"
+                )
             }
             Self::InvalidRegister { register } => {
                 write!(f, "register {register} is outside the eligibility table")
@@ -195,14 +206,91 @@ impl std::fmt::Display for EconomyError {
 
 impl std::error::Error for EconomyError {}
 
+/// Execution phase controlling boundary supervision and comparator scoring (Charter DR #40).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExecutionPhase {
+    /// Supervised wake phase: boundary ports and comparators score against external ground truth.
+    #[default]
+    Wake,
+    /// Unsupervised sleep/loopback phase: boundary rewards are zero (`0.0`) and comparators score
+    /// internal agreement `alt == primary` against each target port's frozen wake null model.
+    Sleep,
+}
+
+/// Registered internal comparator site `EQZ(SUB(primary, alt))` attached to boundary port `p`.
+#[derive(Clone, Debug)]
+pub struct ComparatorSite {
+    /// Difference node `SUB(primary, alt)` (`in(0)` = primary, `in(1)` = alt).
+    pub sub_node: NodeId,
+    /// Equality detector `EQZ(sub_node)`.
+    pub eqz_node: NodeId,
+    /// Target boundary output port $p$ supplying the calibrated wake null model $P_{\text{null}}^{(p)}$.
+    pub target_port: u16,
+    /// Source-channel bitmask for the primary derivation (`sub_node.in(0)`).
+    pub primary_channel_mask: u64,
+    /// Source-channel bitmask for the alternative derivation (`sub_node.in(1)`).
+    pub alt_channel_mask: u64,
+    /// Wake prequential scorer tracking port $p$'s wake null model $P_{\text{null}}^{(p)}$.
+    pub scorer: PointForecastScorer,
+    /// Sleep-segment scorer operating against a frozen copy of the wake null model $P_{\text{null}}^{(p)}$.
+    sleep_scorer: Option<PointForecastScorer>,
+}
+
+impl ComparatorSite {
+    /// Substrate node pair (`sub_node`, `eqz_node`) used for causal sensitivity and ancestry.
+    #[must_use]
+    pub const fn target(&self) -> ComparatorTarget {
+        ComparatorTarget {
+            sub_node: self.sub_node,
+            eqz_node: self.eqz_node,
+        }
+    }
+
+    /// Source-channel independence weight $\iota(a, b) = \frac{1}{|C_a \cap C_b| + 1}$
+    /// applied to positive internal agreement in sleep.
+    #[must_use]
+    pub fn sleep_agreement_weight(&self) -> f64 {
+        channel_independence_weight(self.primary_channel_mask, self.alt_channel_mask)
+    }
+
+    /// Active sleep-segment scorer when inside [`ExecutionPhase::Sleep`].
+    #[must_use]
+    pub const fn sleep_scorer(&self) -> Option<&PointForecastScorer> {
+        self.sleep_scorer.as_ref()
+    }
+
+    /// Active scorer for the current phase (Sleep segment scorer if present, else Wake scorer).
+    #[must_use]
+    pub fn active_scorer(&self) -> &PointForecastScorer {
+        self.sleep_scorer.as_ref().unwrap_or(&self.scorer)
+    }
+}
+
+/// Output of scoring all registered comparators for a single tick.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComparatorObservation {
+    /// Net prequential reward for each comparator in bits (zero when empty).
+    pub rewards: Vec<f64>,
+    /// Count of comparators reporting agreement (`eqz_node == 1`) on this tick.
+    pub agreements: u64,
+    /// Count of comparators reporting disagreement (`eqz_node == 0`) on this tick.
+    pub disagreements: u64,
+}
+
 /// Result of applying one tick of metabolic flux and maintenance.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EconomyTick {
-    /// Total net reward across output ports.
+    /// Total net reward across output ports and registered comparators.
     pub net_flux: f64,
+    /// Net reward contributed by registered comparators on this tick (`0.0` if none).
+    pub comparator_flux: f64,
+    /// Number of registered comparators reporting agreement (`eqz_node == 1`) on this tick.
+    pub comparator_agreements: u64,
+    /// Number of registered comparators reporting disagreement (`eqz_node == 0`) on this tick.
+    pub comparator_disagreements: u64,
     /// Total maintenance actually deducted (juveniles are exempt).
     pub maintenance: f64,
-    /// Per-node payout from port rewards before maintenance and clipping.
+    /// Per-node payout from port and comparator rewards before maintenance and clipping.
     pub node_credit: Vec<f64>,
     /// Per-node net energy change after reserve clipping.
     pub node_delta: Vec<f64>,
@@ -225,6 +313,11 @@ pub struct EconomyState {
     nodes: Vec<NodeEconomy>,
     scorers: Vec<PointForecastScorer>,
     register_eligibility: Vec<Vec<f64>>,
+    phase: ExecutionPhase,
+    comparators: Vec<ComparatorSite>,
+    comparator_agreement_ticks: u64,
+    comparator_disagreement_ticks: u64,
+    cumulative_comparator_flux: f64,
 }
 
 impl EconomyState {
@@ -258,7 +351,127 @@ impl EconomyState {
                 .map(|_| PointForecastScorer::new(width, config.null_model))
                 .collect(),
             register_eligibility: vec![vec![0.0; nodes]; registers],
+            phase: ExecutionPhase::Wake,
+            comparators: Vec::new(),
+            comparator_agreement_ticks: 0,
+            comparator_disagreement_ticks: 0,
+            cumulative_comparator_flux: 0.0,
         })
+    }
+
+    /// Current execution phase (`Wake` or `Sleep`).
+    #[must_use]
+    pub const fn phase(&self) -> ExecutionPhase {
+        self.phase
+    }
+
+    /// Transitions execution phase, initializing or clearing per-segment Sleep scorers against
+    /// frozen wake null models without mutating Wake state.
+    pub fn set_phase(&mut self, phase: ExecutionPhase) {
+        if self.phase == phase {
+            return;
+        }
+        match phase {
+            ExecutionPhase::Sleep => {
+                for comp in &mut self.comparators {
+                    let wake_null = self
+                        .scorers
+                        .get(usize::from(comp.target_port))
+                        .map_or_else(|| comp.scorer.null_model(), PointForecastScorer::null_model);
+                    let mut sleep_scorer = PointForecastScorer::new(self.width, wake_null.kind());
+                    *sleep_scorer.null_model_mut() = wake_null.clone();
+                    comp.sleep_scorer = Some(sleep_scorer);
+                }
+            }
+            ExecutionPhase::Wake => {
+                for comp in &mut self.comparators {
+                    comp.sleep_scorer = None;
+                }
+            }
+        }
+        self.phase = phase;
+    }
+
+    /// Registered comparator sites.
+    #[must_use]
+    pub fn comparators(&self) -> &[ComparatorSite] {
+        &self.comparators
+    }
+
+    /// Mutable reference to registered comparator sites.
+    pub fn comparators_mut(&mut self) -> &mut Vec<ComparatorSite> {
+        &mut self.comparators
+    }
+
+    /// Cumulative comparator agreement ticks (`eqz_node == 1`).
+    #[must_use]
+    pub const fn comparator_agreement_ticks(&self) -> u64 {
+        self.comparator_agreement_ticks
+    }
+
+    /// Cumulative comparator disagreement ticks (`eqz_node == 0`).
+    #[must_use]
+    pub const fn comparator_disagreement_ticks(&self) -> u64 {
+        self.comparator_disagreement_ticks
+    }
+
+    /// Cumulative net flux (in bits) credited through registered comparators.
+    #[must_use]
+    pub const fn cumulative_comparator_flux(&self) -> f64 {
+        self.cumulative_comparator_flux
+    }
+
+    /// Registers a comparator `EQZ(SUB(primary, alt))` targeting output port `target_port`,
+    /// initializing its scorer to port `target_port`'s current wake null model $P_{\text{null}}^{(p)}$.
+    pub fn register_comparator(
+        &mut self,
+        sub_node: NodeId,
+        eqz_node: NodeId,
+        target_port: u16,
+        primary_channel_mask: u64,
+        alt_channel_mask: u64,
+    ) -> Result<usize, EconomyError> {
+        if sub_node.index() >= self.nodes.len()
+            || eqz_node.index() >= self.nodes.len()
+            || usize::from(target_port) >= self.scorers.len()
+        {
+            return Err(EconomyError::DimensionMismatch);
+        }
+        if sub_node == eqz_node
+            || self
+                .comparators
+                .iter()
+                .any(|c| c.sub_node == sub_node || c.eqz_node == eqz_node)
+        {
+            return Err(EconomyError::InvalidStructureMapping);
+        }
+        let wake_null = self.scorers[usize::from(target_port)].null_model().clone();
+        let mut scorer = PointForecastScorer::new(self.width, wake_null.kind());
+        *scorer.null_model_mut() = wake_null;
+        let sleep_scorer = if self.phase == ExecutionPhase::Sleep {
+            Some(scorer.clone())
+        } else {
+            None
+        };
+        self.comparators.push(ComparatorSite {
+            sub_node,
+            eqz_node,
+            target_port,
+            primary_channel_mask,
+            alt_channel_mask,
+            scorer,
+            sleep_scorer,
+        });
+        Ok(self.comparators.len() - 1)
+    }
+
+    /// Removes comparator `index`, returning it if it existed.
+    pub fn remove_comparator(&mut self, index: usize) -> Option<ComparatorSite> {
+        if index < self.comparators.len() {
+            Some(self.comparators.remove(index))
+        } else {
+            None
+        }
     }
 
     /// Unified observation horizon $W_{\text{obs}}$ in ticks used by HorizonDerived reserve capping.
@@ -399,6 +612,10 @@ impl EconomyState {
             self.observation_horizon,
         )?;
         remapped.scorers.clone_from(&self.scorers);
+        remapped.phase = self.phase;
+        remapped.comparator_agreement_ticks = self.comparator_agreement_ticks;
+        remapped.comparator_disagreement_ticks = self.comparator_disagreement_ticks;
+        remapped.cumulative_comparator_flux = self.cumulative_comparator_flux;
         for (old, mapped) in old_to_new_nodes.iter().enumerate() {
             if let Some(new) = mapped {
                 remapped.nodes[*new] = self.nodes[old];
@@ -415,10 +632,32 @@ impl EconomyState {
                 }
             }
         }
+        for comp in &self.comparators {
+            let Some(mapped_sub) = old_to_new_nodes.get(comp.sub_node.index()).copied() else {
+                return Err(EconomyError::InvalidStructureMapping);
+            };
+            let Some(mapped_eqz) = old_to_new_nodes.get(comp.eqz_node.index()).copied() else {
+                return Err(EconomyError::InvalidStructureMapping);
+            };
+            if let (Some(new_sub), Some(new_eqz)) = (mapped_sub, mapped_eqz) {
+                let Ok(sub_u32) = u32::try_from(new_sub) else {
+                    return Err(EconomyError::InvalidStructureMapping);
+                };
+                let Ok(eqz_u32) = u32::try_from(new_eqz) else {
+                    return Err(EconomyError::InvalidStructureMapping);
+                };
+                let mut cloned = comp.clone();
+                cloned.sub_node = NodeId(sub_u32);
+                cloned.eqz_node = NodeId(eqz_u32);
+                remapped.comparators.push(cloned);
+            }
+        }
         Ok(remapped)
     }
 
     /// Prequential reward on each output port, updating its null model after scoring the fact.
+    ///
+    /// In [`ExecutionPhase::Sleep`], returns zero reward per port without mutating wake null models.
     pub fn observe_predictions(
         &mut self,
         predictions: &[u64],
@@ -426,6 +665,9 @@ impl EconomyState {
     ) -> Result<Vec<f64>, EconomyError> {
         if predictions.len() != self.scorers.len() || facts.len() != predictions.len() {
             return Err(EconomyError::DimensionMismatch);
+        }
+        if self.phase == ExecutionPhase::Sleep {
+            return Ok(vec![0.0; predictions.len()]);
         }
         let mut rewards = Vec::with_capacity(predictions.len());
         for (i, (&prediction, &fact)) in predictions.iter().zip(facts).enumerate() {
@@ -435,6 +677,8 @@ impl EconomyState {
     }
 
     /// Computes reward for a single output port against its observation.
+    ///
+    /// Returns `0.0` without mutating the port's wake null model in [`ExecutionPhase::Sleep`].
     pub fn score_port_single(
         &mut self,
         port: usize,
@@ -443,6 +687,9 @@ impl EconomyState {
     ) -> Result<f64, EconomyError> {
         if port >= self.scorers.len() {
             return Err(EconomyError::DimensionMismatch);
+        }
+        if self.phase == ExecutionPhase::Sleep {
+            return Ok(0.0);
         }
         let scorer = &mut self.scorers[port];
         Ok(score_with_reward_mode(
@@ -455,6 +702,8 @@ impl EconomyState {
     }
 
     /// Advances null-model statistics for an unconnected output port without scoring or requiring ancestry.
+    ///
+    /// No-op in [`ExecutionPhase::Sleep`] so wake null models remain frozen.
     pub fn observe_unconnected_port(
         &mut self,
         port: usize,
@@ -463,10 +712,95 @@ impl EconomyState {
         if port >= self.scorers.len() {
             return Err(EconomyError::DimensionMismatch);
         }
+        if self.phase == ExecutionPhase::Sleep {
+            return Ok(());
+        }
         self.scorers[port]
             .null_model_mut()
             .observe_and_surprisal(raw_fact);
         Ok(())
+    }
+
+    /// Scores all registered comparators for one tick (Wake against ground truth `facts[target_port]`,
+    /// Sleep against `primary` under each port's frozen wake null model with agreement weight $\iota$).
+    pub fn observe_comparators(
+        &mut self,
+        primary_values: &[u64],
+        alt_values: &[u64],
+        eqz_values: &[u64],
+        facts: Option<&[u64]>,
+    ) -> Result<ComparatorObservation, EconomyError> {
+        let count = self.comparators.len();
+        if primary_values.len() != count || alt_values.len() != count || eqz_values.len() != count {
+            return Err(EconomyError::DimensionMismatch);
+        }
+        if self.phase == ExecutionPhase::Wake {
+            let Some(facts) = facts else {
+                return Err(EconomyError::DimensionMismatch);
+            };
+            if facts.len() != self.scorers.len() {
+                return Err(EconomyError::DimensionMismatch);
+            }
+        }
+
+        let mut rewards = Vec::with_capacity(count);
+        let mut agreements = 0u64;
+        let mut disagreements = 0u64;
+        let mode = self.config.reward_mode;
+        let width = self.width;
+
+        for m in 0..count {
+            let eqz_active = width.normalize(eqz_values[m]) != 0;
+            if eqz_active {
+                agreements += 1;
+            } else {
+                disagreements += 1;
+            }
+            let reward = match self.phase {
+                ExecutionPhase::Wake => {
+                    let target_port = usize::from(self.comparators[m].target_port);
+                    let fact = facts.expect("Wake phase checked non-empty facts")[target_port];
+                    score_with_reward_mode(
+                        &mut self.comparators[m].scorer,
+                        mode,
+                        width,
+                        alt_values[m],
+                        fact,
+                    )
+                }
+                ExecutionPhase::Sleep => {
+                    let comp = &mut self.comparators[m];
+                    let iota = comp.sleep_agreement_weight();
+                    let sleep_scorer = comp.sleep_scorer.get_or_insert_with(|| {
+                        let frozen = comp.scorer.null_model();
+                        let mut fresh = PointForecastScorer::new(width, frozen.kind());
+                        *fresh.null_model_mut() = frozen.clone();
+                        fresh
+                    });
+                    let frozen_null = sleep_scorer.null_model().clone();
+                    let raw_r = score_with_reward_mode(
+                        sleep_scorer,
+                        mode,
+                        width,
+                        alt_values[m],
+                        primary_values[m],
+                    );
+                    *sleep_scorer.null_model_mut() = frozen_null;
+                    if width.normalize(alt_values[m]) == width.normalize(primary_values[m]) {
+                        raw_r * iota
+                    } else {
+                        raw_r
+                    }
+                }
+            };
+            rewards.push(reward);
+        }
+
+        Ok(ComparatorObservation {
+            rewards,
+            agreements,
+            disagreements,
+        })
     }
 
     /// Applies conserved port rewards and per-node maintenance for one tick.
@@ -478,21 +812,79 @@ impl EconomyState {
         port_ancestry: &[Vec<f64>],
         maintenance_costs: &[f64],
     ) -> Result<EconomyTick, EconomyError> {
+        self.apply_tick_core(
+            port_rewards,
+            port_ancestry,
+            &[],
+            &[],
+            0,
+            0,
+            maintenance_costs,
+        )
+    }
+
+    /// Applies conserved port + comparator rewards and per-node maintenance for one tick.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves exact conservation across port and comparator flux alongside telemetry counts"
+    )]
+    pub fn apply_tick_with_comparators(
+        &mut self,
+        port_rewards: &[f64],
+        port_ancestry: &[Vec<f64>],
+        comparator_rewards: &[f64],
+        comparator_ancestry: &[Vec<f64>],
+        comparator_agreements: u64,
+        comparator_disagreements: u64,
+        maintenance_costs: &[f64],
+    ) -> Result<EconomyTick, EconomyError> {
+        self.apply_tick_core(
+            port_rewards,
+            port_ancestry,
+            comparator_rewards,
+            comparator_ancestry,
+            comparator_agreements,
+            comparator_disagreements,
+            maintenance_costs,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Shared core guarantees bit-identical M2a path when comparators are empty"
+    )]
+    fn apply_tick_core(
+        &mut self,
+        port_rewards: &[f64],
+        port_ancestry: &[Vec<f64>],
+        comparator_rewards: &[f64],
+        comparator_ancestry: &[Vec<f64>],
+        comparator_agreements: u64,
+        comparator_disagreements: u64,
+        maintenance_costs: &[f64],
+    ) -> Result<EconomyTick, EconomyError> {
         if port_rewards.len() != self.scorers.len()
             || port_ancestry.len() != port_rewards.len()
+            || comparator_rewards.len() != self.comparators.len()
+            || comparator_ancestry.len() != comparator_rewards.len()
             || maintenance_costs.len() != self.nodes.len()
         {
             return Err(EconomyError::DimensionMismatch);
         }
         if port_rewards.iter().any(|v| !v.is_finite())
+            || comparator_rewards.iter().any(|v| !v.is_finite())
             || maintenance_costs.iter().any(|v| !v.is_finite() || *v < 0.0)
             || !port_rewards.iter().sum::<f64>().is_finite()
+            || !comparator_rewards.iter().sum::<f64>().is_finite()
             || !maintenance_costs.iter().sum::<f64>().is_finite()
-            || port_ancestry.iter().any(|ancestry| {
-                ancestry.len() != self.nodes.len()
-                    || ancestry.iter().any(|v| !v.is_finite() || *v < 0.0)
-                    || !ancestry.iter().sum::<f64>().is_finite()
-            })
+            || port_ancestry
+                .iter()
+                .chain(comparator_ancestry)
+                .any(|ancestry| {
+                    ancestry.len() != self.nodes.len()
+                        || ancestry.iter().any(|v| !v.is_finite() || *v < 0.0)
+                        || !ancestry.iter().sum::<f64>().is_finite()
+                })
         {
             return Err(EconomyError::InvalidTickData);
         }
@@ -503,6 +895,29 @@ impl EconomyState {
             if total_ancestry == 0.0 {
                 if reward != 0.0 {
                     return Err(EconomyError::MissingAncestry { port });
+                }
+                continue;
+            }
+            for (index, (&share, node)) in ancestry.iter().zip(&self.nodes).enumerate() {
+                let credit = reward * (share / total_ancestry);
+                if credit >= 0.0 || node.juvenile_ticks == 0 {
+                    delta[index] += credit;
+                }
+            }
+        }
+        let mut comparator_flux = 0.0;
+        for (comp_idx, (&reward, ancestry)) in comparator_rewards
+            .iter()
+            .zip(comparator_ancestry)
+            .enumerate()
+        {
+            comparator_flux += reward;
+            let total_ancestry: f64 = ancestry.iter().sum();
+            if total_ancestry == 0.0 {
+                if reward != 0.0 {
+                    return Err(EconomyError::MissingComparatorAncestry {
+                        comparator: comp_idx,
+                    });
                 }
                 continue;
             }
@@ -552,21 +967,26 @@ impl EconomyState {
                             if total_ancestry > 0.0 {
                                 let share = ancestry[index] / total_ancestry;
                                 if share > 0.0 && port < self.scorers.len() {
-                                    let scorer = &self.scorers[port];
-                                    let q = scorer.q_hat();
-                                    let p_null = 1.0 / (2.0f64.powi(i32::from(self.width.bits())));
-                                    if q > p_null {
-                                        let one_minus_q = 1.0 - q;
-                                        let denom = if one_minus_q < RESERVE_MISMATCH_DENOM_FLOOR {
-                                            node_floored = true;
-                                            RESERVE_MISMATCH_DENOM_FLOOR
-                                        } else {
-                                            one_minus_q
-                                        };
-                                        let mismatch_loss =
-                                            ((1.0 - p_null) / denom).log2().max(0.0);
-                                        drain_rate += share * mismatch_loss;
-                                    }
+                                    drain_rate += share
+                                        * reserve_drain_loss(
+                                            &self.scorers[port],
+                                            self.width,
+                                            &mut node_floored,
+                                        );
+                                }
+                            }
+                        }
+                        for (comp_idx, ancestry) in comparator_ancestry.iter().enumerate() {
+                            let total_ancestry: f64 = ancestry.iter().sum();
+                            if total_ancestry > 0.0 {
+                                let share = ancestry[index] / total_ancestry;
+                                if share > 0.0 && comp_idx < self.comparators.len() {
+                                    drain_rate += share
+                                        * reserve_drain_loss(
+                                            self.comparators[comp_idx].active_scorer(),
+                                            self.width,
+                                            &mut node_floored,
+                                        );
                                 }
                             }
                         }
@@ -616,8 +1036,25 @@ impl EconomyState {
             delta[index] = node.energy - previous_energy;
         }
 
+        self.comparator_agreement_ticks = self
+            .comparator_agreement_ticks
+            .saturating_add(comparator_agreements);
+        self.comparator_disagreement_ticks = self
+            .comparator_disagreement_ticks
+            .saturating_add(comparator_disagreements);
+        self.cumulative_comparator_flux += comparator_flux;
+
+        let net_flux = if comparator_rewards.is_empty() {
+            port_rewards.iter().sum()
+        } else {
+            port_rewards.iter().sum::<f64>() + comparator_flux
+        };
+
         Ok(EconomyTick {
-            net_flux: port_rewards.iter().sum(),
+            net_flux,
+            comparator_flux,
+            comparator_agreements,
+            comparator_disagreements,
             maintenance,
             node_credit,
             node_delta: delta,
@@ -650,6 +1087,39 @@ impl EconomyState {
         Ok(tick)
     }
 
+    /// Applies a sensitivity-assembled tick with comparator shares and latches register eligibility.
+    pub fn apply_causal_tick_with_comparators(
+        &mut self,
+        port_rewards: &[f64],
+        comparator_rewards: &[f64],
+        comparator_agreements: u64,
+        comparator_disagreements: u64,
+        ancestry: &ComparatorCausalAncestry,
+        maintenance_costs: &[f64],
+    ) -> Result<EconomyTick, EconomyError> {
+        if ancestry.base.next_register_eligibility.len() != self.register_eligibility.len()
+            || ancestry.base.next_register_eligibility.iter().any(|trace| {
+                trace.len() != self.nodes.len()
+                    || trace.iter().any(|value| !value.is_finite() || *value < 0.0)
+            })
+        {
+            return Err(EconomyError::DimensionMismatch);
+        }
+        let tick = self.apply_tick_with_comparators(
+            port_rewards,
+            &ancestry.base.port_shares,
+            comparator_rewards,
+            &ancestry.comparator_shares,
+            comparator_agreements,
+            comparator_disagreements,
+            maintenance_costs,
+        )?;
+        for (register, trace) in ancestry.base.next_register_eligibility.iter().enumerate() {
+            self.register_eligibility[register].copy_from_slice(trace);
+        }
+        Ok(tick)
+    }
+
     /// Stores ancestry for the next tick of a synchronous register.
     pub fn set_register_eligibility(
         &mut self,
@@ -668,6 +1138,23 @@ impl EconomyState {
         };
         trace.copy_from_slice(ancestry);
         Ok(())
+    }
+}
+
+fn reserve_drain_loss(scorer: &PointForecastScorer, width: Width, node_floored: &mut bool) -> f64 {
+    let q = scorer.q_hat();
+    let p_null = 1.0 / (2.0f64.powi(i32::from(width.bits())));
+    if q > p_null {
+        let one_minus_q = 1.0 - q;
+        let denom = if one_minus_q < RESERVE_MISMATCH_DENOM_FLOOR {
+            *node_floored = true;
+            RESERVE_MISMATCH_DENOM_FLOOR
+        } else {
+            one_minus_q
+        };
+        ((1.0 - p_null) / denom).log2().max(0.0)
+    } else {
+        0.0
     }
 }
 
@@ -990,5 +1477,204 @@ mod tests {
             .apply_tick(&[0.0], &[vec![1.0, 0.0]], &[0.0, 0.0])
             .unwrap();
         assert!((economy.nodes()[1].energy - decayed_cap).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sleep_freezes_wake_null_model_and_applies_iota_asymmetrically() {
+        let config = EconomyConfig {
+            juvenile_ticks: 0,
+            reserve_cap: ReserveCap::Uncapped,
+            ..EconomyConfig::default()
+        };
+        let mut economy =
+            EconomyState::new(config, Width::BITS_1, 4, 1, 0, test_obs_horizon(&config)).unwrap();
+        let sub_a = NodeId(2);
+        let eqz_a = NodeId(3);
+        let comp_idx = economy
+            .register_comparator(sub_a, eqz_a, 0, 0b01, 0b01)
+            .unwrap();
+        assert_eq!(comp_idx, 0);
+
+        // Warm up Wake with balanced alternating stream so p_null(0) == p_null(1) == 0.5.
+        for t in 0..40u64 {
+            let s = t % 2;
+            let r_port = economy.observe_predictions(&[s], &[s]).unwrap();
+            let comp_obs = economy
+                .observe_comparators(&[s], &[s], &[1], Some(&[s]))
+                .unwrap();
+            economy
+                .apply_tick_with_comparators(
+                    &r_port,
+                    &[vec![1.0, 0.0, 0.0, 0.0]],
+                    &comp_obs.rewards,
+                    &[vec![0.0, 1.0, 1.0, 1.0]],
+                    comp_obs.agreements,
+                    comp_obs.disagreements,
+                    &[0.0; 4],
+                )
+                .unwrap();
+        }
+        let wake_null_before_sleep = economy.scorers()[0].null_model().clone();
+        let wake_comp_q_before = economy.comparators()[0].scorer.q_hat();
+
+        // Enter Sleep: boundary rewards are zero, null model stays frozen, agreement scaled by iota = 0.5.
+        economy.set_phase(ExecutionPhase::Sleep);
+        let mut sleep_agree_sum = 0.0;
+        for t in 0..16u64 {
+            let s = t % 2;
+            let r_port = economy.observe_predictions(&[s], &[0]).unwrap();
+            assert_eq!(r_port, vec![0.0]);
+            let comp_obs = economy.observe_comparators(&[s], &[s], &[1], None).unwrap();
+            assert!(comp_obs.rewards[0] >= 0.0);
+            sleep_agree_sum += comp_obs.rewards[0];
+            economy
+                .apply_tick_with_comparators(
+                    &r_port,
+                    &[vec![1.0, 0.0, 0.0, 0.0]],
+                    &comp_obs.rewards,
+                    &[vec![0.25, 0.25, 0.25, 0.25]],
+                    comp_obs.agreements,
+                    comp_obs.disagreements,
+                    &[0.0; 4],
+                )
+                .unwrap();
+        }
+        assert!(sleep_agree_sum > 0.0);
+        // Compare against disjoint channels (iota = 1.0) -> exactly 2x positive Sleep agreement flux.
+        let mut disjoint_econ =
+            EconomyState::new(config, Width::BITS_1, 4, 1, 0, test_obs_horizon(&config)).unwrap();
+        disjoint_econ
+            .register_comparator(sub_a, eqz_a, 0, 0b01, 0b10)
+            .unwrap();
+        for t in 0..40u64 {
+            let s = t % 2;
+            let _ = disjoint_econ.observe_predictions(&[s], &[s]).unwrap();
+            let _ = disjoint_econ
+                .observe_comparators(&[s], &[s], &[1], Some(&[s]))
+                .unwrap();
+        }
+        disjoint_econ.set_phase(ExecutionPhase::Sleep);
+        let mut disjoint_sum = 0.0;
+        for t in 0..16u64 {
+            let s = t % 2;
+            let obs = disjoint_econ
+                .observe_comparators(&[s], &[s], &[1], None)
+                .unwrap();
+            disjoint_sum += obs.rewards[0];
+        }
+        assert!((disjoint_sum - 2.0 * sleep_agree_sum).abs() < 1e-12);
+
+        // Verify disagreement pays full 1.0 loss regardless of channel overlap (iota = 0.5 == iota = 1.0).
+        let shared_disagree = economy.observe_comparators(&[0], &[1], &[0], None).unwrap();
+        let disjoint_disagree = disjoint_econ
+            .observe_comparators(&[0], &[1], &[0], None)
+            .unwrap();
+        assert!(shared_disagree.rewards[0] < 0.0);
+        assert!((shared_disagree.rewards[0] - disjoint_disagree.rewards[0]).abs() < 1e-12);
+
+        assert_eq!(
+            economy.scorers()[0].null_model().probability(0).to_bits(),
+            wake_null_before_sleep.probability(0).to_bits()
+        );
+        assert_eq!(
+            economy.scorers()[0].null_model().probability(1).to_bits(),
+            wake_null_before_sleep.probability(1).to_bits()
+        );
+        assert_eq!(
+            economy.comparators()[0]
+                .scorer
+                .null_model()
+                .probability(0)
+                .to_bits(),
+            wake_null_before_sleep.probability(0).to_bits()
+        );
+        assert_eq!(
+            economy.comparators()[0]
+                .scorer
+                .null_model()
+                .probability(1)
+                .to_bits(),
+            wake_null_before_sleep.probability(1).to_bits()
+        );
+        assert_eq!(economy.comparators()[0].scorer.q_hat(), wake_comp_q_before);
+        assert_eq!(economy.comparator_agreement_ticks(), 56);
+        assert_eq!(economy.comparator_disagreement_ticks(), 0);
+    }
+
+    #[test]
+    fn comparator_hallucinating_wrong_agreement_starves_in_wake() {
+        let config = EconomyConfig {
+            juvenile_ticks: 0,
+            reserve_cap: ReserveCap::Uncapped,
+            ..EconomyConfig::default()
+        };
+        let mut economy =
+            EconomyState::new(config, Width::BITS_1, 4, 1, 0, test_obs_horizon(&config)).unwrap();
+        economy
+            .register_comparator(NodeId(2), NodeId(3), 0, 0b01, 0b10)
+            .unwrap();
+
+        // Warm up briefly (16 ticks), then both primary and alt agree (`eqz == 1`) on `1 - fact`
+        // while settling realistic maturity description debt (> initial_energy = 4.0).
+        // Net comparator flux after the drift turns strictly negative and starves all comparator nodes.
+        let debts = [12.0, 12.0, 12.0, 12.0];
+        let mut post_drift_comp_flux = 0.0;
+        for t in 0..80u64 {
+            let fact = t % 2;
+            let hallucinated = if t < 16 { fact } else { 1 - fact };
+            let r_port = economy
+                .observe_predictions(&[hallucinated], &[fact])
+                .unwrap();
+            let comp_obs = economy
+                .observe_comparators(&[hallucinated], &[hallucinated], &[1], Some(&[fact]))
+                .unwrap();
+            let maint = if t == 16 { debts } else { [0.0; 4] };
+            let tick = economy
+                .apply_tick_with_comparators(
+                    &r_port,
+                    &[vec![1.0, 0.0, 0.0, 0.0]],
+                    &comp_obs.rewards,
+                    &[vec![0.0, 1.0, 1.0, 1.0]],
+                    comp_obs.agreements,
+                    comp_obs.disagreements,
+                    &maint,
+                )
+                .unwrap();
+            if t >= 16 {
+                assert!(
+                    comp_obs.rewards[0] <= 0.0,
+                    "mutually agreeing wrong oscillator must not gain wake reward at tick {t}"
+                );
+                assert!(tick.comparator_flux <= 0.0);
+                post_drift_comp_flux += tick.comparator_flux;
+            }
+        }
+        assert!(post_drift_comp_flux < 0.0);
+        assert!(economy.nodes()[1].energy <= 0.0);
+        assert!(economy.nodes()[2].energy <= 0.0);
+        assert!(economy.nodes()[3].energy <= 0.0);
+    }
+
+    #[test]
+    fn economy_remap_structure_updates_and_prunes_comparators() {
+        let config = EconomyConfig::default();
+        let mut economy =
+            EconomyState::new(config, Width::BITS_1, 5, 1, 0, test_obs_horizon(&config)).unwrap();
+        economy
+            .register_comparator(NodeId(1), NodeId(2), 0, 0b01, 0b10)
+            .unwrap();
+        economy
+            .register_comparator(NodeId(3), NodeId(4), 0, 0b01, 0b01)
+            .unwrap();
+        economy.set_phase(ExecutionPhase::Sleep);
+
+        // Drop node 0, compact 1->0, 2->1, drop 3->None (prunes comp 1), 4->2.
+        let remapped = economy
+            .remap_structure(&[None, Some(0), Some(1), None, Some(2)], 3, &[], 0)
+            .unwrap();
+        assert_eq!(remapped.phase(), ExecutionPhase::Sleep);
+        assert_eq!(remapped.comparators().len(), 1);
+        assert_eq!(remapped.comparators()[0].sub_node, NodeId(0));
+        assert_eq!(remapped.comparators()[0].eqz_node, NodeId(1));
     }
 }

@@ -195,18 +195,16 @@ pub fn solve_epsilon_machine(spec: &FiniteStateSpec, noise: &NoiseModel) -> Epsi
     }
 }
 
-/// Extracts per-channel symmetric substitution rate $\varepsilon_c$ from `noise`.
+/// Extracts initial/stationary per-channel symmetric substitution rate $\varepsilon_c(0)$ from `noise`.
 #[must_use]
 pub fn per_channel_epsilon(noise: &NoiseModel, num_channels: usize) -> Vec<f64> {
-    let mut channel_eps = vec![0.0f64; num_channels];
-    if let NoiseModel::IndependentSubstitution { epsilon, channels } = noise {
-        for &ch in channels {
-            if usize::from(ch) < num_channels {
-                channel_eps[usize::from(ch)] = *epsilon;
-            }
-        }
-    }
-    channel_eps
+    per_channel_epsilon_at(noise, num_channels, 0)
+}
+
+/// Extracts per-channel symmetric substitution rate $\varepsilon_c(t)$ from `noise` at `tick`.
+#[must_use]
+pub fn per_channel_epsilon_at(noise: &NoiseModel, num_channels: usize, tick: u64) -> Vec<f64> {
+    noise.channel_epsilons_at(num_channels, tick)
 }
 
 fn log2_alternatives(k_bits: u8) -> f64 {
@@ -325,13 +323,26 @@ pub fn realized_oracle_step_bits(
     clean_frame: &[u64],
     observed_frame: &[u64],
 ) -> Option<f64> {
+    realized_oracle_step_bits_at(noise, 0, width, clean_frame, observed_frame)
+}
+
+/// Tick-indexed variant of [`realized_oracle_step_bits`] supporting scheduled [`NoiseModel::ChannelFaultSchedule`] transitions.
+#[must_use]
+pub fn realized_oracle_step_bits_at(
+    noise: &NoiseModel,
+    tick: u64,
+    width: Width,
+    clean_frame: &[u64],
+    observed_frame: &[u64],
+) -> Option<f64> {
     if clean_frame.len() != observed_frame.len() {
         return None;
     }
-    let channel_eps = per_channel_epsilon(noise, clean_frame.len());
     let mut bits = 0.0f64;
-    for (ch, &eps) in channel_eps.iter().enumerate() {
-        bits += realized_oracle_channel_step_bits(eps, width, clean_frame[ch], observed_frame[ch])?;
+    for (ch, (&clean, &obs)) in clean_frame.iter().zip(observed_frame.iter()).enumerate() {
+        let ch_u16 = u16::try_from(ch).ok()?;
+        let eps = noise.channel_epsilon_at(ch_u16, tick);
+        bits += realized_oracle_channel_step_bits(eps, width, clean, obs)?;
     }
     Some(bits)
 }
