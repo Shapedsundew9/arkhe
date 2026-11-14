@@ -1,6 +1,7 @@
 //! Milestone 2a cross-channel coupling acceptance verification suite (`G2A.1`–`G2A.5`).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -10,8 +11,8 @@ use crate::baselines::{
 };
 use crate::config::{BuildProvenance, CliffCountersSummary, compute_ground_truth_yardstick};
 use crate::env::{
-    CrossLinearOp, CrossNonlinearOp, FiniteStateGenerator, FiniteStateSpec, GeneratorConfig,
-    LfsrStage, NoiseModel, NoisyEnvironment, SpecExportError, TierGenerator,
+    CrossLinearOp, CrossNonlinearOp, EpsilonMachineSummary, FiniteStateGenerator, FiniteStateSpec,
+    GeneratorConfig, LfsrStage, NoiseModel, NoisyEnvironment, SpecExportError, TierGenerator,
     compound_reactive_entropy_bits,
 };
 use crate::metrics::{BudgetAccountingMode, Scorecard};
@@ -503,447 +504,493 @@ struct SeedOutcome {
     failures: Vec<String>,
 }
 
-fn evaluate_g2a1_seed(master_seed: u64, horizon: u64) -> SeedOutcome {
+#[derive(Clone, Debug, Default)]
+struct TaskOutcomePiece {
+    ok: bool,
+    excluded: bool,
+    cliff: CliffCountersSummary,
+    failure: Option<String>,
+}
+
+struct G2a1TaskSpec {
+    label: &'static str,
+    width: Width,
+    gen_cfg: GeneratorConfig,
+}
+
+fn g2a1_task_specs() -> Vec<G2a1TaskSpec> {
     let d0 = driver_small_0();
     let d1 = driver_small_1();
-
-    let tasks: Vec<(&str, Width, GeneratorConfig)> = vec![
-        (
-            "DelayedAffine(d=1,k=1)",
-            Width::BITS_1,
-            GeneratorConfig::T2_DelayedAffine {
+    vec![
+        G2a1TaskSpec {
+            label: "DelayedAffine(d=1,k=1)",
+            width: Width::BITS_1,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 1,
                 mul_a: 1,
                 add_b: 1,
             },
-        ),
-        (
-            "DelayedAffine(d=1,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_DelayedAffine {
+        },
+        G2a1TaskSpec {
+            label: "DelayedAffine(d=1,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 1,
                 mul_a: 1,
                 add_b: 1,
             },
-        ),
-        (
-            "DelayedAffine(d=2,k=1)",
-            Width::BITS_1,
-            GeneratorConfig::T2_DelayedAffine {
+        },
+        G2a1TaskSpec {
+            label: "DelayedAffine(d=2,k=1)",
+            width: Width::BITS_1,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 2,
                 mul_a: 1,
                 add_b: 1,
             },
-        ),
-        (
-            "DelayedAffine(d=2,3x+2,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_DelayedAffine {
+        },
+        G2a1TaskSpec {
+            label: "DelayedAffine(d=2,3x+2,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 2,
                 mul_a: 3,
                 add_b: 2,
             },
-        ),
-        (
-            "DelayedAffine(d=4,k=1)",
-            Width::BITS_1,
-            GeneratorConfig::T2_DelayedAffine {
+        },
+        G2a1TaskSpec {
+            label: "DelayedAffine(d=4,k=1)",
+            width: Width::BITS_1,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 4,
                 mul_a: 1,
                 add_b: 1,
             },
-        ),
-        (
-            "DelayedAffine(d=4,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_DelayedAffine {
+        },
+        G2a1TaskSpec {
+            label: "DelayedAffine(d=4,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 4,
                 mul_a: 1,
                 add_b: 1,
             },
-        ),
-        (
-            "CrossAdd(d=1,2,k=1)",
-            Width::BITS_1,
-            GeneratorConfig::T2_CrossLinear {
+        },
+        G2a1TaskSpec {
+            label: "CrossAdd(d=1,2,k=1)",
+            width: Width::BITS_1,
+            gen_cfg: GeneratorConfig::T2_CrossLinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossLinearOp::Add,
             },
-        ),
-        (
-            "CrossAdd(d=1,2,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_CrossLinear {
+        },
+        G2a1TaskSpec {
+            label: "CrossAdd(d=1,2,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_CrossLinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossLinearOp::Add,
             },
-        ),
-        (
-            "CrossSub(d=1,2,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_CrossLinear {
+        },
+        G2a1TaskSpec {
+            label: "CrossSub(d=1,2,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_CrossLinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossLinearOp::Sub,
             },
-        ),
-        (
-            "CrossMul(d=1,2,k=1)",
-            Width::BITS_1,
-            GeneratorConfig::T2_CrossNonlinear {
+        },
+        G2a1TaskSpec {
+            label: "CrossMul(d=1,2,k=1)",
+            width: Width::BITS_1,
+            gen_cfg: GeneratorConfig::T2_CrossNonlinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossNonlinearOp::Mul,
             },
-        ),
-        (
-            "CrossMul(d=1,2,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_CrossNonlinear {
+        },
+        G2a1TaskSpec {
+            label: "CrossMul(d=1,2,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_CrossNonlinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossNonlinearOp::Mul,
             },
-        ),
-        (
-            "CrossMulEqz(d=1,2,k=1)",
-            Width::BITS_1,
-            GeneratorConfig::T2_CrossNonlinear {
+        },
+        G2a1TaskSpec {
+            label: "CrossMulEqz(d=1,2,k=1)",
+            width: Width::BITS_1,
+            gen_cfg: GeneratorConfig::T2_CrossNonlinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossNonlinearOp::MulEqz,
             },
-        ),
-        (
-            "CrossMulEqz(d=1,2,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_CrossNonlinear {
+        },
+        G2a1TaskSpec {
+            label: "CrossMulEqz(d=1,2,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_CrossNonlinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossNonlinearOp::MulEqz,
             },
-        ),
-        (
-            "CrossAddEqz(d=1,2,k=1)",
-            Width::BITS_1,
-            GeneratorConfig::T2_CrossNonlinear {
+        },
+        G2a1TaskSpec {
+            label: "CrossAddEqz(d=1,2,k=1)",
+            width: Width::BITS_1,
+            gen_cfg: GeneratorConfig::T2_CrossNonlinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossNonlinearOp::AddEqz,
             },
-        ),
-        (
-            "CrossAddEqz(d=1,2,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_CrossNonlinear {
+        },
+        G2a1TaskSpec {
+            label: "CrossAddEqz(d=1,2,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_CrossNonlinear {
                 driver_0: d0,
                 driver_1: d1,
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossNonlinearOp::AddEqz,
             },
-        ),
-    ];
-
-    let seeds_bank = SeedBank::new(master_seed);
-    let mut seed_cliff = CliffCountersSummary::default();
-    let mut excluded_cases = 0usize;
-    let mut failures = Vec::new();
-    let mut all_ok = true;
-
-    for (label, width, gen_cfg) in tasks {
-        let generator = gen_cfg.build(width).expect("valid T2 generator");
-        let channels = generator.channels();
-        let target = usize::from(channels) - 1;
-        let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
-        let coupled = run_learner_on_env(
-            &mut env,
-            width,
-            channels,
-            WireDelayMode::Combinational,
-            horizon,
-            seeds_bank,
-            None,
-        );
-        seed_cliff.accumulate(&coupled.cliff);
-        if coupled.excluded {
-            excluded_cases += 1;
-        }
-        let target_sc = &coupled.scorecard.per_channel[target];
-        let cross_wired = circuit_target_cone_uses_cross_channel(
-            coupled.learner.editable().circuit(),
-            target as u16,
-        );
-        let coupled_ok = !coupled.excluded
-            && target_sc.post_transient_clean_mismatches == 0
-            && target_sc.excess_residual_bits_over_h_mu <= 0.005
-            && cross_wired;
-
-        // Marginal K=1 target-only control must fail to lock (clean_err >= 0.10).
-        let marg_gen =
-            MarginalTargetGenerator::new(gen_cfg.build(width).expect("valid T2 gen"), target);
-        let mut marg_env = NoisyEnvironment::new(marg_gen, NoiseModel::None, seeds_bank).unwrap();
-        let marg = run_learner_on_env(
-            &mut marg_env,
-            width,
-            1,
-            WireDelayMode::Combinational,
-            horizon,
-            seeds_bank,
-            None,
-        );
-        seed_cliff.accumulate(&marg.cliff);
-        if marg.excluded {
-            excluded_cases += 1;
-        }
-        let marg_err = (marg.scorecard.per_channel[0].post_transient_clean_mismatches as f64)
-            / (marg.scorecard.evaluated_ticks.max(1) as f64);
-        let marginal_ok = !marg.excluded && marg_err >= 0.10;
-
-        if !(coupled_ok && marginal_ok) {
-            all_ok = false;
-            failures.push(format!(
-                "G2A.1 {label} seed={master_seed}: clean_mis={} excess={:.4} cross_wired={cross_wired} marg_err={marg_err:.4} excl={}/{}",
-                target_sc.post_transient_clean_mismatches,
-                target_sc.excess_residual_bits_over_h_mu,
-                coupled.excluded,
-                marg.excluded
-            ));
-        }
-    }
-
-    SeedOutcome {
-        passed: all_ok && excluded_cases == 0,
-        cliff: seed_cliff,
-        excluded_cases,
-        failures,
-    }
+        },
+    ]
 }
 
-fn evaluate_g2a2_seed(master_seed: u64, horizon: u64) -> SeedOutcome {
-    let d_hi = driver_hi_0();
-    let d0 = driver_small_0();
-    let d1 = driver_small_1();
+fn run_g2a1_task(spec: &G2a1TaskSpec, master_seed: u64, horizon: u64) -> (TaskOutcomePiece, usize) {
     let seeds_bank = SeedBank::new(master_seed);
-    let mut seed_cliff = CliffCountersSummary::default();
-    let mut excluded_cases = 0usize;
-    let mut failures = Vec::new();
-    let mut all_ok = true;
+    let mut cliff = CliffCountersSummary::default();
+    let mut excluded_count = 0usize;
 
-    // (a) Deep non-aliasing Combinational tasks (d in {5, 6, 8}) across k in {1, 2}.
+    let generator = spec.gen_cfg.build(spec.width).expect("valid T2 generator");
+    let channels = generator.channels();
+    let target = usize::from(channels) - 1;
+    let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
+    let coupled = run_learner_on_env(
+        &mut env,
+        spec.width,
+        channels,
+        WireDelayMode::Combinational,
+        horizon,
+        seeds_bank,
+        None,
+    );
+    cliff.accumulate(&coupled.cliff);
+    if coupled.excluded {
+        excluded_count += 1;
+    }
+    let target_sc = &coupled.scorecard.per_channel[target];
+    let cross_wired =
+        circuit_target_cone_uses_cross_channel(coupled.learner.editable().circuit(), target as u16);
+    let coupled_ok = !coupled.excluded
+        && target_sc.post_transient_clean_mismatches == 0
+        && target_sc.excess_residual_bits_over_h_mu <= 0.005
+        && cross_wired;
+
+    // Marginal K=1 target-only control must fail to lock (clean_err >= 0.10).
+    let marg_gen = MarginalTargetGenerator::new(
+        spec.gen_cfg.build(spec.width).expect("valid T2 gen"),
+        target,
+    );
+    let mut marg_env = NoisyEnvironment::new(marg_gen, NoiseModel::None, seeds_bank).unwrap();
+    let marg = run_learner_on_env(
+        &mut marg_env,
+        spec.width,
+        1,
+        WireDelayMode::Combinational,
+        horizon,
+        seeds_bank,
+        None,
+    );
+    cliff.accumulate(&marg.cliff);
+    if marg.excluded {
+        excluded_count += 1;
+    }
+    let marg_err = (marg.scorecard.per_channel[0].post_transient_clean_mismatches as f64)
+        / (marg.scorecard.evaluated_ticks.max(1) as f64);
+    let marginal_ok = !marg.excluded && marg_err >= 0.10;
+
+    let ok = coupled_ok && marginal_ok;
+    let failure = (!ok).then(|| {
+        format!(
+            "G2A.1 {} seed={master_seed}: clean_mis={} excess={:.4} cross_wired={cross_wired} marg_err={marg_err:.4} excl={}/{}",
+            spec.label,
+            target_sc.post_transient_clean_mismatches,
+            target_sc.excess_residual_bits_over_h_mu,
+            coupled.excluded,
+            marg.excluded
+        )
+    });
+    (
+        TaskOutcomePiece {
+            ok,
+            excluded: excluded_count > 0,
+            cliff,
+            failure,
+        },
+        excluded_count,
+    )
+}
+
+struct G2a2DeepSpec {
+    width: Width,
+    lag: usize,
+    gen_cfg: GeneratorConfig,
+}
+
+struct G2a2TphSpec {
+    label: &'static str,
+    width: Width,
+    gen_cfg: GeneratorConfig,
+}
+
+fn g2a2_deep_specs() -> Vec<G2a2DeepSpec> {
+    let d_hi = driver_hi_0();
+    let mut out = Vec::with_capacity(6);
     for width in [Width::BITS_1, Width::BITS_2] {
         for lag in [5usize, 6, 8] {
-            let gen_cfg = GeneratorConfig::T2_DelayedAffine {
-                driver: d_hi.clone(),
-                lag,
-                mul_a: 1,
-                add_b: 1,
-            };
-            let generator = gen_cfg.build(width).expect("valid deep T2 generator");
-            let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
-            let res = run_learner_on_env(
-                &mut env,
+            out.push(G2a2DeepSpec {
                 width,
-                2,
-                WireDelayMode::Combinational,
-                horizon,
-                seeds_bank,
-                None,
-            );
-            seed_cliff.accumulate(&res.cliff);
-            if res.excluded {
-                excluded_cases += 1;
-            }
-            let target_sc = &res.scorecard.per_channel[1];
-            let ok = !res.excluded
-                && target_sc.post_transient_clean_mismatches == 0
-                && res.cliff.lag_deepening_steps >= 1;
-            if !ok {
-                all_ok = false;
-                failures.push(format!(
-                    "G2A.2a DeepAffine(d={lag},k={}) seed={master_seed}: clean_mis={} deep_steps={} excl={}",
-                    width.bits(),
-                    target_sc.post_transient_clean_mismatches,
-                    res.cliff.lag_deepening_steps,
-                    res.excluded
-                ));
-            }
+                lag,
+                gen_cfg: GeneratorConfig::T2_DelayedAffine {
+                    driver: d_hi.clone(),
+                    lag,
+                    mul_a: 1,
+                    add_b: 1,
+                },
+            });
         }
     }
+    out
+}
 
-    // (a.2) M1 K=1 ring-before-deepening invariance check.
-    {
-        let gen_cfg = GeneratorConfig::T1_PeriodicMotif {
-            motif: vec![0, 0, 0, 0, 1],
-        };
-        let generator = gen_cfg.build(Width::BITS_1).unwrap();
-        let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
-        let res = run_learner_on_env(
-            &mut env,
-            Width::BITS_1,
-            1,
-            WireDelayMode::Combinational,
-            horizon,
-            seeds_bank,
-            None,
-        );
-        seed_cliff.accumulate(&res.cliff);
-        if res.excluded {
-            excluded_cases += 1;
-        }
-        let ok = !res.excluded
-            && res.scorecard.per_channel[0].post_transient_clean_mismatches == 0
-            && res.learner.ring_closure_events() >= 1
-            && res.cliff.lag_deepening_steps == 0;
-        if !ok {
-            all_ok = false;
-            failures.push(format!(
-                "G2A.2a M1-RingInvariance seed={master_seed}: clean_mis={} rings={} deep_steps={}",
-                res.scorecard.per_channel[0].post_transient_clean_mismatches,
-                res.learner.ring_closure_events(),
-                res.cliff.lag_deepening_steps
-            ));
-        }
-    }
-
-    // (b) TicksPerHop causal latency alignment (strict edge.hops == 1).
-    let tph_tasks: Vec<(&str, Width, GeneratorConfig)> = vec![
-        (
-            "TphDelayedAffine(d=3,k=1)",
-            Width::BITS_1,
-            GeneratorConfig::T2_DelayedAffine {
+fn g2a2_tph_specs() -> Vec<G2a2TphSpec> {
+    let d0 = driver_small_0();
+    let d1 = driver_small_1();
+    vec![
+        G2a2TphSpec {
+            label: "TphDelayedAffine(d=3,k=1)",
+            width: Width::BITS_1,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 3,
                 mul_a: 1,
                 add_b: 1,
             },
-        ),
-        (
-            "TphDelayedAffine(d=3,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_DelayedAffine {
+        },
+        G2a2TphSpec {
+            label: "TphDelayedAffine(d=3,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 3,
                 mul_a: 3,
                 add_b: 1,
             },
-        ),
-        (
-            "TphCrossSum(d=3,3,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_CrossLinear {
+        },
+        G2a2TphSpec {
+            label: "TphCrossSum(d=3,3,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_CrossLinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 3,
                 lag_1: 3,
                 op: CrossLinearOp::Add,
             },
-        ),
-        (
-            "TphCrossSum(d=3,5,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_CrossLinear {
+        },
+        G2a2TphSpec {
+            label: "TphCrossSum(d=3,5,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_CrossLinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 3,
                 lag_1: 5,
                 op: CrossLinearOp::Add,
             },
-        ),
-        (
-            "TphAddEqz(d=3,4,k=2)",
-            Width::BITS_2,
-            GeneratorConfig::T2_CrossNonlinear {
+        },
+        G2a2TphSpec {
+            label: "TphAddEqz(d=3,4,k=2)",
+            width: Width::BITS_2,
+            gen_cfg: GeneratorConfig::T2_CrossNonlinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 3,
                 lag_1: 4,
                 op: CrossNonlinearOp::AddEqz,
             },
-        ),
-        (
-            "TphMulEqzPair(d=4,4,k=1)",
-            Width::BITS_1,
-            GeneratorConfig::T2_CrossNonlinear {
+        },
+        G2a2TphSpec {
+            label: "TphMulEqzPair(d=4,4,k=1)",
+            width: Width::BITS_1,
+            gen_cfg: GeneratorConfig::T2_CrossNonlinear {
                 driver_0: d0,
                 driver_1: d1,
                 lag_0: 4,
                 lag_1: 4,
                 op: CrossNonlinearOp::MulEqzPair,
             },
-        ),
-    ];
+        },
+    ]
+}
 
-    for (label, width, gen_cfg) in tph_tasks {
-        let generator = gen_cfg.build(width).expect("valid Tph generator");
-        let channels = generator.channels();
-        let target = usize::from(channels) - 1;
-        let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
-        let res = run_learner_on_env(
-            &mut env,
-            width,
-            channels,
-            WireDelayMode::TicksPerHop,
-            horizon,
-            seeds_bank,
-            None,
-        );
-        seed_cliff.accumulate(&res.cliff);
-        if res.excluded {
-            excluded_cases += 1;
-        }
-        let edges_unit_hop = res
-            .learner
-            .editable()
-            .circuit()
-            .edges()
-            .iter()
-            .all(|e| e.hops == 1);
-        let target_sc = &res.scorecard.per_channel[target];
-        let ok = !res.excluded && target_sc.post_transient_clean_mismatches == 0 && edges_unit_hop;
-        if !ok {
-            all_ok = false;
-            failures.push(format!(
-                "G2A.2b {label} seed={master_seed}: clean_mis={} edges_unit_hop={edges_unit_hop} excl={}",
-                target_sc.post_transient_clean_mismatches, res.excluded
-            ));
-        }
-    }
-
-    SeedOutcome {
-        passed: all_ok && excluded_cases == 0,
-        cliff: seed_cliff,
-        excluded_cases,
-        failures,
+fn run_g2a2_deep_task(spec: &G2a2DeepSpec, master_seed: u64, horizon: u64) -> TaskOutcomePiece {
+    let seeds_bank = SeedBank::new(master_seed);
+    let generator = spec
+        .gen_cfg
+        .build(spec.width)
+        .expect("valid deep T2 generator");
+    let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
+    let res = run_learner_on_env(
+        &mut env,
+        spec.width,
+        2,
+        WireDelayMode::Combinational,
+        horizon,
+        seeds_bank,
+        None,
+    );
+    let target_sc = &res.scorecard.per_channel[1];
+    let ok = !res.excluded
+        && target_sc.post_transient_clean_mismatches == 0
+        && res.cliff.lag_deepening_steps >= 1;
+    let failure = (!ok).then(|| {
+        format!(
+            "G2A.2a DeepAffine(d={},k={}) seed={master_seed}: clean_mis={} deep_steps={} excl={}",
+            spec.lag,
+            spec.width.bits(),
+            target_sc.post_transient_clean_mismatches,
+            res.cliff.lag_deepening_steps,
+            res.excluded
+        )
+    });
+    TaskOutcomePiece {
+        ok,
+        excluded: res.excluded,
+        cliff: res.cliff,
+        failure,
     }
 }
 
-fn evaluate_g2a3_seed(master_seed: u64, horizon: u64) -> SeedOutcome {
-    let panels: Vec<(&str, Width, Vec<Vec<u64>>)> = vec![
+fn run_g2a2_m1_ring_task(master_seed: u64, horizon: u64) -> TaskOutcomePiece {
+    let seeds_bank = SeedBank::new(master_seed);
+    let gen_cfg = GeneratorConfig::T1_PeriodicMotif {
+        motif: vec![0, 0, 0, 0, 1],
+    };
+    let generator = gen_cfg.build(Width::BITS_1).unwrap();
+    let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
+    let res = run_learner_on_env(
+        &mut env,
+        Width::BITS_1,
+        1,
+        WireDelayMode::Combinational,
+        horizon,
+        seeds_bank,
+        None,
+    );
+    let ok = !res.excluded
+        && res.scorecard.per_channel[0].post_transient_clean_mismatches == 0
+        && res.learner.ring_closure_events() >= 1
+        && res.cliff.lag_deepening_steps == 0;
+    let failure = (!ok).then(|| {
+        format!(
+            "G2A.2a M1-RingInvariance seed={master_seed}: clean_mis={} rings={} deep_steps={}",
+            res.scorecard.per_channel[0].post_transient_clean_mismatches,
+            res.learner.ring_closure_events(),
+            res.cliff.lag_deepening_steps
+        )
+    });
+    TaskOutcomePiece {
+        ok,
+        excluded: res.excluded,
+        cliff: res.cliff,
+        failure,
+    }
+}
+
+fn run_g2a2_tph_task(spec: &G2a2TphSpec, master_seed: u64, horizon: u64) -> TaskOutcomePiece {
+    let seeds_bank = SeedBank::new(master_seed);
+    let generator = spec.gen_cfg.build(spec.width).expect("valid Tph generator");
+    let channels = generator.channels();
+    let target = usize::from(channels) - 1;
+    let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
+    let res = run_learner_on_env(
+        &mut env,
+        spec.width,
+        channels,
+        WireDelayMode::TicksPerHop,
+        horizon,
+        seeds_bank,
+        None,
+    );
+    let edges_unit_hop = res
+        .learner
+        .editable()
+        .circuit()
+        .edges()
+        .iter()
+        .all(|e| e.hops == 1);
+    let target_sc = &res.scorecard.per_channel[target];
+    let ok = !res.excluded && target_sc.post_transient_clean_mismatches == 0 && edges_unit_hop;
+    let failure = (!ok).then(|| {
+        format!(
+            "G2A.2b {} seed={master_seed}: clean_mis={} edges_unit_hop={edges_unit_hop} excl={}",
+            spec.label, target_sc.post_transient_clean_mismatches, res.excluded
+        )
+    });
+    TaskOutcomePiece {
+        ok,
+        excluded: res.excluded,
+        cliff: res.cliff,
+        failure,
+    }
+}
+
+struct G2a3SoloSpec {
+    panel_label: &'static str,
+    width: Width,
+    wire_delay: WireDelayMode,
+    motif: Vec<u64>,
+}
+
+struct G2a3MultiSpec {
+    panel_label: &'static str,
+    width: Width,
+    wire_delay: WireDelayMode,
+    motifs: Vec<Vec<u64>>,
+    solo_indices: Vec<usize>,
+}
+
+fn g2a3_specs() -> (Vec<G2a3SoloSpec>, Vec<G2a3MultiSpec>) {
+    let panels: [(&'static str, Width, Vec<Vec<u64>>); 6] = [
         ("K=2,k=1", Width::BITS_1, vec![vec![0, 1], vec![0, 1, 1]]),
         ("K=2,k=2", Width::BITS_2, vec![vec![0, 3], vec![0, 1, 3]]),
         (
@@ -968,16 +1015,9 @@ fn evaluate_g2a3_seed(master_seed: u64, horizon: u64) -> SeedOutcome {
         ),
     ];
 
-    let w_diag = GrowthConfig::default().diagnostic_window as f64;
-    let seeds_bank = SeedBank::new(master_seed);
-    let mut seed_cliff = CliffCountersSummary::default();
-    let mut excluded_cases = 0usize;
-    let mut failures = Vec::new();
-    let mut all_ok = true;
-
-    // Cache solo K=1 runs by (k_bits, wire_delay_tag, motif) within this seed so shared channels
-    // across K=2,3,4 are evaluated only once per (k, wire_delay, motif).
-    let mut solo_cache: BTreeMap<(u8, u8, Vec<u64>), Option<u64>> = BTreeMap::new();
+    let mut solo_map: BTreeMap<(u8, u8, Vec<u64>), usize> = BTreeMap::new();
+    let mut solos = Vec::new();
+    let mut multis = Vec::with_capacity(panels.len() * 2);
 
     for wire_delay in [WireDelayMode::Combinational, WireDelayMode::TicksPerHop] {
         let wd_tag = match wire_delay {
@@ -985,73 +1025,163 @@ fn evaluate_g2a3_seed(master_seed: u64, horizon: u64) -> SeedOutcome {
             WireDelayMode::TicksPerHop => 1u8,
         };
         for (panel_label, width, motifs) in &panels {
-            let mut solo_locks = Vec::with_capacity(motifs.len());
+            let mut solo_indices = Vec::with_capacity(motifs.len());
             for motif in motifs {
                 let key = (width.bits(), wd_tag, motif.clone());
-                let t_solo = if let Some(&cached) = solo_cache.get(&key) {
-                    cached
+                let idx = if let Some(&existing) = solo_map.get(&key) {
+                    existing
                 } else {
-                    let s_gen = MultiChannelPeriodicGenerator::new(
-                        format!("G2A3Solo:{panel_label}"),
-                        *width,
-                        vec![motif.clone()],
-                    );
-                    let mut s_env =
-                        NoisyEnvironment::new(s_gen, NoiseModel::None, seeds_bank).unwrap();
-                    let s_res = run_learner_on_env(
-                        &mut s_env, *width, 1, wire_delay, horizon, seeds_bank, None,
-                    );
-                    seed_cliff.accumulate(&s_res.cliff);
-                    if s_res.excluded {
-                        excluded_cases += 1;
-                        all_ok = false;
-                    }
-                    let t_lock = if s_res.excluded
-                        || s_res.scorecard.per_channel[0].post_transient_clean_mismatches != 0
-                    {
-                        None
-                    } else {
-                        s_res.scorecard.per_channel[0].ticks_to_clean_solution
-                    };
-                    solo_cache.insert(key, t_lock);
-                    t_lock
+                    let next_idx = solos.len();
+                    solos.push(G2a3SoloSpec {
+                        panel_label,
+                        width: *width,
+                        wire_delay,
+                        motif: motif.clone(),
+                    });
+                    solo_map.insert(key, next_idx);
+                    next_idx
                 };
-                solo_locks.push(t_solo);
+                solo_indices.push(idx);
             }
+            multis.push(G2a3MultiSpec {
+                panel_label,
+                width: *width,
+                wire_delay,
+                motifs: motifs.clone(),
+                solo_indices,
+            });
+        }
+    }
 
-            let m_gen = MultiChannelPeriodicGenerator::new(
-                format!("G2A3Multi:{panel_label}"),
-                *width,
-                motifs.clone(),
-            );
-            let k_ports = m_gen.channels();
-            let mut m_env = NoisyEnvironment::new(m_gen, NoiseModel::None, seeds_bank).unwrap();
-            let m_res = run_learner_on_env(
-                &mut m_env, *width, k_ports, wire_delay, horizon, seeds_bank, None,
-            );
-            seed_cliff.accumulate(&m_res.cliff);
-            if m_res.excluded {
-                excluded_cases += 1;
-                all_ok = false;
-            }
+    (solos, multis)
+}
 
-            for (ch, solo_t) in solo_locks.iter().enumerate() {
-                let ch_sc = &m_res.scorecard.per_channel[ch];
-                let ch_ok = match (*solo_t, ch_sc.ticks_to_clean_solution) {
-                    (Some(ts), Some(tm)) if !m_res.excluded => {
-                        ch_sc.post_transient_clean_mismatches == 0
-                            && (tm as f64) <= 1.50 * (ts as f64).max(w_diag)
-                    }
-                    _ => false,
-                };
-                if !ch_ok {
+#[derive(Default)]
+struct G2a3SoloOutcome {
+    cliff: CliffCountersSummary,
+    excluded: bool,
+    t_lock: Option<u64>,
+}
+
+#[derive(Default)]
+struct G2a3MultiOutcome {
+    cliff: CliffCountersSummary,
+    excluded: bool,
+    channels: Vec<(Option<u64>, u64)>,
+}
+
+fn run_g2a3_solo_task(spec: &G2a3SoloSpec, master_seed: u64, horizon: u64) -> G2a3SoloOutcome {
+    let seeds_bank = SeedBank::new(master_seed);
+    let s_gen = MultiChannelPeriodicGenerator::new(
+        format!("G2A3Solo:{}", spec.panel_label),
+        spec.width,
+        vec![spec.motif.clone()],
+    );
+    let mut s_env = NoisyEnvironment::new(s_gen, NoiseModel::None, seeds_bank).unwrap();
+    let s_res = run_learner_on_env(
+        &mut s_env,
+        spec.width,
+        1,
+        spec.wire_delay,
+        horizon,
+        seeds_bank,
+        None,
+    );
+    let t_lock =
+        if s_res.excluded || s_res.scorecard.per_channel[0].post_transient_clean_mismatches != 0 {
+            None
+        } else {
+            s_res.scorecard.per_channel[0].ticks_to_clean_solution
+        };
+    G2a3SoloOutcome {
+        cliff: s_res.cliff,
+        excluded: s_res.excluded,
+        t_lock,
+    }
+}
+
+fn run_g2a3_multi_task(spec: &G2a3MultiSpec, master_seed: u64, horizon: u64) -> G2a3MultiOutcome {
+    let seeds_bank = SeedBank::new(master_seed);
+    let m_gen = MultiChannelPeriodicGenerator::new(
+        format!("G2A3Multi:{}", spec.panel_label),
+        spec.width,
+        spec.motifs.clone(),
+    );
+    let k_ports = m_gen.channels();
+    let mut m_env = NoisyEnvironment::new(m_gen, NoiseModel::None, seeds_bank).unwrap();
+    let m_res = run_learner_on_env(
+        &mut m_env,
+        spec.width,
+        k_ports,
+        spec.wire_delay,
+        horizon,
+        seeds_bank,
+        None,
+    );
+    let channels = m_res
+        .scorecard
+        .per_channel
+        .iter()
+        .map(|sc| {
+            (
+                sc.ticks_to_clean_solution,
+                sc.post_transient_clean_mismatches,
+            )
+        })
+        .collect();
+    G2a3MultiOutcome {
+        cliff: m_res.cliff,
+        excluded: m_res.excluded,
+        channels,
+    }
+}
+
+fn reduce_g2a3_seed(
+    master_seed: u64,
+    solos: &[G2a3SoloOutcome],
+    multis: &[G2a3MultiOutcome],
+    multi_specs: &[G2a3MultiSpec],
+) -> SeedOutcome {
+    let w_diag = GrowthConfig::default().diagnostic_window as f64;
+    let mut seed_cliff = CliffCountersSummary::default();
+    let mut excluded_cases = 0usize;
+    let mut failures = Vec::new();
+    let mut all_ok = true;
+
+    let mut solo_seen = vec![false; solos.len()];
+    for (m_out, m_spec) in multis.iter().zip(multi_specs) {
+        for &solo_idx in &m_spec.solo_indices {
+            if !solo_seen[solo_idx] {
+                solo_seen[solo_idx] = true;
+                let s = &solos[solo_idx];
+                seed_cliff.accumulate(&s.cliff);
+                if s.excluded {
+                    excluded_cases += 1;
                     all_ok = false;
-                    failures.push(format!(
-                        "G2A.3 {panel_label} {wire_delay:?} ch={ch} seed={master_seed}: \
-                         solo={solo_t:?} multi={:?} clean_mis={}",
-                        ch_sc.ticks_to_clean_solution, ch_sc.post_transient_clean_mismatches
-                    ));
                 }
+            }
+        }
+        seed_cliff.accumulate(&m_out.cliff);
+        if m_out.excluded {
+            excluded_cases += 1;
+            all_ok = false;
+        }
+        for (ch, &solo_idx) in m_spec.solo_indices.iter().enumerate() {
+            let solo_t = solos[solo_idx].t_lock;
+            let (tm_opt, clean_mis) = m_out.channels[ch];
+            let ch_ok = match (solo_t, tm_opt) {
+                (Some(ts), Some(tm)) if !m_out.excluded => {
+                    clean_mis == 0 && (tm as f64) <= 1.50 * (ts as f64).max(w_diag)
+                }
+                _ => false,
+            };
+            if !ch_ok {
+                all_ok = false;
+                failures.push(format!(
+                    "G2A.3 {} {:?} ch={ch} seed={master_seed}: \
+                     solo={solo_t:?} multi={tm_opt:?} clean_mis={clean_mis}",
+                    m_spec.panel_label, m_spec.wire_delay
+                ));
             }
         }
     }
@@ -1171,12 +1301,6 @@ impl PredictorBaseline for CausalReactiveOracle {
     }
 }
 
-struct G2a4SeedOutcome {
-    outcome: SeedOutcome,
-    /// Per-task `(kt_learner, h_reactive)` samples for the 4 all-channel noise tasks.
-    all_noise_samples: [(f64, f64); 4],
-}
-
 fn max_g2a4b_mean_h_reactive_dev(samples: &[[(f64, f64); 4]]) -> f64 {
     if samples.is_empty() {
         return 0.0;
@@ -1191,18 +1315,29 @@ fn max_g2a4b_mean_h_reactive_dev(samples: &[[(f64, f64); 4]]) -> f64 {
     max_dev
 }
 
-fn evaluate_g2a4_seed(master_seed: u64, horizon: u64) -> G2a4SeedOutcome {
-    const EPSILON: f64 = 0.05;
+const G2A4_EPSILON: f64 = 0.05;
+
+struct G2a4aTaskSpec {
+    label: &'static str,
+    width: Width,
+    gen_cfg: GeneratorConfig,
+    epsilon_machine: Option<EpsilonMachineSummary>,
+}
+
+struct G2a4bTaskSpec {
+    label: &'static str,
+    width: Width,
+    m_inputs: usize,
+    gen_cfg: GeneratorConfig,
+}
+
+fn g2a4_base_specs() -> (
+    Vec<(&'static str, Width, GeneratorConfig)>,
+    Vec<G2a4bTaskSpec>,
+) {
     let d0 = driver_small_0();
     let d1 = driver_small_1();
-    let seeds_bank = SeedBank::new(master_seed);
-    let mut seed_cliff = CliffCountersSummary::default();
-    let mut excluded_cases = 0usize;
-    let mut failures = Vec::new();
-    let mut all_ok = true;
-
-    // (a) Target-only noise (paired target-channel KT regret vs clean-target Bayes oracle <= 0.030).
-    let target_only_tasks: Vec<(&str, Width, GeneratorConfig)> = vec![
+    let a = vec![
         (
             "TargetNoise:DelayedAffine(d=2,k=1)",
             Width::BITS_1,
@@ -1257,162 +1392,173 @@ fn evaluate_g2a4_seed(master_seed: u64, horizon: u64) -> G2a4SeedOutcome {
             },
         ),
     ];
-
-    for (label, width, gen_cfg) in target_only_tasks {
-        let generator = gen_cfg.build(width).unwrap();
-        let channels = generator.channels();
-        let target = usize::from(channels) - 1;
-        let noise = NoiseModel::IndependentSubstitution {
-            epsilon: EPSILON,
-            channels: vec![target as u16],
-        };
-        let gt = compute_ground_truth_yardstick(
-            &gen_cfg,
-            width,
-            WireDelayMode::Combinational,
-            &noise,
-            512,
-            None,
-        )
-        .expect("ground truth yardstick succeeds on small coprime LFSRs");
-        let mut env = NoisyEnvironment::new(generator, noise, seeds_bank).unwrap();
-        let res = run_learner_on_env(
-            &mut env,
-            width,
-            channels,
-            WireDelayMode::Combinational,
-            horizon,
-            seeds_bank,
-            gt.epsilon_machine.as_ref(),
-        );
-        seed_cliff.accumulate(&res.cliff);
-        if res.excluded {
-            excluded_cases += 1;
-        }
-        let target_sc = &res.scorecard.per_channel[target];
-        let regret = target_sc.paired_residual_regret_bits_per_symbol;
-        let ok = !res.excluded && regret.is_some_and(|r| r <= 0.030);
-        if !ok {
-            all_ok = false;
-            failures.push(format!(
-                "G2A.4a {label} seed={master_seed}: paired_regret={regret:?} kt={:.4} excl={}",
-                target_sc.prequential_kt_residual_bits_per_symbol, res.excluded
-            ));
-        }
-    }
-
-    // (b) All-channel observation noise (channels = 0..K): within <= 0.040 b/sym of H_reactive(eps, m, k).
-    let all_channel_tasks: Vec<(&str, Width, usize, GeneratorConfig)> = vec![
-        (
-            "AllNoise:DelayedAffine(d=2,k=1)",
-            Width::BITS_1,
-            1,
-            GeneratorConfig::T2_DelayedAffine {
+    let b = vec![
+        G2a4bTaskSpec {
+            label: "AllNoise:DelayedAffine(d=2,k=1)",
+            width: Width::BITS_1,
+            m_inputs: 1,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 2,
                 mul_a: 1,
                 add_b: 1,
             },
-        ),
-        (
-            "AllNoise:DelayedAffine(d=2,k=2)",
-            Width::BITS_2,
-            1,
-            GeneratorConfig::T2_DelayedAffine {
+        },
+        G2a4bTaskSpec {
+            label: "AllNoise:DelayedAffine(d=2,k=2)",
+            width: Width::BITS_2,
+            m_inputs: 1,
+            gen_cfg: GeneratorConfig::T2_DelayedAffine {
                 driver: d0.clone(),
                 lag: 2,
                 mul_a: 1,
                 add_b: 1,
             },
-        ),
-        (
-            "AllNoise:CrossAdd(d=1,2,k=1)",
-            Width::BITS_1,
-            2,
-            GeneratorConfig::T2_CrossLinear {
+        },
+        G2a4bTaskSpec {
+            label: "AllNoise:CrossAdd(d=1,2,k=1)",
+            width: Width::BITS_1,
+            m_inputs: 2,
+            gen_cfg: GeneratorConfig::T2_CrossLinear {
                 driver_0: d0.clone(),
                 driver_1: d1.clone(),
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossLinearOp::Add,
             },
-        ),
-        (
-            "AllNoise:CrossAdd(d=1,2,k=2)",
-            Width::BITS_2,
-            2,
-            GeneratorConfig::T2_CrossLinear {
+        },
+        G2a4bTaskSpec {
+            label: "AllNoise:CrossAdd(d=1,2,k=2)",
+            width: Width::BITS_2,
+            m_inputs: 2,
+            gen_cfg: GeneratorConfig::T2_CrossLinear {
                 driver_0: d0,
                 driver_1: d1,
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossLinearOp::Add,
             },
-        ),
-    ];
-
-    let mut all_noise_samples = [(0.0f64, 0.0f64); 4];
-    for (task_idx, (label, width, m_inputs, gen_cfg)) in all_channel_tasks.into_iter().enumerate() {
-        let generator = gen_cfg.build(width).unwrap();
-        let channels = generator.channels();
-        let target = usize::from(channels) - 1;
-        let noise = NoiseModel::IndependentSubstitution {
-            epsilon: EPSILON,
-            channels: (0..channels).collect(),
-        };
-        let mut oracle_env =
-            NoisyEnvironment::new(gen_cfg.build(width).unwrap(), noise.clone(), seeds_bank)
-                .unwrap();
-        let mut oracle = CausalReactiveOracle::from_config(width, channels, &gen_cfg);
-        let oracle_sc = run_prequential_harness(
-            &mut oracle_env,
-            &mut oracle,
-            horizon,
-            DEFAULT_M2A_WARMUP,
-            DEFAULT_M2A_BUDGET,
-            None,
-            None,
-        );
-        let oracle_kt = oracle_sc.per_channel[target].prequential_kt_residual_bits_per_symbol;
-
-        let mut env = NoisyEnvironment::new(generator, noise, seeds_bank).unwrap();
-        let res = run_learner_on_env(
-            &mut env,
-            width,
-            channels,
-            WireDelayMode::Combinational,
-            horizon,
-            seeds_bank,
-            None,
-        );
-        seed_cliff.accumulate(&res.cliff);
-        if res.excluded {
-            excluded_cases += 1;
-        }
-        let target_sc = &res.scorecard.per_channel[target];
-        let kt = target_sc.prequential_kt_residual_bits_per_symbol;
-        let h_react = compound_reactive_entropy_bits(EPSILON, m_inputs, width.bits());
-        all_noise_samples[task_idx] = (kt, h_react);
-        let paired_diff = (kt - oracle_kt).abs();
-        let ok = !res.excluded && paired_diff <= 0.040;
-        if !ok {
-            all_ok = false;
-            failures.push(format!(
-                "G2A.4b {label} seed={master_seed}: kt={kt:.4} oracle_kt={oracle_kt:.4} |paired_diff|={paired_diff:.4} H_reactive={h_react:.4} excl={}",
-                res.excluded
-            ));
-        }
-    }
-
-    G2a4SeedOutcome {
-        outcome: SeedOutcome {
-            passed: all_ok && excluded_cases == 0,
-            cliff: seed_cliff,
-            excluded_cases,
-            failures,
         },
-        all_noise_samples,
+    ];
+    (a, b)
+}
+
+fn build_g2a4a_machine(width: Width, gen_cfg: &GeneratorConfig) -> Option<EpsilonMachineSummary> {
+    let generator = gen_cfg.build(width).unwrap();
+    let target = usize::from(generator.channels()) - 1;
+    let noise = NoiseModel::IndependentSubstitution {
+        epsilon: G2A4_EPSILON,
+        channels: vec![target as u16],
+    };
+    compute_ground_truth_yardstick(
+        gen_cfg,
+        width,
+        WireDelayMode::Combinational,
+        &noise,
+        512,
+        None,
+    )
+    .expect("ground truth yardstick succeeds on small coprime LFSRs")
+    .epsilon_machine
+}
+
+fn run_g2a4a_task(spec: &G2a4aTaskSpec, master_seed: u64, horizon: u64) -> TaskOutcomePiece {
+    let seeds_bank = SeedBank::new(master_seed);
+    let generator = spec.gen_cfg.build(spec.width).unwrap();
+    let channels = generator.channels();
+    let target = usize::from(channels) - 1;
+    let noise = NoiseModel::IndependentSubstitution {
+        epsilon: G2A4_EPSILON,
+        channels: vec![target as u16],
+    };
+    let mut env = NoisyEnvironment::new(generator, noise, seeds_bank).unwrap();
+    let res = run_learner_on_env(
+        &mut env,
+        spec.width,
+        channels,
+        WireDelayMode::Combinational,
+        horizon,
+        seeds_bank,
+        spec.epsilon_machine.as_ref(),
+    );
+    let target_sc = &res.scorecard.per_channel[target];
+    let regret = target_sc.paired_residual_regret_bits_per_symbol;
+    let ok = !res.excluded && regret.is_some_and(|r| r <= 0.030);
+    let failure = (!ok).then(|| {
+        format!(
+            "G2A.4a {} seed={master_seed}: paired_regret={regret:?} kt={:.4} excl={}",
+            spec.label, target_sc.prequential_kt_residual_bits_per_symbol, res.excluded
+        )
+    });
+    TaskOutcomePiece {
+        ok,
+        excluded: res.excluded,
+        cliff: res.cliff,
+        failure,
     }
+}
+
+fn run_g2a4b_task(
+    spec: &G2a4bTaskSpec,
+    master_seed: u64,
+    horizon: u64,
+) -> (TaskOutcomePiece, (f64, f64)) {
+    let seeds_bank = SeedBank::new(master_seed);
+    let generator = spec.gen_cfg.build(spec.width).unwrap();
+    let channels = generator.channels();
+    let target = usize::from(channels) - 1;
+    let noise = NoiseModel::IndependentSubstitution {
+        epsilon: G2A4_EPSILON,
+        channels: (0..channels).collect(),
+    };
+    let mut oracle_env = NoisyEnvironment::new(
+        spec.gen_cfg.build(spec.width).unwrap(),
+        noise.clone(),
+        seeds_bank,
+    )
+    .unwrap();
+    let mut oracle = CausalReactiveOracle::from_config(spec.width, channels, &spec.gen_cfg);
+    let oracle_sc = run_prequential_harness(
+        &mut oracle_env,
+        &mut oracle,
+        horizon,
+        DEFAULT_M2A_WARMUP,
+        DEFAULT_M2A_BUDGET,
+        None,
+        None,
+    );
+    let oracle_kt = oracle_sc.per_channel[target].prequential_kt_residual_bits_per_symbol;
+
+    let mut env = NoisyEnvironment::new(generator, noise, seeds_bank).unwrap();
+    let res = run_learner_on_env(
+        &mut env,
+        spec.width,
+        channels,
+        WireDelayMode::Combinational,
+        horizon,
+        seeds_bank,
+        None,
+    );
+    let target_sc = &res.scorecard.per_channel[target];
+    let kt = target_sc.prequential_kt_residual_bits_per_symbol;
+    let h_react = compound_reactive_entropy_bits(G2A4_EPSILON, spec.m_inputs, spec.width.bits());
+    let paired_diff = (kt - oracle_kt).abs();
+    let ok = !res.excluded && paired_diff <= 0.040;
+    let failure = (!ok).then(|| {
+        format!(
+            "G2A.4b {} seed={master_seed}: kt={kt:.4} oracle_kt={oracle_kt:.4} |paired_diff|={paired_diff:.4} H_reactive={h_react:.4} excl={}",
+            spec.label, res.excluded
+        )
+    });
+    (
+        TaskOutcomePiece {
+            ok,
+            excluded: res.excluded,
+            cliff: res.cliff,
+            failure,
+        },
+        (kt, h_react),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -1528,52 +1674,6 @@ struct DeterministicG2a5Cache {
     cross_ctw: Vec<G2a5RunMetrics>,
 }
 
-fn build_deterministic_g2a5_cache(panel: &[G2a5TaskSpec], horizon: u64) -> DeterministicG2a5Cache {
-    let zero_seed = SeedBank::new(0);
-    let mut ctw = Vec::with_capacity(panel.len());
-    let mut reeds_sloane = Vec::with_capacity(panel.len());
-    let mut cross_ctw = Vec::with_capacity(panel.len());
-
-    for spec in panel {
-        let channels = spec.gen_cfg.build(spec.width).unwrap().channels();
-        ctw.push(run_baseline_on_g2a5(
-            spec,
-            Box::new(CtwBaseline::new(spec.width, channels, 9)),
-            horizon,
-            zero_seed,
-        ));
-        reeds_sloane.push(run_baseline_on_g2a5(
-            spec,
-            Box::new(ReedsSloaneBaseline::new(spec.width, channels)),
-            horizon,
-            zero_seed,
-        ));
-        cross_ctw.push(run_baseline_on_g2a5(
-            spec,
-            Box::new(CrossChannelCtwBaseline::with_default_depth(
-                spec.width, channels,
-            )),
-            horizon,
-            zero_seed,
-        ));
-    }
-
-    DeterministicG2a5Cache {
-        ctw,
-        reeds_sloane,
-        cross_ctw,
-    }
-}
-
-struct G2a5SeedResult {
-    passed: bool,
-    cliff: CliffCountersSummary,
-    excluded_cases: usize,
-    /// Per task index: [Arkhe, RandomSearch, CGP, CTW, ReedsSloane, CrossCTW, RNN].
-    per_task_metrics: Vec<[G2a5RunMetrics; 7]>,
-    failures: Vec<String>,
-}
-
 /// Per-seed G2A.5 pass condition against online search baselines (`RandomSearch`, `CGP`):
 /// either Arkhe achieves >= 0.25 b/sym KT residual advantage, or both predictors attain
 /// exact `100%` post-transient clean match rate within floating-point parity (`<= 1e-6` b/sym).
@@ -1584,108 +1684,98 @@ fn g2a5_search_baseline_seed_ok(arkhe_m: &G2a5RunMetrics, baseline_m: &G2a5RunMe
             && (arkhe_m.target_kt - baseline_m.target_kt).abs() <= 1e-6)
 }
 
-fn evaluate_g2a5_seed(
+fn run_g2a5_task(
+    spec: &G2a5TaskSpec,
+    det_idx: usize,
+    det_cache: &DeterministicG2a5Cache,
     master_seed: u64,
     horizon: u64,
-    panel: &[G2a5TaskSpec],
-    det_cache: &DeterministicG2a5Cache,
-) -> G2a5SeedResult {
+) -> (TaskOutcomePiece, [G2a5RunMetrics; 7]) {
     let seeds_bank = SeedBank::new(master_seed);
     let mut cliff = CliffCountersSummary::default();
-    let mut excluded_cases = 0usize;
-    let mut per_task_metrics = Vec::with_capacity(panel.len());
-    let mut failures = Vec::new();
-    let mut all_ok = true;
 
-    for (idx, spec) in panel.iter().enumerate() {
-        let generator = spec.gen_cfg.build(spec.width).unwrap();
-        let channels = generator.channels();
-        let target = usize::from(channels) - 1;
-        let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
-        let arkhe = run_learner_on_env(
-            &mut env,
+    let generator = spec.gen_cfg.build(spec.width).unwrap();
+    let channels = generator.channels();
+    let target = usize::from(channels) - 1;
+    let mut env = NoisyEnvironment::new(generator, NoiseModel::None, seeds_bank).unwrap();
+    let arkhe = run_learner_on_env(
+        &mut env,
+        spec.width,
+        channels,
+        WireDelayMode::Combinational,
+        horizon,
+        seeds_bank,
+        None,
+    );
+    cliff.accumulate(&arkhe.cliff);
+    let arkhe_m = G2a5RunMetrics::from_scorecard(&arkhe.scorecard, target);
+    let rs_m = run_baseline_on_g2a5(
+        spec,
+        Box::new(RandomSearchBaseline::new(
             spec.width,
             channels,
             WireDelayMode::Combinational,
-            horizon,
+            5,
+            128,
+            32,
             seeds_bank,
-            None,
-        );
-        cliff.accumulate(&arkhe.cliff);
-        if arkhe.excluded {
-            excluded_cases += 1;
-            all_ok = false;
-        }
-        let arkhe_m = G2a5RunMetrics::from_scorecard(&arkhe.scorecard, target);
-        let rs_m = run_baseline_on_g2a5(
-            spec,
-            Box::new(RandomSearchBaseline::new(
-                spec.width,
-                channels,
-                WireDelayMode::Combinational,
-                5,
-                128,
-                32,
-                seeds_bank,
-            )),
-            horizon,
+        )),
+        horizon,
+        seeds_bank,
+    );
+    let cgp_m = run_baseline_on_g2a5(
+        spec,
+        Box::new(CgpBaseline::new(
+            spec.width,
+            channels,
+            WireDelayMode::Combinational,
+            4,
+            8,
+            128,
             seeds_bank,
-        );
-        let cgp_m = run_baseline_on_g2a5(
-            spec,
-            Box::new(CgpBaseline::new(
-                spec.width,
-                channels,
-                WireDelayMode::Combinational,
-                4,
-                8,
-                128,
-                seeds_bank,
-            )),
-            horizon,
-            seeds_bank,
-        );
-        let ctw_m = det_cache.ctw[idx].clone();
-        let bm_m = det_cache.reeds_sloane[idx].clone();
-        let cross_ctw_m = det_cache.cross_ctw[idx].clone();
-        let rnn_m = run_baseline_on_g2a5(
-            spec,
-            Box::new(RnnBaseline::with_defaults(spec.width, channels, seeds_bank).unwrap()),
-            horizon,
-            seeds_bank,
-        );
+        )),
+        horizon,
+        seeds_bank,
+    );
+    let ctw_m = det_cache.ctw[det_idx].clone();
+    let bm_m = det_cache.reeds_sloane[det_idx].clone();
+    let cross_ctw_m = det_cache.cross_ctw[det_idx].clone();
+    let rnn_m = run_baseline_on_g2a5(
+        spec,
+        Box::new(RnnBaseline::with_defaults(spec.width, channels, seeds_bank).unwrap()),
+        horizon,
+        seeds_bank,
+    );
 
-        let rs_ok = g2a5_search_baseline_seed_ok(&arkhe_m, &rs_m);
-        let cgp_ok = g2a5_search_baseline_seed_ok(&arkhe_m, &cgp_m);
-        let mut task_ok = !arkhe.excluded && rs_ok && cgp_ok;
-        if spec.nonlinear {
-            let margin_ctw = ctw_m.target_kt - arkhe_m.target_kt;
-            let margin_bm = bm_m.target_kt - arkhe_m.target_kt;
-            task_ok = task_ok && margin_ctw >= 0.25 && margin_bm >= 0.25;
-        }
-        if !task_ok {
-            all_ok = false;
-            failures.push(format!(
-                "G2A.5 {} seed={master_seed}: arkhe={:.4} rs={:.4} cgp={:.4} ctw={:.4} bm={:.4}",
-                spec.label,
-                arkhe_m.target_kt,
-                rs_m.target_kt,
-                cgp_m.target_kt,
-                ctw_m.target_kt,
-                bm_m.target_kt
-            ));
-        }
-
-        per_task_metrics.push([arkhe_m, rs_m, cgp_m, ctw_m, bm_m, cross_ctw_m, rnn_m]);
+    let rs_ok = g2a5_search_baseline_seed_ok(&arkhe_m, &rs_m);
+    let cgp_ok = g2a5_search_baseline_seed_ok(&arkhe_m, &cgp_m);
+    let mut task_ok = !arkhe.excluded && rs_ok && cgp_ok;
+    if spec.nonlinear {
+        let margin_ctw = ctw_m.target_kt - arkhe_m.target_kt;
+        let margin_bm = bm_m.target_kt - arkhe_m.target_kt;
+        task_ok = task_ok && margin_ctw >= 0.25 && margin_bm >= 0.25;
     }
+    let failure = (!task_ok).then(|| {
+        format!(
+            "G2A.5 {} seed={master_seed}: arkhe={:.4} rs={:.4} cgp={:.4} ctw={:.4} bm={:.4}",
+            spec.label,
+            arkhe_m.target_kt,
+            rs_m.target_kt,
+            cgp_m.target_kt,
+            ctw_m.target_kt,
+            bm_m.target_kt
+        )
+    });
 
-    G2a5SeedResult {
-        passed: all_ok && excluded_cases == 0,
-        cliff,
-        excluded_cases,
-        per_task_metrics,
-        failures,
-    }
+    (
+        TaskOutcomePiece {
+            ok: task_ok,
+            excluded: arkhe.excluded,
+            cliff,
+            failure,
+        },
+        [arkhe_m, rs_m, cgp_m, ctw_m, bm_m, cross_ctw_m, rnn_m],
+    )
 }
 
 const G2A5_BASELINE_NAMES: [&str; 7] = [
@@ -1780,103 +1870,570 @@ struct EvaluatedSingleBank {
     raw_g2a5_metrics: Vec<Vec<[G2a5RunMetrics; 7]>>,
 }
 
+const M2A_GATE_SPECS: [(&str, f64); 5] = [
+    ("G2A.1", 0.90),
+    ("G2A.2", 0.90),
+    ("G2A.3", 0.90),
+    ("G2A.4", 0.85),
+    ("G2A.5", 0.85),
+];
+
 struct AllGatesSeedOutcome {
-    gates: [SeedOutcome; 4],
+    gates: [SeedOutcome; 5],
     g4b_samples: [(f64, f64); 4],
-    g5: G2a5SeedResult,
+    g5_metrics: Vec<[G2a5RunMetrics; 7]>,
 }
 
-fn run_single_bank_internal(
-    seed_offset: u32,
-    seeds: u32,
-    horizon: u64,
-    parallel_seeds: bool,
-    det_g2a5: &DeterministicG2a5Cache,
-) -> EvaluatedSingleBank {
-    let seeds_tested = seeds.max(1);
-    let panel = g2a5_panel_specs();
+/// Shared task specs plus deterministic yardstick/baseline caches built in parallel once per run.
+struct M2aSharedSpecs {
+    g1: Vec<G2a1TaskSpec>,
+    g2_deep: Vec<G2a2DeepSpec>,
+    g2_tph: Vec<G2a2TphSpec>,
+    g3_solos: Vec<G2a3SoloSpec>,
+    g3_multis: Vec<G2a3MultiSpec>,
+    g4a: Vec<G2a4aTaskSpec>,
+    g4b: Vec<G2a4bTaskSpec>,
+    g5_panel: Vec<G2a5TaskSpec>,
+    det_g5: DeterministicG2a5Cache,
+}
 
-    let eval_one_seed = |seed_idx: u32| -> AllGatesSeedOutcome {
-        let master_seed = u64::from(seed_offset + seed_idx);
-        let g4 = evaluate_g2a4_seed(master_seed, horizon);
-        AllGatesSeedOutcome {
-            gates: [
-                evaluate_g2a1_seed(master_seed, horizon),
-                evaluate_g2a2_seed(master_seed, horizon),
-                evaluate_g2a3_seed(master_seed, horizon),
-                g4.outcome,
-            ],
-            g4b_samples: g4.all_noise_samples,
-            g5: evaluate_g2a5_seed(master_seed, horizon, &panel, det_g2a5),
-        }
-    };
+enum DeterministicInitOut {
+    G4a(usize, Option<EpsilonMachineSummary>),
+    Ctw(usize, G2a5RunMetrics),
+    Bm(usize, G2a5RunMetrics),
+    CrossCtw(usize, G2a5RunMetrics),
+}
 
-    let mut per_seed: Vec<Option<AllGatesSeedOutcome>> = (0..seeds_tested).map(|_| None).collect();
+impl M2aSharedSpecs {
+    fn build(horizon: u64) -> Self {
+        let g1 = g2a1_task_specs();
+        let g2_deep = g2a2_deep_specs();
+        let g2_tph = g2a2_tph_specs();
+        let (g3_solos, g3_multis) = g2a3_specs();
+        let (g4a_bases, g4b) = g2a4_base_specs();
+        let g5_panel = g2a5_panel_specs();
 
-    if parallel_seeds && seeds_tested > 1 {
+        let n4a = g4a_bases.len();
+        let n5 = g5_panel.len();
+        let total_jobs = n4a + n5 * 3;
+        let next_job = AtomicUsize::new(0);
         let num_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(seeds_tested as usize)
+            .min(total_jobs)
             .max(1);
-        std::thread::scope(|s| {
-            let chunk_size = (seeds_tested as usize).div_ceil(num_threads);
-            for (chunk_idx, slice) in per_seed.chunks_mut(chunk_size).enumerate() {
-                let start = chunk_idx * chunk_size;
-                s.spawn(move || {
-                    for (off, slot) in slice.iter_mut().enumerate() {
-                        *slot = Some(eval_one_seed((start + off) as u32));
-                    }
-                });
+        let zero_seed = SeedBank::new(0);
+
+        let run_job = |job_idx: usize| -> DeterministicInitOut {
+            if job_idx < n4a {
+                let (_, width, ref gen_cfg) = g4a_bases[job_idx];
+                DeterministicInitOut::G4a(job_idx, build_g2a4a_machine(width, gen_cfg))
+            } else {
+                let rem = job_idx - n4a;
+                let task_idx = rem / 3;
+                let kind = rem % 3;
+                let spec = &g5_panel[task_idx];
+                let channels = spec.gen_cfg.build(spec.width).unwrap().channels();
+                match kind {
+                    0 => DeterministicInitOut::Ctw(
+                        task_idx,
+                        run_baseline_on_g2a5(
+                            spec,
+                            Box::new(CtwBaseline::new(spec.width, channels, 9)),
+                            horizon,
+                            zero_seed,
+                        ),
+                    ),
+                    1 => DeterministicInitOut::Bm(
+                        task_idx,
+                        run_baseline_on_g2a5(
+                            spec,
+                            Box::new(ReedsSloaneBaseline::new(spec.width, channels)),
+                            horizon,
+                            zero_seed,
+                        ),
+                    ),
+                    _ => DeterministicInitOut::CrossCtw(
+                        task_idx,
+                        run_baseline_on_g2a5(
+                            spec,
+                            Box::new(CrossChannelCtwBaseline::with_default_depth(
+                                spec.width, channels,
+                            )),
+                            horizon,
+                            zero_seed,
+                        ),
+                    ),
+                }
             }
-        });
-    } else {
-        for (idx, slot) in per_seed.iter_mut().enumerate() {
-            *slot = Some(eval_one_seed(idx as u32));
+        };
+
+        let mut outputs = Vec::with_capacity(total_jobs);
+        if num_threads <= 1 {
+            for job_idx in 0..total_jobs {
+                outputs.push(run_job(job_idx));
+            }
+        } else {
+            let mut per_thread = Vec::with_capacity(num_threads);
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(num_threads);
+                for _ in 0..num_threads {
+                    handles.push(s.spawn(|| {
+                        let mut local = Vec::new();
+                        loop {
+                            let idx = next_job.fetch_add(1, Ordering::Relaxed);
+                            if idx >= total_jobs {
+                                break;
+                            }
+                            local.push(run_job(idx));
+                        }
+                        local
+                    }));
+                }
+                for handle in handles {
+                    per_thread.push(handle.join().expect("deterministic cache worker panicked"));
+                }
+            });
+            for local in per_thread {
+                outputs.extend(local);
+            }
+        }
+
+        let mut g4a_machines: Vec<Option<Option<EpsilonMachineSummary>>> = vec![None; n4a];
+        let mut ctw = vec![None; n5];
+        let mut reeds_sloane = vec![None; n5];
+        let mut cross_ctw = vec![None; n5];
+        for out in outputs {
+            match out {
+                DeterministicInitOut::G4a(idx, m) => g4a_machines[idx] = Some(m),
+                DeterministicInitOut::Ctw(idx, m) => ctw[idx] = Some(m),
+                DeterministicInitOut::Bm(idx, m) => reeds_sloane[idx] = Some(m),
+                DeterministicInitOut::CrossCtw(idx, m) => cross_ctw[idx] = Some(m),
+            }
+        }
+
+        let g4a = g4a_bases
+            .into_iter()
+            .zip(g4a_machines)
+            .map(|((label, width, gen_cfg), machine)| G2a4aTaskSpec {
+                label,
+                width,
+                gen_cfg,
+                epsilon_machine: machine.expect("g4a machine populated"),
+            })
+            .collect();
+
+        Self {
+            g1,
+            g2_deep,
+            g2_tph,
+            g3_solos,
+            g3_multis,
+            g4a,
+            g4b,
+            g5_panel,
+            det_g5: DeterministicG2a5Cache {
+                ctw: ctw.into_iter().map(|x| x.expect("ctw cached")).collect(),
+                reeds_sloane: reeds_sloane
+                    .into_iter()
+                    .map(|x| x.expect("reeds_sloane cached"))
+                    .collect(),
+                cross_ctw: cross_ctw
+                    .into_iter()
+                    .map(|x| x.expect("cross_ctw cached"))
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum M2aTaskKind {
+    G1(usize),
+    G2Deep(usize),
+    G2M1Ring,
+    G2Tph(usize),
+    G3Solo(usize),
+    G3Multi(usize),
+    G4a(usize),
+    G4b(usize),
+    G5(usize),
+}
+
+enum M2aTaskPayload {
+    G1 {
+        idx: usize,
+        piece: TaskOutcomePiece,
+        excl: usize,
+    },
+    G2Deep {
+        idx: usize,
+        piece: TaskOutcomePiece,
+    },
+    G2M1Ring(TaskOutcomePiece),
+    G2Tph {
+        idx: usize,
+        piece: TaskOutcomePiece,
+    },
+    G3Solo {
+        idx: usize,
+        out: G2a3SoloOutcome,
+    },
+    G3Multi {
+        idx: usize,
+        out: G2a3MultiOutcome,
+    },
+    G4a {
+        idx: usize,
+        piece: TaskOutcomePiece,
+    },
+    G4b {
+        idx: usize,
+        piece: TaskOutcomePiece,
+        sample: (f64, f64),
+    },
+    G5 {
+        idx: usize,
+        piece: TaskOutcomePiece,
+        metrics: Box<[G2a5RunMetrics; 7]>,
+    },
+}
+
+struct M2aTaskOutput {
+    seed_idx: usize,
+    payload: M2aTaskPayload,
+}
+
+fn per_seed_task_schedule_lpt(specs: &M2aSharedSpecs) -> Vec<M2aTaskKind> {
+    let total = specs.g5_panel.len()
+        + specs.g1.len()
+        + specs.g4b.len()
+        + specs.g2_deep.len()
+        + specs.g4a.len()
+        + specs.g2_tph.len()
+        + specs.g3_multis.len()
+        + specs.g3_solos.len()
+        + 1;
+    let mut order = Vec::with_capacity(total);
+    // Longest-processing-time-first ordering minimizes parallel tail latency on small seed counts.
+    order.extend((0..specs.g5_panel.len()).map(M2aTaskKind::G5));
+    order.extend((0..specs.g1.len()).map(M2aTaskKind::G1));
+    order.extend((0..specs.g4b.len()).map(M2aTaskKind::G4b));
+    order.extend((0..specs.g2_deep.len()).map(M2aTaskKind::G2Deep));
+    order.extend((0..specs.g4a.len()).map(M2aTaskKind::G4a));
+    order.extend((0..specs.g2_tph.len()).map(M2aTaskKind::G2Tph));
+    order.extend((0..specs.g3_multis.len()).map(M2aTaskKind::G3Multi));
+    order.extend((0..specs.g3_solos.len()).map(M2aTaskKind::G3Solo));
+    order.push(M2aTaskKind::G2M1Ring);
+    order
+}
+
+fn execute_m2a_task(
+    specs: &M2aSharedSpecs,
+    seed_idx: usize,
+    kind: M2aTaskKind,
+    master_seed: u64,
+    horizon: u64,
+) -> M2aTaskOutput {
+    let payload = match kind {
+        M2aTaskKind::G1(idx) => {
+            let (piece, excl) = run_g2a1_task(&specs.g1[idx], master_seed, horizon);
+            M2aTaskPayload::G1 { idx, piece, excl }
+        }
+        M2aTaskKind::G2Deep(idx) => M2aTaskPayload::G2Deep {
+            idx,
+            piece: run_g2a2_deep_task(&specs.g2_deep[idx], master_seed, horizon),
+        },
+        M2aTaskKind::G2M1Ring => {
+            M2aTaskPayload::G2M1Ring(run_g2a2_m1_ring_task(master_seed, horizon))
+        }
+        M2aTaskKind::G2Tph(idx) => M2aTaskPayload::G2Tph {
+            idx,
+            piece: run_g2a2_tph_task(&specs.g2_tph[idx], master_seed, horizon),
+        },
+        M2aTaskKind::G3Solo(idx) => M2aTaskPayload::G3Solo {
+            idx,
+            out: run_g2a3_solo_task(&specs.g3_solos[idx], master_seed, horizon),
+        },
+        M2aTaskKind::G3Multi(idx) => M2aTaskPayload::G3Multi {
+            idx,
+            out: run_g2a3_multi_task(&specs.g3_multis[idx], master_seed, horizon),
+        },
+        M2aTaskKind::G4a(idx) => M2aTaskPayload::G4a {
+            idx,
+            piece: run_g2a4a_task(&specs.g4a[idx], master_seed, horizon),
+        },
+        M2aTaskKind::G4b(idx) => {
+            let (piece, sample) = run_g2a4b_task(&specs.g4b[idx], master_seed, horizon);
+            M2aTaskPayload::G4b { idx, piece, sample }
+        }
+        M2aTaskKind::G5(idx) => {
+            let (piece, metrics) = run_g2a5_task(
+                &specs.g5_panel[idx],
+                idx,
+                &specs.det_g5,
+                master_seed,
+                horizon,
+            );
+            M2aTaskPayload::G5 {
+                idx,
+                piece,
+                metrics: Box::new(metrics),
+            }
+        }
+    };
+    M2aTaskOutput { seed_idx, payload }
+}
+
+fn reduce_task_pieces(pieces: impl IntoIterator<Item = (TaskOutcomePiece, usize)>) -> SeedOutcome {
+    let mut cliff = CliffCountersSummary::default();
+    let mut excluded_cases = 0usize;
+    let mut failures = Vec::new();
+    let mut all_ok = true;
+    for (piece, excl) in pieces {
+        cliff.accumulate(&piece.cliff);
+        excluded_cases += excl;
+        if !piece.ok {
+            all_ok = false;
+        }
+        if let Some(f) = piece.failure {
+            failures.push(f);
+        }
+    }
+    SeedOutcome {
+        passed: all_ok && excluded_cases == 0,
+        cliff,
+        excluded_cases,
+        failures,
+    }
+}
+
+struct SeedTaskAccumulator {
+    g1: Vec<Option<(TaskOutcomePiece, usize)>>,
+    g2_deep: Vec<Option<TaskOutcomePiece>>,
+    g2_ring: Option<TaskOutcomePiece>,
+    g2_tph: Vec<Option<TaskOutcomePiece>>,
+    g3_solos: Vec<Option<G2a3SoloOutcome>>,
+    g3_multis: Vec<Option<G2a3MultiOutcome>>,
+    g4a: Vec<Option<TaskOutcomePiece>>,
+    g4b: Vec<Option<(TaskOutcomePiece, (f64, f64))>>,
+    g5: Vec<Option<(TaskOutcomePiece, [G2a5RunMetrics; 7])>>,
+}
+
+fn vec_none<T>(len: usize) -> Vec<Option<T>> {
+    (0..len).map(|_| None).collect()
+}
+
+impl SeedTaskAccumulator {
+    fn new(specs: &M2aSharedSpecs) -> Self {
+        Self {
+            g1: vec_none(specs.g1.len()),
+            g2_deep: vec_none(specs.g2_deep.len()),
+            g2_ring: None,
+            g2_tph: vec_none(specs.g2_tph.len()),
+            g3_solos: vec_none(specs.g3_solos.len()),
+            g3_multis: vec_none(specs.g3_multis.len()),
+            g4a: vec_none(specs.g4a.len()),
+            g4b: vec_none(specs.g4b.len()),
+            g5: vec_none(specs.g5_panel.len()),
         }
     }
 
+    fn insert(&mut self, payload: M2aTaskPayload) {
+        match payload {
+            M2aTaskPayload::G1 { idx, piece, excl } => self.g1[idx] = Some((piece, excl)),
+            M2aTaskPayload::G2Deep { idx, piece } => self.g2_deep[idx] = Some(piece),
+            M2aTaskPayload::G2M1Ring(piece) => self.g2_ring = Some(piece),
+            M2aTaskPayload::G2Tph { idx, piece } => self.g2_tph[idx] = Some(piece),
+            M2aTaskPayload::G3Solo { idx, out } => self.g3_solos[idx] = Some(out),
+            M2aTaskPayload::G3Multi { idx, out } => self.g3_multis[idx] = Some(out),
+            M2aTaskPayload::G4a { idx, piece } => self.g4a[idx] = Some(piece),
+            M2aTaskPayload::G4b { idx, piece, sample } => self.g4b[idx] = Some((piece, sample)),
+            M2aTaskPayload::G5 {
+                idx,
+                piece,
+                metrics,
+            } => self.g5[idx] = Some((piece, *metrics)),
+        }
+    }
+
+    fn into_outcome(self, master_seed: u64, multi_specs: &[G2a3MultiSpec]) -> AllGatesSeedOutcome {
+        let unit_excl = |p: TaskOutcomePiece| {
+            let ex = usize::from(p.excluded);
+            (p, ex)
+        };
+        let g1 = reduce_task_pieces(
+            self.g1
+                .into_iter()
+                .map(|x| x.expect("G2A.1 task completed")),
+        );
+        let g2 = reduce_task_pieces(
+            self.g2_deep
+                .into_iter()
+                .map(|x| x.expect("G2A.2 deep task completed"))
+                .chain(std::iter::once(
+                    self.g2_ring.expect("G2A.2 M1 ring task completed"),
+                ))
+                .chain(
+                    self.g2_tph
+                        .into_iter()
+                        .map(|x| x.expect("G2A.2 Tph task completed")),
+                )
+                .map(unit_excl),
+        );
+        let solos: Vec<G2a3SoloOutcome> = self
+            .g3_solos
+            .into_iter()
+            .map(|x| x.expect("G2A.3 solo task completed"))
+            .collect();
+        let multis: Vec<G2a3MultiOutcome> = self
+            .g3_multis
+            .into_iter()
+            .map(|x| x.expect("G2A.3 multi task completed"))
+            .collect();
+        let g3 = reduce_g2a3_seed(master_seed, &solos, &multis, multi_specs);
+
+        let mut g4_pieces = Vec::with_capacity(self.g4a.len() + self.g4b.len());
+        g4_pieces.extend(
+            self.g4a
+                .into_iter()
+                .map(|x| unit_excl(x.expect("G2A.4a task completed"))),
+        );
+        let mut g4b_samples = Vec::with_capacity(self.g4b.len());
+        for item in self.g4b {
+            let (piece, sample) = item.expect("G2A.4b task completed");
+            g4_pieces.push(unit_excl(piece));
+            g4b_samples.push(sample);
+        }
+        let g4 = reduce_task_pieces(g4_pieces);
+
+        let mut g5_pieces = Vec::with_capacity(self.g5.len());
+        let mut g5_metrics = Vec::with_capacity(self.g5.len());
+        for item in self.g5 {
+            let (piece, metrics) = item.expect("G2A.5 task completed");
+            g5_pieces.push(unit_excl(piece));
+            g5_metrics.push(metrics);
+        }
+        let g5 = reduce_task_pieces(g5_pieces);
+
+        AllGatesSeedOutcome {
+            gates: [g1, g2, g3, g4, g5],
+            g4b_samples: g4b_samples.try_into().expect("4 G2A.4b samples per seed"),
+            g5_metrics,
+        }
+    }
+}
+
+fn evaluate_m2a_seed_range(
+    specs: &M2aSharedSpecs,
+    seed_offset: u32,
+    total_seeds: u32,
+    horizon: u64,
+) -> Vec<AllGatesSeedOutcome> {
+    let total_seeds_usize = total_seeds.max(1) as usize;
+    let per_seed = per_seed_task_schedule_lpt(specs);
+    let mut queue = Vec::with_capacity(total_seeds_usize * per_seed.len());
+    for task in per_seed {
+        for seed_idx in 0..total_seeds_usize {
+            queue.push((seed_idx, task));
+        }
+    }
+
+    let total_tasks = queue.len();
+    let next_idx = AtomicUsize::new(0);
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(total_tasks)
+        .max(1);
+
+    let mut accumulators: Vec<SeedTaskAccumulator> = (0..total_seeds_usize)
+        .map(|_| SeedTaskAccumulator::new(specs))
+        .collect();
+
+    if num_threads <= 1 {
+        for &(seed_idx, kind) in &queue {
+            let master_seed = u64::from(seed_offset) + (seed_idx as u64);
+            let out = execute_m2a_task(specs, seed_idx, kind, master_seed, horizon);
+            accumulators[out.seed_idx].insert(out.payload);
+        }
+    } else {
+        let mut per_thread = Vec::with_capacity(num_threads);
+        std::thread::scope(|s| {
+            let queue_ref = &queue;
+            let next_ref = &next_idx;
+            let mut handles = Vec::with_capacity(num_threads);
+            for _ in 0..num_threads {
+                handles.push(s.spawn(move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                        if idx >= queue_ref.len() {
+                            break;
+                        }
+                        let (seed_idx, kind) = queue_ref[idx];
+                        let master_seed = u64::from(seed_offset) + (seed_idx as u64);
+                        local.push(execute_m2a_task(
+                            specs,
+                            seed_idx,
+                            kind,
+                            master_seed,
+                            horizon,
+                        ));
+                    }
+                    local
+                }));
+            }
+            for handle in handles {
+                per_thread.push(handle.join().expect("m2a worker thread panicked"));
+            }
+        });
+        for local in per_thread {
+            for out in local {
+                accumulators[out.seed_idx].insert(out.payload);
+            }
+        }
+    }
+
+    accumulators
+        .into_iter()
+        .enumerate()
+        .map(|(seed_idx, acc)| {
+            let master_seed = u64::from(seed_offset) + (seed_idx as u64);
+            acc.into_outcome(master_seed, &specs.g3_multis)
+        })
+        .collect()
+}
+
+fn summarize_single_bank(
+    seed_offset: u32,
+    seeds_tested: u32,
+    horizon: u64,
+    g5_panel: &[G2a5TaskSpec],
+    outcomes: Vec<AllGatesSeedOutcome>,
+) -> EvaluatedSingleBank {
     let mut pass_counts = [0usize; 5];
     let mut excl_counts = [0usize; 5];
     let mut gate_cliffs = [CliffCountersSummary::default(); 5];
     let mut gate_failures: [Vec<String>; 5] = Default::default();
-    let mut raw_g2a4b_metrics = Vec::with_capacity(seeds_tested as usize);
-    let mut raw_g2a5_metrics = Vec::with_capacity(seeds_tested as usize);
+    let mut raw_g2a4b_metrics = Vec::with_capacity(outcomes.len());
+    let mut raw_g2a5_metrics = Vec::with_capacity(outcomes.len());
 
-    for item in per_seed {
-        let AllGatesSeedOutcome {
-            gates: [g1, g2, g3, g4],
-            g4b_samples,
-            g5,
-        } = item.expect("seed evaluated");
-        let outs = [
-            (0, g1.passed, g1.excluded_cases, g1.cliff, g1.failures),
-            (1, g2.passed, g2.excluded_cases, g2.cliff, g2.failures),
-            (2, g3.passed, g3.excluded_cases, g3.cliff, g3.failures),
-            (3, g4.passed, g4.excluded_cases, g4.cliff, g4.failures),
-            (4, g5.passed, g5.excluded_cases, g5.cliff, g5.failures),
-        ];
-        for (idx, passed, excl, cliff, fails) in outs {
-            if passed {
+    for item in outcomes {
+        for (idx, g) in item.gates.into_iter().enumerate() {
+            if g.passed {
                 pass_counts[idx] += 1;
             }
-            excl_counts[idx] += excl;
-            gate_cliffs[idx].accumulate(&cliff);
-            gate_failures[idx].extend(fails);
+            excl_counts[idx] += g.excluded_cases;
+            gate_cliffs[idx].accumulate(&g.cliff);
+            gate_failures[idx].extend(g.failures);
         }
-        raw_g2a4b_metrics.push(g4b_samples);
-        raw_g2a5_metrics.push(g5.per_task_metrics);
+        raw_g2a4b_metrics.push(item.g4b_samples);
+        raw_g2a5_metrics.push(item.g5_metrics);
     }
 
     let max_g4_mean_dev = max_g2a4b_mean_h_reactive_dev(&raw_g2a4b_metrics);
-    let (g2a5_benchmarks, min_margin) = aggregate_g2a5_benchmarks(&panel, &raw_g2a5_metrics);
-    let specs: [(&str, f64); 5] = [
-        ("G2A.1", 0.90),
-        ("G2A.2", 0.90),
-        ("G2A.3", 0.90),
-        ("G2A.4", 0.85),
-        ("G2A.5", 0.85),
-    ];
+    let (g2a5_benchmarks, min_margin) = aggregate_g2a5_benchmarks(g5_panel, &raw_g2a5_metrics);
 
     let total = seeds_tested as usize;
     let mut total_cliff = CliffCountersSummary::default();
@@ -1884,7 +2441,7 @@ fn run_single_bank_internal(
     let mut gates = Vec::with_capacity(5);
     let mut all_passed = true;
 
-    for (idx, &(gate_name, target_rate)) in specs.iter().enumerate() {
+    for (idx, &(gate_name, target_rate)) in M2A_GATE_SPECS.iter().enumerate() {
         let passed_seeds = pass_counts[idx];
         let excl = excl_counts[idx];
         let empirical_rate = (passed_seeds as f64) / (total as f64);
@@ -1966,13 +2523,20 @@ pub fn run_m2a_verification_suite(
     }
     let seeds_tested = seeds.max(1);
     check_m2a_seed_range_holdout(seed_offset, seeds_tested, allow_holdout)?;
-    let panel = g2a5_panel_specs();
-    let det_g2a5 = build_deterministic_g2a5_cache(&panel, horizon);
-    Ok(run_single_bank_internal(seed_offset, seeds_tested, horizon, true, &det_g2a5).summary)
+    let specs = M2aSharedSpecs::build(horizon);
+    let outcomes = evaluate_m2a_seed_range(&specs, seed_offset, seeds_tested, horizon);
+    Ok(summarize_single_bank(
+        seed_offset,
+        seeds_tested,
+        horizon,
+        &specs.g5_panel,
+        outcomes,
+    )
+    .summary)
 }
 
-/// Runs Milestone 2a multi-bank evaluation across `banks` consecutive banks in parallel via
-/// `std::thread::scope`, scoring each gate `G2A.1`–`G2A.5` via [`evaluate_multi_bank_gate`].
+/// Runs Milestone 2a multi-bank evaluation across `banks` consecutive banks using a unified
+/// parallel task pool, scoring each gate `G2A.1`–`G2A.5` via [`evaluate_multi_bank_gate`].
 ///
 /// # Errors
 ///
@@ -1997,36 +2561,24 @@ pub fn run_m2a_bank_evaluation(
     let total_seeds = seeds_per_bank.saturating_mul(banks);
     check_m2a_seed_range_holdout(seed_offset, total_seeds, allow_holdout)?;
 
-    let panel = g2a5_panel_specs();
-    let det_g2a5 = build_deterministic_g2a5_cache(&panel, horizon);
-
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(banks as usize)
-        .max(1);
-
-    let mut bank_outputs: Vec<Option<EvaluatedSingleBank>> = (0..banks).map(|_| None).collect();
-    std::thread::scope(|s| {
-        let chunk_size = (banks as usize).div_ceil(num_threads);
-        for (chunk_idx, slice) in bank_outputs.chunks_mut(chunk_size).enumerate() {
-            let start_bank = chunk_idx * chunk_size;
-            let det_ref = &det_g2a5;
-            s.spawn(move || {
-                for (off, slot) in slice.iter_mut().enumerate() {
-                    let b = (start_bank + off) as u32;
-                    let b_offset = seed_offset.saturating_add(b.saturating_mul(seeds_per_bank));
-                    *slot = Some(run_single_bank_internal(
-                        b_offset,
-                        seeds_per_bank,
-                        horizon,
-                        false,
-                        det_ref,
-                    ));
-                }
-            });
-        }
-    });
+    let specs = M2aSharedSpecs::build(horizon);
+    let all_outcomes = evaluate_m2a_seed_range(&specs, seed_offset, total_seeds, horizon);
+    let mut outcomes_iter = all_outcomes.into_iter();
+    let mut bank_outputs = Vec::with_capacity(banks as usize);
+    for b in 0..banks {
+        let b_offset = seed_offset.saturating_add(b.saturating_mul(seeds_per_bank));
+        let slice: Vec<_> = outcomes_iter
+            .by_ref()
+            .take(seeds_per_bank as usize)
+            .collect();
+        bank_outputs.push(summarize_single_bank(
+            b_offset,
+            seeds_per_bank,
+            horizon,
+            &specs.g5_panel,
+            slice,
+        ));
+    }
 
     let mut samples_per_gate: [Vec<BankSample>; 5] = Default::default();
     let mut banks_above_target = [0u32; 5];
@@ -2038,8 +2590,7 @@ pub fn run_m2a_bank_evaluation(
     let mut total_cliff = CliffCountersSummary::default();
     let mut total_excluded = 0usize;
 
-    for (b_idx, out_opt) in bank_outputs.into_iter().enumerate() {
-        let out = out_opt.expect("bank evaluated");
+    for (b_idx, out) in bank_outputs.into_iter().enumerate() {
         total_cliff.accumulate(&out.summary.cliff_counters);
         total_excluded += out.summary.excluded_cases;
         all_g2a4b_raw.extend(out.raw_g2a4b_metrics);
@@ -2066,18 +2617,12 @@ pub fn run_m2a_bank_evaluation(
     }
 
     let pooled_max_g4_mean_dev = max_g2a4b_mean_h_reactive_dev(&all_g2a4b_raw);
-    let (g2a5_benchmarks, pooled_min_margin) = aggregate_g2a5_benchmarks(&panel, &all_g2a5_raw);
-    let specs: [(&str, f64); 5] = [
-        ("G2A.1", 0.90),
-        ("G2A.2", 0.90),
-        ("G2A.3", 0.90),
-        ("G2A.4", 0.85),
-        ("G2A.5", 0.85),
-    ];
+    let (g2a5_benchmarks, pooled_min_margin) =
+        aggregate_g2a5_benchmarks(&specs.g5_panel, &all_g2a5_raw);
 
     let mut gates = Vec::with_capacity(5);
     let mut all_passed = total_excluded == 0;
-    for (idx, &(gate_name, target_rate)) in specs.iter().enumerate() {
+    for (idx, &(gate_name, target_rate)) in M2A_GATE_SPECS.iter().enumerate() {
         let stats = evaluate_multi_bank_gate(&samples_per_gate[idx], target_rate);
         let excl = gate_excl[idx];
         let g4_mean_ok = idx != 3 || pooled_max_g4_mean_dev <= 0.040;
