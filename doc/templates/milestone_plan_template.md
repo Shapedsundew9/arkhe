@@ -8,7 +8,7 @@
 
 - **Hypotheses tested:** `<H_x, ...>`
 - **Explicit non-goals / deferred hypotheses:** `<What this milestone does NOT claim>`
-- **Decision rights:** Per Charter §7.1 and `.github/copilot-instructions.md` Rule 7, parameter values, gate thresholds, seed banks, golden re-blessing approvals, and kill-criterion interpretation require explicit user sign-off before confirmatory execution.
+- **Decision rights & execution tiers:** Per Charter §7.1 and [`.github/copilot-instructions.md`](../../.github/copilot-instructions.md) Rules 2, 4, 5, and 7, parameter values, Milestone-Scoped Scaffolding $\to$ Derived Scaling Law evolutions, gate thresholds, seed banks, golden re-blessing approvals, and kill-criterion interpretation require explicit user sign-off before confirmatory execution. Implementation follows the 3-tier hierarchy (Tier 1 Hydrogen workers with a 2-strike escalation rule; Tier 2 `arkhe-watchdog`; Tier 3 Argon orchestrator).
 
 ## 2. Exploratory Characterisation Summary
 
@@ -37,7 +37,7 @@ Document exploratory measurements recorded prior to pre-registration (Rule 8: ex
 
 ## 6. Parameter Inventory Changes
 
-List every constant added, reclassified, derived, or bounded in [`doc/parameter_inventory.md`](../parameter_inventory.md), with its classification, config path, telemetry counter, and sensitivity sweep plan.
+List every constant added, reclassified (e.g., **Milestone-Scoped Scaffolding** evolved into a zero-free-parameter **Derived Scaling Law** as scale axes $\tau, K, k, N$ expand), derived, or bounded in [`doc/parameter_inventory.md`](../parameter_inventory.md), with its classification, config path, telemetry counter, backward-reduction behavior on golden traces, and sensitivity sweep plan.
 
 ## 7. Phased Implementation Plan
 

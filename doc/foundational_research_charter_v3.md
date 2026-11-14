@@ -405,14 +405,14 @@ Every milestone follows the fixed experimental sequence:
 1. **Charter hypothesis** (§6) $\rightarrow$ **exploratory characterisation** (measuring distributions and costs with **no** gating thresholds, per Rule 8).
 2. **Milestone plan with pre-registration** ([milestone_plan_template.md](templates/milestone_plan_template.md)): hypotheses, gates with feasibility arguments citing theoretical bounds or measured baselines (Rule 9), explicit dev/confirmation/holdout seed banks, kill/revisit criteria, and [parameter_inventory.md](parameter_inventory.md) updates.
 3. **User sign-off** before confirmatory code or threshold changes.
-4. **Phased implementation:** one phase per commit with golden-trace invariance checks (or written rationale when behavior changes intentionally).
+4. **Phased implementation under three-tier governance:** one phase per commit with golden-trace invariance checks (or written mathematical derivation + prior-milestone gate verification when a Milestone-Scoped Scaffolding constant evolves into a zero-free-parameter Derived Scaling Law on an expanded scale axis $\tau, K, k, N$; see [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) Rules 2, 4, 5, and 7).
 5. **Development banks** $\rightarrow$ **confirmation bank** $\rightarrow$ **single-shot holdout** (opened once after dev/confirmation pass) $\rightarrow$ **attainment record** in [research_record.md](research_record.md) $\rightarrow$ **independent review**.
 
-| Decision domain | Agent authority | User authority |
+| Decision domain | Agent authority (3-tier hierarchy) | User authority |
 | :--- | :--- | :--- |
-| Behavior-preserving engineering refactors, telemetry wiring, test coverage | **Decides** (proven by golden traces) | Reviews commits |
-| Exploratory measurement harnesses and profiles (no pass/fail gates) | **Decides** | Reviews findings |
-| Scientific parameters, values, search bounds, guardrails (`parameter_inventory.md`) | Recommends / implements only after sign-off | **Decides** |
+| Behavior-preserving engineering refactors, telemetry wiring, test coverage | **Tier 1 (Hydrogen workers, 2-strike bounded)** / **Tier 2 (`arkhe-watchdog` audit)** / **Tier 3 (Orchestrator)** decide & verify via golden traces | Reviews commits |
+| Exploratory measurement harnesses and profiles (no pass/fail gates) | **Tier 3 + Tier 1** decide & run | Reviews findings |
+| Scientific parameters, values, Milestone-Scoped Scaffolding $\to$ Derived Scaling Law evolutions, search bounds, guardrails (`parameter_inventory.md`) | **Tier 3** formulates holistic derivation & recommends (`blocker_report.md`); **Tier 1** implements only after sign-off | **Decides** |
 | Pre-registered gate thresholds, $P_{\text{target}}$, seed banks, golden re-blessing, Charter text, kill-criterion interpretation, milestone sign-off | Drafts & escalates with options (`blocker_report.md`) | **Decides** |
 
 ---

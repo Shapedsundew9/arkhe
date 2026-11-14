@@ -18,6 +18,8 @@ Cite the exact section of the Charter, milestone plan, or parameter inventory de
 
 ## 4. Hypotheses ranked by evidence
 
+State whether the cause is an implementation bug, an architectural interaction, or a **Milestone-Scoped Scaffolding** constant binding under an expanded scale axis ($\tau, K, k, N$).
+
 1. **Primary hypothesis:** ... (supporting observation / test)
 2. **Alternative hypothesis:** ... (what would distinguish it)
 
@@ -25,7 +27,7 @@ Cite the exact section of the Charter, milestone plan, or parameter inventory de
 
 | Option | Behavior changed | Constants / gates touched | Engineering & scientific cost |
 | :--- | :--- | :--- | :--- |
-| **(a)** | ... | ... | ... |
+| **(a) Derived Scaling Law (Primary remedy when a scaffolding constant binds)** | Replace binding Milestone-Scoped Scaffolding scalar with a zero-free-parameter derived scaling law; state whether it reduces identically at earlier milestone scales or requires golden fixture re-blessing + backward gate verification | ... | ... |
 | **(b)** | ... | ... | ... |
 
 ## 6. Recommendation
