@@ -1,6 +1,6 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), historical Milestone 0–1 sign-off records plus pre-Milestone 2 readiness verification live in [doc/research_record.md](doc/research_record.md), and the Stage M2a pre-registration draft lives in [doc/milestone_2a_plan.md](doc/milestone_2a_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)** and **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), historical Milestone 0–1 sign-off records plus pre-Milestone 2 readiness verification live in [doc/research_record.md](doc/research_record.md), and the approved Stage M2a pre-registration plan lives in [doc/milestone_2a_plan.md](doc/milestone_2a_plan.md).
 
 ## Overview
 

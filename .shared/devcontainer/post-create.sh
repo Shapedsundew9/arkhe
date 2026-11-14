@@ -26,6 +26,7 @@ if [[ ! -f "$ANTIGRAVITY_SETTINGS" ]]; then
     mkdir -p "$(dirname "$ANTIGRAVITY_SETTINGS")"
     cat > "$ANTIGRAVITY_SETTINGS" <<'EOF'
 {
+    "agentMode": "",
     "colorScheme": "solarized dark",
     "trustedWorkspaces": [
         "/workspaces"
@@ -38,15 +39,13 @@ if [[ ! -f "$ANTIGRAVITY_SETTINGS" ]]; then
             "command(*)",
             "read_url(*)",
             "read_browser_page(*)",
-            "search_web(*)"            
+            "search_web(*)"
         ],
         "deny": [
             "command(rm -rf)",
             "command(sudo)"
         ],
-        "ask": [
-            "plan"
-        ]
+        "ask": []
     }
 }
 EOF
