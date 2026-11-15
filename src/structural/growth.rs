@@ -4889,6 +4889,9 @@ fn evaluate_stage3_candidate_pre(
     if (0..num_outputs).any(|q| e_cand_by_port[q] > baseline.e_curr_by_port[q]) {
         return None;
     }
+    if baseline.e_curr_by_port[out_idx] == 0 && e_alt_diag > 0 {
+        return None;
+    }
     if flux_alt <= 0.0 || e_alt_diag + growth_config.min_match_gain > e_null_diag {
         return None;
     }

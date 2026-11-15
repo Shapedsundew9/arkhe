@@ -18,7 +18,7 @@ use crate::structural::growth::{
     AutonomousRingProposal, DiagnosticBuffer, GrowthConfig, GrowthError, RedundancySproutProposal,
     ScoredSproutProposal, SproutTelemetry, assign_stage3_juvenile_ticks, check_deeper_lag_for_port,
     diagnose_residual, effective_juvenile_ticks, evaluate_comparator_ring_promotion,
-    port_cone_register_depth, port_primary_cone_is_mature,
+    observation_horizon, port_cone_register_depth, port_primary_cone_is_mature,
     propose_autonomous_delay_ring_scored_with_telemetry, propose_redundancy_sprout,
     propose_sprout_band_scored_internal,
 };
@@ -62,6 +62,9 @@ pub struct PortDevelopmentalState {
     pub port_sprout_events: u64,
     pub epoch_snapshots: Vec<GrowthEpochSnapshot>,
     pub replay_ticks_consumed: u64,
+    pub stage2_checks_completed: u64,
+    pub stage2_exhausted: bool,
+    pub stage3_exhausted: bool,
 }
 
 impl PortDevelopmentalState {
@@ -73,6 +76,9 @@ impl PortDevelopmentalState {
             port_sprout_events: 0,
             epoch_snapshots: Vec::new(),
             replay_ticks_consumed: 0,
+            stage2_checks_completed: 0,
+            stage2_exhausted: false,
+            stage3_exhausted: false,
         }
     }
 }
@@ -159,20 +165,38 @@ impl ComparatorWakeWindow {
         self.disagree.iter().filter(|&&d| d).count()
     }
 
-    fn e_primary_count(&self) -> usize {
-        self.e_primary.iter().filter(|&&e| e).count()
-    }
-
-    fn e_alt_count(&self) -> usize {
-        self.e_alt.iter().filter(|&&e| e).count()
-    }
-
     fn flux_primary(&self) -> f64 {
         self.r_primary.iter().sum()
     }
 
     fn flux_alt(&self) -> f64 {
         self.r_alt.iter().sum()
+    }
+
+    #[cfg(test)]
+    fn disagreement_count_tail(&self, w: usize) -> usize {
+        let start = self.disagree.len().saturating_sub(w);
+        self.disagree.iter().skip(start).filter(|&&d| d).count()
+    }
+
+    fn e_primary_count_tail(&self, w: usize) -> usize {
+        let start = self.e_primary.len().saturating_sub(w);
+        self.e_primary.iter().skip(start).filter(|&&e| e).count()
+    }
+
+    fn e_alt_count_tail(&self, w: usize) -> usize {
+        let start = self.e_alt.len().saturating_sub(w);
+        self.e_alt.iter().skip(start).filter(|&&e| e).count()
+    }
+
+    fn flux_primary_tail(&self, w: usize) -> f64 {
+        let start = self.r_primary.len().saturating_sub(w);
+        self.r_primary.iter().skip(start).sum()
+    }
+
+    fn flux_alt_tail(&self, w: usize) -> f64 {
+        let start = self.r_alt.len().saturating_sub(w);
+        self.r_alt.iter().skip(start).sum()
     }
 }
 
@@ -343,11 +367,13 @@ impl ArkheLearner {
         let port_states = (0..num_outputs)
             .map(|_| PortDevelopmentalState::new(growth_config.diagnostic_window))
             .collect();
+        let comp_cap = observation_horizon(&economy_config, &growth_config)
+            .max(growth_config.diagnostic_window);
         let comparator_windows = editable
             .economy()
             .comparators()
             .iter()
-            .map(|c| ComparatorWakeWindow::new(c.sub_node, growth_config.diagnostic_window))
+            .map(|c| ComparatorWakeWindow::new(c.sub_node, comp_cap))
             .collect();
         Ok(Self {
             editable,
@@ -524,6 +550,8 @@ impl ArkheLearner {
                 .reset_predictor_counts();
             self.port_states[q].diagnostic_buffer.clear();
             self.port_states[q].ticks_since_last_check = 0;
+            self.port_states[q].stage2_exhausted = false;
+            self.port_states[q].stage3_exhausted = false;
         }
     }
 
@@ -597,6 +625,18 @@ impl ArkheLearner {
                 .all(|frame| width.normalize(frame[port_idx]) == 0)
     }
 
+    fn port_needs_stage2(&self, port_idx: usize) -> bool {
+        !self.is_port_zero_error(port_idx) && !self.port_states[port_idx].stage2_exhausted
+    }
+
+    fn port_needs_stage3(&self, port_idx: usize) -> bool {
+        self.growth_config.redundancy_sprouting
+            && !self.port_needs_stage2(port_idx)
+            && self.is_port_driven(port_idx as u16)
+            && self.port_redundancy_arity_eligible(port_idx as u16)
+            && !self.port_states[port_idx].stage3_exhausted
+    }
+
     fn port_budget_allowance(&self, port_idx: usize, global_budget: &TickBudget) -> u64 {
         let num_ports = self.port_states.len();
         if num_ports <= 1 {
@@ -609,16 +649,25 @@ impl ArkheLearner {
         });
         let base_share = total_budget / (num_ports as u64);
         let mut idle_pool = 0u64;
-        let mut active_ports = 0usize;
+        let mut stage2_active_ports = 0usize;
+        let mut stage3_active_ports = 0usize;
         for q in 0..num_ports {
-            if self.is_port_zero_error(q) {
-                idle_pool += base_share.saturating_sub(self.port_states[q].replay_ticks_consumed);
+            if self.port_needs_stage2(q) {
+                stage2_active_ports += 1;
+            } else if self.port_needs_stage3(q) {
+                stage3_active_ports += 1;
             } else {
-                active_ports += 1;
+                idle_pool += base_share.saturating_sub(self.port_states[q].replay_ticks_consumed);
             }
         }
-        let extra = if active_ports > 0 && !self.is_port_zero_error(port_idx) {
-            idle_pool / (active_ports as u64)
+        let extra = if stage2_active_ports > 0 {
+            if self.port_needs_stage2(port_idx) {
+                idle_pool / (stage2_active_ports as u64)
+            } else {
+                0
+            }
+        } else if stage3_active_ports > 0 && self.port_needs_stage3(port_idx) {
+            idle_pool / (stage3_active_ports as u64)
         } else {
             0
         };
@@ -672,6 +721,8 @@ impl ArkheLearner {
                 .economy_mut()
                 .assign_sprout_debts(&self.ledger.node_debts);
             self.reset_changed_ports(&pre_sprout_circuit, &old_to_new);
+            self.port_states[port_idx].stage2_exhausted = false;
+            self.port_states[port_idx].stage3_exhausted = false;
             self.port_states[port_idx].port_sprout_events += 1;
             self.sprout_events += 1;
             true
@@ -797,7 +848,8 @@ impl ArkheLearner {
     }
 
     fn sync_comparator_windows(&mut self) {
-        let diag_cap = self.growth_config.diagnostic_window;
+        let diag_cap = observation_horizon(&self.economy_config, &self.growth_config)
+            .max(self.growth_config.diagnostic_window);
         let comps = self.editable.economy().comparators();
         let existing = std::mem::take(&mut self.comparator_windows);
         let mut synced = Vec::with_capacity(comps.len());
@@ -1070,6 +1122,8 @@ impl ArkheLearner {
         self.sync_comparator_windows();
         self.port_states[port_idx].diagnostic_buffer.clear();
         self.port_states[port_idx].ticks_since_last_check = 0;
+        self.port_states[port_idx].stage2_exhausted = false;
+        self.port_states[port_idx].stage3_exhausted = false;
         self.redundancy_sprout_events += 1;
         true
     }
@@ -1152,6 +1206,8 @@ impl ArkheLearner {
             state.diagnostic_buffer.clear();
         }
         self.port_states[target_idx].ticks_since_last_check = 0;
+        self.port_states[target_idx].stage2_exhausted = false;
+        self.port_states[target_idx].stage3_exhausted = false;
         true
     }
 
@@ -1225,12 +1281,15 @@ impl ArkheLearner {
         }
         self.port_states[target_idx].diagnostic_buffer.clear();
         self.port_states[target_idx].ticks_since_last_check = 0;
+        self.port_states[target_idx].stage2_exhausted = false;
+        self.port_states[target_idx].stage3_exhausted = false;
         self.driver_handoff_events += 1;
         true
     }
 
     fn process_wake_comparator_events(&mut self) -> bool {
         let min_gain = self.growth_config.min_match_gain;
+        let w_diag = self.growth_config.diagnostic_window;
         let split_tax = self.economy_config.split_code_tax;
         let count = self.editable.economy().comparators().len();
 
@@ -1242,42 +1301,44 @@ impl ArkheLearner {
             let Some(win) = self.comparator_windows.get(comp_idx) else {
                 continue;
             };
-            if !win.is_full() {
+            if win.disagree.len() < w_diag {
                 continue;
             }
 
-            let e_primary = win.e_primary_count();
-            let e_alt = win.e_alt_count();
-            let flux_primary = win.flux_primary();
-            let flux_alt = win.flux_alt();
+            let e_primary = win.e_primary_count_tail(w_diag);
+            let e_alt = win.e_alt_count_tail(w_diag);
+            let flux_primary = win.flux_primary_tail(w_diag);
+            let flux_alt = win.flux_alt_tail(w_diag);
             let delta_l_comp =
                 comparator_marginal_code_bits(self.editable.circuit(), &comp, split_tax);
 
-            // Step A: Wake Driver Handoff.
+            // Step A: Reversible Wake Driver Handoff over trailing W_diag ticks.
             if e_alt < e_primary && (flux_alt - flux_primary) > delta_l_comp {
                 let _ = self.perform_comparator_handoff(comp_idx);
             }
 
-            // Step B: Two-Clause Refutation Pruning.
+            // Step B: Irreversible Two-Clause Refutation Pruning over full W_obs horizon.
             let Some(win_after) = self.comparator_windows.get(comp_idx) else {
                 continue;
             };
-            let disagreements = win_after.disagreement_count();
-            if disagreements >= min_gain {
-                let f_pri = win_after.flux_primary();
-                let f_alt = win_after.flux_alt();
-                let prune_decision = if f_alt <= 0.0 && f_pri > 0.0 {
-                    Some(false)
-                } else if f_pri <= 0.0 && f_alt > 0.0 {
-                    Some(true)
-                } else {
-                    None
-                };
-                if let Some(prune_primary) = prune_decision
-                    && self.excise_port_comparator(comp_idx, prune_primary)
-                {
-                    self.disagreement_prune_events += 1;
-                    return true;
+            if win_after.is_full() {
+                let disagreements = win_after.disagreement_count();
+                if disagreements >= min_gain {
+                    let f_pri = win_after.flux_primary();
+                    let f_alt = win_after.flux_alt();
+                    let prune_decision = if f_alt <= 0.0 && f_pri > 0.0 {
+                        Some(false)
+                    } else if f_pri <= 0.0 && f_alt > 0.0 {
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    if let Some(prune_primary) = prune_decision
+                        && self.excise_port_comparator(comp_idx, prune_primary)
+                    {
+                        self.disagreement_prune_events += 1;
+                        return true;
+                    }
                 }
             }
         }
@@ -1881,82 +1942,68 @@ impl PredictorBaseline for ArkheLearner {
             }
         }
 
-        // Sprouting and autonomous delay-ring check
+        // Pass 1 (Stage 1 + Stage 2 across all eligible ports) before Pass 2 (Stage 3).
         let start_port = (self.tick as usize) % num_ports;
+        let mut sprouted_any = false;
+        let mut pass1_timers: Vec<Option<u64>> = vec![None; num_ports];
         for offset in 0..num_ports {
             let p = (start_port + offset) % num_ports;
             let port_u16 = p as u16;
 
             let is_cone_mature =
                 port_is_cone_mature(self.editable.circuit(), self.editable.economy(), port_u16);
-            let is_primary_mature = port_primary_cone_is_mature(
-                self.editable.circuit(),
-                self.editable.economy(),
-                port_u16,
-            );
-            let diag_zero_res = self.port_states[p]
-                .diagnostic_buffer
-                .residuals
-                .iter()
-                .all(|frame| frame[p] == 0);
-            let ready_for_stage12 = is_cone_mature;
-            let ready_for_stage3_only =
-                self.growth_config.redundancy_sprouting && is_primary_mature && diag_zero_res;
             let is_primed = port_is_primed(self.editable.circuit(), base_ancestry, port_u16);
             let buf_ready =
                 self.port_states[p].diagnostic_buffer.len() >= self.growth_config.diagnostic_window;
             let timer_ready =
                 self.port_states[p].ticks_since_last_check >= self.growth_config.sprout_interval;
 
-            if !((ready_for_stage12 || ready_for_stage3_only)
-                && is_primed
-                && buf_ready
-                && timer_ready)
-            {
+            if !(is_cone_mature && is_primed && buf_ready && timer_ready) {
                 continue;
             }
 
             let prev_ticks_since_check = self.port_states[p].ticks_since_last_check;
             self.port_states[p].ticks_since_last_check = 0;
+            pass1_timers[p] = Some(prev_ticks_since_check);
 
-            let mut sprouted = false;
-            if ready_for_stage12 {
-                // 1. Idle mature node pruning (D1b.1)
-                let idle_nodes = self.port_states[p]
-                    .diagnostic_buffer
-                    .idle_mature_nodes(self.editable.economy());
-                if !idle_nodes.is_empty() {
-                    let pre_prune_circuit = self.editable.circuit().clone();
-                    if let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes(
-                        &idle_nodes,
-                        &self.port_states[p].diagnostic_buffer.inputs,
-                        &self.port_states[p].diagnostic_buffer.predictions,
-                        self.economy_config.split_code_tax,
-                    ) {
-                        let any_pruned = old_to_new.iter().any(Option::is_none);
-                        if any_pruned {
-                            self.ledger.on_prune(
-                                self.editable.circuit(),
-                                self.economy_config.split_code_tax,
-                                &old_to_new,
-                            );
-                            self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
-                            self.apply_node_remap_to_windows(&old_to_new);
-                            self.idle_prune_events += 1;
-                            self.tick += 1;
-                            return None;
-                        }
+            // 1. Idle mature node pruning (D1b.1)
+            let idle_nodes = self.port_states[p]
+                .diagnostic_buffer
+                .idle_mature_nodes(self.editable.economy());
+            if !idle_nodes.is_empty() {
+                let pre_prune_circuit = self.editable.circuit().clone();
+                if let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes(
+                    &idle_nodes,
+                    &self.port_states[p].diagnostic_buffer.inputs,
+                    &self.port_states[p].diagnostic_buffer.predictions,
+                    self.economy_config.split_code_tax,
+                ) {
+                    let any_pruned = old_to_new.iter().any(Option::is_none);
+                    if any_pruned {
+                        self.ledger.on_prune(
+                            self.editable.circuit(),
+                            self.economy_config.split_code_tax,
+                            &old_to_new,
+                        );
+                        self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
+                        self.apply_node_remap_to_windows(&old_to_new);
+                        self.idle_prune_events += 1;
+                        self.tick += 1;
+                        return None;
                     }
                 }
+            }
 
-                // Check if Snapshot 2 needs to be recorded after this port's Sprout 2 has settled
-                if self.port_states[p].port_sprout_events == 2
-                    && self.port_states[p].epoch_snapshots.len() == 2
-                {
-                    self.record_epoch_snapshot(p, 2, false);
-                }
+            // Check if Snapshot 2 needs to be recorded after this port's Sprout 2 has settled
+            if self.port_states[p].port_sprout_events == 2
+                && self.port_states[p].epoch_snapshots.len() == 2
+            {
+                self.record_epoch_snapshot(p, 2, false);
+            }
 
-                let port_zero_error = self.is_port_zero_error(p);
+            let mut sprouted = false;
+            let port_zero_error = self.is_port_zero_error(p);
+            if !self.port_states[p].stage2_exhausted {
                 let mut port_budget = if num_ports == 1 {
                     *budget
                 } else {
@@ -2158,9 +2205,10 @@ impl PredictorBaseline for ArkheLearner {
                 self.sprout_blocked_max_nodes += stage0_tel.sprout_blocked_max_nodes
                     + ring_tel.sprout_blocked_max_nodes
                     + if sprouted { 0 } else { band_blocked };
-                self.sprout_budget_exhausted += stage0_tel.sprout_budget_exhausted
+                let stage2_budget_exhausted = stage0_tel.sprout_budget_exhausted
                     + ring_tel.sprout_budget_exhausted
                     + if sprouted { 0 } else { band_exhausted };
+                self.sprout_budget_exhausted += stage2_budget_exhausted;
                 self.ring_period_bound += ring_tel.ring_period_bound;
 
                 let bound_tel = last_band_tel.as_ref().unwrap_or(&stage0_tel);
@@ -2184,78 +2232,142 @@ impl PredictorBaseline for ArkheLearner {
                         bound += 1;
                     }
                     self.lag_horizon_bound += bound;
+                    let obs_full = self.obs_window.len()
+                        >= observation_horizon(&self.economy_config, &self.growth_config);
+                    if obs_full
+                        && ((!port_zero_error && stage2_budget_exhausted == 0)
+                            || (self.is_port_driven(port_u16)
+                                && !self.port_q_hat_exceeds_null(p, predictions[p])))
+                    {
+                        self.port_states[p].stage2_exhausted = true;
+                    }
                 }
             }
+            self.port_states[p].stage2_checks_completed += 1;
 
-            // 3. Causal-disjoint redundancy sprouting (M2B-D2): runs strictly AFTER Stage 2 returns None.
-            let stage3_eligible = !sprouted
-                && self.growth_config.redundancy_sprouting
-                && self.is_port_driven(port_u16)
-                && port_comparators_mature(
+            if sprouted {
+                sprouted_any = true;
+                break;
+            }
+        }
+
+        // Pass 2: Causal-disjoint redundancy sprouting (Stage 3, M2B-D2) runs only if Pass 1 did not sprout.
+        if !sprouted_any && self.growth_config.redundancy_sprouting {
+            for offset in 0..num_ports {
+                let p = (start_port + offset) % num_ports;
+                let port_u16 = p as u16;
+
+                let is_primary_mature = port_primary_cone_is_mature(
                     self.editable.circuit(),
                     self.editable.economy(),
                     port_u16,
-                )
-                && self.port_comparators_primed(comp_ancestry, port_u16)
-                && self.port_q_hat_exceeds_null(p, predictions[p])
-                && self.port_redundancy_arity_eligible(port_u16);
-            if stage3_eligible && self.sibling_has_juvenile_nodes(p) {
-                self.port_states[p].ticks_since_last_check = prev_ticks_since_check;
-            } else if stage3_eligible {
-                let any_sibling_unsolved =
-                    (0..num_ports).any(|q| q != p && !self.is_port_zero_error(q));
-                let mut stage3_tel = SproutTelemetry::default();
-                if num_ports == 1 {
-                    if let Ok(Some(prop)) = propose_redundancy_sprout(
-                        &self.editable,
-                        &self.obs_window,
-                        &self.port_states[p].diagnostic_buffer,
-                        &self.growth_config,
-                        &self.economy_config,
-                        budget,
-                        port_u16,
-                        &mut stage3_tel,
-                    ) {
-                        sprouted = self.commit_redundancy_sprout(p, prop);
-                    }
-                } else {
-                    let total_budget = self
-                        .total_budget_seen
-                        .unwrap_or_else(|| budget.remaining().saturating_add(budget.consumed()));
-                    let base_share = total_budget / (num_ports as u64);
-                    let cap = if any_sibling_unsolved {
-                        base_share
-                            .saturating_sub(self.port_states[p].replay_ticks_consumed)
-                            .min(budget.remaining())
-                    } else {
-                        self.port_budget_allowance(p, budget)
-                    };
-                    let mut stage3_budget = TickBudget::new(cap);
-                    if let Ok(Some(prop)) = propose_redundancy_sprout(
-                        &self.editable,
-                        &self.obs_window,
-                        &self.port_states[p].diagnostic_buffer,
-                        &self.growth_config,
-                        &self.economy_config,
-                        &mut stage3_budget,
-                        port_u16,
-                        &mut stage3_tel,
-                    ) {
-                        sprouted = self.commit_redundancy_sprout(p, prop);
-                    }
-                    let spent = stage3_budget.consumed();
-                    let _ = budget.try_consume(spent);
-                    self.port_states[p].replay_ticks_consumed += spent;
-                }
-                if !sprouted {
-                    self.sprout_blocked_max_nodes += stage3_tel.sprout_blocked_max_nodes;
-                    self.sprout_budget_exhausted += stage3_tel.sprout_budget_exhausted;
-                }
-                self.candidate_list_truncated += stage3_tel.candidate_list_truncated;
-            }
+                );
+                let diag_zero_res = self.port_states[p]
+                    .diagnostic_buffer
+                    .residuals
+                    .iter()
+                    .all(|frame| frame[p] == 0);
+                let ready_for_stage3_only = is_primary_mature && diag_zero_res;
+                let ran_pass1 = pass1_timers[p].is_some();
+                let is_primed = port_is_primed(self.editable.circuit(), base_ancestry, port_u16);
+                let buf_ready = self.port_states[p].diagnostic_buffer.len()
+                    >= self.growth_config.diagnostic_window;
+                let timer_ready = ran_pass1
+                    || self.port_states[p].ticks_since_last_check
+                        >= self.growth_config.sprout_interval;
 
-            if sprouted {
-                break;
+                if !((ran_pass1 || ready_for_stage3_only) && is_primed && buf_ready && timer_ready)
+                {
+                    continue;
+                }
+
+                let prev_ticks_since_check =
+                    pass1_timers[p].unwrap_or(self.port_states[p].ticks_since_last_check);
+                self.port_states[p].ticks_since_last_check = 0;
+
+                let stage3_eligible = !self.port_states[p].stage3_exhausted
+                    && self.is_port_driven(port_u16)
+                    && port_comparators_mature(
+                        self.editable.circuit(),
+                        self.editable.economy(),
+                        port_u16,
+                    )
+                    && self.port_comparators_primed(comp_ancestry, port_u16)
+                    && self.port_q_hat_exceeds_null(p, predictions[p])
+                    && self.port_redundancy_arity_eligible(port_u16);
+                let sibling_waiting_stage2 = (0..num_ports)
+                    .any(|q| q != p && self.port_states[q].stage2_checks_completed == 0);
+                if stage3_eligible && (self.sibling_has_juvenile_nodes(p) || sibling_waiting_stage2)
+                {
+                    self.port_states[p].ticks_since_last_check = prev_ticks_since_check;
+                } else if stage3_eligible {
+                    let any_sibling_needs_stage2 =
+                        (0..num_ports).any(|q| q != p && self.port_needs_stage2(q));
+                    let mut stage3_tel = SproutTelemetry::default();
+                    let mut stage3_ok_none = false;
+                    let mut sprouted = false;
+                    if num_ports == 1 {
+                        match propose_redundancy_sprout(
+                            &self.editable,
+                            &self.obs_window,
+                            &self.port_states[p].diagnostic_buffer,
+                            &self.growth_config,
+                            &self.economy_config,
+                            budget,
+                            port_u16,
+                            &mut stage3_tel,
+                        ) {
+                            Ok(Some(prop)) => {
+                                sprouted = self.commit_redundancy_sprout(p, prop);
+                            }
+                            Ok(None) => stage3_ok_none = true,
+                            Err(_) => {}
+                        }
+                    } else {
+                        let total_budget = self.total_budget_seen.unwrap_or_else(|| {
+                            budget.remaining().saturating_add(budget.consumed())
+                        });
+                        let base_share = total_budget / (num_ports as u64);
+                        let cap = if any_sibling_needs_stage2 {
+                            base_share
+                                .saturating_sub(self.port_states[p].replay_ticks_consumed)
+                                .min(budget.remaining())
+                        } else {
+                            self.port_budget_allowance(p, budget)
+                        };
+                        let mut stage3_budget = TickBudget::new(cap);
+                        match propose_redundancy_sprout(
+                            &self.editable,
+                            &self.obs_window,
+                            &self.port_states[p].diagnostic_buffer,
+                            &self.growth_config,
+                            &self.economy_config,
+                            &mut stage3_budget,
+                            port_u16,
+                            &mut stage3_tel,
+                        ) {
+                            Ok(Some(prop)) => {
+                                sprouted = self.commit_redundancy_sprout(p, prop);
+                            }
+                            Ok(None) => stage3_ok_none = true,
+                            Err(_) => {}
+                        }
+                        let spent = stage3_budget.consumed();
+                        let _ = budget.try_consume(spent);
+                        self.port_states[p].replay_ticks_consumed += spent;
+                    }
+                    if !sprouted {
+                        self.sprout_blocked_max_nodes += stage3_tel.sprout_blocked_max_nodes;
+                        self.sprout_budget_exhausted += stage3_tel.sprout_budget_exhausted;
+                        if stage3_ok_none && stage3_tel.sprout_budget_exhausted == 0 {
+                            self.port_states[p].stage3_exhausted = true;
+                        }
+                    }
+                    self.candidate_list_truncated += stage3_tel.candidate_list_truncated;
+                    if sprouted {
+                        break;
+                    }
+                }
             }
         }
 
@@ -4223,5 +4335,27 @@ mod tests {
                 "{label} (deg 11 x deg 9) must have zero active comparators"
             );
         }
+    }
+
+    #[test]
+    fn comparator_wake_window_tail_helpers_match_dual_timescale() {
+        let mut win = ComparatorWakeWindow::new(NodeId(0), 256);
+        for _ in 0..192 {
+            win.push(false, 1.0, 1.0, false, false);
+        }
+        assert!(!win.is_full());
+        assert_eq!(win.disagree.len(), 192);
+        for _ in 0..64 {
+            win.push(true, -1.0, 1.0, true, false);
+        }
+        assert!(win.is_full());
+        assert_eq!(win.disagreement_count_tail(64), 64);
+        assert_eq!(win.e_primary_count_tail(64), 64);
+        assert_eq!(win.e_alt_count_tail(64), 0);
+        assert!((win.flux_primary_tail(64) + 64.0).abs() < 1e-12);
+        assert!((win.flux_alt_tail(64) - 64.0).abs() < 1e-12);
+        assert_eq!(win.disagreement_count(), 64);
+        assert!((win.flux_primary() - 128.0).abs() < 1e-12);
+        assert!((win.flux_alt() - 256.0).abs() < 1e-12);
     }
 }
