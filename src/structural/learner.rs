@@ -786,6 +786,13 @@ impl ArkheLearner {
             reserve_mismatch_floored: self.reserve_mismatch_floored,
             lag_deepening_steps: self.lag_deepening_steps,
             sprout_budget_exhausted: self.sprout_budget_exhausted,
+            redundancy_sprout_events: self.redundancy_sprout_events,
+            active_comparator_count: self.active_comparator_count(),
+            comparator_agreement_ticks: self.comparator_agreement_ticks(),
+            comparator_disagreement_ticks: self.comparator_disagreement_ticks(),
+            cumulative_comparator_flux: self.cumulative_comparator_flux(),
+            driver_handoff_events: self.driver_handoff_events,
+            disagreement_prune_events: self.disagreement_prune_events,
         }
     }
 

@@ -329,6 +329,20 @@ pub struct ArkheM1Telemetry {
     pub lag_deepening_steps: u64,
     #[serde(default)]
     pub sprout_budget_exhausted: u64,
+    #[serde(default)]
+    pub redundancy_sprout_events: u64,
+    #[serde(default)]
+    pub active_comparator_count: usize,
+    #[serde(default)]
+    pub comparator_agreement_ticks: u64,
+    #[serde(default)]
+    pub comparator_disagreement_ticks: u64,
+    #[serde(default)]
+    pub cumulative_comparator_flux: f64,
+    #[serde(default)]
+    pub driver_handoff_events: u64,
+    #[serde(default)]
+    pub disagreement_prune_events: u64,
 }
 
 /// Aggregated cliff, bound, and guardrail telemetry across one or more learner runs (§B3).
@@ -778,5 +792,48 @@ mod tests {
                 learning_rate: DEFAULT_RNN_LEARNING_RATE,
             }
         );
+    }
+
+    #[test]
+    fn arkhe_m1_telemetry_serde_roundtrip_and_legacy_defaults() {
+        let legacy_json = r#"{
+            "final_node_count": 4,
+            "final_split_count": 1,
+            "final_delay_count": 2,
+            "final_total_energy": 12.5,
+            "min_mature_node_energy": 3.0,
+            "cumulative_net_flux": 40.0,
+            "cumulative_maturity_debt_paid": 8.0,
+            "null_calibrated_mdl_delta_bits": -20.0,
+            "sprout_events": 1,
+            "ring_closure_events": 0,
+            "starvation_prune_events": 0,
+            "idle_prune_events": 0
+        }"#;
+        let parsed: ArkheM1Telemetry =
+            serde_json::from_str(legacy_json).expect("legacy ArkheM1Telemetry JSON deserializes");
+        assert_eq!(parsed.final_node_count, 4);
+        assert_eq!(parsed.redundancy_sprout_events, 0);
+        assert_eq!(parsed.active_comparator_count, 0);
+        assert_eq!(parsed.comparator_agreement_ticks, 0);
+        assert_eq!(parsed.comparator_disagreement_ticks, 0);
+        assert_eq!(parsed.cumulative_comparator_flux, 0.0);
+        assert_eq!(parsed.driver_handoff_events, 0);
+        assert_eq!(parsed.disagreement_prune_events, 0);
+
+        let full = ArkheM1Telemetry {
+            redundancy_sprout_events: 2,
+            active_comparator_count: 1,
+            comparator_agreement_ticks: 120,
+            comparator_disagreement_ticks: 3,
+            cumulative_comparator_flux: 18.75,
+            driver_handoff_events: 1,
+            disagreement_prune_events: 1,
+            ..parsed
+        };
+        let encoded = serde_json::to_string(&full).expect("serialize ArkheM1Telemetry");
+        let roundtrip: ArkheM1Telemetry =
+            serde_json::from_str(&encoded).expect("deserialize ArkheM1Telemetry");
+        assert_eq!(roundtrip, full);
     }
 }
