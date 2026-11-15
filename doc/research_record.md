@@ -474,7 +474,7 @@ Prior to Milestone 2b ([milestone_2b_plan.md](milestone_2b_plan.md)), analytical
 
 ## 11. Milestone 2b Implementation, Derived Scaling Laws, & Verification Record (`2026-11-15`)
 
-Milestone 2b ([milestone_2b_plan.md](milestone_2b_plan.md)) implemented wake/sleep epistemic comparator economics (`M2B-D1`), strict causal-support disjoint redundancy neurogenesis (`M2B-D2`), offline loopback falsification, and Phase 4 dev-ratified derived scaling laws (`M2B-A1`–`M2B-A3`, `M2B-B1`–`M2B-B3`, `M2B-C1`; see [Chief Scientist Review](milestone_2b_chief_scientist_review.md) and [Stage-3 Blocker Report](milestone_2b_stage3_blocker_report.md)) without opening single-shot holdout `40000..=40019`.
+Milestone 2b ([milestone_2b_plan.md](milestone_2b_plan.md)) implemented wake/sleep epistemic comparator economics (`M2B-D1`), strict causal-support disjoint redundancy neurogenesis (`M2B-D2`), offline loopback falsification, and Phase 4 dev-ratified derived scaling laws (`M2B-A1`–`M2B-A3`, `M2B-B1`–`M2B-B3`, `M2B-C1`; see [Chief Scientist Review](milestone_2b_chief_scientist_review.md) and [Stage-3 Blocker Report](milestone_2b_stage3_blocker_report.md)), passing dev/confirmation prior to user-authorized single-shot holdout `40000..=40019` (`b211afa`).
 
 ### 11.1 Implemented Architecture & Derived Amendments (`8ca68a2`–`220349f` + Phase 4)
 
@@ -501,7 +501,7 @@ Under ratified `M2B-D3` (`GrowthConfig::default().redundancy_sprouting = true`),
 
 ### 11.3 Milestone 2b Dev & Confirmation Attainment Summary (`1e1c9dd8a7151060a011d956081fad50`)
 
-All release verification runs executed against the identical compiled Phase 4 source tree (`source_tree_fnv1a128 = 1e1c9dd8a7151060a011d956081fad50`, `git_commit_sha = 220349f07350d6321027ac1a8e4fce6eb5379522`):
+All release verification runs executed against the identical compiled Phase 4 source tree (`source_tree_fnv1a128 = 1e1c9dd8a7151060a011d956081fad50`; dev/confirmation recorded at `220349f` and re-verified on clean `main` at `b211afa8a8c30a381ff230c672ac961d03f6e442`, `git_dirty = false`, where single-shot holdout `40000..=40019` ran once after user authorization):
 
 | Suite & Seed Range | Outcome | Gate Results & Pooled Statistics | Auxiliary / Characterization Metric | `excluded_cases` | `sprout_blocked_max_nodes` |
 | :--- | :--- | :--- | :--- | ---: | ---: |
@@ -510,6 +510,8 @@ All release verification runs executed against the identical compiled Phase 4 so
 | `verify-m2b` dev (`0..20`) | `all_passed: true` | `G2B.1` `300/300` (`1.0`), `G2B.2` `200/200` (`1.0`), `G2B.3` `140/140` (`1.0`), `G2B.4` `178/180` (`0.988889`), `G2B.5` `40/40` (`1.0`) | `G2B.1` `max_err = 1.895e-15` b/sym; `G2B.4` `0.00105` b/sym; `G2B.5` `+1.43021` b/sym | `0` | `0` |
 | `verify-m2b` dev (`20..1020`, `50` banks × `20` seeds = `1,000` seeds) | `all_passed: true` | `G2B.1` `15000/15000` (`LB99 = 0.999693`, $p = 1.0$); `G2B.2` `10000/10000` (`LB99 = 0.999540`, $p = 1.0$); `G2B.3` `7000/7000` (`LB99 = 0.999342`, $p = 1.0$); `G2B.4` `8797/9000` (`LB99 = 0.973532`, `mean = 0.977444`, `std = 0.009617`, `p5 = 0.961111`, $\chi^2 = 36.997051, df = 49, p = 0.90383$); `G2B.5` `2000/2000` (`LB99 = 0.997700`, $p = 1.0$) | `G2B.1` `max_err = 1.89478e-15` b/sym; `G2B.4` `0.003639` b/sym; `G2B.5` `+1.42432` b/sym | `0` | `0` |
 | `verify-m2b` conf (`20040..=20059`) | `all_passed: true` | `G2B.1` `300/300` (`1.0`), `G2B.2` `200/200` (`1.0`), `G2B.3` `140/140` (`1.0`), `G2B.4` `177/180` (`0.983333`), `G2B.5` `40/40` (`1.0`) | `G2B.1` `max_err = 1.895e-15` b/sym; `G2B.4` `0.00865` b/sym; `G2B.5` `+1.42105` b/sym | `0` | `0` |
+| `verify-m2b` single-shot holdout (`40000..=40019`, `b211afa`) | `all_passed: true` | `G2B.1` `300/300` (`1.0`), `G2B.2` `200/200` (`1.0`), `G2B.3` `140/140` (`1.0`), `G2B.4` `178/180` (`0.988889`), `G2B.5` `40/40` (`1.0`) | `G2B.1` `max_err = 1.895e-15` b/sym; `G2B.4` `0.00827` b/sym; `G2B.5` `+1.42922` b/sym | `0` | `0` |
 
 - **1,000-seed cliff telemetry (`20..1020`):** `reserve_clipped_count = 94,653,731` (`72,251,297.41` bits), `reserve_mismatch_floored = 0`, `sprout_blocked_max_nodes = 0`, `candidate_undecidable = 569,573`, `candidate_list_truncated = 836,647`, `lag_horizon_bound = 0`, `ring_period_bound = 1,372`, `lag_deepening_steps = 330,576`, `sprout_budget_exhausted = 1,231,141`.
-- **Holdout Seed Governance:** M1 (`10000..=10019`), M2b (`40000..=40019`), and reserved M3 (`50000..=50019`) holdout ranges remain **locked and untouched** pending explicit user sign-off; M2a single-shot holdout (`30000..=30019`) ran once at `aa6fb6d`.
+- **Single-shot holdout cliff telemetry (`40000..=40019`, `b211afa`):** `reserve_clipped_count = 1,902,736` (`1,439,402.43` bits), `reserve_mismatch_floored = 0`, `sprout_blocked_max_nodes = 0`, `candidate_undecidable = 11,469`, `candidate_list_truncated = 16,524`, `lag_horizon_bound = 0`, `ring_period_bound = 29`, `lag_deepening_steps = 5,868`, `sprout_budget_exhausted = 23,868`.
+- **Holdout Seed Governance:** M1 (`10000..=10019`) and reserved M3 (`50000..=50019`) holdout ranges remain **locked and untouched** pending explicit user sign-off; M2a single-shot holdout (`30000..=30019`) ran once at `aa6fb6d`, and M2b single-shot holdout (`40000..=40019`) ran once after user authorization at `b211afa` (`source_tree_fnv1a128 = 1e1c9dd8a7151060a011d956081fad50`, `all_passed: true`, `excluded_cases: 0`).
