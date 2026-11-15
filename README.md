@@ -1,17 +1,17 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, and **Milestone 2a (`M2a — Cross-channel predictive coupling`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), historical Milestone 0–2a sign-off records plus pre-Milestone 2 readiness verification live in [doc/research_record.md](doc/research_record.md), Chief Scientist governance and escalation principles live in [doc/chief_scientist_role.md](doc/chief_scientist_role.md), and the ratified Stage M2b pre-registration plan lives in [doc/milestone_2b_plan.md](doc/milestone_2b_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, and **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), Milestone 0–2b sign-off records and derivations live in [doc/research_record.md](doc/research_record.md), Chief Scientist governance and escalation principles live in [doc/chief_scientist_role.md](doc/chief_scientist_role.md), and the ratified Stage M2b pre-registration plan lives in [doc/milestone_2b_plan.md](doc/milestone_2b_plan.md).
 
 ## Overview
 
 Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k}$ ($1 \le k \le 64$) with:
 
 - **`substrate`**: Exact $\mathbb{Z}_{2^k}$ ring arithmetic, Level-0 primitives (`ADD`, `SUB`, `MUL`, `EQZ`, `SPLIT`, `DELAY`), Charter §2.5 structural invariant checks, scalar evaluator (`ScalarState`), and 64-lane bit-parallel evaluator (`BitParallel64State` at $k = 1$).
-- **`structural`**: Coordinate-free graph editing over `substrate::Circuit`, metabolic reserves and retrograde sensitivity, state-preserving live surgery, and finite-ring residual diagnostics with progressive lag deepening.
-- **`env`**: Finite-state benchmark generators (`T1`, `T2`, `T3b`, `T3c`), declared channel substitution noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
-- **`metrics`**: Surprisal null models, Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests (with per-channel breakdowns) separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
+- **`structural`**: Coordinate-free graph editing over `substrate::Circuit`, metabolic reserves and retrograde sensitivity, state-preserving live surgery, causal-disjoint redundancy sprouting, wake/sleep counterfactual comparators, and finite-ring residual diagnostics with progressive lag deepening.
+- **`env`**: Finite-state benchmark generators (`T1`, `T2`, `T2_MultiViewCoupled`, `T3b`, `T3c`), declared channel substitution & scheduled channel-fault noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
+- **`metrics`**: Epistemic & boundary-null surprisal models ($\Delta E \equiv -\Delta L_{\text{null}}^{\text{epistemic}}$), Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests (with per-channel breakdowns) separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
 - **`baselines`**: Compute-matched prequential baseline harness (`RandomSearch`, `(1+λ) CGP`, `CTW`, `CrossChannelCtw`, BPTT `Rnn`, `ReedsSloane`, and certified small-circuit `Exhaustive` synthesis) over phase-exact sliding observation windows.
-- **`rng`, `config`, `verify`, `verify_m1`, & `verify_m2a`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, M0/M1a/M1b/M2a verification batteries, pooled Clopper–Pearson + $\chi^2$/permutation homogeneity bank statistics, and `profile-compute` scaling/counter profiling.
+- **`rng`, `config`, `verify`, `verify_m1`, `verify_m2a`, & `verify_m2b`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, M0/M1a/M1b/M2a/M2b verification batteries (`G2B.1`–`G2B.5`), pooled Clopper–Pearson + $\chi^2$/permutation homogeneity bank statistics, and `profile-compute` scaling/counter profiling.
 
 ## Project Structure
 
@@ -25,7 +25,9 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   │   └── milestone_plan_template.md
 │   ├── chief_scientist_role.md
 │   ├── foundational_research_charter_v3.md
+│   ├── milestone_2b_chief_scientist_review.md
 │   ├── milestone_2b_plan.md
+│   ├── milestone_2b_stage3_blocker_report.md
 │   ├── parameter_inventory.md
 │   └── research_record.md
 ├── scripts/
@@ -40,6 +42,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   ├── substrate/
 │   ├── verify_m1/
 │   ├── verify_m2a/
+│   ├── verify_m2b/
 │   ├── config.rs
 │   ├── lib.rs
 │   ├── main.rs
@@ -53,6 +56,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   ├── m0_acceptance.rs
 │   ├── m1a_economy.rs
 │   ├── m1b_neurogenesis.rs
+│   ├── m2b_comparators.rs
 │   ├── multi_channel_development.rs
 │   ├── post-create.sh
 │   └── regime_shift.rs
@@ -100,6 +104,14 @@ cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdo
 ```bash
 cargo run --locked --release -- verify-m2a --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m2a --banks 50 --seed-offset 20 --seeds 20
+```
+
+1. Run the Milestone 2b redundant derivations and counterfactual comparators suite (`G2B.1`–`G2B.5`):
+
+```bash
+cargo run --locked --release -- verify-m2b --seed-offset 0 --seeds 20
+cargo run --locked --release -- verify-m2b --banks 50 --seed-offset 20 --seeds 20
+cargo run --locked --release -- verify-m2b --seed-offset 20040 --seeds 20
 ```
 
 1. Run the Phase 0 / readiness compute and cliff-counter profiler:

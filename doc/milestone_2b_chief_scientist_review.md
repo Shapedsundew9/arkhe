@@ -165,7 +165,7 @@ Per [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-a
 
 ## 6. Post-`83ca660` Blocker Audit: Are We Over-Protecting Early-Phase Constants?
 
-Following implementation of `M2B-A1`–`M2B-A3` (`83ca660`), `verify-m2b --seed-offset 0 --seeds 20` now passes **`G2B.1` (`300/300`)**, **`G2B.3` (`140/140`)**, and **`G2B.4` (`180/180`, `pooled_|E[KT]-H_bayes_class| = 0.00105`, `0` false prunes)** cleanly, while surfacing the three boundary blockers documented in [`doc/milestone_2b_blocker_report.md`](milestone_2b_blocker_report.md) (`G2B.5` at `34/40`; `G2B.2` at `120/200`).
+Following implementation of `M2B-A1`–`M2B-A3` (`83ca660`), `verify-m2b --seed-offset 0 --seeds 20` now passes **`G2B.1` (`300/300`)**, **`G2B.3` (`140/140`)**, and **`G2B.4` (`180/180`, `pooled_|E[KT]-H_bayes_class| = 0.00105`, `0` false prunes)** cleanly, while surfacing the three boundary blockers documented in retired `doc/milestone_2b_blocker_report.md` (consolidated in §6.1–§6.2 below; `G2B.5` at `34/40`; `G2B.2` at `120/200`).
 
 Stepping back to ask **whether over-protecting early Milestone-1 scaffolding constants is forcing us into Ptolemaic epicycles**, auditing all six M1 scaffolding constants in [`doc/parameter_inventory.md`](parameter_inventory.md) gives a sharp, asymmetric answer: **YES on `juvenile_ticks = 128` (and `1 * initial_energy = 4.0` at `growth.rs:2681`), NO on `W_obs = 256` and `W_diag = 64`.**
 
@@ -207,4 +207,76 @@ Per [`doc/parameter_inventory.md` §2.1](parameter_inventory.md#21-parameter-sca
 
 ### 6.3 Ratified Post-`83ca660` Blocker Decisions (`2026-11-15` User Sign-Off)
 
-All three proposals above (`M2B-B1` unified per-node debt-amortization maturation law + `new_nodes * initial_energy` with Rule-4 golden governance, `M2B-B2` atomic 1-sided comparator bankruptcy refutation preserving `W_obs = 256`, and `M2B-B3` `{0, 3, (5, 6)}` lag separation + target/comparator anti-starvation scope preserving `W_diag = 64` until `M5`) have been **ratified by the user (`2026-11-15`)** and folded into [`doc/milestone_2b_plan.md`](milestone_2b_plan.md) (§2.2, §2.3, §3, §6, §8.1) and [`doc/milestone_2b_blocker_report.md`](milestone_2b_blocker_report.md) (§8) for execution by the `m2b_verify` swarm (`holdout 40000..=40019` remains locked).
+All three proposals above (`M2B-B1` unified per-node debt-amortization maturation law + `new_nodes * initial_energy` with Rule-4 golden governance, `M2B-B2` atomic 1-sided comparator bankruptcy refutation preserving `W_obs = 256`, and `M2B-B3` `{0, 3, (5, 6)}` lag separation + target/comparator anti-starvation scope preserving `W_diag = 64` until `M5`) have been **ratified by the user (`2026-11-15`)** and folded into [`doc/milestone_2b_plan.md`](milestone_2b_plan.md) (§2.2, §2.3, §3, §6, §8.1; prior `doc/milestone_2b_blocker_report.md` retired after Commit 1 `ca7136c`) for execution by the `m2b_verify` swarm (`holdout 40000..=40019` remains locked).
+
+---
+
+## 7. Post-`ca7136c` Stage-3 Blocker Audit: Two-Clause Causal-Dilution Decidability (`Proposal M2B-C1`)
+
+Following Commit 1 (`ca7136c`) in the `m2b_verify` worktree, `tests/golden_traces.rs` (`1/1` bit-identical), `verify-m1`, `verify-m2a`, **`G2B.1` (`300/300`)**, **`G2B.3` (`140/140`)**, **`G2B.4` (`179/180`, `99.44%`, `dis_prunes = 0`)**, and **`G2B.5` (`40/40`, `100%`, `+1.4385` b/sym advantage)** all pass with `0` guardrail exclusions ([`doc/milestone_2b_stage3_blocker_report.md`](milestone_2b_stage3_blocker_report.md)). Only `G2B.2` fails (`140/200`, `70.0% < 90.0%`): Stage 2 solves all `200/200` cases at `clean_mis = 0`, `target_starv = 0`, `comp_starv = 0`, and Stage 3 discovers the exact `e_alt = 0` disjoint backup on all three remaining tasks (`MV_Affine_k2_TphSplit`, `MV_Eqz_k2_Comb`, `MV_MulEqz_k2_Comb`), rejecting all three **solely** at the unscaled `horizon_ceiling = 512` (`2 * W_obs`) gate inside [`src/structural/growth.rs`](../src/structural/growth.rs) (`compute_debt_amortization_juvenile_ticks`).
+
+### 7.1 Direction Check (`Question a`): Per-Node Economy Is Working as Designed; Eliminate the Split-Brain Ceiling
+
+1. **Why Option (b) (Cone-Pooled Debt / Relaxed `Split` Share) Must Be Rejected:**
+   - Under [Charter §3.1.2 & §3.1.3](foundational_research_charter_v3.md#312-metabolism), individual per-node description debt $\Delta L_v$ and normalized retrograde sensitivity credit $\text{share}(v) / Z_{\text{tot}}$ are the primary defense against `M3` credit free-riders (`H4`). Pooling debt across sibling nodes in a sprouted cone would allow parasitic branches or redundant `Split` nodes to survive graduation by riding on productive siblings, while breaking bit-identical `tests/golden_traces.rs`.
+2. **Why Option (c) (Narrowing `G2B.2` or Doubling `W_obs`) Must Be Rejected:**
+   - Dropping `MV_Eqz_k2_Comb`, `MV_MulEqz_k2_Comb`, or `MV_Affine_k2_TphSplit` weakens nonlinear and causal `TicksPerHop` coverage to protect an unscaled M1 ceiling (violating Principle 1 & Rule 2). Doubling `W_obs` globally doubles `ReserveCap::HorizonDerived` drainage latency (`tests/regime_shift.rs`) and pushes `Step B` wake refutation past `G2B.5`'s post-fault window.
+3. **Root Cause — Anti-Epicycle Diagnosis of `compute_debt_amortization_juvenile_ticks`:**
+   - Commit 1 (`ca7136c`) already had to introduce a Stage-2-only boolean workaround (`allow_deep_base_scaling = true` in Stage 2 so `c2a` at `d_cone = 14`, `t_base = 1175`, `t_debt = 1144` could pass, while setting `allow_deep_base_scaling = false` in Stage 3).
+   - That boolean flag is a textbook split-brain seam: in Stage 3 it immediately rejected `MV_Affine_k2_TphSplit` (`t_debt = 308 <= 512`) solely because `M2B-D1`'s already-ratified `effective_comparator_juvenile_ticks(5, 1.5641) = 557` exceeded `512`.
+   - Meanwhile, on `MV_Eqz_k2_Comb` (`EqzAddConst` + `Sub` + `Eqz`, `8` new nodes), exact first-principles trace physics explains `n31(Split)` (`ConstLoop(1)`'s `Split`, `debt = 29.37` bits, `r_hat = 0.03507` b/tick, `td = 838`): at $k = 2$, `Eqz` compresses uniform $\mathbb{Z}_4$ into a `75%/25%` Bernoulli stream ($H_2(0.25) = 0.811$ b/tick; `~0.756` b/tick over 64-tick KT warmup), and on the `75%` non-zero ticks `n31` is attenuated through `sens(n31) = 1/(2^k - 1) = 1/3`, `Add` fan-in `1/2`, and `sens(Add) = 1/3` ($\implies w_{n31} = 1/18$) while downstream `Eqz_alt`, `Sub_comp`, and `Eqz_comp` draw unit weight `1.0` each ($Z_{\text{tot}} = Z_{\text{alt}} + 2 = 4.30$), giving analytical $\mathbb{E}[\hat{r}_{n31}^+] \approx 0.035$ b/tick.
+
+### 7.2 Quantitative Audit of Blocker Option (a) vs. `Proposal M2B-C1` (`Option a+`)
+
+Evaluating Blocker Report Option (a) ($H_{\text{Opt (a)}} = \lceil 2 W_{\text{obs}} \cdot (t_{\text{base}} / t_{\text{juv,min}}) \rceil$) exposes **two mathematical flaws** when tested against tail statistics and adversarial noise:
+
+1. **Inverted $Z_{\text{alt}}$ Scaling on Multi-Node Cones (`MV_Eqz` Binomial Tail Trap):**
+   - In [`src/structural/economy.rs`](../src/structural/economy.rs) (`apply_tick_core`), comparator credit is divided by **`total_ancestry` $= Z_{\text{tot}} = Z_{\text{alt}} + 2$**.
+   - However, [`effective_comparator_juvenile_ticks`](../src/structural/growth.rs) multiplies flat `t_eff(2) = 128` by $\frac{Z_{\text{alt}} + 2}{Z_{\text{alt}}} = 1 + \frac{2}{Z_{\text{alt}}}$, which **puts $Z_{\text{alt}}$ in the denominator** (converting Stage-2 multi-node time to Stage-3 time while omitting Stage-2's own $Z_{\text{alt}}$ dilution at $d \le 3$).
+   - Consequently, as `alt` grows from a 1-node cone ($Z_{\text{alt}} = 0.90, Z_{\text{tot}} = 2.90$) to an 8-node `EqzAddConst` comparator ($Z_{\text{alt}} = 2.30, Z_{\text{tot}} = 4.30$), true denominator dilution **increases** from $2.90\times$ to $4.30\times$, whereas Option (a)'s ceiling **shrinks** from `1,652` ticks down to `960` ticks! While deterministic clean `G2B.2` (`m = 20/64` ones in `[192..256]`) clears `840 <= 960` by `120` ticks, under noisy or sparse Binomial($64, 0.25$) realizations ($m \le 9\text{–}10/64$ ones), $t_{\text{debt}}$ rises to `1,050`–`1,250 > 960`–`1,060` and **fails**.
+2. **Un-Gated Small-$Z_{\text{alt}}$ Juvenile Over-Shielding Under Noise (`Threat A`):**
+   - In [`evaluate_stage3_candidate_pre`](../src/structural/growth.rs), noisy Stage-3 candidates only check `flux_alt > 0.0` and `e_alt_diag + min_match_gain <= e_null_diag` (unlike Stage 2, which checks `projected_survival > delta_l_sprout` and `j_mat_cand < j_mat_curr`).
+   - Under raw Option (a) alone, a barely-positive noisy candidate (`flux_alt = +3.0` bits over `64` ticks, $\Delta L_{\text{new}} = 85$ bits $\implies$ whole-cone crossover $W^*_{\text{cone}} = 1,818 \gg 512$ ticks) with $d_{\text{alt}} = 4, Z_{\text{alt}} = 0.90$ receives `H_Opt(a) = 2,388` ticks—creating an **un-prunable juvenile zombie** for the rest of $T = 2000$ (since [`process_wake_comparator_events`](../src/structural/learner.rs) skips `!comparator_cone_is_mature`).
+
+**Clean Zero-Free-Parameter Synthesis (`Proposal M2B-C1` — Two-Clause Subgraph Crossover + Total-Ancestry Dilution Law):**
+
+Eliminate `allow_deep_base_scaling: bool` entirely and enforce two orthogonal, zero-free-parameter decidability bounds uniformly across Stage 2 and Stage 3 in [`compute_debt_amortization_juvenile_ticks`](../src/structural/growth.rs):
+
+1. **Clause (i) — Subgraph Epistemic MDL Crossover Bound (`Anti-Noise Guard`):**
+   $$t_{\text{cone}}(V_{\text{new}}) \triangleq d_{\text{cone}} + \left\lceil \frac{\sum_{v \in V_{\text{new}}} \Delta L_v}{\sum_{v \in V_{\text{new}}} \hat{r}_v^+} \right\rceil \le 2 W_{\text{obs}} \quad (= 512\text{ ticks at defaults}).$$
+   - By the mediant inequality ($\frac{\sum \Delta L_v}{\sum \hat{r}_v^+} \le \max_v \frac{\Delta L_v}{\hat{r}_v^+}$), **every** sprout that already passed `t_debt <= 512` in Commit 1 (`tests/golden_traces.rs`, `verify-m1`, `verify-m2a`, `G2B.1`, `G2B.3`–`G2B.5`, and `140/140` of `G2B.2`) satisfies $t_{\text{cone}} \le 512$ **identically**.
+   - Every multi-node / deep exact cone also satisfies $t_{\text{cone}} \le 512$ with wide margin, while weak noisy correlations ($\hat{R}^+_{\text{new}}$ small relative to $\Delta L_{\text{new}}$) are rejected immediately with `CandidateUndecidable`.
+2. **Clause (ii) — Per-Node Causal-Dilution Ceiling (`Anti-Parasite Guard`):**
+   $$t_{\text{juv}}(V_{\text{new}}) = \max(t_{\text{base}},\, t_{\text{debt}}) \le H_{\text{node}}(V_{\text{new}}) \triangleq \left\lceil 2 W_{\text{obs}} \cdot \max\!\left(\frac{t_{\text{base}}}{t_{\text{juv,min}}},\ Z_{\text{tot}}\right) \right\rceil,$$
+   where $Z_{\text{tot}} \ge 1.0$ is the replay-measured mean active causal ancestry on the target sink (`port_shares[out_port].sum()` in Stage 2; `comparator_shares[comp_idx].sum() = Z_alt + 2` in Stage 3).
+
+| Workload / Regime | $d$ | $N_{\text{new}}$ | $Z_{\text{tot}}$ | $t_{\text{cone}}$ ($\le 512$) | $t_{\text{base}}$ | $t_{\text{debt}}$ | Opt (a) Ceiling | **`M2B-C1` $H_{\text{node}}$** | Outcome |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| M1 1-node (`k=1, d=1`) | `1` | `1` | `1.00` | `45` | `128` | `45` | `512` | **`512`** | Exact M1 reduction (`t_juv = 128`) |
+| M2a `c2a` deep chain (`d=14`) | `14` | `15` | `7.71` | `234` | `1175` | `1144` | `4700` | **`4700`** | Passes (`t_juv = 1175`, no `bool` flag) |
+| `MV_Affine_k2_TphSplit` | `5` | `7` | `3.56` | `55` | `557` | `308` | `2228` | **`2228`** | Passes (`t_juv = 557`, matures `t ≈ 820`) |
+| `MV_MulEqz_k2_Comb` | `5` | `16` | `5.52` | `253` | `383` | `546` | `1532` | **`2826`** | Passes (`t_juv = 546`, matures `t ≈ 850`) |
+| `MV_Eqz_k2_Comb` (`m=20/64`) | `2` | `8` | `4.30` | `226` | `240` | `840` | `960` (tight) | **`2200`** | Passes (`t_juv = 840`, matures `t ≈ 1100`) |
+| `MV_Eqz_k2_Comb` (`m=10/64` tail) | `2` | `8` | `3.91` | `334` | `262` | `1210` | `1048` (**FAIL**) | **`2004`** | Passes sparse tail cleanly |
+| Weak noisy fluke (`+3b/64t`, `d=4`) | `4` | `3` | `2.90` | **`1818 > 512`** | `597` | `1812` | `2388` (**LEAK**) | Rejected by Clause (i) | Blocked (`CandidateUndecidable`) |
+| `M3` near-zero-share parasite leaf | `2` | `5` | `3.50` | `200` | `220` | **`10002`** | `880` | **`1792`** (`10002 > 1792`) | Blocked (`CandidateUndecidable`) |
+
+### 7.3 Full-Surface Code Audit: Two Coupled Hygiene Catches in `src/structural/learner.rs`
+
+Auditing Commit 1 (`ca7136c`) around Pass 2 (`ArkheLearner::observe`, `src/structural/learner.rs:2550–2560`) uncovered two concrete oversights that **must** be fixed alongside `M2B-C1`:
+
+1. **Dropped Stage-3 `CandidateUndecidable` & `LagHorizonBound` Telemetry (Rule 3 Violation):**
+   - At `learner.rs:2553–2558`, Pass 2 forwards `stage3_tel.sprout_blocked_max_nodes`, `stage3_tel.sprout_budget_exhausted`, and `stage3_tel.candidate_list_truncated`, **but omits `self.candidate_undecidable += stage3_tel.candidate_undecidable;` and `self.lag_horizon_bound += stage3_tel.lag_horizon_bound;`**—silently discarding `CandidateUndecidable` increments emitted by `compute_debt_amortization_juvenile_ticks` in Stage 3.
+2. **Premature `stage3_exhausted` Before `obs_window` Fills (`learner.rs:2554` vs. `2425`):**
+   - Stage 2 (`learner.rs:2425`) gates `stage2_exhausted = true` on `obs_full` (`self.obs_window.len() >= observation_horizon(...)`), whereas Stage 3 (`learner.rs:2554`) sets `stage3_exhausted = true` unconditionally whenever `stage3_ok_none && stage3_tel.sprout_budget_exhausted == 0`. Gating `stage3_exhausted = true` on `obs_full && (diag_zero_res || !self.port_needs_stage2(p))` (matching Stage 2's `obs_full` invariant) prevents a transient noise burst on a partially filled replay window from permanently locking out Stage 3 for the remainder of a noisy `G2B.4` run while still donating idle `TickBudget` once `obs_window` is full.
+
+### 7.4 Operational & Quota Recommendation
+
+With `gemini-4-hydrogen-*` at `5%` remaining (resetting `2026-11-21T11:27:38Z`) while `claude-opus-5-5-high` and `claude-sonnet-5-5-high` stand at `100%` (resetting in ~4 hours at `2026-11-16T00:34:28Z`), `M2B-C1` + the two `learner.rs` telemetry/exhaustion lines touch ~35 lines across `src/structural/growth.rs` and `src/structural/learner.rs` with zero golden-trace churn (`tests/golden_traces.rs` remains `1/1` bit-identical by the mediant inequality). Keep `@monitor` paused on Hydrogen and execute the surgical `M2B-C1` patch + `verify-m2b` dev/confirmation runs (`0..20`, `20..1020`, `20040..=20059`; keeping `40000..=40019` locked) using available `claude-sonnet-5-5-high` / `claude-opus-5-5-high` capacity before its `00:34Z` reset window.
+
+### 7.5 Ratified Post-`ca7136c` Decision (`2026-11-15` User Sign-Off — `M2B-C1`)
+
+Per [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-and-decision-rights) and [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) Rules 2, 3, 4, 5, and 7, the Principal Investigator **ratified `Proposal M2B-C1` (`2026-11-15`)** for governance-doc handoff to the `swarm-m2b-verify-d32f3276` worktree:
+
+1. **`M2B-C1` (Two-Clause Subgraph Crossover + Total-Ancestry Dilution Decidability Law):** Remove `allow_deep_base_scaling` and enforce both (i) $t_{\text{cone}}(V_{\text{new}}) = d_{\text{cone}} + \lceil (\sum_{v \in V_{\text{new}}} \Delta L_v) / (\sum_{v \in V_{\text{new}}} \hat{r}_v^+) \rceil \le 2 W_{\text{obs}}$ (`512` at defaults) and (ii) $t_{\text{juv}}(V_{\text{new}}) = \max(t_{\text{base}}, t_{\text{debt}}) \le \lceil 2 W_{\text{obs}} \cdot \max(t_{\text{base}} / t_{\text{juv,min}}, Z_{\text{tot}}) \rceil$ uniformly across Stage 2 and Stage 3 in [`src/structural/growth.rs`](../src/structural/growth.rs), alongside forwarding `stage3_tel.candidate_undecidable` + `stage3_tel.lag_horizon_bound` and gating `stage3_exhausted` on `obs_full` in [`src/structural/learner.rs`](../src/structural/learner.rs).
+2. **Quota & Worktree Execution Authorization:** Keep `@monitor` paused to preserve the remaining `5%` `gemini-4-hydrogen-*` quota; temporary Tier-1/3 execution on `claude-sonnet-5-5-high` / `claude-opus-5-5-high` is authorized for applying `M2B-C1` in `swarm-m2b-verify-d32f3276` and running dev (`0..20`, `20..1020`) and confirmation (`20040..=20059`) suites (`holdout 40000..=40019` remains strictly locked until user sign-off).

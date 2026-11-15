@@ -20,6 +20,7 @@ pub mod substrate;
 pub mod verify;
 pub mod verify_m1;
 pub mod verify_m2a;
+pub mod verify_m2b;
 
 use std::fs;
 use std::path::PathBuf;
@@ -149,6 +150,24 @@ pub enum Commands {
         #[arg(long)]
         banks: Option<u32>,
         /// Explicit authorization to run against pre-registered M2a holdout seeds 30000..=30019.
+        #[arg(long, alias = "allow-holdout", default_value_t = false)]
+        holdout: bool,
+    },
+    /// Run Milestone 2b epistemic comparator economics, loopback & fault-survival verification gates (`G2B.1`–`G2B.5`).
+    VerifyM2b {
+        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
+        #[arg(long, default_value_t = 0)]
+        seed_offset: u32,
+        /// Number of master seeds evaluated (per bank when `--banks` is set).
+        #[arg(long, default_value_t = 20)]
+        seeds: u32,
+        /// Simulation horizon T in ticks.
+        #[arg(long, default_value_t = verify_m2b::DEFAULT_M2B_HORIZON)]
+        horizon: u64,
+        /// Number of consecutive seed banks to score (when set, activates multi-bank mode).
+        #[arg(long)]
+        banks: Option<u32>,
+        /// Explicit authorization to run against pre-registered M2b holdout seeds 40000..=40019.
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
     },
@@ -396,6 +415,38 @@ where
                     Ok(())
                 } else {
                     Err("Milestone 2a verification failed one or more acceptance gates".into())
+                }
+            }
+        }
+        Some(Commands::VerifyM2b {
+            seed_offset,
+            seeds,
+            horizon,
+            banks,
+            holdout,
+        }) => {
+            if let Some(num_banks) = banks {
+                let report = verify_m2b::run_m2b_bank_evaluation(
+                    seed_offset,
+                    seeds,
+                    num_banks,
+                    horizon,
+                    holdout,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.all_passed {
+                    Ok(())
+                } else {
+                    Err("Milestone 2b bank evaluation failed one or more gates".into())
+                }
+            } else {
+                let summary =
+                    verify_m2b::run_m2b_verification_suite(seed_offset, seeds, horizon, holdout)?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+                if summary.all_passed {
+                    Ok(())
+                } else {
+                    Err("Milestone 2b verification failed one or more acceptance gates".into())
                 }
             }
         }

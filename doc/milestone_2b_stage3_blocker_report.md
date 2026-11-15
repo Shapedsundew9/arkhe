@@ -66,3 +66,21 @@ Also note operational quota status: `gemini-4-hydrogen-xhigh` / `-high` stands a
 
 - Will not weaken `G2B.2` (`MV_Eqz_k2_Comb`, `MV_MulEqz_k2_Comb`, `MV_Affine_k2_TphSplit`) or alter `512` (`2 * W_obs`) / `M2B-B1` unilaterally (`GEMINI.md` Rules 2, 5, 7).
 - Will not modify `economy.rs` / `mdl.rs` debt pooling or `split_code_tax`, and will not run `20..1020`, `20040..=20059`, or holdout `40000..=40019` until ratified.
+
+## 8. Ratified Decision (`2026-11-15` User Sign-Off — `Proposal M2B-C1`)
+
+Per [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-and-decision-rights) and [`doc/milestone_2b_chief_scientist_review.md §7`](milestone_2b_chief_scientist_review.md#7-post-ca7136c-stage-3-blocker-audit-two-clause-causal-dilution-decidability-proposal-m2b-c1), the Principal Investigator ratified **`Proposal M2B-C1` (Refined Option `a+`)** (`2026-11-15`):
+
+1. **Unified Two-Clause Decidability Law (`src/structural/growth.rs`, zero new constants):**
+   - Delete `allow_deep_base_scaling: bool` from `compute_debt_amortization_juvenile_ticks`.
+   - Measure mean active sink causal ancestry $Z_{\text{tot}} = \max(1.0, \bar{Z}_{\text{sink}})$ during the Pass-1 replay (`port_shares[out_port].sum()` in Stage 2 `verify_stage2_debt_amortization_and_survival`; `z_alt + COMPARATOR_PRIMITIVE_COUNT as f64` in Stage 3 `stage3_measure_z_alt_and_survive`).
+   - Require **both** bounds (emitting `candidate_undecidable += 1` and rejecting if either binds):
+     1. **Subgraph Epistemic Crossover (`Anti-Noise Guard`):**
+        $$t_{\text{cone}}(V_{\text{new}}) = d_{\text{cone}} + \left\lceil \frac{\sum_{v \in V_{\text{new}}} \Delta L_v}{\sum_{v \in V_{\text{new}}} \hat{r}_v^+} \right\rceil \le 2 W_{\text{obs}} \quad (= 512\text{ at defaults}).$$
+     2. **Per-Node Causal-Dilution Ceiling (`Anti-Parasite Guard`):**
+        $$t_{\text{juv}}(V_{\text{new}}) = \max(t_{\text{base}},\, t_{\text{debt}}) \le H_{\text{node}}(V_{\text{new}}) = \left\lceil 2 W_{\text{obs}} \cdot \max\!\left(\frac{t_{\text{base}}}{t_{\text{juv,min}}},\ Z_{\text{tot}}\right) \right\rceil.$$
+2. **Coupled Pass-2 Hygiene Fixes (`src/structural/learner.rs`):**
+   - Forward `self.candidate_undecidable += stage3_tel.candidate_undecidable;` and `self.lag_horizon_bound += stage3_tel.lag_horizon_bound;` in Pass 2 (`ArkheLearner::observe`, Rule 3 observability).
+   - Gate `self.port_states[p].stage3_exhausted = true` on `obs_full` (`self.obs_window.len() >= observation_horizon(&self.economy_config, &self.growth_config)`, matching Stage 2's `stage2_exhausted` invariant) so partial-window noise bursts cannot prematurely lock out Stage 3.
+3. **Operational & Quota Authorization:**
+   - Keep `@monitor` paused to preserve the remaining `5%` `gemini-4-hydrogen-*` quota; temporary execution on `claude-sonnet-5-5-medium` (prior to `2026-11-16T00:34:28Z` reset) is authorized to apply `M2B-C1` in `swarm-m2b-verify-d32f3276`, verify bit-identical `tests/golden_traces.rs` + `verify-m1` + `verify-m2a`, and execute `verify-m2b` on `0..20`, `20..1020`, and `20040..=20059`. Single-shot holdout `40000..=40019` remains locked until explicit user sign-off.
