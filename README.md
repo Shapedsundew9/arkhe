@@ -1,6 +1,6 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, and **Milestone 2a (`M2a — Cross-channel predictive coupling`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), historical Milestone 0–2a sign-off records plus pre-Milestone 2 readiness verification live in [doc/research_record.md](doc/research_record.md), and the ratified Stage M2b pre-registration plan lives in [doc/milestone_2b_plan.md](doc/milestone_2b_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, and **Milestone 2a (`M2a — Cross-channel predictive coupling`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), historical Milestone 0–2a sign-off records plus pre-Milestone 2 readiness verification live in [doc/research_record.md](doc/research_record.md), Chief Scientist governance and escalation principles live in [doc/chief_scientist_role.md](doc/chief_scientist_role.md), and the ratified Stage M2b pre-registration plan lives in [doc/milestone_2b_plan.md](doc/milestone_2b_plan.md).
 
 ## Overview
 
@@ -23,6 +23,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   ├── templates/
 │   │   ├── blocker_report.md
 │   │   └── milestone_plan_template.md
+│   ├── chief_scientist_role.md
 │   ├── foundational_research_charter_v3.md
 │   ├── milestone_2b_plan.md
 │   ├── parameter_inventory.md
