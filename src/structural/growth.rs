@@ -16,11 +16,11 @@ use crate::structural::graph_edit::{
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
-    assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
+    ComparatorTarget, assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
     counterfactual_sensitivity, counterfactual_sensitivity_with_comparators,
 };
 use crate::structural::surgery::{
-    EditableCircuit, MarginalDebtLedger, explicit_delay_register_index,
+    EditableCircuit, MarginalDebtLedger, explicit_delay_register_index, port_cone_changed,
     port_upstream_cone_and_edges, port_uses_boundary_in, register_mapping,
 };
 use crate::substrate::{
@@ -43,12 +43,15 @@ pub const fn observation_horizon(economy: &EconomyConfig, growth: &GrowthConfig)
     (economy.juvenile_ticks as usize).saturating_add(growth.diagnostic_window.saturating_mul(2))
 }
 
-/// Derived causal-depth-scaled juvenile maturation horizon (`d2-A`, §4.3).
+/// Derived causal-depth-scaled statistical maturation floor (`d2-A`, §4.3; `M2B-B1`).
 ///
-/// Reduces identically to `economy_config.juvenile_ticks` when `juvenile_ticks == 0` or
-/// `d_cone <= max_reactive_lag`. For deeper register chains, compensates for `d_cone` ticks of
-/// pipeline fill, retrograde discount $\gamma^{-(d_{\text{cone}} - \tau_{\max})}$, and chain-sum
-/// normalization $\frac{1 - \gamma^{d_{\text{cone}}}}{1 - \gamma^{\tau_{\max}}}$.
+/// Reduces identically to `economy_config.juvenile_ticks` ($t_{\text{juv,min}}$; `0` in
+/// conservation tests) when `juvenile_ticks == 0` or `d_cone <= max_reactive_lag`. For deeper
+/// register chains, compensates for `d_cone` ticks of pipeline fill, retrograde discount
+/// $\gamma^{-(d_{\text{cone}} - \tau_{\max})}$, and chain-sum normalization
+/// $\frac{1 - \gamma^{d_{\text{cone}}}}{1 - \gamma^{\tau_{\max}}}$. Stage-2 and Stage-3 sprouts
+/// extend above this floor whenever per-node debt amortization $\lceil \Delta L_v / \hat{r}_v^+ \rceil$
+/// requires additional ticks within $2 W_{\text{obs}}$ (`M2B-B1`).
 #[must_use]
 pub fn effective_juvenile_ticks(
     d_cone: usize,
@@ -2017,6 +2020,7 @@ enum SproutMotifOutcome {
         j_cand: f64,
         delta_flux: f64,
         is_1_op: bool,
+        effective_juvenile_ticks: u32,
     },
     BlockedMaxNodes,
     Rejected,
@@ -2499,7 +2503,7 @@ fn evaluate_sprout_motif(
             if let Some(b) = budget.as_deref_mut()
                 && !b.try_consume(baseline.w_replay as u64)
             {
-                if let Some(tel) = telemetry.as_deref_mut() {
+                if let Some(tel) = telemetry {
                     tel.sprout_budget_exhausted += 1;
                 }
                 return SproutMotifOutcome::OutOfBudget;
@@ -2529,7 +2533,7 @@ fn evaluate_sprout_motif(
         && let Some(b) = budget
         && !b.try_consume(baseline.w_replay as u64)
     {
-        if let Some(tel) = telemetry.as_deref_mut() {
+        if let Some(tel) = telemetry {
             tel.sprout_budget_exhausted += 1;
         }
         return SproutMotifOutcome::OutOfBudget;
@@ -2675,36 +2679,24 @@ fn evaluate_sprout_motif(
         );
 
     let d_cone = port_cone_register_depth(&staged, out_port);
-    let eff_juv = effective_juvenile_ticks(d_cone, economy_config, growth_config);
+    let eff_juv_base = effective_juvenile_ticks(d_cone, economy_config, growth_config);
+    let old_n = editable.circuit().node_count();
+    let new_nodes = staged.node_count().saturating_sub(old_n);
 
     if economy_config.juvenile_ticks > 0 && delta_l_sprout > 0.0 {
-        let (projected_survival, horizon_limit) = if d_cone
-            <= usize::from(growth_config.max_reactive_lag)
-        {
-            (
-                economy_config.initial_energy
-                    + (f64::from(economy_config.juvenile_ticks) / w_diag as f64) * pos_flux_cand,
-                obs_window.capacity(),
-            )
-        } else {
-            let new_nodes = staged
-                .node_count()
-                .saturating_sub(editable.circuit().node_count())
-                .max(1);
-            let endowment = (new_nodes as f64) * economy_config.initial_energy;
-            let scaled_flux = (f64::from(eff_juv) / w_diag as f64) * pos_flux_cand;
-            (
-                endowment + scaled_flux,
-                observation_horizon(economy_config, growth_config)
-                    .max((eff_juv as usize).saturating_add(2 * w_diag)),
-            )
-        };
+        let endowment = (new_nodes.max(1) as f64) * economy_config.initial_energy;
+        let scaled_flux = (f64::from(eff_juv_base) / w_diag as f64) * pos_flux_cand;
+        let projected_survival = endowment + scaled_flux;
+        let horizon_limit = obs_window
+            .capacity()
+            .max(observation_horizon(economy_config, growth_config))
+            .max((eff_juv_base as usize).saturating_add(2 * w_diag));
         if projected_survival <= delta_l_sprout {
             let delta_i_hat = pos_flux_cand / (w_diag as f64);
             if delta_i_hat > 0.0 {
                 let w_star = delta_l_sprout / delta_i_hat;
                 if w_star > (horizon_limit as f64)
-                    && let Some(tel) = telemetry
+                    && let Some(tel) = telemetry.as_deref_mut()
                 {
                     tel.candidate_undecidable += 1;
                 }
@@ -2744,13 +2736,495 @@ fn evaluate_sprout_motif(
         }
     }
 
+    let effective_juvenile_ticks = if economy_config.juvenile_ticks > 0 && new_nodes > 0 {
+        let Some(t_juv) = verify_stage2_debt_amortization_and_survival(
+            editable,
+            obs_window,
+            growth_config,
+            economy_config,
+            &staged,
+            &staged_compiled,
+            baseline,
+            out_port,
+            d_cone,
+            eff_juv_base,
+            telemetry,
+        ) else {
+            return SproutMotifOutcome::Rejected;
+        };
+        t_juv
+    } else {
+        eff_juv_base
+    };
+
     SproutMotifOutcome::Accepted {
         circuit: staged,
         e_cand,
         j_cand,
         delta_flux,
         is_1_op,
+        effective_juvenile_ticks,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_causal_tick(
+    sim: &mut EditableCircuit,
+    input: &[u64],
+    truth: &[u64],
+    predictions: &mut [u64],
+    zeros_maint: &[f64],
+    targets: &[ComparatorTarget],
+    sample_count: usize,
+    economy_config: &EconomyConfig,
+    seed_bank: SeedBank,
+    step_seed: u64,
+    score_tick: bool,
+    compute_ancestry: bool,
+    comp_capture_idx: Option<usize>,
+    sink_port: Option<usize>,
+) -> Option<(Vec<f64>, Option<f64>, Option<f64>)> {
+    let num_outputs = usize::from(sim.compiled().num_outputs());
+    sim.step(input, predictions).ok()?;
+    let node_outs = node_output_values(sim.circuit(), sim.state());
+    sim.economy_mut().record_activity(&node_outs).ok()?;
+    if !compute_ancestry {
+        return Some((Vec::new(), None, None));
+    }
+    let eff_samples = sample_count.min(RING_SIM_SENSITIVITY_SAMPLES);
+    if targets.is_empty() {
+        let snapshot = counterfactual_sensitivity(
+            sim.circuit(),
+            sim.compiled(),
+            sim.state(),
+            seed_bank,
+            step_seed,
+            eff_samples,
+        )
+        .ok()?;
+        let ancestry = assemble_causal_ancestry(
+            sim.circuit(),
+            sim.compiled(),
+            sim.state(),
+            &snapshot,
+            &sim.economy().activity(),
+            sim.economy().register_eligibility(),
+            economy_config.trace_discount,
+        )
+        .ok()?;
+        if !score_tick {
+            for (reg, trace) in ancestry.next_register_eligibility.iter().enumerate() {
+                sim.economy_mut()
+                    .set_register_eligibility(reg, trace)
+                    .ok()?;
+            }
+            return Some((Vec::new(), None, None));
+        }
+        let z_sink =
+            sink_port.and_then(|q| ancestry.port_shares.get(q).map(|s| s.iter().sum::<f64>()));
+        let mut port_rewards = vec![0.0; num_outputs];
+        for q in 0..num_outputs {
+            if q < truth.len() && ancestry.port_shares[q].iter().sum::<f64>() > 0.0 {
+                port_rewards[q] = sim
+                    .economy_mut()
+                    .score_port_single(q, predictions[q], truth[q])
+                    .ok()?;
+            } else if q < truth.len() {
+                let _ = sim.economy_mut().observe_unconnected_port(q, truth[q]);
+            }
+        }
+        let econ_tick = sim
+            .economy_mut()
+            .apply_causal_tick(&port_rewards, &ancestry, zeros_maint)
+            .ok()?;
+        Some((econ_tick.node_credit, None, z_sink))
+    } else {
+        let wires = if score_tick {
+            Some(sim.state().wire_values().to_vec())
+        } else {
+            None
+        };
+        let snapshot = counterfactual_sensitivity_with_comparators(
+            sim.circuit(),
+            sim.compiled(),
+            sim.state(),
+            seed_bank,
+            step_seed,
+            eff_samples,
+            targets,
+        )
+        .ok()?;
+        let ancestry = assemble_causal_ancestry_with_comparators(
+            sim.circuit(),
+            sim.compiled(),
+            sim.state(),
+            &snapshot,
+            &sim.economy().activity(),
+            sim.economy().register_eligibility(),
+            economy_config.trace_discount,
+            targets,
+            false,
+        )
+        .ok()?;
+        let z_tick = comp_capture_idx.map(|m| {
+            let comp = &sim.economy().comparators()[m];
+            ancestry.comparator_shares[m]
+                .iter()
+                .enumerate()
+                .filter(|&(u, _)| u != comp.sub_node.index() && u != comp.eqz_node.index())
+                .map(|(_, &s)| s)
+                .sum()
+        });
+        if !score_tick {
+            for (reg, trace) in ancestry.base.next_register_eligibility.iter().enumerate() {
+                sim.economy_mut()
+                    .set_register_eligibility(reg, trace)
+                    .ok()?;
+            }
+            return Some((Vec::new(), z_tick, None));
+        }
+        let z_sink = sink_port.and_then(|q| {
+            ancestry
+                .base
+                .port_shares
+                .get(q)
+                .map(|s| s.iter().sum::<f64>())
+        });
+        let mut port_rewards = vec![0.0; num_outputs];
+        for q in 0..num_outputs {
+            if q < truth.len() && ancestry.base.port_shares[q].iter().sum::<f64>() > 0.0 {
+                port_rewards[q] = sim
+                    .economy_mut()
+                    .score_port_single(q, predictions[q], truth[q])
+                    .ok()?;
+            } else if q < truth.len() {
+                let _ = sim.economy_mut().observe_unconnected_port(q, truth[q]);
+            }
+        }
+        let wires = wires.as_deref()?;
+        let mut pri_vals = Vec::with_capacity(targets.len());
+        let mut alt_vals = Vec::with_capacity(targets.len());
+        let mut eqz_vals = Vec::with_capacity(targets.len());
+        for comp in sim.economy().comparators() {
+            let sub_in = &sim.compiled().node_input_wires()[comp.sub_node.index()];
+            pri_vals.push(wires[sub_in[0]]);
+            alt_vals.push(wires[sub_in[1]]);
+            eqz_vals.push(node_outs[comp.eqz_node.index()]);
+        }
+        let fact_slice = truth.get(..num_outputs).unwrap_or(truth);
+        let comp_obs = sim
+            .economy_mut()
+            .observe_comparators(&pri_vals, &alt_vals, &eqz_vals, Some(fact_slice))
+            .ok()?;
+        let econ_tick = sim
+            .economy_mut()
+            .apply_causal_tick_with_comparators(
+                &port_rewards,
+                &comp_obs.rewards,
+                comp_obs.agreements,
+                comp_obs.disagreements,
+                &ancestry,
+                zeros_maint,
+            )
+            .ok()?;
+        Some((econ_tick.node_credit, z_tick, z_sink))
+    }
+}
+
+/// Unified Stage-2 / Stage-3 decidability law for per-node debt amortization (`M2B-B1` + `M2B-C1`).
+///
+/// For the new-node set `V_new` (`!is_survivor`), with per-node marginal debt `ΔL_v`, measured positive
+/// credit rate `r̂_v⁺` and measured mean sink causal ancestry `z_tot >= 1`:
+///
+/// * free-rider rejection: any `r̂_v⁺ <= 0` (or non-finite) rejects immediately;
+/// * Clause (i) (subgraph epistemic crossover, anti-noise):
+///   `t_cone = d_cone + ceil(Σ ΔL_v / Σ r̂_v⁺) <= 2 W_obs`;
+/// * Clause (ii) (per-node causal-dilution ceiling, anti-parasite):
+///   `t_juv = max(t_base, max_v (d_cone + ceil(ΔL_v / r̂_v⁺))) <= ceil(2 W_obs · max(t_base / t_juv,min, z_tot))`.
+///
+/// Either bound binding emits `candidate_undecidable += 1` and rejects.
+#[allow(clippy::too_many_arguments)]
+fn compute_debt_amortization_juvenile_ticks(
+    is_survivor: &[bool],
+    node_debts: &[f64],
+    pos_credit_sums: &[f64],
+    eval_ticks: usize,
+    d_cone: usize,
+    base_eff_juv: u32,
+    z_tot: f64,
+    economy_config: &EconomyConfig,
+    growth_config: &GrowthConfig,
+    telemetry: Option<&mut SproutTelemetry>,
+) -> Option<u32> {
+    if eval_ticks == 0 {
+        return None;
+    }
+    let w_obs = observation_horizon(economy_config, growth_config);
+    let ceiling = w_obs.saturating_mul(2);
+    let eval_ticks_f64 = eval_ticks as f64;
+    let mut max_amort_ticks = 0usize;
+    let mut sum_debt = 0.0f64;
+    let mut sum_rate = 0.0f64;
+    let mut undecidable = false;
+    for (idx, &surv) in is_survivor.iter().enumerate() {
+        if surv {
+            continue;
+        }
+        let r_hat_plus = pos_credit_sums.get(idx).copied().unwrap_or(0.0) / eval_ticks_f64;
+        if !r_hat_plus.is_finite() || r_hat_plus <= 0.0 {
+            return None;
+        }
+        let debt_v = node_debts.get(idx).copied().unwrap_or(0.0).max(0.0);
+        sum_debt += debt_v;
+        sum_rate += r_hat_plus;
+        if debt_v > 0.0 {
+            let ceil_ticks = (debt_v / r_hat_plus).ceil();
+            if !ceil_ticks.is_finite() {
+                undecidable = true;
+            } else {
+                max_amort_ticks = max_amort_ticks.max(ceil_ticks as usize);
+            }
+        }
+    }
+    let cone_amort = if sum_debt > 0.0 {
+        (sum_debt / sum_rate).ceil()
+    } else {
+        0.0
+    };
+    let t_cone_ok = cone_amort.is_finite() && (d_cone as f64) + cone_amort <= ceiling as f64;
+
+    let t_base = f64::from(base_eff_juv);
+    let t_min = f64::from(economy_config.juvenile_ticks);
+    let base_ratio = if t_min > 0.0 { t_base / t_min } else { 1.0 };
+    let scale = base_ratio.max(z_tot).max(1.0);
+    let h_node = ((ceiling as f64) * scale).ceil();
+    let t_debt = d_cone.saturating_add(max_amort_ticks);
+    let t_juv = (base_eff_juv as usize).max(t_debt);
+    let t_node_ok = h_node.is_finite() && (t_debt as f64) <= h_node && (t_juv as f64) <= h_node;
+
+    if undecidable || !t_cone_ok || !t_node_ok {
+        if let Some(tel) = telemetry {
+            tel.candidate_undecidable += 1;
+        }
+        return None;
+    }
+    u32::try_from(t_juv).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_stage2_debt_amortization_and_survival(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    staged: &Circuit,
+    staged_compiled: &crate::substrate::CompiledCircuit,
+    baseline: &BaselineReplayMetrics,
+    out_port: u16,
+    d_cone: usize,
+    base_eff_juv: u32,
+    telemetry: Option<&mut SproutTelemetry>,
+) -> Option<u32> {
+    let old_n = editable.circuit().node_count();
+    let old_to_new: Vec<Option<NodeId>> = (0..old_n).map(|i| Some(NodeId(i as u32))).collect();
+    let mut sim_template = editable.clone();
+    sim_template
+        .recompile_preserving_state(staged.clone(), &old_to_new)
+        .ok()?;
+    let mut sim_ledger = MarginalDebtLedger {
+        last_committed_code_bits: baseline.l_curr,
+        ..MarginalDebtLedger::default()
+    };
+    sim_ledger.on_sprout(
+        sim_template.circuit(),
+        economy_config.split_code_tax,
+        &old_to_new,
+    );
+    sim_template
+        .economy_mut()
+        .assign_sprout_debts(&sim_ledger.node_debts);
+
+    let num_outputs = usize::from(staged_compiled.num_outputs());
+    for q in 0..num_outputs {
+        if port_cone_changed(
+            editable.circuit(),
+            sim_template.circuit(),
+            &old_to_new,
+            q as u16,
+        ) {
+            sim_template
+                .economy_mut()
+                .port_scorer_mut(q)
+                .reset_predictor_counts();
+        }
+    }
+
+    let node_count = sim_template.circuit().node_count();
+    let is_survivor: Vec<bool> = (0..node_count).map(|idx| idx < old_n).collect();
+    let targets = sim_template.comparator_targets();
+    let zeros_maint = vec![0.0; node_count];
+    let mut predictions = vec![0u64; num_outputs];
+    let seed_bank = SeedBank::new(0);
+    let sample_count = growth_config.sensitivity_sample_count;
+    let w_obs = obs_window.len();
+    let replay_start = baseline.start_idx;
+    let eval_start = baseline.eval_start_idx;
+
+    let seed_stage2_regs = |sim_mut: &mut EditableCircuit, align_idx: usize| {
+        let fresh = ScalarState::new(staged_compiled);
+        let mut staged_regs = fresh.registers().to_vec();
+        if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(align_idx)
+            && snap_epoch == editable.structure_epoch()
+        {
+            let reg_map = register_mapping(
+                editable.circuit(),
+                staged,
+                editable.compiled(),
+                staged_compiled,
+                &old_to_new,
+            );
+            for (old_r, new_r) in reg_map.iter().enumerate() {
+                if let Some(nr) = new_r
+                    && old_r < snap_regs.len()
+                    && *nr < staged_regs.len()
+                {
+                    staged_regs[*nr] = snap_regs[old_r];
+                }
+            }
+        }
+        let _ = sim_mut.set_registers(&staged_regs);
+    };
+
+    // Pass 1: Replay `staged` over `obs_window` to measure per-node positive credit rate `r_hat_v^+`.
+    let mut r_sim = sim_template.clone();
+    for (idx, &surv) in is_survivor.iter().enumerate() {
+        if !surv && let Some(node_econ) = r_sim.economy_mut().node_mut(idx) {
+            node_econ.juvenile_ticks = (w_obs as u32).saturating_add(1);
+        }
+    }
+    seed_stage2_regs(&mut r_sim, replay_start);
+    let mut pos_credit_sums = vec![0.0; node_count];
+    let mut z_tot_sum = 0.0f64;
+    let mut eval_ticks = 0usize;
+    for idx in replay_start..w_obs {
+        let input = if idx == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[idx - 1]
+        };
+        let truth = &obs_window.frames()[idx];
+        let score_tick = idx >= eval_start;
+        let compute_ancestry = d_cone > 0 || score_tick;
+        let (node_credit, _, z_sink) = replay_causal_tick(
+            &mut r_sim,
+            input,
+            truth,
+            &mut predictions,
+            &zeros_maint,
+            &targets,
+            sample_count,
+            economy_config,
+            seed_bank,
+            idx as u64,
+            score_tick,
+            compute_ancestry,
+            None,
+            Some(usize::from(out_port)),
+        )?;
+        if score_tick {
+            for (v, &c) in node_credit.iter().enumerate() {
+                pos_credit_sums[v] += c.max(0.0);
+            }
+            z_tot_sum += z_sink.unwrap_or(0.0);
+            eval_ticks += 1;
+        }
+    }
+    let z_tot = if eval_ticks > 0 {
+        (z_tot_sum / eval_ticks as f64).max(1.0)
+    } else {
+        1.0
+    };
+
+    let t_juv = compute_debt_amortization_juvenile_ticks(
+        &is_survivor,
+        &sim_ledger.node_debts,
+        &pos_credit_sums,
+        eval_ticks,
+        d_cone,
+        base_eff_juv,
+        z_tot,
+        economy_config,
+        growth_config,
+        telemetry,
+    )?;
+
+    // Pass 2: Simulate `t_juv` replay ticks with `juvenile_ticks = t_juv` on `V_new` and verify
+    // `energy > sim_ledger.node_debts[idx]` for every new node prior to commit.
+    let mut grad_sim = sim_template;
+    let sim_circuit = grad_sim.circuit().clone();
+    assign_stage3_juvenile_ticks(
+        &sim_circuit,
+        grad_sim.economy_mut(),
+        &is_survivor,
+        t_juv,
+        economy_config,
+        growth_config,
+    );
+    seed_stage2_regs(&mut grad_sim, replay_start);
+
+    let j_ticks = t_juv as usize;
+    let w_span = w_obs.saturating_sub(replay_start).max(1);
+    let reactive_warmup = d_cone.min(w_span / 2);
+    let settled_chunk = w_span.saturating_sub(reactive_warmup).max(1);
+    for step_idx in 0..j_ticks {
+        let frame_idx = if step_idx < w_span {
+            replay_start + step_idx
+        } else {
+            let offset = (step_idx - w_span) % settled_chunk;
+            if offset == 0 {
+                seed_stage2_regs(&mut grad_sim, replay_start);
+                for w in 0..reactive_warmup {
+                    let w_idx = replay_start + w;
+                    let w_in = if w_idx == 0 {
+                        obs_window.prior_frame()
+                    } else {
+                        &obs_window.frames()[w_idx - 1]
+                    };
+                    grad_sim.step(w_in, &mut predictions).ok()?;
+                }
+            }
+            replay_start + reactive_warmup + offset
+        };
+        let input = if frame_idx == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[frame_idx - 1]
+        };
+        let truth = &obs_window.frames()[frame_idx];
+        replay_causal_tick(
+            &mut grad_sim,
+            input,
+            truth,
+            &mut predictions,
+            &zeros_maint,
+            &targets,
+            sample_count,
+            economy_config,
+            seed_bank,
+            step_idx as u64,
+            true,
+            true,
+            None,
+            None,
+        )?;
+    }
+
+    let survived = is_survivor
+        .iter()
+        .enumerate()
+        .filter(|&(_, &surv)| !surv)
+        .all(|(idx, _)| grad_sim.economy().nodes()[idx].energy > sim_ledger.node_debts[idx]);
+    survived.then_some(t_juv)
 }
 
 fn for_each_u1_deeper_motif(
@@ -2871,6 +3345,8 @@ pub struct ScoredSproutProposal {
     pub e_cand: usize,
     /// Uniform horizon-adjusted MDL ranking score (`l_cand + rank_scale * facts_cand`).
     pub j_cand: f64,
+    /// Unified per-node debt-amortization juvenile maturation horizon (`M2B-B1`).
+    pub effective_juvenile_ticks: u32,
 }
 
 fn is_better_mdl(j_cand: f64, delta_flux: f64, prev_j: f64, prev_flux: f64) -> bool {
@@ -3153,9 +3629,9 @@ pub(crate) fn propose_sprout_band_scored_internal(
         return Ok((None, false));
     }
 
-    let mut best_same: Option<(Circuit, usize, f64, f64, bool)> = None;
-    let mut best_cross: Option<(Circuit, usize, f64, f64)> = None;
-    let mut best_other: Option<(Circuit, usize, f64, f64)> = None;
+    let mut best_same: Option<(Circuit, usize, f64, f64, bool, u32)> = None;
+    let mut best_cross: Option<(Circuit, usize, f64, f64, u32)> = None;
+    let mut best_other: Option<(Circuit, usize, f64, f64, u32)> = None;
     let mut blocked_by_max_nodes = 0u64;
     for motif in &candidates {
         match evaluate_sprout_motif(
@@ -3177,22 +3653,29 @@ pub(crate) fn propose_sprout_band_scored_internal(
                 j_cand,
                 delta_flux,
                 is_1_op,
+                effective_juvenile_ticks,
             } => {
                 if is_epoch_1 {
                     if motif_is_cross_channel(motif, out_port) {
                         let is_better = match &best_cross {
                             None => true,
-                            Some((_, _, prev_j, prev_flux)) => {
+                            Some((_, _, prev_j, prev_flux, _)) => {
                                 is_better_mdl(j_cand, delta_flux, *prev_j, *prev_flux)
                             }
                         };
                         if is_better {
-                            best_cross = Some((staged, e_cand, j_cand, delta_flux));
+                            best_cross = Some((
+                                staged,
+                                e_cand,
+                                j_cand,
+                                delta_flux,
+                                effective_juvenile_ticks,
+                            ));
                         }
                     } else {
                         let is_better = match &best_same {
                             None => true,
-                            Some((_, _, prev_j, prev_flux, prev_1_op)) => {
+                            Some((_, _, prev_j, prev_flux, prev_1_op, _)) => {
                                 if is_1_op && !prev_1_op {
                                     true
                                 } else if !is_1_op && *prev_1_op {
@@ -3203,18 +3686,26 @@ pub(crate) fn propose_sprout_band_scored_internal(
                             }
                         };
                         if is_better {
-                            best_same = Some((staged, e_cand, j_cand, delta_flux, is_1_op));
+                            best_same = Some((
+                                staged,
+                                e_cand,
+                                j_cand,
+                                delta_flux,
+                                is_1_op,
+                                effective_juvenile_ticks,
+                            ));
                         }
                     }
                 } else {
                     let is_better = match &best_other {
                         None => true,
-                        Some((_, _, prev_j, prev_flux)) => {
+                        Some((_, _, prev_j, prev_flux, _)) => {
                             is_better_mdl(j_cand, delta_flux, *prev_j, *prev_flux)
                         }
                     };
                     if is_better {
-                        best_other = Some((staged, e_cand, j_cand, delta_flux));
+                        best_other =
+                            Some((staged, e_cand, j_cand, delta_flux, effective_juvenile_ticks));
                     }
                 }
             }
@@ -3233,11 +3724,13 @@ pub(crate) fn propose_sprout_band_scored_internal(
                 circuit: same.0,
                 e_cand: same.1,
                 j_cand: same.2,
+                effective_juvenile_ticks: same.5,
             }),
             (None, Some(cross)) => Some(ScoredSproutProposal {
                 circuit: cross.0,
                 e_cand: cross.1,
                 j_cand: cross.2,
+                effective_juvenile_ticks: cross.4,
             }),
             (Some(same), Some(cross)) => {
                 if is_better_mdl(cross.2, cross.3, same.2, same.3) {
@@ -3245,21 +3738,26 @@ pub(crate) fn propose_sprout_band_scored_internal(
                         circuit: cross.0,
                         e_cand: cross.1,
                         j_cand: cross.2,
+                        effective_juvenile_ticks: cross.4,
                     })
                 } else {
                     Some(ScoredSproutProposal {
                         circuit: same.0,
                         e_cand: same.1,
                         j_cand: same.2,
+                        effective_juvenile_ticks: same.5,
                     })
                 }
             }
         }
     } else {
-        best_other.map(|(circuit, e_cand, j_cand, _)| ScoredSproutProposal {
-            circuit,
-            e_cand,
-            j_cand,
+        best_other.map(|(circuit, e_cand, j_cand, _, effective_juvenile_ticks)| {
+            ScoredSproutProposal {
+                circuit,
+                e_cand,
+                j_cand,
+                effective_juvenile_ticks,
+            }
         })
     };
 
@@ -4400,6 +4898,7 @@ fn stage3_measure_z_alt_and_survive(
     out_port: u16,
     primary_channel_mask: u64,
     pre: &EvaluatedStage3Pre,
+    telemetry: &mut SproutTelemetry,
 ) -> Option<(usize, f64, u32)> {
     let staged = &pre.staged;
     let is_tph = staged.wire_delay() == WireDelayMode::TicksPerHop;
@@ -4491,75 +4990,85 @@ fn stage3_measure_z_alt_and_survive(
         sim_mut.set_registers(&regs).is_ok()
     };
 
-    // Pass 1: Measure empirical steady-state `Z_alt` over `eval_start..w_replay`.
+    // Pass 1: Measure empirical steady-state `Z_alt` and per-node positive credit rates `r_hat_v^+`
+    // over `eval_start..w_replay` (`M2B-D1` & `M2B-B1`).
     let mut z_sim = sim.clone();
+    for (idx, &surv) in is_survivor.iter().enumerate() {
+        if !surv && let Some(node_econ) = z_sim.economy_mut().node_mut(idx) {
+            node_econ.juvenile_ticks = (w_replay as u32).saturating_add(1);
+        }
+    }
     if !seed_regs(&mut z_sim, obs_window.start_tick()) {
         return None;
     }
     let targets = z_sim.comparator_targets();
     let seed_bank = SeedBank::new(0);
     let sample_count = growth_config.sensitivity_sample_count;
+    let node_count = sim.circuit().node_count();
+    let zeros_maint = vec![0.0; node_count];
     let mut predictions = vec![0u64; num_outputs];
     let mut z_sum = 0.0f64;
     let mut z_ticks = 0usize;
+    let mut pos_credit_sums = vec![0.0; node_count];
+    let mut eval_ticks = 0usize;
     for (idx, frame) in obs_window.frames().iter().enumerate() {
         let input = if idx == 0 {
             obs_window.prior_frame()
         } else {
             &obs_window.frames()[idx - 1]
         };
-        z_sim.step(input, &mut predictions).ok()?;
-        let node_outs = node_output_values(z_sim.circuit(), z_sim.state());
-        z_sim.economy_mut().record_activity(&node_outs).ok()?;
-        if d_alt > 0 || idx >= eval_start {
-            let snapshot = counterfactual_sensitivity_with_comparators(
-                z_sim.circuit(),
-                z_sim.compiled(),
-                z_sim.state(),
-                seed_bank,
-                idx as u64,
-                sample_count.min(RING_SIM_SENSITIVITY_SAMPLES),
-                &targets,
-            )
-            .ok()?;
-            let ancestry = assemble_causal_ancestry_with_comparators(
-                z_sim.circuit(),
-                z_sim.compiled(),
-                z_sim.state(),
-                &snapshot,
-                &z_sim.economy().activity(),
-                z_sim.economy().register_eligibility(),
-                economy_config.trace_discount,
-                &targets,
-                false,
-            )
-            .ok()?;
-            for (reg, trace) in ancestry.base.next_register_eligibility.iter().enumerate() {
-                z_sim
-                    .economy_mut()
-                    .set_register_eligibility(reg, trace)
-                    .ok()?;
-            }
-            if idx >= eval_start {
-                let shares = &ancestry.comparator_shares[comp_idx];
-                let z_tick: f64 = shares
-                    .iter()
-                    .enumerate()
-                    .filter(|&(u, _)| u != pre.sub_node.index() && u != pre.eqz_node.index())
-                    .map(|(_, &s)| s)
-                    .sum();
-                z_sum += z_tick;
+        let score_tick = idx >= eval_start;
+        let compute_ancestry = d_alt > 0 || score_tick;
+        let (node_credit, z_tick, _) = replay_causal_tick(
+            &mut z_sim,
+            input,
+            frame,
+            &mut predictions,
+            &zeros_maint,
+            &targets,
+            sample_count,
+            economy_config,
+            seed_bank,
+            idx as u64,
+            score_tick,
+            compute_ancestry,
+            Some(comp_idx),
+            None,
+        )?;
+        if score_tick {
+            if let Some(zt) = z_tick {
+                z_sum += zt;
                 z_ticks += 1;
             }
+            for (v, &c) in node_credit.iter().enumerate() {
+                pos_credit_sums[v] += c.max(0.0);
+            }
+            eval_ticks += 1;
         }
-        let _ = frame;
     }
     let z_alt = if z_ticks > 0 {
         z_sum / (z_ticks as f64)
     } else {
         0.0
     };
-    let eff_juv = effective_comparator_juvenile_ticks(d_alt, z_alt, economy_config, growth_config);
+    let base_eff_juv =
+        effective_comparator_juvenile_ticks(d_alt, z_alt, economy_config, growth_config);
+    let eff_juv = if economy_config.juvenile_ticks > 0 && is_survivor.iter().any(|&s| !s) {
+        compute_debt_amortization_juvenile_ticks(
+            &is_survivor,
+            &sim_ledger.node_debts,
+            &pos_credit_sums,
+            eval_ticks,
+            d_alt,
+            base_eff_juv,
+            (z_alt + COMPARATOR_PRIMITIVE_COUNT as f64).max(1.0),
+            economy_config,
+            growth_config,
+            Some(telemetry),
+        )?
+    } else {
+        base_eff_juv
+    };
 
     // Pass 2: Simulate buffered graduation survival across `eff_juv` ticks.
     let sim_circuit = sim.circuit().clone();
@@ -4583,7 +5092,6 @@ fn stage3_measure_z_alt_and_survive(
     if !seed_regs(&mut sim, obs_window.start_tick()) {
         return None;
     }
-    let zeros_maint = vec![0.0; sim.circuit().node_count()];
     let j_ticks = eff_juv as usize;
     let ring_period = pre.autonomous_ring.as_ref().map(|(p, _, _)| *p);
     let cycle_len = ring_period
@@ -4622,67 +5130,22 @@ fn stage3_measure_z_alt_and_survive(
             &obs_window.frames()[frame_idx - 1]
         };
         let truth = &obs_window.frames()[frame_idx];
-        sim.step(input, &mut predictions).ok()?;
-        let wires = sim.state().wire_values().to_vec();
-        let node_outs = node_output_values(sim.circuit(), sim.state());
-        sim.economy_mut().record_activity(&node_outs).ok()?;
-        let snapshot = counterfactual_sensitivity_with_comparators(
-            sim.circuit(),
-            sim.compiled(),
-            sim.state(),
+        replay_causal_tick(
+            &mut sim,
+            input,
+            truth,
+            &mut predictions,
+            &zeros_maint,
+            &targets,
+            sample_count,
+            economy_config,
             seed_bank,
             step_idx as u64,
-            sample_count.min(RING_SIM_SENSITIVITY_SAMPLES),
-            &targets,
-        )
-        .ok()?;
-        let ancestry = assemble_causal_ancestry_with_comparators(
-            sim.circuit(),
-            sim.compiled(),
-            sim.state(),
-            &snapshot,
-            &sim.economy().activity(),
-            sim.economy().register_eligibility(),
-            economy_config.trace_discount,
-            &targets,
-            false,
-        )
-        .ok()?;
-
-        let mut port_rewards = vec![0.0; num_outputs];
-        for q in 0..num_outputs {
-            if q < truth.len() && ancestry.base.port_shares[q].iter().sum::<f64>() > 0.0 {
-                port_rewards[q] = sim
-                    .economy_mut()
-                    .score_port_single(q, predictions[q], truth[q])
-                    .ok()?;
-            } else if q < truth.len() {
-                let _ = sim.economy_mut().observe_unconnected_port(q, truth[q]);
-            }
-        }
-        let mut pri_vals = Vec::with_capacity(targets.len());
-        let mut alt_vals = Vec::with_capacity(targets.len());
-        let mut eqz_vals = Vec::with_capacity(targets.len());
-        for comp in sim.economy().comparators() {
-            let sub_in = &sim.compiled().node_input_wires()[comp.sub_node.index()];
-            pri_vals.push(wires[sub_in[0]]);
-            alt_vals.push(wires[sub_in[1]]);
-            eqz_vals.push(node_outs[comp.eqz_node.index()]);
-        }
-        let comp_obs = sim
-            .economy_mut()
-            .observe_comparators(&pri_vals, &alt_vals, &eqz_vals, Some(&truth[..num_outputs]))
-            .ok()?;
-        sim.economy_mut()
-            .apply_causal_tick_with_comparators(
-                &port_rewards,
-                &comp_obs.rewards,
-                comp_obs.agreements,
-                comp_obs.disagreements,
-                &ancestry,
-                &zeros_maint,
-            )
-            .ok()?;
+            true,
+            true,
+            None,
+            None,
+        )?;
     }
 
     let survived = is_survivor
@@ -5552,6 +6015,7 @@ pub fn propose_redundancy_sprout(
             out_port,
             primary_channel_mask,
             &cand,
+            telemetry,
         ) {
             let old_nodes = cand.old_to_new.len();
             let new_nodes = (old_nodes..cand.staged.node_count())
@@ -6484,5 +6948,247 @@ mod tests {
         {
             assert_eq!(prop.alt_channel_mask & 1u64, 0);
         }
+    }
+
+    #[test]
+    fn m2b_b1_debt_amortization_law_covers_free_rider_undecidable_and_backward_reduction() {
+        let econ = EconomyConfig::default();
+        let growth = GrowthConfig::default();
+
+        // 1. d <= 3 backward reduction (z_tot = 1): fast amortization keeps t_juv at the 128 floor.
+        for d in 0..=3usize {
+            let base = effective_juvenile_ticks(d, &econ, &growth);
+            assert_eq!(base, econ.juvenile_ticks);
+            let mut tel = SproutTelemetry::default();
+            let got = compute_debt_amortization_juvenile_ticks(
+                &[true, false, false],
+                &[0.0, 5.0, 6.0],
+                &[0.0, 64.0, 64.0],
+                128,
+                d,
+                base,
+                1.0,
+                &econ,
+                &growth,
+                Some(&mut tel),
+            );
+            assert_eq!(got, Some(128));
+            assert_eq!(tel.candidate_undecidable, 0);
+        }
+
+        // 2. Zero-share free-rider rejection: zero positive credit on one new node rejects cleanly.
+        let mut tel_fr = SproutTelemetry::default();
+        assert_eq!(
+            compute_debt_amortization_juvenile_ticks(
+                &[true, false, false],
+                &[0.0, 5.0, 6.0],
+                &[0.0, 64.0, 0.0],
+                128,
+                1,
+                effective_juvenile_ticks(1, &econ, &growth),
+                1.0,
+                &econ,
+                &growth,
+                Some(&mut tel_fr),
+            ),
+            None
+        );
+        assert_eq!(tel_fr.candidate_undecidable, 0);
+
+        // 3. Stage-2 multi-node weak credit amortization: slowest new node determines t_debt > 128.
+        let base2 = effective_juvenile_ticks(2, &econ, &growth);
+        assert_eq!(
+            compute_debt_amortization_juvenile_ticks(
+                &[false, false],
+                &[5.0, 12.0],
+                &[64.0, 6.4],
+                128,
+                2,
+                base2,
+                1.0,
+                &econ,
+                &growth,
+                None,
+            ),
+            Some(242)
+        );
+
+        // 4a. Clause (ii) (anti-parasite): a near-zero-share leaf (t_debt ~ 602) exceeds the undiluted
+        //     ceiling 2 * W_obs = 512 when z_tot = 1, but survives once measured causal dilution
+        //     z_tot = 4 scales the ceiling to 2048.
+        let mut tel_undec = SproutTelemetry::default();
+        assert_eq!(
+            compute_debt_amortization_juvenile_ticks(
+                &[false, false],
+                &[5.0, 12.0],
+                &[64.0, 2.56],
+                128,
+                2,
+                base2,
+                1.0,
+                &econ,
+                &growth,
+                Some(&mut tel_undec),
+            ),
+            None
+        );
+        assert_eq!(tel_undec.candidate_undecidable, 1);
+        let diluted = compute_debt_amortization_juvenile_ticks(
+            &[false, false],
+            &[5.0, 12.0],
+            &[64.0, 2.56],
+            128,
+            2,
+            base2,
+            4.0,
+            &econ,
+            &growth,
+            None,
+        )
+        .expect("causal dilution z_tot = 4 admits the weak leaf");
+        assert!((602..=603).contains(&diluted));
+
+        // 4b. Clause (i) (anti-noise): uniformly weak correlations (cone crossover 2 + 550 > 512) are
+        //     rejected even when the per-node ceiling is relaxed by z_tot = 4.
+        let mut tel_noise = SproutTelemetry::default();
+        assert_eq!(
+            compute_debt_amortization_juvenile_ticks(
+                &[false, false],
+                &[5.0, 6.0],
+                &[1.28, 1.28],
+                128,
+                2,
+                base2,
+                4.0,
+                &econ,
+                &growth,
+                Some(&mut tel_noise),
+            ),
+            None
+        );
+        assert_eq!(tel_noise.candidate_undecidable, 1);
+
+        // 4c. M2a d = 14 chain (c2a): gamma^13-attenuated leaves (t_debt = 1144 <= t_base) pass with the
+        //     single code path; without base/z scaling the same cone is rejected at 512.
+        let base14 = effective_juvenile_ticks(14, &econ, &growth);
+        assert!(base14 > 512);
+        let deep_credits = [128.0, 0.02729 * 128.0, 0.01941 * 128.0];
+        let deep_debts = [12.0, 20.728, 21.931];
+        let deep = compute_debt_amortization_juvenile_ticks(
+            &[false, false, false],
+            &deep_debts,
+            &deep_credits,
+            128,
+            14,
+            base14,
+            7.71,
+            &econ,
+            &growth,
+            None,
+        );
+        assert_eq!(deep, Some(base14));
+        let mut tel_deep = SproutTelemetry::default();
+        assert_eq!(
+            compute_debt_amortization_juvenile_ticks(
+                &[false, false, false],
+                &deep_debts,
+                &deep_credits,
+                128,
+                14,
+                econ.juvenile_ticks,
+                1.0,
+                &econ,
+                &growth,
+                Some(&mut tel_deep),
+            ),
+            None
+        );
+        assert_eq!(tel_deep.candidate_undecidable, 1);
+
+        // 4d. Finite guards: non-finite z_tot and juvenile_ticks == 0 never loosen the law.
+        let econ0 = EconomyConfig {
+            juvenile_ticks: 0,
+            ..EconomyConfig::default()
+        };
+        assert_eq!(
+            compute_debt_amortization_juvenile_ticks(
+                &[false],
+                &[5.0],
+                &[64.0],
+                128,
+                1,
+                0,
+                f64::NAN,
+                &econ0,
+                &growth,
+                None,
+            ),
+            Some(11)
+        );
+
+        // 5. Circuit-level free-rider rejection via verify_stage2_debt_amortization_and_survival:
+        //    useful node drives alternating BoundaryOut(0) cleanly; parasitic second node gets 0 share.
+        let base_c = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+        let editable = EditableCircuit::new(base_c, econ).unwrap();
+        let mut obs = ObservationWindow::new(1, 256);
+        for t in 0..256usize {
+            obs.push_frame(&[(t % 2) as u64]);
+        }
+        let baseline = replay_current_baseline(&editable, &obs, &growth, &econ, 0, true);
+        let mut staged = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
+        let split = staged.add_node(Primitive::Split);
+        let useful = staged.add_node(Primitive::Eqz);
+        let parasite = staged.add_node(Primitive::Eqz);
+        staged.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn {
+                node: split,
+                port: 0,
+            },
+        );
+        staged.connect(
+            SignalSource::NodeOut {
+                node: split,
+                port: 0,
+            },
+            SignalSink::NodeIn {
+                node: useful,
+                port: 0,
+            },
+        );
+        staged.connect(
+            SignalSource::NodeOut {
+                node: split,
+                port: 1,
+            },
+            SignalSink::NodeIn {
+                node: parasite,
+                port: 0,
+            },
+        );
+        staged.connect(
+            SignalSource::NodeOut {
+                node: useful,
+                port: 0,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        let staged_compiled = staged.compile().unwrap();
+        assert_eq!(
+            verify_stage2_debt_amortization_and_survival(
+                &editable,
+                &obs,
+                &growth,
+                &econ,
+                &staged,
+                &staged_compiled,
+                &baseline,
+                0,
+                0,
+                effective_juvenile_ticks(0, &econ, &growth),
+                None,
+            ),
+            None
+        );
     }
 }

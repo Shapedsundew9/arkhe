@@ -15,9 +15,9 @@ pub use economy::{
 };
 pub use graph_edit::{
     DerivationConeInfo, SplicedComparator, advance_tph_autonomous_ring_phase,
-    build_autonomous_ring, build_autonomous_ring_source, cone_channel_mask, derivation_cone_info,
-    excise_comparator_branch, is_pure_boundary_split, materialize_const_loop,
-    prune_starved_preserving_healthy_split_branches, source_register_depth,
+    build_autonomous_ring, build_autonomous_ring_source, comparator_exclusive_arm_nodes,
+    cone_channel_mask, derivation_cone_info, excise_comparator_branch, is_pure_boundary_split,
+    materialize_const_loop, prune_starved_preserving_healthy_split_branches, source_register_depth,
     splice_comparator_onto_port, stack_output_binary_op, swap_comparator_driver, tap_source,
 };
 pub use growth::{

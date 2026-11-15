@@ -94,7 +94,10 @@ pub struct EconomyConfig {
     pub trace_discount: f64,
     /// Initial reserve assigned to each placed node.
     pub initial_energy: f64,
-    /// Ticks for which new nodes are protected from maintenance and negative payout.
+    /// Minimum statistical maturation floor $t_{\text{juv,min}}$ (`128 = 2 * W_diag`; `0` in
+    /// conservation tests) protecting new nodes from maintenance and negative payout; actual
+    /// Stage-2 / Stage-3 grace extends dynamically up to $2 W_{\text{obs}}$ via per-node debt
+    /// amortization (`M2B-B1`).
     pub juvenile_ticks: u32,
     /// Reserve ceiling policy.
     pub reserve_cap: ReserveCap,

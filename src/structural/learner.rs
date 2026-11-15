@@ -11,16 +11,16 @@ use crate::metrics::facts_code_bits;
 use crate::rng::SeedBank;
 use crate::structural::economy::{ComparatorSite, EconomyConfig, EconomyState, ExecutionPhase};
 use crate::structural::graph_edit::{
-    advance_tph_autonomous_ring_phase, excise_comparator_branch, is_pure_boundary_split,
-    prune_starved_preserving_healthy_split_branches, swap_comparator_driver,
+    advance_tph_autonomous_ring_phase, comparator_exclusive_arm_nodes, excise_comparator_branch,
+    is_pure_boundary_split, prune_starved_preserving_healthy_split_branches,
+    swap_comparator_driver,
 };
 use crate::structural::growth::{
     AutonomousRingProposal, DiagnosticBuffer, GrowthConfig, GrowthError, RedundancySproutProposal,
     ScoredSproutProposal, SproutTelemetry, assign_stage3_juvenile_ticks, check_deeper_lag_for_port,
-    diagnose_residual, effective_juvenile_ticks, evaluate_comparator_ring_promotion,
-    observation_horizon, port_cone_register_depth, port_primary_cone_is_mature,
-    propose_autonomous_delay_ring_scored_with_telemetry, propose_redundancy_sprout,
-    propose_sprout_band_scored_internal,
+    diagnose_residual, evaluate_comparator_ring_promotion, observation_horizon,
+    port_primary_cone_is_mature, propose_autonomous_delay_ring_scored_with_telemetry,
+    propose_redundancy_sprout, propose_sprout_band_scored_internal,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
@@ -30,9 +30,11 @@ use crate::structural::sensitivity::{
 };
 use crate::structural::surgery::{
     EditableCircuit, MarginalDebtLedger, explicit_delay_register_index, port_cone_changed,
-    port_is_cone_mature, port_is_primed,
+    port_is_cone_mature, port_is_primed, port_upstream_cone_and_edges,
 };
-use crate::substrate::{Circuit, NodeId, Primitive, SignalSink, Width, WireDelayMode};
+use crate::substrate::{
+    Circuit, NodeId, Primitive, SignalSink, SignalSource, Width, WireDelayMode,
+};
 
 /// Telemetry record capturing residual entropy and diagnostic mutual information across growth epochs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -63,6 +65,7 @@ pub struct PortDevelopmentalState {
     pub epoch_snapshots: Vec<GrowthEpochSnapshot>,
     pub replay_ticks_consumed: u64,
     pub stage2_checks_completed: u64,
+    pub stage2_mature_at_tick: u64,
     pub stage2_exhausted: bool,
     pub stage3_exhausted: bool,
 }
@@ -77,6 +80,7 @@ impl PortDevelopmentalState {
             epoch_snapshots: Vec::new(),
             replay_ticks_consumed: 0,
             stage2_checks_completed: 0,
+            stage2_mature_at_tick: 0,
             stage2_exhausted: false,
             stage3_exhausted: false,
         }
@@ -173,7 +177,6 @@ impl ComparatorWakeWindow {
         self.r_alt.iter().sum()
     }
 
-    #[cfg(test)]
     fn disagreement_count_tail(&self, w: usize) -> usize {
         let start = self.disagree.len().saturating_sub(w);
         self.disagree.iter().skip(start).filter(|&&d| d).count()
@@ -229,6 +232,8 @@ pub struct ArkheLearner {
     comparator_windows: Vec<ComparatorWakeWindow>,
     sprout_events: u64,
     starvation_prune_events: u64,
+    port_starvation_prune_events: Vec<u64>,
+    comparator_starvation_prune_events: u64,
     idle_prune_events: u64,
     ring_closure_events: u64,
     redundancy_sprout_events: u64,
@@ -315,6 +320,8 @@ impl ArkheLearner {
             comparator_windows: Vec::new(),
             sprout_events: 0,
             starvation_prune_events: 0,
+            port_starvation_prune_events: vec![0; channels_usize],
+            comparator_starvation_prune_events: 0,
             idle_prune_events: 0,
             ring_closure_events: 0,
             redundancy_sprout_events: 0,
@@ -365,7 +372,18 @@ impl ArkheLearner {
             }
         }
         let port_states = (0..num_outputs)
-            .map(|_| PortDevelopmentalState::new(growth_config.diagnostic_window))
+            .map(|p| {
+                let mut state = PortDevelopmentalState::new(growth_config.diagnostic_window);
+                let (cone, _) = port_upstream_cone_and_edges(editable.circuit(), p as u16);
+                let max_juv = cone
+                    .iter()
+                    .filter_map(|n| editable.economy().nodes().get(n.index()))
+                    .map(|e| u64::from(e.juvenile_ticks))
+                    .max()
+                    .unwrap_or(0);
+                state.stage2_mature_at_tick = max_juv;
+                state
+            })
             .collect();
         let comp_cap = observation_horizon(&economy_config, &growth_config)
             .max(growth_config.diagnostic_window);
@@ -390,6 +408,8 @@ impl ArkheLearner {
             comparator_windows,
             sprout_events: 0,
             starvation_prune_events: 0,
+            port_starvation_prune_events: vec![0; num_outputs],
+            comparator_starvation_prune_events: 0,
             idle_prune_events: 0,
             ring_closure_events: 0,
             redundancy_sprout_events: 0,
@@ -464,6 +484,20 @@ impl ArkheLearner {
     #[must_use]
     pub const fn starvation_prune_events(&self) -> u64 {
         self.starvation_prune_events
+    }
+
+    /// Per-output-port starvation prunings where a starved node lay in `BoundaryOut(p)`'s backward
+    /// cone or in a comparator cone targeting port `p` (`M2B-B2`).
+    #[must_use]
+    pub fn port_starvation_prune_events(&self) -> &[u64] {
+        &self.port_starvation_prune_events
+    }
+
+    /// Total starvation prunings hitting a registered comparator cone (`sub_node`, `eqz_node`, or
+    /// upstream branch) (`M2B-B2`).
+    #[must_use]
+    pub const fn comparator_starvation_prune_events(&self) -> u64 {
+        self.comparator_starvation_prune_events
     }
 
     /// Total causal zero-sensitivity idle prunings committed.
@@ -550,6 +584,7 @@ impl ArkheLearner {
                 .reset_predictor_counts();
             self.port_states[q].diagnostic_buffer.clear();
             self.port_states[q].ticks_since_last_check = 0;
+            self.port_states[q].stage2_mature_at_tick = 0;
             self.port_states[q].stage2_exhausted = false;
             self.port_states[q].stage3_exhausted = false;
         }
@@ -676,7 +711,12 @@ impl ArkheLearner {
             .min(global_budget.remaining())
     }
 
-    fn commit_sprout(&mut self, port_idx: usize, sprout_circ: Circuit) -> bool {
+    fn commit_sprout(
+        &mut self,
+        port_idx: usize,
+        sprout_circ: Circuit,
+        effective_juvenile_ticks: u32,
+    ) -> bool {
         let port_sprouts = self.port_states[port_idx].port_sprout_events;
         if port_sprouts == 0 || port_sprouts == 1 {
             self.record_epoch_snapshot(port_idx, port_sprouts as usize, true);
@@ -690,26 +730,21 @@ impl ArkheLearner {
             .recompile_preserving_state(sprout_circ, &old_to_new)
             .is_ok()
         {
-            let d_cone = port_cone_register_depth(self.editable.circuit(), port_idx as u16);
-            if d_cone > usize::from(self.growth_config.max_reactive_lag) {
-                let eff_juv =
-                    effective_juvenile_ticks(d_cone, &self.economy_config, &self.growth_config);
-                let mut surviving = vec![false; self.editable.circuit().node_count()];
-                for new_id in old_to_new.iter().flatten() {
-                    if let Some(slot) = surviving.get_mut(new_id.index()) {
-                        *slot = true;
-                    }
+            let mut surviving = vec![false; self.editable.circuit().node_count()];
+            for new_id in old_to_new.iter().flatten() {
+                if let Some(slot) = surviving.get_mut(new_id.index()) {
+                    *slot = true;
                 }
-                for (idx, node) in self
-                    .editable
-                    .economy_mut()
-                    .nodes_mut()
-                    .iter_mut()
-                    .enumerate()
-                {
-                    if !surviving[idx] {
-                        node.juvenile_ticks = eff_juv;
-                    }
+            }
+            for (idx, node) in self
+                .editable
+                .economy_mut()
+                .nodes_mut()
+                .iter_mut()
+                .enumerate()
+            {
+                if !surviving[idx] {
+                    node.juvenile_ticks = effective_juvenile_ticks;
                 }
             }
             self.ledger.on_sprout(
@@ -721,6 +756,9 @@ impl ArkheLearner {
                 .economy_mut()
                 .assign_sprout_debts(&self.ledger.node_debts);
             self.reset_changed_ports(&pre_sprout_circuit, &old_to_new);
+            self.port_states[port_idx].stage2_mature_at_tick = self
+                .tick
+                .saturating_add(u64::from(effective_juvenile_ticks));
             self.port_states[port_idx].stage2_exhausted = false;
             self.port_states[port_idx].stage3_exhausted = false;
             self.port_states[port_idx].port_sprout_events += 1;
@@ -943,7 +981,8 @@ impl ArkheLearner {
                 continue;
             }
             if !port_primary_cone_is_mature(circuit, economy, q as u16)
-                || !port_comparators_mature(circuit, economy, q as u16)
+                && (self.port_states[q].port_sprout_events == 0
+                    || self.tick < self.port_states[q].stage2_mature_at_tick)
             {
                 return true;
             }
@@ -1287,6 +1326,143 @@ impl ArkheLearner {
         true
     }
 
+    fn try_wake_comparator_bankruptcy_refutation(
+        &mut self,
+        starved_set: &BTreeSet<NodeId>,
+    ) -> bool {
+        let min_gain = self.growth_config.min_match_gain;
+        let w_diag = self.growth_config.diagnostic_window;
+        let comps = self.editable.economy().comparators().to_vec();
+        for (comp_idx, comp) in comps.iter().enumerate() {
+            if !comparator_cone_is_mature(self.editable.circuit(), self.editable.economy(), comp) {
+                continue;
+            }
+            let Some(win) = self.comparator_windows.get(comp_idx) else {
+                continue;
+            };
+            if win.disagree.len() < w_diag || win.disagreement_count_tail(w_diag) < min_gain {
+                continue;
+            }
+            let target_port_subs: Vec<NodeId> = comps
+                .iter()
+                .filter(|c| c.target_port == comp.target_port)
+                .map(|c| c.sub_node)
+                .collect();
+            let surviving_comp_nodes: Vec<(NodeId, NodeId)> = comps
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| (i != comp_idx).then_some((c.sub_node, c.eqz_node)))
+                .collect();
+            let circuit = self.editable.circuit();
+            let Some(pri_excl) = comparator_exclusive_arm_nodes(
+                circuit,
+                comp.sub_node,
+                comp.eqz_node,
+                comp.target_port,
+                true,
+                &target_port_subs,
+                &surviving_comp_nodes,
+            ) else {
+                continue;
+            };
+            let Some(alt_excl) = comparator_exclusive_arm_nodes(
+                circuit,
+                comp.sub_node,
+                comp.eqz_node,
+                comp.target_port,
+                false,
+                &target_port_subs,
+                &surviving_comp_nodes,
+            ) else {
+                continue;
+            };
+            let comp_node_starved =
+                starved_set.contains(&comp.sub_node) || starved_set.contains(&comp.eqz_node);
+            let pri_starved = pri_excl.iter().any(|n| starved_set.contains(n));
+            let alt_starved = alt_excl.iter().any(|n| starved_set.contains(n));
+            if !(comp_node_starved || pri_starved || alt_starved) {
+                continue;
+            }
+            if pri_starved && alt_starved {
+                continue;
+            }
+            let prune_decision = if !pri_starved && !alt_starved {
+                if win.flux_alt() <= 0.0 && win.flux_primary_tail(w_diag) > 0.0 {
+                    Some(false)
+                } else if win.flux_primary() <= 0.0 && win.flux_alt_tail(w_diag) > 0.0 {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if alt_starved {
+                (win.flux_alt() <= 0.0 && win.flux_primary_tail(w_diag) > 0.0).then_some(false)
+            } else {
+                (win.flux_primary() <= 0.0 && win.flux_alt_tail(w_diag) > 0.0).then_some(true)
+            };
+            if let Some(prune_primary) = prune_decision
+                && self.excise_port_comparator(comp_idx, prune_primary)
+            {
+                self.disagreement_prune_events += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn record_scoped_starvation_prune(
+        &mut self,
+        pre_prune_circuit: &Circuit,
+        pre_comps: &[ComparatorSite],
+        starved_set: &BTreeSet<NodeId>,
+    ) {
+        let num_ports = self.port_starvation_prune_events.len();
+        let mut port_hit = vec![false; num_ports];
+        for (p, hit) in port_hit.iter_mut().enumerate() {
+            let (cone, _) = port_upstream_cone_and_edges(pre_prune_circuit, p as u16);
+            if cone.iter().any(|n| starved_set.contains(n)) {
+                *hit = true;
+            }
+        }
+        let mut comp_hit = false;
+        for comp in pre_comps {
+            let mut visited = BTreeSet::new();
+            let mut stack = vec![comp.sub_node, comp.eqz_node];
+            let mut hit_this = false;
+            while let Some(node) = stack.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                if starved_set.contains(&node) {
+                    hit_this = true;
+                    break;
+                }
+                for edge in pre_prune_circuit.edges() {
+                    if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                        && dst == node
+                        && let SignalSource::NodeOut { node: src, .. } = edge.src
+                    {
+                        stack.push(src);
+                    }
+                }
+            }
+            if hit_this {
+                comp_hit = true;
+                let tp = usize::from(comp.target_port);
+                if tp < port_hit.len() {
+                    port_hit[tp] = true;
+                }
+            }
+        }
+        for (p, &hit) in port_hit.iter().enumerate() {
+            if hit {
+                self.port_starvation_prune_events[p] += 1;
+            }
+        }
+        if comp_hit {
+            self.comparator_starvation_prune_events += 1;
+        }
+    }
+
     fn process_wake_comparator_events(&mut self) -> bool {
         let min_gain = self.growth_config.min_match_gain;
         let w_diag = self.growth_config.diagnostic_window;
@@ -1591,7 +1767,9 @@ fn comparator_cone_is_mature(
         let Some(econ) = economy.nodes().get(node.index()) else {
             return false;
         };
-        if !is_pure_boundary_split(circuit, node) && econ.juvenile_ticks > 0 {
+        let is_comb_split = circuit.wire_delay() == WireDelayMode::Combinational
+            && matches!(circuit.nodes().get(node.index()), Some(Primitive::Split));
+        if !is_pure_boundary_split(circuit, node) && !is_comb_split && econ.juvenile_ticks > 0 {
             return false;
         }
         for edge in circuit.edges() {
@@ -1859,12 +2037,17 @@ impl PredictorBaseline for ArkheLearner {
 
         // Starvation pruning
         if !econ_tick.starved_nodes.is_empty() {
-            let pre_prune_circuit = self.editable.circuit().clone();
             let starved_set: BTreeSet<NodeId> = econ_tick
                 .starved_nodes
                 .iter()
                 .map(|&idx| NodeId(idx as u32))
                 .collect();
+            if self.try_wake_comparator_bankruptcy_refutation(&starved_set) {
+                self.tick += 1;
+                return None;
+            }
+            let pre_prune_circuit = self.editable.circuit().clone();
+            let pre_comps = self.editable.economy().comparators().to_vec();
             let juvenile_set: BTreeSet<NodeId> = self
                 .editable
                 .economy()
@@ -1894,6 +2077,7 @@ impl PredictorBaseline for ArkheLearner {
                 self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
                 self.apply_node_remap_to_windows(&old_to_new);
                 self.starvation_prune_events += 1;
+                self.record_scoped_starvation_prune(&pre_prune_circuit, &pre_comps, &starved_set);
             }
         }
 
@@ -2059,7 +2243,8 @@ impl PredictorBaseline for ArkheLearner {
 
                 let mut deferred_best: Option<DeferredProposal> = match stage0_res {
                     Ok(Some(prop)) if prop.e_cand == 0 || !can_deepen_eligible => {
-                        sprouted = self.commit_sprout(p, prop.circuit);
+                        sprouted =
+                            self.commit_sprout(p, prop.circuit, prop.effective_juvenile_ticks);
                         None
                     }
                     Ok(Some(prop)) => Some(DeferredProposal::Sprout(prop)),
@@ -2166,7 +2351,11 @@ impl PredictorBaseline for ArkheLearner {
 
                         if let Ok(Some(band_prop)) = band_res {
                             if band_prop.e_cand == 0 {
-                                sprouted = self.commit_sprout(p, band_prop.circuit);
+                                sprouted = self.commit_sprout(
+                                    p,
+                                    band_prop.circuit,
+                                    band_prop.effective_juvenile_ticks,
+                                );
                                 break;
                             }
                             if deferred_best
@@ -2184,7 +2373,9 @@ impl PredictorBaseline for ArkheLearner {
 
                 if !sprouted && let Some(winner) = deferred_best {
                     sprouted = match winner {
-                        DeferredProposal::Sprout(prop) => self.commit_sprout(p, prop.circuit),
+                        DeferredProposal::Sprout(prop) => {
+                            self.commit_sprout(p, prop.circuit, prop.effective_juvenile_ticks)
+                        }
                         DeferredProposal::Ring(ring_prop, _) => {
                             self.commit_ring_proposal(ring_prop)
                         }
@@ -2359,10 +2550,18 @@ impl PredictorBaseline for ArkheLearner {
                     if !sprouted {
                         self.sprout_blocked_max_nodes += stage3_tel.sprout_blocked_max_nodes;
                         self.sprout_budget_exhausted += stage3_tel.sprout_budget_exhausted;
-                        if stage3_ok_none && stage3_tel.sprout_budget_exhausted == 0 {
+                        let obs_full = self.obs_window.len()
+                            >= observation_horizon(&self.economy_config, &self.growth_config);
+                        if obs_full
+                            && stage3_ok_none
+                            && stage3_tel.sprout_budget_exhausted == 0
+                            && (self.is_port_zero_error(p) || !self.port_needs_stage2(p))
+                        {
                             self.port_states[p].stage3_exhausted = true;
                         }
                     }
+                    self.candidate_undecidable += stage3_tel.candidate_undecidable;
+                    self.lag_horizon_bound += stage3_tel.lag_horizon_bound;
                     self.candidate_list_truncated += stage3_tel.candidate_list_truncated;
                     if sprouted {
                         break;
@@ -3600,32 +3799,17 @@ mod tests {
             assert_eq!(learner.active_comparator_count(), 0);
         }
 
-        // 2. Non-redundant T2_CrossNonlinear (deg 4 x deg 4 and deg 11 x deg 9) halts at 0 comparators on channel 2.
-        for (driver_0, driver_1) in [
-            (
-                LfsrStage {
-                    taps: vec![1, 1, 0, 1],
-                    init: vec![1, 0, 0, 1],
-                },
-                LfsrStage {
-                    taps: vec![1, 0, 1, 1],
-                    init: vec![1, 1, 0, 1],
-                },
-            ),
-            (
-                LfsrStage {
+        // 2a. Genuinely non-redundant T2_CrossNonlinear (deg 11 x deg 9, period 1,046,017) halts at 0 comparators on channel 2.
+        {
+            let non_red_cfg = GeneratorConfig::T2_CrossNonlinear {
+                driver_0: LfsrStage {
                     taps: vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1],
                     init: vec![1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
                 },
-                LfsrStage {
+                driver_1: LfsrStage {
                     taps: vec![0, 0, 0, 1, 0, 0, 0, 0, 1],
                     init: vec![1, 1, 0, 1, 0, 1, 1, 0, 1],
                 },
-            ),
-        ] {
-            let non_red_cfg = GeneratorConfig::T2_CrossNonlinear {
-                driver_0,
-                driver_1,
                 lag_0: 1,
                 lag_1: 2,
                 op: CrossNonlinearOp::MulEqz,
@@ -3660,8 +3844,72 @@ mod tests {
                     .comparators()
                     .iter()
                     .all(|c| c.target_port != 2),
-                "non-redundant T2_CrossNonlinear target port 2 must form 0 comparators"
+                "non-redundant T2_CrossNonlinear (deg 11 x deg 9) target port 2 must form 0 comparators"
             );
+        }
+
+        // 2b. Short-period T2_CrossNonlinear (deg 4 x deg 4, ch2 period 21) forms a valid causal-disjoint
+        //     port-2 comparator (primary {ch0, ch1} vs alt {ch2} = 0b100) with 0 starvation/disagreement prunes.
+        {
+            let short_cfg = GeneratorConfig::T2_CrossNonlinear {
+                driver_0: LfsrStage {
+                    taps: vec![1, 1, 0, 1],
+                    init: vec![1, 0, 0, 1],
+                },
+                driver_1: LfsrStage {
+                    taps: vec![1, 0, 1, 1],
+                    init: vec![1, 1, 0, 1],
+                },
+                lag_0: 1,
+                lag_1: 2,
+                op: CrossNonlinearOp::MulEqz,
+            };
+            let sb_sp = SeedBank::new(4);
+            let mut env_sp = NoisyEnvironment::new(
+                short_cfg.build(Width::BITS_1).unwrap(),
+                NoiseModel::None,
+                sb_sp,
+            )
+            .unwrap();
+            let mut learner_sp = ArkheLearner::new(
+                Width::BITS_1,
+                3,
+                WireDelayMode::Combinational,
+                GrowthConfig::default(),
+                sb_sp,
+            )
+            .unwrap();
+            let mut budget_sp = TickBudget::new(200_000);
+            let mut clean_sp = [0u64; 3];
+            let mut obs_sp = [0u64; 3];
+            for _ in 0..800 {
+                env_sp.step_frame(&mut clean_sp, &mut obs_sp);
+                let _ = learner_sp.predict(&mut budget_sp);
+                learner_sp.observe(&obs_sp, &mut budget_sp);
+            }
+            let port2_comps: Vec<_> = learner_sp
+                .editable()
+                .economy()
+                .comparators()
+                .iter()
+                .filter(|c| c.target_port == 2)
+                .collect();
+            assert_eq!(
+                port2_comps.len(),
+                1,
+                "short-period deg 4 x deg 4 target port 2 must form 1 comparator"
+            );
+            assert_eq!(
+                port2_comps[0].primary_channel_mask & port2_comps[0].alt_channel_mask,
+                0,
+                "port 2 comparator source masks must be disjoint"
+            );
+            assert_eq!(
+                port2_comps[0].alt_channel_mask, 0b100,
+                "port 2 alt derivation must route via channel 2 self-history (0b100)"
+            );
+            assert_eq!(learner_sp.starvation_prune_events(), 0);
+            assert_eq!(learner_sp.disagreement_prune_events(), 0);
         }
 
         // 3. NoisyAlternating (eps=0.05) forms comparator without sprout/prune thrashing.
@@ -4357,5 +4605,115 @@ mod tests {
         assert_eq!(win.disagreement_count(), 64);
         assert!((win.flux_primary() - 128.0).abs() < 1e-12);
         assert!((win.flux_alt() - 256.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn m2b_b2_bankruptcy_refutation_excises_one_sided_vs_both_starved_regime_shift() {
+        use crate::structural::graph_edit::splice_comparator_onto_port;
+        use std::collections::BTreeSet;
+
+        let build_two_arm_learner = || {
+            let mut circ = Circuit::new(Width::BITS_1, 2, 2, WireDelayMode::Combinational);
+            let pri_eqz = circ.add_node(Primitive::Eqz);
+            circ.connect(
+                SignalSource::BoundaryIn(0),
+                SignalSink::NodeIn {
+                    node: pri_eqz,
+                    port: 0,
+                },
+            );
+            circ.connect(
+                SignalSource::NodeOut {
+                    node: pri_eqz,
+                    port: 0,
+                },
+                SignalSink::BoundaryOut(0),
+            );
+            let alt_delay = circ.add_node(Primitive::Delay { init: 0 });
+            circ.connect(
+                SignalSource::BoundaryIn(1),
+                SignalSink::NodeIn {
+                    node: alt_delay,
+                    port: 0,
+                },
+            );
+            let spliced = splice_comparator_onto_port(
+                &mut circ,
+                0,
+                SignalSource::NodeOut {
+                    node: alt_delay,
+                    port: 0,
+                },
+            )
+            .unwrap();
+            let econ = EconomyConfig {
+                juvenile_ticks: 0,
+                ..EconomyConfig::default()
+            };
+            let mut editable = EditableCircuit::new(circ, econ).unwrap();
+            editable
+                .register_comparator(spliced.sub_node, spliced.eqz_node, 0, 1, 2)
+                .unwrap();
+            let mut learner =
+                ArkheLearner::from_editable(editable, GrowthConfig::default(), SeedBank::new(0))
+                    .unwrap();
+            let w_diag = learner.growth_config.diagnostic_window;
+            for _ in 0..w_diag {
+                learner.comparator_windows[0].push(true, 1.0, -1.0, false, true);
+            }
+            (learner, pri_eqz, alt_delay)
+        };
+
+        // 1. Both exclusive arms starved (regime shift): 1-sided bankruptcy refutation MUST NOT fire;
+        //    scoped starvation counters attribute the event to port 0 and comparators.
+        {
+            let (mut learner, pri_eqz, alt_delay) = build_two_arm_learner();
+            let mut starved_both = BTreeSet::new();
+            starved_both.insert(pri_eqz);
+            starved_both.insert(alt_delay);
+            assert!(
+                !learner.try_wake_comparator_bankruptcy_refutation(&starved_both),
+                "both-starved comparator must decline 1-sided refutation"
+            );
+            assert_eq!(learner.active_comparator_count(), 1);
+            assert_eq!(learner.disagreement_prune_events(), 0);
+
+            let pre_circ = learner.editable.circuit().clone();
+            let pre_comps = learner.editable.economy().comparators().to_vec();
+            learner.record_scoped_starvation_prune(&pre_circ, &pre_comps, &starved_both);
+            assert_eq!(learner.port_starvation_prune_events(), &[1, 0]);
+            assert_eq!(learner.comparator_starvation_prune_events(), 1);
+        }
+
+        // 2. End-to-end observe() on 1-sided bankruptcy (alt_delay energy < 0 while pri_eqz solvent):
+        //    triggers atomic 1-sided comparator refutation without recording starvation prune.
+        {
+            let (mut learner, pri_eqz, alt_delay) = build_two_arm_learner();
+            learner
+                .editable
+                .economy_mut()
+                .node_mut(pri_eqz.index())
+                .unwrap()
+                .energy = 100.0;
+            learner
+                .editable
+                .economy_mut()
+                .node_mut(alt_delay.index())
+                .unwrap()
+                .energy = -1.0;
+            let mut budget = TickBudget::new(10_000);
+            let _ = learner.predict(&mut budget);
+            learner.observe(&[1, 0], &mut budget);
+
+            assert_eq!(learner.active_comparator_count(), 0);
+            assert_eq!(learner.disagreement_prune_events(), 1);
+            assert_eq!(learner.starvation_prune_events(), 0);
+            assert_eq!(learner.port_starvation_prune_events(), &[0, 0]);
+            assert_eq!(learner.comparator_starvation_prune_events(), 0);
+            // Primary BoundaryOut(0) route remains intact after alt excision.
+            let mut check_budget = TickBudget::new(10_000);
+            let pred = learner.predict(&mut check_budget);
+            assert_eq!(pred[0], 0);
+        }
     }
 }

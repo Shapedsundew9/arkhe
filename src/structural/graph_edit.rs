@@ -1048,13 +1048,45 @@ pub fn swap_comparator_driver(
     true
 }
 
-/// Excises a comparator (`sub_node`, `eqz_node`) and either its `alt` branch (`prune_primary = false`)
-/// or its `primary` branch (`prune_primary = true`, promoting `alt` to `BoundaryOut(target_port)` first).
-///
-/// Only removes nodes inside the excised branch whose outputs are not reachable from any surviving
-/// boundary output or any node in `surviving_comparator_nodes`.
-#[must_use]
-pub fn excise_comparator_branch(
+fn collect_comparator_live_nodes(
+    work: &Circuit,
+    sub_node: NodeId,
+    eqz_node: NodeId,
+    surviving_comparator_nodes: &[(NodeId, NodeId)],
+) -> BTreeSet<NodeId> {
+    let mut live_nodes = BTreeSet::new();
+    let mut live_stack: Vec<NodeId> = Vec::new();
+    for edge in work.edges() {
+        if let SignalSink::BoundaryOut(_) = edge.dst
+            && let SignalSource::NodeOut { node, .. } = edge.src
+        {
+            live_stack.push(node);
+        }
+    }
+    for &(other_sub, other_eqz) in surviving_comparator_nodes {
+        if other_sub != sub_node && other_eqz != eqz_node {
+            live_stack.push(other_sub);
+            live_stack.push(other_eqz);
+        }
+    }
+    while let Some(node) = live_stack.pop() {
+        if !live_nodes.insert(node) {
+            continue;
+        }
+        for edge in work.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == node
+                && let SignalSource::NodeOut { node: src, .. } = edge.src
+            {
+                live_stack.push(src);
+            }
+        }
+    }
+    live_nodes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_comparator_arm_excision(
     circuit: &Circuit,
     sub_node: NodeId,
     eqz_node: NodeId,
@@ -1062,7 +1094,8 @@ pub fn excise_comparator_branch(
     prune_primary: bool,
     target_port_subs: &[NodeId],
     surviving_comparator_nodes: &[(NodeId, NodeId)],
-) -> Option<(Circuit, Vec<Option<NodeId>>)> {
+    collapse_splits: bool,
+) -> Option<(Circuit, BTreeSet<NodeId>)> {
     let mut work = circuit.clone();
     if prune_primary && !swap_comparator_driver(&mut work, target_port, sub_node, target_port_subs)
     {
@@ -1145,7 +1178,7 @@ pub fn excise_comparator_branch(
 
     // In Combinational mode, collapse 1-consumer degenerate `Split`s left on `sub0_src` / `alt_src`.
     let mut collapsed_splits = BTreeSet::new();
-    if work.wire_delay() == WireDelayMode::Combinational {
+    if collapse_splits && work.wire_delay() == WireDelayMode::Combinational {
         let mut seed_splits = BTreeSet::new();
         if let SignalSource::NodeOut { node, .. } = sub0_src {
             seed_splits.insert(node);
@@ -1238,34 +1271,8 @@ pub fn excise_comparator_branch(
     }
 
     // Compute all surviving live nodes reachable from BoundaryOut(0..K) and surviving comparators.
-    let mut live_nodes = BTreeSet::new();
-    let mut live_stack: Vec<NodeId> = Vec::new();
-    for edge in work.edges() {
-        if let SignalSink::BoundaryOut(_) = edge.dst
-            && let SignalSource::NodeOut { node, .. } = edge.src
-        {
-            live_stack.push(node);
-        }
-    }
-    for &(other_sub, other_eqz) in surviving_comparator_nodes {
-        if other_sub != sub_node && other_eqz != eqz_node {
-            live_stack.push(other_sub);
-            live_stack.push(other_eqz);
-        }
-    }
-    while let Some(node) = live_stack.pop() {
-        if !live_nodes.insert(node) {
-            continue;
-        }
-        for edge in work.edges() {
-            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
-                && dst == node
-                && let SignalSource::NodeOut { node: src, .. } = edge.src
-            {
-                live_stack.push(src);
-            }
-        }
-    }
+    let live_nodes =
+        collect_comparator_live_nodes(&work, sub_node, eqz_node, surviving_comparator_nodes);
 
     let mut removed: BTreeSet<NodeId> = excised_candidates
         .into_iter()
@@ -1276,6 +1283,67 @@ pub fn excise_comparator_branch(
     for s in collapsed_splits {
         removed.insert(s);
     }
+    Some((work, removed))
+}
+
+/// Returns the set of existing nodes in `circuit` that belong exclusively to a comparator's
+/// `primary` (`prune_primary = true`) or `alt` (`prune_primary = false`) branch, excluding the
+/// comparator nodes (`sub_node`, `eqz_node`) themselves and any node reachable from surviving
+/// boundary outputs or surviving comparators (`M2B-B2`).
+#[must_use]
+pub fn comparator_exclusive_arm_nodes(
+    circuit: &Circuit,
+    sub_node: NodeId,
+    eqz_node: NodeId,
+    target_port: u16,
+    prune_primary: bool,
+    target_port_subs: &[NodeId],
+    surviving_comparator_nodes: &[(NodeId, NodeId)],
+) -> Option<BTreeSet<NodeId>> {
+    let (_, removed) = prepare_comparator_arm_excision(
+        circuit,
+        sub_node,
+        eqz_node,
+        target_port,
+        prune_primary,
+        target_port_subs,
+        surviving_comparator_nodes,
+        false,
+    )?;
+    let orig_count = circuit.node_count();
+    Some(
+        removed
+            .into_iter()
+            .filter(|&n| n != sub_node && n != eqz_node && n.index() < orig_count)
+            .collect(),
+    )
+}
+
+/// Excises a comparator (`sub_node`, `eqz_node`) and either its `alt` branch (`prune_primary = false`)
+/// or its `primary` branch (`prune_primary = true`, promoting `alt` to `BoundaryOut(target_port)` first).
+///
+/// Only removes nodes inside the excised branch whose outputs are not reachable from any surviving
+/// boundary output or any node in `surviving_comparator_nodes`.
+#[must_use]
+pub fn excise_comparator_branch(
+    circuit: &Circuit,
+    sub_node: NodeId,
+    eqz_node: NodeId,
+    target_port: u16,
+    prune_primary: bool,
+    target_port_subs: &[NodeId],
+    surviving_comparator_nodes: &[(NodeId, NodeId)],
+) -> Option<(Circuit, Vec<Option<NodeId>>)> {
+    let (mut work, removed) = prepare_comparator_arm_excision(
+        circuit,
+        sub_node,
+        eqz_node,
+        target_port,
+        prune_primary,
+        target_port_subs,
+        surviving_comparator_nodes,
+        true,
+    )?;
     let old_to_new = work.remove_nodes(&removed);
     work.compile().ok()?;
     Some((work, old_to_new))
