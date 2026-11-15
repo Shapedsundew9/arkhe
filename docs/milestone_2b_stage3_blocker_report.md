@@ -38,13 +38,13 @@ Verbatim `seed = 0` Stage-3 diagnostics (`@m2b_verify` `#55` inside `stage3_meas
 
 ## 3. What was expected and why
 
-Under [doc/milestone_2b_plan.md §2.2 & §3](milestone_2b_plan.md#3-pre-registered-hypotheses--falsifiable-success-criteria), all declared `T2_MultiViewCoupled` tasks (`MV_Affine_k2_TphSplit`, `MV_Eqz_k2_Comb`, `MV_MulEqz_k2_Comb`) are expected to sprout a disjoint `EQZ(SUB(primary, alt))` comparator in Stage 3 (`G2B.2`), bounded by `M2B-B1`'s ratified ceiling $t_{\text{juv}}(V_{\text{new}}) \le 2 W_{\text{obs}} = 512$.
+Under [docs/milestone_2b_plan.md §2.2 & §3](milestone_2b_plan.md#3-pre-registered-hypotheses--falsifiable-success-criteria), all declared `T2_MultiViewCoupled` tasks (`MV_Affine_k2_TphSplit`, `MV_Eqz_k2_Comb`, `MV_MulEqz_k2_Comb`) are expected to sprout a disjoint `EQZ(SUB(primary, alt))` comparator in Stage 3 (`G2B.2`), bounded by `M2B-B1`'s ratified ceiling $t_{\text{juv}}(V_{\text{new}}) \le 2 W_{\text{obs}} = 512$.
 
 ## 4. Hypotheses ranked by evidence
 
 1. **Primary hypothesis (Exact Individual-Node Credit Normalization Bounds vs. Unscaled `512` Ceiling — `MV_Affine_k2_TphSplit`, `MV_Eqz_k2_Comb`, `MV_MulEqz_k2_Comb`):**
    - `MV_Affine_k2_TphSplit` has `t_debt = 308 <= 512` and is blocked solely because `allow_deep_base_scaling = false` clipped `M2B-D1`'s already-derived `effective_comparator_juvenile_ticks(5, 1.5641) = 557` at `512`.
-   - On `MV_Eqz_k2_Comb` and `MV_MulEqz_k2_Comb`, `EconomyState` normalizes a bounded comparator reward ($\approx 1$–$2$ bits/tick) across total sensitivity `Z_alt + 2` (`4.30` and `5.52`) and propagates `gamma^d` decay to upstream `Split` (`29.37` bits including `split_code_tax`) and `Delay` leaves (`r_hat = 0.031`–`0.035` b/tick). Consequently, exact `e_alt = 0` leaf amortization legitimately requires **`546` (`MV_MulEqz`)** and **`840` (`MV_Eqz`)** ticks (`> 512`, though still `< 2000`). Note that `163` ticks estimated earlier in [`doc/milestone_2b_chief_scientist_review.md §6.1`](milestone_2b_chief_scientist_review.md#61-where-we-are-over-protecting-m1-constants-juvenile_ticks--128--1--initial_energy-blocker-2) was an aggregate cone average rather than individual unpooled `Split`/leaf `EconomyState` payback time.
+   - On `MV_Eqz_k2_Comb` and `MV_MulEqz_k2_Comb`, `EconomyState` normalizes a bounded comparator reward ($\approx 1$–$2$ bits/tick) across total sensitivity `Z_alt + 2` (`4.30` and `5.52`) and propagates `gamma^d` decay to upstream `Split` (`29.37` bits including `split_code_tax`) and `Delay` leaves (`r_hat = 0.031`–`0.035` b/tick). Consequently, exact `e_alt = 0` leaf amortization legitimately requires **`546` (`MV_MulEqz`)** and **`840` (`MV_Eqz`)** ticks (`> 512`, though still `< 2000`). Note that `163` ticks estimated earlier in [`docs/milestone_2b_chief_scientist_review.md §6.1`](milestone_2b_chief_scientist_review.md#61-where-we-are-over-protecting-m1-constants-juvenile_ticks--128--1--initial_energy-blocker-2) was an aggregate cone average rather than individual unpooled `Split`/leaf `EconomyState` payback time.
 2. **Alternative hypothesis (Bug in Stage-3 `pos_credit_sums` or `sim_ledger` debt accounting):**
    - Disproven by consistency across nodes: `MV_MulEqz_k2_Comb` has `15/16` new nodes under `487` ticks and only `n31(Delay)` at `541` (`gamma^5` attenuation); `MV_AddEqz_k2_Comb` already passes `20/20`; `r_hat = 0.031`–`0.035` matches actual `EconomyState` credit allocation (so graduating before `838` ticks would cause `n31` to starve immediately at graduation).
 
@@ -69,7 +69,7 @@ Also note operational quota status: `gemini-4-hydrogen-xhigh` / `-high` stands a
 
 ## 8. Ratified Decision (`2026-11-15` User Sign-Off — `Proposal M2B-C1`)
 
-Per [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-and-decision-rights) and [`doc/milestone_2b_chief_scientist_review.md §7`](milestone_2b_chief_scientist_review.md#7-post-ca7136c-stage-3-blocker-audit-two-clause-causal-dilution-decidability-proposal-m2b-c1), the Principal Investigator ratified **`Proposal M2B-C1` (Refined Option `a+`)** (`2026-11-15`):
+Per [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-and-decision-rights) and [`docs/milestone_2b_chief_scientist_review.md §7`](milestone_2b_chief_scientist_review.md#7-post-ca7136c-stage-3-blocker-audit-two-clause-causal-dilution-decidability-proposal-m2b-c1), the Principal Investigator ratified **`Proposal M2B-C1` (Refined Option `a+`)** (`2026-11-15`):
 
 1. **Unified Two-Clause Decidability Law (`src/structural/growth.rs`, zero new constants):**
    - Delete `allow_deep_base_scaling: bool` from `compute_debt_amortization_juvenile_ticks`.

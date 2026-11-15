@@ -33,11 +33,11 @@ use crate::verify_m1::{
     m1b::classify_case_outcome,
 };
 
-/// Default prequential horizon $T$ for Milestone 2b verification (`doc/milestone_2b_plan.md` §6).
+/// Default prequential horizon $T$ for Milestone 2b verification (`docs/milestone_2b_plan.md` §6).
 pub const DEFAULT_M2B_HORIZON: u64 = 2_000;
 /// Default transient warmup window $W$ for Milestone 2b verification.
 pub const DEFAULT_M2B_WARMUP: u64 = 500;
-/// Default search TickBudget per verification run (`doc/milestone_2b_plan.md` §6).
+/// Default search TickBudget per verification run (`docs/milestone_2b_plan.md` §6).
 pub const DEFAULT_M2B_BUDGET: u64 = 200_000;
 /// Pre-registered offline loopback horizon $T_{\text{loop}}$ in ticks (`G2B.3`, §6).
 pub const DEFAULT_M2B_LOOPBACK_TICKS: u64 = 128;

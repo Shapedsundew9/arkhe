@@ -37,7 +37,7 @@ Document exploratory measurements recorded prior to pre-registration (Rule 8: ex
 
 ## 6. Parameter Inventory Changes
 
-List every constant added, reclassified (e.g., **Milestone-Scoped Scaffolding** evolved into a zero-free-parameter **Derived Scaling Law** as scale axes $\tau, K, k, N$ expand), derived, or bounded in [`doc/parameter_inventory.md`](../parameter_inventory.md), with its classification, config path, telemetry counter, backward-reduction behavior on golden traces, and sensitivity sweep plan.
+List every constant added, reclassified (e.g., **Milestone-Scoped Scaffolding** evolved into a zero-free-parameter **Derived Scaling Law** as scale axes $\tau, K, k, N$ expand), derived, or bounded in [`docs/parameter_inventory.md`](../parameter_inventory.md), with its classification, config path, telemetry counter, backward-reduction behavior on golden traces, and sensitivity sweep plan.
 
 ## 7. Phased Implementation Plan
 

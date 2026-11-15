@@ -62,7 +62,7 @@ Read `.shared/ai/core/common-instructions.md`.
    fan-out are priced only through description length (`L(C)`, `split_code_tax`).
 2. **Parameter classification and evolution of scaffolding constants into derived scaling laws.**
    Every constant, bound, or threshold in `src/structural/` and `src/verify_*/` is classified in
-   `doc/parameter_inventory.md` (migrated from retired `doc/coordinate_free_scaling_plan.md` §2.1)
+   `docs/parameter_inventory.md` (migrated from retired `doc/coordinate_free_scaling_plan.md` §2.1)
    as **Derived**, **Milestone-Scoped Scaffolding**, **Pre-registered**, **Search bound**,
    **Compute guardrail**, or **Numerical guard**. Adding or changing a constant requires updating
    that inventory. Early milestones may fix **Milestone-Scoped Scaffolding** constants (e.g.,
@@ -85,7 +85,7 @@ Read `.shared/ai/core/common-instructions.md`.
    fundamental derivation legitimately changes M1 trajectories while passing all M1 gates
    (`verify-m1`), re-blessing `tests/golden_traces.rs` with the written mathematical derivation is
    the expected scientific path.
-5. **Stop and escalate** (write a blocker report per `doc/templates/blocker_report.md`—prioritizing a
+5. **Stop and escalate** (write a blocker report per `docs/templates/blocker_report.md`—prioritizing a
    first-principles Derived Scaling Law as Option (a) whenever a scaffolding constant or bound binds
    on an expanded scale axis—then wait for the user) when any of these occur:
    - a structural limit, guardrail, starvation cliff, search bound, or milestone-scoped scaffolding

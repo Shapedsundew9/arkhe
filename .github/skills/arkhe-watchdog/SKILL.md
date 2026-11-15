@@ -17,7 +17,7 @@ A swarm can fail in two ways: (1) all agents go to sleep waiting on each other (
 
 ## Context & Token-Saving Rules (Strict)
 
-- **NEVER read the codebase or documentation.** Do not read `src/`, `tests/`, or `doc/` files (except a tiny `git diff --stat` or a targeted test-file diff hunk if W3/W4 triggers). You do not fix bugs, run builds, run tests, or write code.
+- **NEVER read the codebase or documentation.** Do not read `src/`, `tests/`, or `docs/` files (except a tiny `git diff --stat` or a targeted test-file diff hunk if W3/W4 triggers). You do not fix bugs, run builds, run tests, or write code.
 - **Maintain your cached conversation state across wakeups.** Because your session stays loaded while sleeping via `swarm_wait`, your earlier turns stay in prompt cache (`cache_read_tokens`). Never re-read transcript lines you already checked.
 - **Track `LAST` (highest board `#seq` read) and `last_line[worker_id]` (highest `transcript.jsonl` line inspected per worker)** in memory across ticks. On each wakeup, inspect **only new lines** after `last_line[worker_id]`!
 - **Post concisely.** Mention only the target member (`@<worker>` or `@coordinator`), cite `#seq` or exact step numbers / changed files, and never write `@all`.

@@ -155,7 +155,7 @@ We audited all three queued fixes in the codebase and identified three subtletie
 
 ## 5. Ratified Governance Decisions (`2026-11-15` User Sign-Off)
 
-Per [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-and-decision-rights) and [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) Rules 2, 4, 5, and 7, all three pre-registration amendments have been **ratified by the user (`2026-11-15`)** and folded into [`doc/milestone_2b_plan.md`](milestone_2b_plan.md) (§2.3, §3, §6, §8.1) for execution by the `m2b_verify` worktree swarm (`holdout 40000..=40019` remains locked until dev `0..20`, `20..1020`, and confirmation `20040..=20059` pass cleanly):
+Per [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-and-decision-rights) and [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) Rules 2, 4, 5, and 7, all three pre-registration amendments have been **ratified by the user (`2026-11-15`)** and folded into [`docs/milestone_2b_plan.md`](milestone_2b_plan.md) (§2.3, §3, §6, §8.1) for execution by the `m2b_verify` worktree swarm (`holdout 40000..=40019` remains locked until dev `0..20`, `20..1020`, and confirmation `20040..=20059` pass cleanly):
 
 1. **`M2B-A1` (Trade-Off 1 — `Proposal 1A+`) — RATIFIED (`2026-11-15`):** Decouple `ComparatorWakeWindow` into `W_handoff = W_diag` (`64`, reversible Step A) and `W_prune = observation_horizon(&economy_config, &growth_config)` (`256`, irreversible Step B), with zero new constants (`golden_traces`, `verify-m1`, `verify-m2a`, and `G2B.5` $\le 64$-tick recovery preserved).
 2. **`M2B-A2` (Trade-Off 2 — Option A) — RATIFIED (`2026-11-15`):** Score each `G2B.4` generator against its exact structural-class Bayes optimum (clean-phase / $\varepsilon$-machine oracle $H_2(\varepsilon) = 0.2864$ b/sym for periodic `T1_Alternating`; `CausalReactiveOracle` and $H_{\text{reactive}}(\varepsilon, m, k)$ for exogenous LFSR `T2_MultiViewCoupled`, pooled `|E[KT] - H_bayes_class| <= 0.040`), with `theory_dis_rate` computed from the formed comparator's actual noisy input-leaf counts `(m_pri, m_alt)`.
@@ -167,7 +167,7 @@ Per [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-a
 
 Following implementation of `M2B-A1`–`M2B-A3` (`83ca660`), `verify-m2b --seed-offset 0 --seeds 20` now passes **`G2B.1` (`300/300`)**, **`G2B.3` (`140/140`)**, and **`G2B.4` (`180/180`, `pooled_|E[KT]-H_bayes_class| = 0.00105`, `0` false prunes)** cleanly, while surfacing the three boundary blockers documented in retired `doc/milestone_2b_blocker_report.md` (consolidated in §6.1–§6.2 below; `G2B.5` at `34/40`; `G2B.2` at `120/200`).
 
-Stepping back to ask **whether over-protecting early Milestone-1 scaffolding constants is forcing us into Ptolemaic epicycles**, auditing all six M1 scaffolding constants in [`doc/parameter_inventory.md`](parameter_inventory.md) gives a sharp, asymmetric answer: **YES on `juvenile_ticks = 128` (and `1 * initial_energy = 4.0` at `growth.rs:2681`), NO on `W_obs = 256` and `W_diag = 64`.**
+Stepping back to ask **whether over-protecting early Milestone-1 scaffolding constants is forcing us into Ptolemaic epicycles**, auditing all six M1 scaffolding constants in [`docs/parameter_inventory.md`](parameter_inventory.md) gives a sharp, asymmetric answer: **YES on `juvenile_ticks = 128` (and `1 * initial_energy = 4.0` at `growth.rs:2681`), NO on `W_obs = 256` and `W_diag = 64`.**
 
 ### 6.1 Where We *Are* Over-Protecting M1 Constants: `juvenile_ticks = 128` & `1 * initial_energy` (`Blocker #2`)
 
@@ -181,7 +181,7 @@ If we merely bolt on a fourth Stage-2-specific multiplier while keeping fixed `1
 
 **Clean De-Contorted Law (`Proposal M2B-B1` — Unified Per-Node Debt-Amortization Maturation):**
 
-Per [`doc/parameter_inventory.md` §2.1](parameter_inventory.md#21-parameter-scaling-derivations--deferred-rules) (*"Milestone-Scoped Scaffolding constants... evolve into zero-free-parameter Derived scaling laws"*):
+Per [`docs/parameter_inventory.md` §2.1](parameter_inventory.md#21-parameter-scaling-derivations--deferred-rules) (*"Milestone-Scoped Scaffolding constants... evolve into zero-free-parameter Derived scaling laws"*):
 
 - Reclassify `EconomyConfig::juvenile_ticks` (`128 = 2 * W_diag`; `0` in conservation tests) explicitly as the **minimum statistical maturation floor** $t_{\text{juv,min}}$.
 - Unify `endowment = new_nodes * initial_energy` across **all** `d_cone` in [`src/structural/growth.rs`](../src/structural/growth.rs) (`evaluate_sprout_motif`).
@@ -207,13 +207,13 @@ Per [`doc/parameter_inventory.md` §2.1](parameter_inventory.md#21-parameter-sca
 
 ### 6.3 Ratified Post-`83ca660` Blocker Decisions (`2026-11-15` User Sign-Off)
 
-All three proposals above (`M2B-B1` unified per-node debt-amortization maturation law + `new_nodes * initial_energy` with Rule-4 golden governance, `M2B-B2` atomic 1-sided comparator bankruptcy refutation preserving `W_obs = 256`, and `M2B-B3` `{0, 3, (5, 6)}` lag separation + target/comparator anti-starvation scope preserving `W_diag = 64` until `M5`) have been **ratified by the user (`2026-11-15`)** and folded into [`doc/milestone_2b_plan.md`](milestone_2b_plan.md) (§2.2, §2.3, §3, §6, §8.1; prior `doc/milestone_2b_blocker_report.md` retired after Commit 1 `ca7136c`) for execution by the `m2b_verify` swarm (`holdout 40000..=40019` remains locked).
+All three proposals above (`M2B-B1` unified per-node debt-amortization maturation law + `new_nodes * initial_energy` with Rule-4 golden governance, `M2B-B2` atomic 1-sided comparator bankruptcy refutation preserving `W_obs = 256`, and `M2B-B3` `{0, 3, (5, 6)}` lag separation + target/comparator anti-starvation scope preserving `W_diag = 64` until `M5`) have been **ratified by the user (`2026-11-15`)** and folded into [`docs/milestone_2b_plan.md`](milestone_2b_plan.md) (§2.2, §2.3, §3, §6, §8.1; prior `doc/milestone_2b_blocker_report.md` retired after Commit 1 `ca7136c`) for execution by the `m2b_verify` swarm (`holdout 40000..=40019` remains locked).
 
 ---
 
 ## 7. Post-`ca7136c` Stage-3 Blocker Audit: Two-Clause Causal-Dilution Decidability (`Proposal M2B-C1`)
 
-Following Commit 1 (`ca7136c`) in the `m2b_verify` worktree, `tests/golden_traces.rs` (`1/1` bit-identical), `verify-m1`, `verify-m2a`, **`G2B.1` (`300/300`)**, **`G2B.3` (`140/140`)**, **`G2B.4` (`179/180`, `99.44%`, `dis_prunes = 0`)**, and **`G2B.5` (`40/40`, `100%`, `+1.4385` b/sym advantage)** all pass with `0` guardrail exclusions ([`doc/milestone_2b_stage3_blocker_report.md`](milestone_2b_stage3_blocker_report.md)). Only `G2B.2` fails (`140/200`, `70.0% < 90.0%`): Stage 2 solves all `200/200` cases at `clean_mis = 0`, `target_starv = 0`, `comp_starv = 0`, and Stage 3 discovers the exact `e_alt = 0` disjoint backup on all three remaining tasks (`MV_Affine_k2_TphSplit`, `MV_Eqz_k2_Comb`, `MV_MulEqz_k2_Comb`), rejecting all three **solely** at the unscaled `horizon_ceiling = 512` (`2 * W_obs`) gate inside [`src/structural/growth.rs`](../src/structural/growth.rs) (`compute_debt_amortization_juvenile_ticks`).
+Following Commit 1 (`ca7136c`) in the `m2b_verify` worktree, `tests/golden_traces.rs` (`1/1` bit-identical), `verify-m1`, `verify-m2a`, **`G2B.1` (`300/300`)**, **`G2B.3` (`140/140`)**, **`G2B.4` (`179/180`, `99.44%`, `dis_prunes = 0`)**, and **`G2B.5` (`40/40`, `100%`, `+1.4385` b/sym advantage)** all pass with `0` guardrail exclusions ([`docs/milestone_2b_stage3_blocker_report.md`](milestone_2b_stage3_blocker_report.md)). Only `G2B.2` fails (`140/200`, `70.0% < 90.0%`): Stage 2 solves all `200/200` cases at `clean_mis = 0`, `target_starv = 0`, `comp_starv = 0`, and Stage 3 discovers the exact `e_alt = 0` disjoint backup on all three remaining tasks (`MV_Affine_k2_TphSplit`, `MV_Eqz_k2_Comb`, `MV_MulEqz_k2_Comb`), rejecting all three **solely** at the unscaled `horizon_ceiling = 512` (`2 * W_obs`) gate inside [`src/structural/growth.rs`](../src/structural/growth.rs) (`compute_debt_amortization_juvenile_ticks`).
 
 ### 7.1 Direction Check (`Question a`): Per-Node Economy Is Working as Designed; Eliminate the Split-Brain Ceiling
 

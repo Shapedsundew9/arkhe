@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that all relative links and heading anchors in README.md and doc/**/*.md resolve."""
+"""Check that all relative links and heading anchors in README.md and docs/**/*.md resolve."""
 
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ EXTERNAL_PREFIXES = ("http://", "https://", "mailto:", "file://", "conversation:
 
 def iter_markdown_files() -> list[pathlib.Path]:
     files = [REPO_ROOT / "README.md"]
-    doc_dir = REPO_ROOT / "doc"
-    if doc_dir.is_dir():
-        files.extend(sorted(doc_dir.rglob("*.md")))
+    docs_dir = REPO_ROOT / "docs"
+    if docs_dir.is_dir():
+        files.extend(sorted(docs_dir.rglob("*.md")))
     return [f for f in files if f.is_file()]
 
 

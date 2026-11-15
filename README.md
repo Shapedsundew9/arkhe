@@ -1,6 +1,6 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, and **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)** from the [Foundational Research Charter v3](doc/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [doc/parameter_inventory.md](doc/parameter_inventory.md), Milestone 0–2b sign-off records and derivations live in [doc/research_record.md](doc/research_record.md), Chief Scientist governance and escalation principles live in [doc/chief_scientist_role.md](doc/chief_scientist_role.md), and the ratified Stage M2b pre-registration plan lives in [doc/milestone_2b_plan.md](doc/milestone_2b_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, and **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)** from the [Foundational Research Charter v3](docs/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [docs/parameter_inventory.md](docs/parameter_inventory.md), Milestone 0–2b sign-off records and derivations live in [docs/research_record.md](docs/research_record.md), Chief Scientist governance and escalation principles live in [docs/chief_scientist_role.md](docs/chief_scientist_role.md), and the ratified Stage M2b pre-registration plan lives in [docs/milestone_2b_plan.md](docs/milestone_2b_plan.md).
 
 ## Overview
 
@@ -19,7 +19,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 .
 ├── .devcontainer/
 ├── .github/
-├── doc/
+├── docs/
 │   ├── templates/
 │   │   ├── blocker_report.md
 │   │   └── milestone_plan_template.md
