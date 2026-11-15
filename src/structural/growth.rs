@@ -6,18 +6,25 @@ use crate::baselines::{ObservationWindow, TickBudget};
 use crate::metrics::mdl::StrippedRingCodeBase;
 use crate::metrics::{PointForecastScorer, circuit_code_bits_with_tax, facts_code_bits};
 use crate::rng::SeedBank;
-use crate::structural::economy::{EconomyConfig, EconomyState, score_with_reward_mode};
+use crate::structural::economy::{
+    ComparatorSite, EconomyConfig, EconomyState, score_with_reward_mode,
+};
 use crate::structural::graph_edit::{
-    build_autonomous_ring, materialize_const_loop, stack_output_binary_op, tap_source,
+    build_autonomous_ring, build_autonomous_ring_source, cone_channel_mask, derivation_cone_info,
+    is_pure_boundary_split, materialize_const_loop, source_has_cycle, source_register_depth,
+    splice_comparator_onto_port, stack_output_binary_op, swap_comparator_driver, tap_source,
 };
 use crate::structural::live::node_output_values;
-use crate::structural::sensitivity::{assemble_causal_ancestry, counterfactual_sensitivity};
+use crate::structural::sensitivity::{
+    assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
+    counterfactual_sensitivity, counterfactual_sensitivity_with_comparators,
+};
 use crate::structural::surgery::{
     EditableCircuit, MarginalDebtLedger, explicit_delay_register_index,
     port_upstream_cone_and_edges, port_uses_boundary_in, register_mapping,
 };
 use crate::substrate::{
-    Circuit, NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
+    Circuit, Edge, NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
 };
 
 /// Numerical tolerance for deterministic candidate $\Delta J$ tie-breaking.
@@ -58,6 +65,48 @@ pub fn effective_juvenile_ticks(
     let scaled = (d_cone as f64)
         + (f64::from(economy_config.juvenile_ticks) * discount_factor * chain_sum_ratio).ceil();
     scaled.min(f64::from(u32::MAX)) as u32
+}
+
+/// Number of unit-sensitivity combinational primitives (`Sub`, `Eqz`) in a comparator site.
+pub const COMPARATOR_PRIMITIVE_COUNT: usize = 2;
+
+/// Zero-free-parameter comparator maturation scaling law parameterized by comparator primitive count.
+///
+/// Reduces identically to [`effective_juvenile_ticks`] when `comp_primitive_count == 0` or `z_alt <= 0.0`.
+#[must_use]
+pub fn effective_comparator_juvenile_ticks_with_primitives(
+    d_alt: usize,
+    z_alt: f64,
+    comp_primitive_count: usize,
+    economy_config: &EconomyConfig,
+    growth_config: &GrowthConfig,
+) -> u32 {
+    let base = effective_juvenile_ticks(d_alt, economy_config, growth_config);
+    if base == 0 || comp_primitive_count == 0 || z_alt <= 0.0 || !z_alt.is_finite() {
+        return base;
+    }
+    let scaled = (f64::from(base) * ((z_alt + comp_primitive_count as f64) / z_alt)).ceil();
+    scaled.min(f64::from(u32::MAX)) as u32
+}
+
+/// Zero-free-parameter comparator maturation grace scaling law (Charter DR #40, `M2B-D1`).
+///
+/// Scales [`effective_juvenile_ticks`] by $\lceil \cdot (Z_{\text{alt}} + 2) / Z_{\text{alt}} \rceil$
+/// to compensate exact share dilution caused by `Sub` and `Eqz` (`COMPARATOR_PRIMITIVE_COUNT = 2`).
+#[must_use]
+pub fn effective_comparator_juvenile_ticks(
+    d_alt: usize,
+    z_alt: f64,
+    economy_config: &EconomyConfig,
+    growth_config: &GrowthConfig,
+) -> u32 {
+    effective_comparator_juvenile_ticks_with_primitives(
+        d_alt,
+        z_alt,
+        COMPARATOR_PRIMITIVE_COUNT,
+        economy_config,
+        growth_config,
+    )
 }
 
 /// Derives the coordinate-free per-circuit node guardrail scaled linearly by channel count.
@@ -161,6 +210,13 @@ pub struct GrowthConfig {
     pub max_ring_period: usize,
     /// Counterfactual sensitivity sample budget per tick when $k > 4$ (exact below).
     pub sensitivity_sample_count: usize,
+    /// Enable Stage 3 causal-disjoint redundancy sprouting and comparator formation (`M2b`).
+    #[serde(default = "default_redundancy_sprouting")]
+    pub redundancy_sprouting: bool,
+}
+
+const fn default_redundancy_sprouting() -> bool {
+    true
 }
 
 impl Default for GrowthConfig {
@@ -177,6 +233,7 @@ impl Default for GrowthConfig {
             min_ring_period: 2,
             max_ring_period: 6,
             sensitivity_sample_count: 8,
+            redundancy_sprouting: true,
         }
     }
 }
@@ -1105,17 +1162,21 @@ impl DiagnosticBuffer {
             });
         }
 
-        // 2. Live internal node outputs (excluding juvenile nodes, §2.4)
+        // 2. Live internal node outputs (excluding juvenile nodes, §2.4, and comparator internals)
         for (node_idx, &primitive) in circuit.nodes().iter().enumerate() {
+            let node = NodeId(u32::try_from(node_idx).expect("fits in u32"));
             if let Some(econ) = economy
-                && econ
+                && (econ
                     .nodes()
                     .get(node_idx)
                     .is_some_and(|n| n.juvenile_ticks > 0)
+                    || econ
+                        .comparators()
+                        .iter()
+                        .any(|c| c.sub_node == node || c.eqz_node == node))
             {
                 continue;
             }
-            let node = NodeId(u32::try_from(node_idx).expect("fits in u32"));
             if primitive == Primitive::Split {
                 let consumers = circuit
                     .edges()
@@ -1735,6 +1796,8 @@ struct BaselineReplayMetrics {
     facts_curr: f64,
     driven_ports: Vec<bool>,
     e_curr_by_port: Vec<usize>,
+    e_comp_curr: Vec<usize>,
+    comp_cone_edges: Vec<Edge>,
     start_idx: usize,
     eval_start_idx: usize,
     eval_offset: usize,
@@ -1745,6 +1808,43 @@ struct BaselineReplayMetrics {
     out_pred_trace: Vec<u64>,
     out_truth_trace: Vec<u64>,
     survivor_map: Vec<Option<NodeId>>,
+}
+
+/// Returns all upstream edges feeding registered comparator cones in `TicksPerHop` mode.
+///
+/// Inserting a `Split` in series along any of these edges shifts register hop depth on an active
+/// comparator branch. Empty when no comparators exist or wire delay is `Combinational`.
+fn comparator_cone_edges(circuit: &Circuit, comparators: &[ComparatorSite]) -> Vec<Edge> {
+    if comparators.is_empty() || circuit.wire_delay() != WireDelayMode::TicksPerHop {
+        return Vec::new();
+    }
+    let mut visited = BTreeSet::new();
+    let mut stack = Vec::new();
+    for comp in comparators {
+        for root in [comp.sub_node, comp.eqz_node] {
+            if visited.insert(root) {
+                stack.push(root);
+            }
+        }
+    }
+    let mut cone_edges = Vec::new();
+    while let Some(node) = stack.pop() {
+        for &edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst_node, .. } = edge.dst
+                && dst_node == node
+            {
+                cone_edges.push(edge);
+                if let SignalSource::NodeOut { node: src_node, .. } = edge.src
+                    && visited.insert(src_node)
+                {
+                    stack.push(src_node);
+                }
+            }
+        }
+    }
+    cone_edges.sort();
+    cone_edges.dedup();
+    cone_edges
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1793,9 +1893,13 @@ fn replay_current_baseline(
         .collect();
     let mut curr_pred = vec![0u64; num_outputs];
     let mut e_curr_by_port = vec![0usize; num_outputs];
+    let comparators = editable.economy().comparators();
+    let mut e_comp_curr = vec![0usize; comparators.len()];
+    let comp_cone_edges = comparator_cone_edges(editable.circuit(), comparators);
     let mut curr_scorer = PointForecastScorer::new(width, economy_config.null_model);
 
-    let can_fast_comb = editable.circuit().wire_delay() == WireDelayMode::Combinational
+    let can_fast_comb = comparators.is_empty()
+        && editable.circuit().wire_delay() == WireDelayMode::Combinational
         && is_epoch_1
             == !driven_ports
                 .get(usize::from(out_port))
@@ -1859,6 +1963,17 @@ fn replay_current_baseline(
                     *e_port += 1;
                 }
             }
+            if !comparators.is_empty() {
+                let wires = curr_state.wire_values();
+                for (m, comp) in comparators.iter().enumerate() {
+                    let sub_in = &editable.compiled().node_input_wires()[comp.sub_node.index()];
+                    if sub_in.len() >= 2
+                        && width.normalize(wires[sub_in[0]]) != width.normalize(wires[sub_in[1]])
+                    {
+                        e_comp_curr[m] += 1;
+                    }
+                }
+            }
             if p_curr != p_truth {
                 e_curr += 1;
             }
@@ -1880,6 +1995,8 @@ fn replay_current_baseline(
         facts_curr,
         driven_ports,
         e_curr_by_port,
+        e_comp_curr,
+        comp_cone_edges,
         start_idx,
         eval_start_idx,
         eval_offset: eval_start_idx - start_idx,
@@ -2400,6 +2517,14 @@ fn evaluate_sprout_motif(
     if staged.nodes().len() > max_nodes {
         return SproutMotifOutcome::BlockedMaxNodes;
     }
+    if !baseline.comp_cone_edges.is_empty()
+        && baseline
+            .comp_cone_edges
+            .iter()
+            .any(|edge| !staged.edges().contains(edge))
+    {
+        return SproutMotifOutcome::Rejected;
+    }
     if !budget_consumed
         && let Some(b) = budget
         && !b.try_consume(baseline.w_replay as u64)
@@ -2464,6 +2589,12 @@ fn evaluate_sprout_motif(
 
     let out_idx = usize::from(out_port);
     let mut e_cand = 0usize;
+    let comparators = editable.economy().comparators();
+    let mut e_comp_cand = if comparators.is_empty() {
+        Vec::new()
+    } else {
+        vec![0usize; comparators.len()]
+    };
 
     for (i, trace_slot) in p_cand_trace.iter_mut().enumerate() {
         let idx = baseline.start_idx + i;
@@ -2487,6 +2618,20 @@ fn evaluate_sprout_motif(
                         && *e_port > baseline.e_curr_by_port[q]
                     {
                         return SproutMotifOutcome::Rejected;
+                    }
+                }
+            }
+            if !comparators.is_empty() {
+                let wires = state.wire_values();
+                for (m, comp) in comparators.iter().enumerate() {
+                    let sub_in = &staged_compiled.node_input_wires()[comp.sub_node.index()];
+                    if sub_in.len() >= 2
+                        && width.normalize(wires[sub_in[0]]) != width.normalize(wires[sub_in[1]])
+                    {
+                        e_comp_cand[m] += 1;
+                        if e_comp_cand[m] > baseline.e_comp_curr[m] {
+                            return SproutMotifOutcome::Rejected;
+                        }
                     }
                 }
             }
@@ -3198,7 +3343,11 @@ pub struct AutonomousRingProposal {
     pub template: Vec<u64>,
 }
 
-fn strip_circuit_for_ring(base: &Circuit, out_port: u16) -> (Circuit, Vec<Option<NodeId>>) {
+fn strip_circuit_for_ring(
+    base: &Circuit,
+    out_port: u16,
+    comparators: &[ComparatorSite],
+) -> (Circuit, Vec<Option<NodeId>>, Vec<NodeId>) {
     let (target_cone, _) = port_upstream_cone_and_edges(base, out_port);
     let mut protected_nodes = BTreeSet::new();
     for q in 0..base.num_outputs() {
@@ -3207,6 +3356,67 @@ fn strip_circuit_for_ring(base: &Circuit, out_port: u16) -> (Circuit, Vec<Option
             protected_nodes.extend(other_cone);
         }
     }
+
+    let collect_upstream = |root: SignalSource, out: &mut BTreeSet<NodeId>| {
+        let mut stack = Vec::new();
+        if let SignalSource::NodeOut { node, .. } = root
+            && out.insert(node)
+        {
+            stack.push(node);
+        }
+        while let Some(node) = stack.pop() {
+            for edge in base.edges() {
+                if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                    && dst == node
+                    && let SignalSource::NodeOut { node: src, .. } = edge.src
+                    && out.insert(src)
+                {
+                    stack.push(src);
+                }
+            }
+        }
+    };
+
+    let mut detached_subs = Vec::new();
+    let mut sub0_edges_to_detach = Vec::new();
+    for comp in comparators {
+        protected_nodes.insert(comp.sub_node);
+        protected_nodes.insert(comp.eqz_node);
+        if comp.target_port == out_port {
+            if let Some(alt_edge) = base.edges().iter().find(|e| {
+                e.dst
+                    == SignalSink::NodeIn {
+                        node: comp.sub_node,
+                        port: 1,
+                    }
+            }) {
+                collect_upstream(alt_edge.src, &mut protected_nodes);
+            }
+            if let Some(pri_edge) = base.edges().iter().find(|e| {
+                e.dst
+                    == SignalSink::NodeIn {
+                        node: comp.sub_node,
+                        port: 0,
+                    }
+            }) {
+                detached_subs.push(comp.sub_node);
+                sub0_edges_to_detach.push((pri_edge.src, pri_edge.dst));
+            }
+        } else {
+            for port in [0u8, 1u8] {
+                if let Some(edge) = base.edges().iter().find(|e| {
+                    e.dst
+                        == SignalSink::NodeIn {
+                            node: comp.sub_node,
+                            port,
+                        }
+                }) {
+                    collect_upstream(edge.src, &mut protected_nodes);
+                }
+            }
+        }
+    }
+
     let removed: BTreeSet<NodeId> = target_cone
         .into_iter()
         .filter(|node| !protected_nodes.contains(node))
@@ -3221,8 +3431,15 @@ fn strip_circuit_for_ring(base: &Circuit, out_port: u16) -> (Circuit, Vec<Option
     for (src, dst) in old_out_edges {
         stripped.disconnect(src, dst);
     }
+    for (src, dst) in sub0_edges_to_detach {
+        stripped.disconnect(src, dst);
+    }
     let old_to_new = stripped.remove_nodes(&removed);
-    (stripped, old_to_new)
+    let reattach_subs: Vec<NodeId> = detached_subs
+        .into_iter()
+        .filter_map(|sub| old_to_new.get(sub.index()).copied().flatten())
+        .collect();
+    (stripped, old_to_new, reattach_subs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3400,6 +3617,7 @@ enum RingPeriodOutcome {
 struct RingEvalPrecomp<'a> {
     stripped: &'a Circuit,
     old_to_new: &'a [Option<NodeId>],
+    reattach_subs: &'a [NodeId],
     obs_out: &'a [u64],
     ring_mdl: &'a StrippedRingCodeBase,
 }
@@ -3486,7 +3704,7 @@ fn evaluate_ring_period(
     }
 
     let max_nodes = effective_max_nodes(editable.circuit().num_inputs(), growth_config);
-    if pre.stripped.nodes().len() + p + 1 > max_nodes {
+    if pre.stripped.nodes().len() + p + 1 + pre.reattach_subs.len() > max_nodes {
         if let Some(tel) = telemetry {
             tel.sprout_blocked_max_nodes += 1;
         }
@@ -3502,7 +3720,7 @@ fn evaluate_ring_period(
     }
 
     let e_ring_upper = (e_curr as isize) - (growth_config.min_match_gain as isize);
-    if exact_fast_counts {
+    if exact_fast_counts && pre.reattach_subs.is_empty() {
         let e_ring_est = w_replay - matched;
         if (e_ring_est as isize) > e_ring_upper {
             return RingPeriodOutcome::Rejected;
@@ -3535,6 +3753,30 @@ fn evaluate_ring_period(
 
     let mut staged = pre.stripped.clone();
     let (ring_delay_nodes, _split) = build_autonomous_ring(&mut staged, p, &mu, out_port);
+    for &sub_node in pre.reattach_subs {
+        let Some(cur_out_src) = staged
+            .edges()
+            .iter()
+            .find(|e| e.dst == SignalSink::BoundaryOut(out_port))
+            .map(|e| e.src)
+        else {
+            return RingPeriodOutcome::Rejected;
+        };
+        let tapped = tap_source(&mut staged, cur_out_src);
+        staged.connect(
+            tapped,
+            SignalSink::NodeIn {
+                node: sub_node,
+                port: 0,
+            },
+        );
+    }
+    if staged.nodes().len() > max_nodes {
+        if let Some(tel) = telemetry {
+            tel.sprout_blocked_max_nodes += 1;
+        }
+        return RingPeriodOutcome::Rejected;
+    }
     let old_to_new = pre.old_to_new.to_vec();
 
     let Ok(staged_compiled) = staged.compile() else {
@@ -3784,12 +4026,17 @@ pub fn propose_autonomous_delay_ring_scored_with_telemetry(
     let j_curr =
         l_curr + facts_code_bits(editable.circuit().width(), w_replay as u64, e_curr as u64);
 
-    let (stripped_base, old_to_new_base) = strip_circuit_for_ring(editable.circuit(), out_port);
+    let (stripped_base, old_to_new_base, reattach_subs) = strip_circuit_for_ring(
+        editable.circuit(),
+        out_port,
+        editable.economy().comparators(),
+    );
     let ring_mdl = StrippedRingCodeBase::new(&stripped_base, economy_config.split_code_tax);
     let obs_out: Vec<u64> = obs_window.frames().iter().map(|f| f[out_idx]).collect();
     let ring_pre = RingEvalPrecomp {
         stripped: &stripped_base,
         old_to_new: &old_to_new_base,
+        reattach_subs: &reattach_subs,
         obs_out: &obs_out,
         ring_mdl: &ring_mdl,
     };
@@ -3857,6 +4104,1477 @@ pub fn propose_autonomous_delay_ring_scored_with_telemetry(
     }
 
     best_ring.map(|(prop, _, e_diag, j_diag)| (prop, e_diag, j_diag))
+}
+
+/// Admissible Stage 3 causal-disjoint redundancy proposal (`M2B-D2`).
+#[derive(Clone, Debug)]
+pub struct RedundancySproutProposal {
+    /// Complete staged circuit containing `alt`, `SUB`, `EQZ`, and comparator fan-out `Split`.
+    pub circuit: Circuit,
+    /// Node identity mapping from pre-sprout circuit (`0..old_node_count`) to `circuit`.
+    pub old_to_new: Vec<Option<NodeId>>,
+    /// Newly added `Primitive::Sub` node (`in(0) = primary`, `in(1) = alt`).
+    pub sub_node: NodeId,
+    /// Newly added `Primitive::Eqz` node (`in(0) = sub_node`).
+    pub eqz_node: NodeId,
+    /// Non-comparator nodes newly added for `alt` (plus any inserted `Split`).
+    pub new_nodes: Vec<NodeId>,
+    /// Register depth $d_{\text{alt}}$ of the `alt` cone feeding `sub_node.in(1)`.
+    pub d_alt: usize,
+    /// Mean Wake causal share sum $Z_{\text{alt}}$ over settled diagnostic ticks.
+    pub z_alt: f64,
+    /// Derived comparator juvenile maturation ticks from [`effective_comparator_juvenile_ticks`].
+    pub effective_juvenile_ticks: u32,
+    /// Channel bitmask of the primary derivation feeding `BoundaryOut(target_port)`.
+    pub primary_channel_mask: u64,
+    /// Channel bitmask of the newly proposed `alt` derivation (`0` if autonomous).
+    pub alt_channel_mask: u64,
+    /// Non-comparator diagnostic mismatches of `alt` over `W_diag`.
+    pub e_alt_diag: usize,
+    /// Objective MDL score $J_{\text{cand}}$ of `alt` over the replay window.
+    pub j_cand: f64,
+    /// Tier (`1` = channel-disjoint $C_{\text{alt}} \cap C_{\text{primary}} = \emptyset$, `2` = disjoint lag/state).
+    pub tier: u8,
+    /// Populated when `alt` is an autonomous delay-ring backup: `(period, template, delay_nodes)`.
+    pub autonomous_ring: Option<(usize, Vec<u64>, Vec<NodeId>)>,
+    /// Populated when splicing a comparator in `TicksPerHop` inserted a `Split` on an autonomous primary cycle.
+    pub primary_tph_split: Option<NodeId>,
+}
+
+struct EvaluatedStage3Pre {
+    staged: Circuit,
+    old_to_new: Vec<Option<NodeId>>,
+    sub_node: NodeId,
+    eqz_node: NodeId,
+    alt_src: SignalSource,
+    alt_channel_mask: u64,
+    e_alt_diag: usize,
+    j_cand: f64,
+    tier: u8,
+    autonomous_ring: Option<(usize, Vec<u64>, Vec<NodeId>)>,
+    primary_tph_split: Option<NodeId>,
+}
+
+fn port_comparator_root_sinks(
+    _circuit: &Circuit,
+    target_port: u16,
+    comparator_sub_nodes: &[NodeId],
+) -> Vec<SignalSink> {
+    let mut sinks = vec![SignalSink::BoundaryOut(target_port)];
+    for &sub_node in comparator_sub_nodes {
+        sinks.push(SignalSink::NodeIn {
+            node: sub_node,
+            port: 1,
+        });
+    }
+    sinks
+}
+
+fn feature_channel_mask(sf: &SourceFeature, circuit: &Circuit) -> Option<u64> {
+    match sf {
+        SourceFeature::BoundaryIn(c) | SourceFeature::LagIn { channel: c, .. } => {
+            if usize::from(*c) < 64 {
+                Some(1u64 << c)
+            } else {
+                Some(0)
+            }
+        }
+        SourceFeature::NodeOut { node, port } => Some(cone_channel_mask(
+            circuit,
+            SignalSource::NodeOut {
+                node: *node,
+                port: *port,
+            },
+        )),
+        SourceFeature::LagYhat { .. } | SourceFeature::LagRes { .. } => None,
+    }
+}
+
+fn build_masked_stage3_pool(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    out_port: u16,
+    max_tau: u8,
+    excl: &crate::structural::graph_edit::DerivationConeInfo,
+    comparator_nodes: &BTreeSet<NodeId>,
+) -> Vec<ResidualFeature> {
+    let circuit = editable.circuit();
+    let is_tph = circuit.wire_delay() == WireDelayMode::TicksPerHop;
+    let raw = diag.build_signal_pool(
+        circuit,
+        obs_window,
+        out_port,
+        max_tau,
+        Some(editable.economy()),
+    );
+    raw.into_iter()
+        .filter(|feat| {
+            let Some(sf) = SourceFeature::parse(&feat.name) else {
+                return false;
+            };
+            match sf {
+                SourceFeature::LagYhat { .. } | SourceFeature::LagRes { .. } => false,
+                SourceFeature::NodeOut { node, port } => {
+                    if excl.excl_nodes.contains(&node) || comparator_nodes.contains(&node) {
+                        return false;
+                    }
+                    // Also reject if any reactive leaf in `node`'s cone collides with `L_excl`.
+                    let mut dummy_sink = Vec::new();
+                    for edge in circuit.edges() {
+                        if edge.src == (SignalSource::NodeOut { node, port }) {
+                            dummy_sink.push(edge.dst);
+                        }
+                    }
+                    let node_info = if let Some(&dst) = dummy_sink.first() {
+                        derivation_cone_info(circuit, &[dst])
+                    } else {
+                        derivation_cone_info(circuit, &[])
+                    };
+                    node_info
+                        .excl_reactive_leaves
+                        .is_disjoint(&excl.excl_reactive_leaves)
+                }
+                SourceFeature::BoundaryIn(c) => {
+                    is_tph || !excl.excl_reactive_leaves.contains(&(c, 0))
+                }
+                SourceFeature::LagIn { channel, tau } => {
+                    is_tph
+                        || !excl
+                            .excl_reactive_leaves
+                            .contains(&(channel, usize::from(tau)))
+                }
+            }
+        })
+        .collect()
+}
+
+fn diagnose_stage3_values(
+    width: Width,
+    truth: &[u64],
+    features: &[ResidualFeature],
+    config: GrowthConfig,
+    min_tau: u8,
+    max_tau: u8,
+) -> Result<ResidualDiagnostics, GrowthError> {
+    if truth.is_empty() {
+        return Err(GrowthError::EmptyTrace);
+    }
+    let truth_norm: Vec<u64> = truth.iter().map(|&v| width.normalize(v)).collect();
+    let zero_error = truth_norm.iter().all(|&v| v == 0);
+    let res_ctx = ResidualContext::new(&truth_norm, width, config.min_match_gain);
+    let len = truth_norm.len();
+
+    let filter_band = min_tau > 1;
+    let mut in_band_flags = vec![false; features.len()];
+    if filter_band {
+        for (idx, feat) in features.iter().enumerate() {
+            let lag = feature_lag(feat);
+            in_band_flags[idx] = lag >= min_tau && lag <= max_tau;
+        }
+    }
+
+    let mut norm_pool = vec![0u64; features.len() * len];
+    for (idx, feat) in features.iter().enumerate() {
+        let dst = &mut norm_pool[idx * len..(idx + 1) * len];
+        for (slot, &val) in dst.iter_mut().zip(&feat.values) {
+            *slot = width.normalize(val);
+        }
+    }
+
+    let mut scratch_1: Vec<(u64, u64)> = Vec::new();
+    let mut scratch_2: Vec<(u64, u64, u64)> = Vec::new();
+    let mut scores = Vec::with_capacity(features.len() * (features.len() + 1) / 2);
+    for first in 0..features.len() {
+        let first_slice = &norm_pool[first * len..(first + 1) * len];
+        let first_in_band = in_band_flags[first];
+        if !filter_band || first_in_band {
+            scores.push(score_singleton_normalized(
+                &res_ctx,
+                &truth_norm,
+                first,
+                first_slice,
+                &mut scratch_1,
+            ));
+        }
+        for second in (first + 1)..features.len() {
+            if !filter_band || first_in_band || in_band_flags[second] {
+                let second_slice = &norm_pool[second * len..(second + 1) * len];
+                scores.push(score_pair_normalized(
+                    &res_ctx,
+                    &truth_norm,
+                    first,
+                    second,
+                    first_slice,
+                    second_slice,
+                    &mut scratch_2,
+                ));
+            }
+        }
+    }
+    scores.sort_by(|left, right| {
+        right
+            .corrected_mutual_information_bits
+            .total_cmp(&left.corrected_mutual_information_bits)
+            .then_with(|| right.match_gain.cmp(&left.match_gain))
+            .then_with(|| left.feature_indices.cmp(&right.feature_indices))
+    });
+
+    let passing_count = scores
+        .iter()
+        .filter(|s| {
+            s.corrected_mutual_information_bits > config.mi_threshold_bits
+                && s.match_gain >= config.min_match_gain
+        })
+        .count();
+    let cap = config.candidate_feature_cap.max(1);
+    let candidate_list_truncated = passing_count > cap;
+    let candidate_features: Vec<FeatureScore> = scores
+        .into_iter()
+        .filter(|s| {
+            s.corrected_mutual_information_bits > config.mi_threshold_bits
+                && s.match_gain >= config.min_match_gain
+        })
+        .take(cap)
+        .collect();
+    let best_feature = candidate_features.first().cloned();
+    let secondary_feature = candidate_features.get(1).cloned();
+    let growth_criterion_met = !zero_error && best_feature.is_some();
+
+    Ok(ResidualDiagnostics {
+        sample_count: len,
+        residual_entropy_bits: res_ctx.entropy_bits,
+        constant_offset: res_ctx.constant_offset,
+        zero_error,
+        lagged_mutual_information_bits: Vec::new(),
+        best_feature,
+        secondary_feature,
+        candidate_features,
+        growth_criterion_met,
+        candidate_list_truncated,
+    })
+}
+
+/// Returns `true` if every non-boundary-`Split` node in `out_port`'s upstream cone is mature.
+pub(crate) fn port_primary_cone_is_mature(
+    circuit: &Circuit,
+    economy: &EconomyState,
+    out_port: u16,
+) -> bool {
+    let (cone_nodes, _) = port_upstream_cone_and_edges(circuit, out_port);
+    cone_nodes.iter().all(|&node| {
+        is_pure_boundary_split(circuit, node)
+            || economy
+                .nodes()
+                .get(node.index())
+                .is_none_or(|n| n.juvenile_ticks == 0)
+    })
+}
+
+/// Assigns Stage 3 juvenile maturation ticks to every new node (`!is_survivor`) matching the
+/// checked graduation horizon `eff_juv`.
+pub(crate) fn assign_stage3_juvenile_ticks(
+    _circuit: &Circuit,
+    economy: &mut EconomyState,
+    is_survivor: &[bool],
+    eff_juv: u32,
+    _economy_config: &EconomyConfig,
+    _growth_config: &GrowthConfig,
+) {
+    for (idx, &surv) in is_survivor.iter().enumerate() {
+        if surv {
+            continue;
+        }
+        if let Some(node_econ) = economy.node_mut(idx) {
+            node_econ.juvenile_ticks = eff_juv;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage3_measure_z_alt_and_survive(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    out_port: u16,
+    primary_channel_mask: u64,
+    pre: &EvaluatedStage3Pre,
+) -> Option<(usize, f64, u32)> {
+    let staged = &pre.staged;
+    let is_tph = staged.wire_delay() == WireDelayMode::TicksPerHop;
+    let d_alt = source_register_depth(staged, pre.alt_src) + usize::from(is_tph);
+    let num_outputs = usize::from(staged.num_outputs());
+    let w_replay = obs_window.len();
+    let w_diag = growth_config.diagnostic_window.max(1);
+    let eval_start = w_replay.saturating_sub(w_diag);
+
+    let mut sim = editable.clone();
+    sim.recompile_preserving_state(staged.clone(), &pre.old_to_new)
+        .ok()?;
+    let l_curr = circuit_code_bits_with_tax(editable.circuit(), 0, economy_config.split_code_tax);
+    let mut sim_ledger = MarginalDebtLedger {
+        last_committed_code_bits: l_curr,
+        ..MarginalDebtLedger::default()
+    };
+    sim_ledger.on_sprout(
+        sim.circuit(),
+        economy_config.split_code_tax,
+        &pre.old_to_new,
+    );
+    sim.economy_mut()
+        .assign_sprout_debts(&sim_ledger.node_debts);
+
+    let mut is_survivor = vec![false; sim.circuit().node_count()];
+    for &mapped in pre.old_to_new.iter().flatten() {
+        if mapped.index() < is_survivor.len() {
+            is_survivor[mapped.index()] = true;
+        }
+    }
+
+    let comp_idx = sim
+        .register_comparator(
+            pre.sub_node,
+            pre.eqz_node,
+            out_port,
+            primary_channel_mask,
+            pre.alt_channel_mask,
+        )
+        .ok()?;
+
+    let seed_regs = |sim_mut: &mut EditableCircuit, align_tick: u64| -> bool {
+        let mut regs = sim_mut.state().registers().to_vec();
+        if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(0)
+            && snap_epoch == editable.structure_epoch()
+        {
+            if let Some(split_node) = pre.primary_tph_split
+                && let Some(adj_regs) =
+                    crate::structural::graph_edit::advance_tph_autonomous_ring_phase(
+                        editable.circuit(),
+                        editable.compiled(),
+                        snap_regs,
+                        sim_mut.circuit(),
+                        sim_mut.compiled(),
+                        &pre.old_to_new,
+                        out_port,
+                        split_node,
+                        pre.sub_node,
+                    )
+            {
+                regs = adj_regs;
+            } else {
+                let reg_map = register_mapping(
+                    editable.circuit(),
+                    sim_mut.circuit(),
+                    editable.compiled(),
+                    sim_mut.compiled(),
+                    &pre.old_to_new,
+                );
+                for (old_r, new_r) in reg_map.iter().enumerate() {
+                    if let Some(nr) = new_r
+                        && old_r < snap_regs.len()
+                    {
+                        regs[*nr] = snap_regs[old_r];
+                    }
+                }
+            }
+        }
+        if let Some((period, ref mu, ref delay_nodes)) = pre.autonomous_ring {
+            for (j, &delay_node) in delay_nodes.iter().enumerate() {
+                let Some(reg_idx) = explicit_delay_register_index(sim_mut.circuit(), delay_node)
+                else {
+                    return false;
+                };
+                regs[reg_idx] = mu[((align_tick as usize) + (period - 1 - j)) % period];
+            }
+        }
+        sim_mut.set_registers(&regs).is_ok()
+    };
+
+    // Pass 1: Measure empirical steady-state `Z_alt` over `eval_start..w_replay`.
+    let mut z_sim = sim.clone();
+    if !seed_regs(&mut z_sim, obs_window.start_tick()) {
+        return None;
+    }
+    let targets = z_sim.comparator_targets();
+    let seed_bank = SeedBank::new(0);
+    let sample_count = growth_config.sensitivity_sample_count;
+    let mut predictions = vec![0u64; num_outputs];
+    let mut z_sum = 0.0f64;
+    let mut z_ticks = 0usize;
+    for (idx, frame) in obs_window.frames().iter().enumerate() {
+        let input = if idx == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[idx - 1]
+        };
+        z_sim.step(input, &mut predictions).ok()?;
+        let node_outs = node_output_values(z_sim.circuit(), z_sim.state());
+        z_sim.economy_mut().record_activity(&node_outs).ok()?;
+        if d_alt > 0 || idx >= eval_start {
+            let snapshot = counterfactual_sensitivity_with_comparators(
+                z_sim.circuit(),
+                z_sim.compiled(),
+                z_sim.state(),
+                seed_bank,
+                idx as u64,
+                sample_count.min(RING_SIM_SENSITIVITY_SAMPLES),
+                &targets,
+            )
+            .ok()?;
+            let ancestry = assemble_causal_ancestry_with_comparators(
+                z_sim.circuit(),
+                z_sim.compiled(),
+                z_sim.state(),
+                &snapshot,
+                &z_sim.economy().activity(),
+                z_sim.economy().register_eligibility(),
+                economy_config.trace_discount,
+                &targets,
+                false,
+            )
+            .ok()?;
+            for (reg, trace) in ancestry.base.next_register_eligibility.iter().enumerate() {
+                z_sim
+                    .economy_mut()
+                    .set_register_eligibility(reg, trace)
+                    .ok()?;
+            }
+            if idx >= eval_start {
+                let shares = &ancestry.comparator_shares[comp_idx];
+                let z_tick: f64 = shares
+                    .iter()
+                    .enumerate()
+                    .filter(|&(u, _)| u != pre.sub_node.index() && u != pre.eqz_node.index())
+                    .map(|(_, &s)| s)
+                    .sum();
+                z_sum += z_tick;
+                z_ticks += 1;
+            }
+        }
+        let _ = frame;
+    }
+    let z_alt = if z_ticks > 0 {
+        z_sum / (z_ticks as f64)
+    } else {
+        0.0
+    };
+    let eff_juv = effective_comparator_juvenile_ticks(d_alt, z_alt, economy_config, growth_config);
+
+    // Pass 2: Simulate buffered graduation survival across `eff_juv` ticks.
+    let sim_circuit = sim.circuit().clone();
+    assign_stage3_juvenile_ticks(
+        &sim_circuit,
+        sim.economy_mut(),
+        &is_survivor,
+        eff_juv,
+        economy_config,
+        growth_config,
+    );
+    if eff_juv == 0 {
+        let ok = is_survivor
+            .iter()
+            .enumerate()
+            .filter(|&(_, &surv)| !surv)
+            .all(|(idx, _)| sim.economy().nodes()[idx].energy > sim_ledger.node_debts[idx]);
+        return ok.then_some((d_alt, z_alt, eff_juv));
+    }
+
+    if !seed_regs(&mut sim, obs_window.start_tick()) {
+        return None;
+    }
+    let zeros_maint = vec![0.0; sim.circuit().node_count()];
+    let j_ticks = eff_juv as usize;
+    let ring_period = pre.autonomous_ring.as_ref().map(|(p, _, _)| *p);
+    let cycle_len = ring_period
+        .map(|p| (w_replay - (w_replay % p)).max(p).min(w_replay))
+        .unwrap_or(w_replay);
+    let reactive_warmup = d_alt.min(w_replay / 2);
+    let settled_chunk = w_replay.saturating_sub(reactive_warmup).max(1);
+
+    for step_idx in 0..j_ticks {
+        let frame_idx = if ring_period.is_some() {
+            step_idx % cycle_len
+        } else if step_idx < w_replay {
+            step_idx
+        } else {
+            let offset = (step_idx - w_replay) % settled_chunk;
+            if offset == 0 {
+                // Re-prime reactive delay registers cleanly on a shadow pass to avoid wrap discontinuity.
+                if !seed_regs(&mut sim, obs_window.start_tick()) {
+                    return None;
+                }
+                for w in 0..reactive_warmup {
+                    let w_in = if w == 0 {
+                        obs_window.prior_frame()
+                    } else {
+                        &obs_window.frames()[w - 1]
+                    };
+                    sim.step(w_in, &mut predictions).ok()?;
+                }
+            }
+            reactive_warmup + offset
+        };
+
+        let input = if frame_idx == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[frame_idx - 1]
+        };
+        let truth = &obs_window.frames()[frame_idx];
+        sim.step(input, &mut predictions).ok()?;
+        let wires = sim.state().wire_values().to_vec();
+        let node_outs = node_output_values(sim.circuit(), sim.state());
+        sim.economy_mut().record_activity(&node_outs).ok()?;
+        let snapshot = counterfactual_sensitivity_with_comparators(
+            sim.circuit(),
+            sim.compiled(),
+            sim.state(),
+            seed_bank,
+            step_idx as u64,
+            sample_count.min(RING_SIM_SENSITIVITY_SAMPLES),
+            &targets,
+        )
+        .ok()?;
+        let ancestry = assemble_causal_ancestry_with_comparators(
+            sim.circuit(),
+            sim.compiled(),
+            sim.state(),
+            &snapshot,
+            &sim.economy().activity(),
+            sim.economy().register_eligibility(),
+            economy_config.trace_discount,
+            &targets,
+            false,
+        )
+        .ok()?;
+
+        let mut port_rewards = vec![0.0; num_outputs];
+        for q in 0..num_outputs {
+            if q < truth.len() && ancestry.base.port_shares[q].iter().sum::<f64>() > 0.0 {
+                port_rewards[q] = sim
+                    .economy_mut()
+                    .score_port_single(q, predictions[q], truth[q])
+                    .ok()?;
+            } else if q < truth.len() {
+                let _ = sim.economy_mut().observe_unconnected_port(q, truth[q]);
+            }
+        }
+        let mut pri_vals = Vec::with_capacity(targets.len());
+        let mut alt_vals = Vec::with_capacity(targets.len());
+        let mut eqz_vals = Vec::with_capacity(targets.len());
+        for comp in sim.economy().comparators() {
+            let sub_in = &sim.compiled().node_input_wires()[comp.sub_node.index()];
+            pri_vals.push(wires[sub_in[0]]);
+            alt_vals.push(wires[sub_in[1]]);
+            eqz_vals.push(node_outs[comp.eqz_node.index()]);
+        }
+        let comp_obs = sim
+            .economy_mut()
+            .observe_comparators(&pri_vals, &alt_vals, &eqz_vals, Some(&truth[..num_outputs]))
+            .ok()?;
+        sim.economy_mut()
+            .apply_causal_tick_with_comparators(
+                &port_rewards,
+                &comp_obs.rewards,
+                comp_obs.agreements,
+                comp_obs.disagreements,
+                &ancestry,
+                &zeros_maint,
+            )
+            .ok()?;
+    }
+
+    let survived = is_survivor
+        .iter()
+        .enumerate()
+        .filter(|&(_, &surv)| !surv)
+        .all(|(idx, _)| sim.economy().nodes()[idx].energy > sim_ledger.node_debts[idx]);
+    survived.then_some((d_alt, z_alt, eff_juv))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_stage3_candidate_pre(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    primary_channel_mask: u64,
+    excl: &crate::structural::graph_edit::DerivationConeInfo,
+    baseline: &BaselineReplayMetrics,
+    e_null_diag: usize,
+    staged: Circuit,
+    spliced: crate::structural::graph_edit::SplicedComparator,
+    alt_src: SignalSource,
+    autonomous_ring: Option<(usize, Vec<u64>, Vec<NodeId>)>,
+    blocked_by_max_nodes: &mut usize,
+    telemetry: &mut SproutTelemetry,
+) -> Option<Result<EvaluatedStage3Pre, ()>> {
+    let max_nodes = effective_max_nodes(staged.num_inputs(), growth_config);
+    if staged.node_count() > max_nodes {
+        *blocked_by_max_nodes += 1;
+        return None;
+    }
+
+    // TicksPerHop structural phase safety: disallow inserting an uncompensated `Split` on any
+    // pre-existing active source edge (which adds +1 register hop and causes live flush errors).
+    if staged.wire_delay() == WireDelayMode::TicksPerHop {
+        let pre_circuit = editable.circuit();
+        let pre_count = pre_circuit.node_count();
+        let allowed_ring_split = spliced
+            .inserted_split
+            .filter(|_| spliced.primary_autonomous_shifted);
+        for idx in pre_count..staged.node_count() {
+            if staged.nodes()[idx] != Primitive::Split {
+                continue;
+            }
+            let new_split = NodeId(u32::try_from(idx).expect("fits in u32"));
+            if Some(new_split) == allowed_ring_split {
+                continue;
+            }
+            let Some(in_edge) = staged.edges().iter().find(|e| {
+                e.dst
+                    == SignalSink::NodeIn {
+                        node: new_split,
+                        port: 0,
+                    }
+            }) else {
+                continue;
+            };
+            if pre_circuit.edges().iter().any(|e| e.src == in_edge.src) {
+                return None;
+            }
+        }
+    }
+
+    // Layer 2 exact post-materialization causal-support disjointness audit.
+    let alt_cone = derivation_cone_info(
+        &staged,
+        &[SignalSink::NodeIn {
+            node: spliced.sub_node,
+            port: 1,
+        }],
+    );
+    if !alt_cone
+        .excl_reactive_leaves
+        .is_disjoint(&excl.excl_reactive_leaves)
+    {
+        return None;
+    }
+    if alt_cone
+        .excl_nodes
+        .iter()
+        .any(|n| excl.excl_nodes.contains(n))
+    {
+        return None;
+    }
+
+    if !budget.try_consume(baseline.w_replay as u64) {
+        telemetry.sprout_budget_exhausted += 1;
+        return Some(Err(()));
+    }
+
+    let Ok(staged_compiled) = staged.compile() else {
+        return None;
+    };
+    let old_to_new: Vec<Option<NodeId>> = (0..editable.circuit().node_count())
+        .map(|i| Some(NodeId(i as u32)))
+        .collect();
+    let mut state = ScalarState::new(&staged_compiled);
+    if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(baseline.start_idx)
+        && snap_epoch == editable.structure_epoch()
+    {
+        let mut regs = state.registers().to_vec();
+        if let Some(split_node) = spliced
+            .inserted_split
+            .filter(|_| spliced.primary_autonomous_shifted)
+        {
+            if let Some(adj_regs) = crate::structural::graph_edit::advance_tph_autonomous_ring_phase(
+                editable.circuit(),
+                editable.compiled(),
+                snap_regs,
+                &staged,
+                &staged_compiled,
+                &old_to_new,
+                out_port,
+                split_node,
+                spliced.sub_node,
+            ) {
+                regs = adj_regs;
+            }
+        } else {
+            let reg_map = register_mapping(
+                editable.circuit(),
+                &staged,
+                editable.compiled(),
+                &staged_compiled,
+                &old_to_new,
+            );
+            for (old_r, new_r) in reg_map.iter().enumerate() {
+                if let Some(nr) = new_r
+                    && old_r < snap_regs.len()
+                {
+                    regs[*nr] = snap_regs[old_r];
+                }
+            }
+        }
+        if let Some((period, ref mu, ref delay_nodes)) = autonomous_ring {
+            let align_tick = (obs_window.start_tick() as usize) + baseline.start_idx;
+            for (j, &delay_node) in delay_nodes.iter().enumerate() {
+                let reg_idx = explicit_delay_register_index(&staged, delay_node)?;
+                regs[reg_idx] = mu[(align_tick + (period - 1 - j)) % period];
+            }
+        }
+        let _ = state.set_registers(&staged_compiled, &regs);
+    } else if let Some((period, ref mu, ref delay_nodes)) = autonomous_ring {
+        let mut regs = state.registers().to_vec();
+        let align_tick = (obs_window.start_tick() as usize) + baseline.start_idx;
+        for (j, &delay_node) in delay_nodes.iter().enumerate() {
+            let reg_idx = explicit_delay_register_index(&staged, delay_node)?;
+            regs[reg_idx] = mu[(align_tick + (period - 1 - j)) % period];
+        }
+        let _ = state.set_registers(&staged_compiled, &regs);
+    }
+
+    let num_outputs = usize::from(staged_compiled.num_outputs());
+    let out_idx = usize::from(out_port);
+    let mut pred = vec![0u64; num_outputs];
+    let mut e_cand_by_port = vec![0usize; num_outputs];
+    let mut e_alt_diag = 0usize;
+    let mut flux_alt = 0.0f64;
+    let sub_alt_wire = staged_compiled.node_input_wires()[spliced.sub_node.index()][1];
+    let mut alt_scorer = PointForecastScorer::new(
+        staged.width(),
+        editable.economy().scorers()[out_idx].null_model().kind(),
+    );
+    *alt_scorer.null_model_mut() = editable.economy().scorers()[out_idx].null_model().clone();
+
+    for i in 0..baseline.w_replay {
+        let idx = baseline.start_idx + i;
+        let input = if idx == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[idx - 1]
+        };
+        let truth = &obs_window.frames()[idx];
+        if state.step(&staged_compiled, input, &mut pred).is_err() {
+            return None;
+        }
+        if idx >= baseline.eval_start_idx {
+            for q in 0..num_outputs {
+                if baseline.driven_ports.get(q).copied().unwrap_or(false)
+                    && q < truth.len()
+                    && pred[q] != truth[q]
+                {
+                    e_cand_by_port[q] += 1;
+                }
+            }
+            let alt_val = state.wire_values()[sub_alt_wire];
+            if alt_val != truth[out_idx] {
+                e_alt_diag += 1;
+            }
+            flux_alt += score_with_reward_mode(
+                &mut alt_scorer,
+                economy_config.reward_mode,
+                staged.width(),
+                alt_val,
+                truth[out_idx],
+            );
+        }
+    }
+
+    // All-Port Non-Regression Guard (∀ q in 0..K including q == target_port).
+    if (0..num_outputs).any(|q| e_cand_by_port[q] > baseline.e_curr_by_port[q]) {
+        return None;
+    }
+    if flux_alt <= 0.0 || e_alt_diag + growth_config.min_match_gain > e_null_diag {
+        return None;
+    }
+
+    let l_cand = circuit_code_bits_with_tax(&staged, 0, economy_config.split_code_tax);
+    let eval_len = baseline
+        .w_replay
+        .saturating_sub(baseline.eval_start_idx.saturating_sub(baseline.start_idx))
+        as u64;
+    let j_cand = l_cand + facts_code_bits(staged.width(), eval_len, e_alt_diag as u64);
+    let alt_channel_mask = if autonomous_ring.is_some() {
+        0
+    } else {
+        cone_channel_mask(&staged, alt_src)
+    };
+    let tier = if (alt_channel_mask & primary_channel_mask) == 0 {
+        1
+    } else {
+        2
+    };
+
+    Some(Ok(EvaluatedStage3Pre {
+        staged,
+        old_to_new,
+        sub_node: spliced.sub_node,
+        eqz_node: spliced.eqz_node,
+        alt_src,
+        alt_channel_mask,
+        e_alt_diag,
+        j_cand,
+        tier,
+        autonomous_ring,
+        primary_tph_split: spliced
+            .primary_autonomous_shifted
+            .then_some(spliced.inserted_split)
+            .flatten(),
+    }))
+}
+
+fn rank_stage3_candidates(candidates: &mut Vec<EvaluatedStage3Pre>) {
+    // Total strict MDL ordering within each tier: lower J (`L(C) + facts_code_bits`), then error count, alt mask, nodes.
+    let cmp_within_tier = |a: &EvaluatedStage3Pre, b: &EvaluatedStage3Pre| {
+        a.j_cand
+            .total_cmp(&b.j_cand)
+            .then_with(|| a.e_alt_diag.cmp(&b.e_alt_diag))
+            .then_with(|| a.alt_channel_mask.cmp(&b.alt_channel_mask))
+            .then_with(|| a.staged.node_count().cmp(&b.staged.node_count()))
+    };
+    let mut exact_tier1 = Vec::new();
+    let mut inexact_tier1 = Vec::new();
+    let mut tier2 = Vec::new();
+    for cand in candidates.drain(..) {
+        if cand.tier == 1 && cand.e_alt_diag == 0 {
+            exact_tier1.push(cand);
+        } else if cand.tier == 1 {
+            inexact_tier1.push(cand);
+        } else {
+            tier2.push(cand);
+        }
+    }
+    exact_tier1.sort_by(cmp_within_tier);
+    inexact_tier1.sort_by(cmp_within_tier);
+    tier2.sort_by(cmp_within_tier);
+
+    // Tier 1 exact (`e_alt == 0`) always has strictly highest priority; otherwise compare best
+    // remaining Tier 1 vs best Tier 2 using `j_cand` (with MDL tie-break favoring Tier 1).
+    candidates.extend(exact_tier1);
+    let tier1_head_beats_tier2 = match (inexact_tier1.first(), tier2.first()) {
+        (Some(t1), Some(t2)) => t1.j_cand <= t2.j_cand + MDL_TIE_BREAK_EPS,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if tier1_head_beats_tier2 {
+        if let Some(head) = (!inexact_tier1.is_empty()).then(|| inexact_tier1.remove(0)) {
+            candidates.push(head);
+        }
+    } else if !tier2.is_empty() {
+        candidates.push(tier2.remove(0));
+    }
+    let mut rest: Vec<EvaluatedStage3Pre> = inexact_tier1.into_iter().chain(tier2).collect();
+    rest.sort_by(|a, b| cmp_within_tier(a, b).then_with(|| a.tier.cmp(&b.tier)));
+    candidates.extend(rest);
+}
+
+/// Checks whether an existing autonomous delay-ring comparator branch (`comp.alt_channel_mask == 0`
+/// with cyclic support) strictly beats a noisy reactive primary driver on `out_port` over the
+/// current structure epoch's replay span, allowing Stage 2 to promote the ring via handoff without
+/// duplicating autonomous cycles or breaking existing comparators.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_comparator_ring_promotion(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    telemetry: &mut SproutTelemetry,
+) -> Option<(usize, usize, f64)> {
+    let circuit = editable.circuit();
+    let has_port_driver = circuit
+        .edges()
+        .iter()
+        .any(|edge| edge.dst == SignalSink::BoundaryOut(out_port));
+    if !has_port_driver || !port_uses_boundary_in(circuit, out_port) {
+        return None;
+    }
+
+    let comparators = editable.economy().comparators();
+    let candidate_indices: Vec<usize> = comparators
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, comp)| {
+            if comp.target_port != out_port || comp.alt_channel_mask != 0 {
+                return None;
+            }
+            let alt_src = circuit
+                .edges()
+                .iter()
+                .find(|e| {
+                    e.dst
+                        == SignalSink::NodeIn {
+                            node: comp.sub_node,
+                            port: 1,
+                        }
+                })
+                .map(|e| e.src)?;
+            source_has_cycle(circuit, alt_src).then_some(idx)
+        })
+        .collect();
+    if candidate_indices.is_empty() {
+        return None;
+    }
+
+    let w_diag = growth_config.diagnostic_window.max(1);
+    let epoch = editable.structure_epoch();
+    let start_idx = (0..obs_window.len()).find(|&idx| {
+        obs_window
+            .state_snapshot_at(idx)
+            .is_some_and(|(snap_epoch, _)| snap_epoch == epoch)
+    })?;
+    let w_replay = obs_window.len().saturating_sub(start_idx);
+    if w_replay < w_diag {
+        return None;
+    }
+    let (_, snap_regs) = obs_window.state_snapshot_at(start_idx)?;
+    let eval_diag_start = obs_window.len() - w_diag;
+
+    if !budget.try_consume(w_replay as u64) {
+        telemetry.sprout_budget_exhausted += 1;
+        return None;
+    }
+
+    let width = circuit.width();
+    let num_outputs = usize::from(editable.compiled().num_outputs());
+    let out_idx = usize::from(out_port);
+    let driven_ports: Vec<bool> = (0..num_outputs)
+        .map(|q| {
+            let port_u16 = u16::try_from(q).expect("output port fits in u16");
+            circuit
+                .edges()
+                .iter()
+                .any(|edge| edge.dst == SignalSink::BoundaryOut(port_u16))
+        })
+        .collect();
+
+    let mut curr_state = ScalarState::new(editable.compiled());
+    if curr_state
+        .set_registers(editable.compiled(), snap_regs)
+        .is_err()
+    {
+        return None;
+    }
+    let mut curr_pred = vec![0u64; num_outputs];
+    let mut e_curr = 0usize;
+    let mut e_curr_diag = 0usize;
+    let mut e_curr_by_port = vec![0usize; num_outputs];
+    let mut e_comp_curr = vec![0usize; comparators.len()];
+    let mut curr_scorer = PointForecastScorer::new(width, economy_config.null_model);
+    let mut flux_curr = 0.0;
+
+    for (i, frame) in obs_window.frames().iter().enumerate().skip(start_idx) {
+        let input = if i == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[i - 1]
+        };
+        if curr_state
+            .step(editable.compiled(), input, &mut curr_pred)
+            .is_err()
+        {
+            return None;
+        }
+        let p_curr = curr_pred[out_idx];
+        let p_truth = frame[out_idx];
+        if p_curr != p_truth {
+            e_curr += 1;
+            if i >= eval_diag_start {
+                e_curr_diag += 1;
+            }
+        }
+        for (q, e_port) in e_curr_by_port.iter_mut().enumerate() {
+            if driven_ports[q] && curr_pred[q] != frame[q] {
+                *e_port += 1;
+            }
+        }
+        let wires = curr_state.wire_values();
+        for (m, comp) in comparators.iter().enumerate() {
+            let sub_in = &editable.compiled().node_input_wires()[comp.sub_node.index()];
+            if sub_in.len() >= 2
+                && width.normalize(wires[sub_in[0]]) != width.normalize(wires[sub_in[1]])
+            {
+                e_comp_curr[m] += 1;
+            }
+        }
+        flux_curr += score_with_reward_mode(
+            &mut curr_scorer,
+            economy_config.reward_mode,
+            width,
+            p_curr,
+            p_truth,
+        );
+    }
+
+    if e_curr_diag == 0 {
+        return None;
+    }
+
+    let l_curr = circuit_code_bits_with_tax(circuit, 0, economy_config.split_code_tax);
+    let j_curr = l_curr + facts_code_bits(width, w_replay as u64, e_curr as u64);
+    let max_nodes = effective_max_nodes(circuit.num_inputs(), growth_config);
+    let target_port_subs: Vec<NodeId> = comparators
+        .iter()
+        .filter(|c| c.target_port == out_port)
+        .map(|c| c.sub_node)
+        .collect();
+    let pre_n = circuit.node_count();
+    let identity_map: Vec<Option<NodeId>> = (0..pre_n).map(|i| Some(NodeId(i as u32))).collect();
+
+    let mut best: Option<(usize, usize, f64, f64)> = None;
+    for comp_idx in candidate_indices {
+        let comp = &comparators[comp_idx];
+        let mut swapped = circuit.clone();
+        if !swap_comparator_driver(&mut swapped, out_port, comp.sub_node, &target_port_subs) {
+            continue;
+        }
+        if swapped.node_count() > max_nodes {
+            telemetry.sprout_blocked_max_nodes += 1;
+            continue;
+        }
+        let Ok(swapped_compiled) = swapped.compile() else {
+            continue;
+        };
+        if !budget.try_consume(w_replay as u64) {
+            telemetry.sprout_budget_exhausted += 1;
+            break;
+        }
+
+        let reg_map = register_mapping(
+            circuit,
+            &swapped,
+            editable.compiled(),
+            &swapped_compiled,
+            &identity_map,
+        );
+        let mut cand_state = ScalarState::new(&swapped_compiled);
+        let mut cand_regs = cand_state.registers().to_vec();
+        for (old_r, new_r) in reg_map.iter().enumerate() {
+            if let Some(nr) = new_r
+                && old_r < snap_regs.len()
+            {
+                cand_regs[*nr] = snap_regs[old_r];
+            }
+        }
+        if cand_state
+            .set_registers(&swapped_compiled, &cand_regs)
+            .is_err()
+        {
+            continue;
+        }
+
+        let mut cand_pred = vec![0u64; num_outputs];
+        let mut e_cand = 0usize;
+        let mut e_cand_diag = 0usize;
+        let mut e_cand_by_port = vec![0usize; num_outputs];
+        let mut e_comp_cand = vec![0usize; comparators.len()];
+        let mut cand_scorer = PointForecastScorer::new(width, economy_config.null_model);
+        let mut flux_cand = 0.0;
+        let mut ok = true;
+
+        for (i, frame) in obs_window.frames().iter().enumerate().skip(start_idx) {
+            let input = if i == 0 {
+                obs_window.prior_frame()
+            } else {
+                &obs_window.frames()[i - 1]
+            };
+            if cand_state
+                .step(&swapped_compiled, input, &mut cand_pred)
+                .is_err()
+            {
+                ok = false;
+                break;
+            }
+            let p_cand = cand_pred[out_idx];
+            if p_cand != frame[out_idx] {
+                e_cand += 1;
+                if i >= eval_diag_start {
+                    e_cand_diag += 1;
+                }
+            }
+            for (q, e_port) in e_cand_by_port.iter_mut().enumerate() {
+                if driven_ports[q] && cand_pred[q] != frame[q] {
+                    *e_port += 1;
+                    if q != out_idx && *e_port > e_curr_by_port[q] {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                break;
+            }
+            let wires = cand_state.wire_values();
+            for (m, c) in comparators.iter().enumerate() {
+                let sub_in = &swapped_compiled.node_input_wires()[c.sub_node.index()];
+                if sub_in.len() >= 2
+                    && width.normalize(wires[sub_in[0]]) != width.normalize(wires[sub_in[1]])
+                {
+                    e_comp_cand[m] += 1;
+                    if e_comp_cand[m] > e_comp_curr[m] {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                break;
+            }
+            flux_cand += score_with_reward_mode(
+                &mut cand_scorer,
+                economy_config.reward_mode,
+                width,
+                p_cand,
+                frame[out_idx],
+            );
+        }
+
+        if !ok || e_cand >= e_curr || flux_cand <= flux_curr {
+            continue;
+        }
+        if swapped.node_count() > pre_n && e_cand + growth_config.min_match_gain > e_curr {
+            continue;
+        }
+        let l_cand = circuit_code_bits_with_tax(&swapped, 0, economy_config.split_code_tax);
+        let j_cand = l_cand + facts_code_bits(width, w_replay as u64, e_cand as u64);
+        if j_cand >= j_curr {
+            continue;
+        }
+
+        let delta_flux = flux_cand - flux_curr;
+        let rank_scale = sprout_rank_scale(swapped.num_inputs(), w_diag, economy_config);
+        let j_cand_diag =
+            l_cand + rank_scale * facts_code_bits(width, w_diag as u64, e_cand_diag as u64);
+
+        let is_better = match best {
+            None => true,
+            Some((_, _, prev_j, prev_flux)) => {
+                is_better_mdl(j_cand_diag, delta_flux, prev_j, prev_flux)
+            }
+        };
+        if is_better {
+            best = Some((comp_idx, e_cand_diag, j_cand_diag, delta_flux));
+        }
+    }
+
+    best.map(|(idx, e_diag, j_diag, _)| (idx, e_diag, j_diag))
+}
+
+/// Searches for a causal-disjoint Stage 3 backup derivation and comparator (`M2B-D2`).
+#[allow(clippy::too_many_arguments)]
+pub fn propose_redundancy_sprout(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    telemetry: &mut SproutTelemetry,
+) -> Result<Option<RedundancySproutProposal>, GrowthError> {
+    if !growth_config.redundancy_sprouting || !growth_config.is_valid() {
+        return Ok(None);
+    }
+    let circuit = editable.circuit();
+    let out_idx = usize::from(out_port);
+    let Some(prim_edge) = circuit
+        .edges()
+        .iter()
+        .find(|e| e.dst == SignalSink::BoundaryOut(out_port))
+    else {
+        return Ok(None);
+    };
+    if diag.len() < growth_config.diagnostic_window {
+        return Ok(None);
+    }
+
+    let comparator_subs: Vec<NodeId> = editable
+        .economy()
+        .comparators()
+        .iter()
+        .filter(|c| c.target_port == out_port)
+        .map(|c| c.sub_node)
+        .collect();
+    let mut comparator_all_nodes = BTreeSet::new();
+    for c in editable.economy().comparators() {
+        comparator_all_nodes.insert(c.sub_node);
+        comparator_all_nodes.insert(c.eqz_node);
+    }
+    let root_sinks = port_comparator_root_sinks(circuit, out_port, &comparator_subs);
+    let excl = derivation_cone_info(circuit, &root_sinks);
+    let primary_channel_mask = cone_channel_mask(circuit, prim_edge.src);
+
+    let baseline = replay_current_baseline(
+        editable,
+        obs_window,
+        growth_config,
+        economy_config,
+        out_port,
+        false,
+    );
+    let truth_slice: Vec<u64> = diag.truth.iter().map(|f| f[out_idx]).collect();
+    let modal_counts = {
+        let mut counts = BTreeMap::<u64, usize>::new();
+        for &v in &truth_slice {
+            *counts.entry(circuit.width().normalize(v)).or_insert(0) += 1;
+        }
+        counts.values().copied().max().unwrap_or(0)
+    };
+    let e_null_diag = truth_slice.len().saturating_sub(modal_counts);
+
+    let mut candidates: Vec<EvaluatedStage3Pre> = Vec::new();
+    let mut budget_hit = false;
+    let mut blocked_by_max_nodes = 0usize;
+
+    // 1. Autonomous delay-ring backup iff `!HasAutonomousCycle(p)` (Tier 1 vs reactive primary).
+    if !excl.has_autonomous_cycle && circuit.wire_delay() == WireDelayMode::Combinational {
+        let w_replay = obs_window.len();
+        let w_diag = growth_config.diagnostic_window.max(1);
+        let eval_start = w_replay.saturating_sub(w_diag);
+        let start_tick = obs_window.start_tick() as usize;
+        for p in growth_config.min_ring_period..=growth_config.max_ring_period {
+            let mut phase_counts = vec![BTreeMap::<u64, usize>::new(); p];
+            for (t, frame) in obs_window.frames().iter().enumerate() {
+                let sym = circuit.width().normalize(frame[out_idx]);
+                let phase = (start_tick + t) % p;
+                *phase_counts[phase].entry(sym).or_insert(0) += 1;
+            }
+            let mut mu = Vec::with_capacity(p);
+            let mut ring_e = 0usize;
+            for pc in &phase_counts {
+                let (best_sym, _) = pc
+                    .iter()
+                    .max_by(|(s_a, c_a), (s_b, c_b)| c_a.cmp(c_b).then_with(|| s_b.cmp(s_a)))
+                    .map(|(&s, &c)| (s, c))
+                    .unwrap_or((0, 0));
+                mu.push(best_sym);
+            }
+            for (t, frame) in obs_window.frames().iter().enumerate().skip(eval_start) {
+                let phase = (start_tick + t) % p;
+                if circuit.width().normalize(frame[out_idx]) != mu[phase] {
+                    ring_e += 1;
+                }
+            }
+            if ring_e + growth_config.min_match_gain > e_null_diag {
+                continue;
+            }
+            let mut staged = circuit.clone();
+            let (delays, _split, ring_src) = build_autonomous_ring_source(&mut staged, p, &mu);
+            if let Some(spliced) = splice_comparator_onto_port(&mut staged, out_port, ring_src) {
+                match evaluate_stage3_candidate_pre(
+                    editable,
+                    obs_window,
+                    growth_config,
+                    economy_config,
+                    budget,
+                    out_port,
+                    primary_channel_mask,
+                    &excl,
+                    &baseline,
+                    e_null_diag,
+                    staged,
+                    spliced,
+                    ring_src,
+                    Some((p, mu, delays)),
+                    &mut blocked_by_max_nodes,
+                    telemetry,
+                ) {
+                    Some(Ok(eval)) => candidates.push(eval),
+                    Some(Err(())) => {
+                        budget_hit = true;
+                        break;
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    // 2. Reactive causal-disjoint search over progressive lag bands (multi-channel deepening mirrors Stage 2).
+    if !budget_hit && budget.remaining() > 0 {
+        let mut bands = Vec::new();
+        let max_lag = growth_config.max_reactive_lag;
+        bands.push((1u8, max_lag));
+        let deepen_max = growth_config.deepening_max_lag.max(max_lag);
+        if circuit.num_outputs() > 1 && deepen_max > max_lag {
+            let mut prev = max_lag;
+            for &cap in &[6u8, 12u8, deepen_max] {
+                let c_cap = cap.min(deepen_max);
+                if c_cap > prev {
+                    bands.push((prev + 1, c_cap));
+                    prev = c_cap;
+                }
+            }
+        }
+
+        'band_loop: for (min_tau, max_tau) in bands {
+            if budget.remaining() == 0 {
+                break;
+            }
+            let masked_pool = build_masked_stage3_pool(
+                editable,
+                obs_window,
+                diag,
+                out_port,
+                max_tau,
+                &excl,
+                &comparator_all_nodes,
+            );
+            if masked_pool.is_empty() {
+                continue;
+            }
+            let tier1_pool: Vec<ResidualFeature> = masked_pool
+                .iter()
+                .filter(|f| {
+                    SourceFeature::parse(&f.name)
+                        .and_then(|sf| feature_channel_mask(&sf, circuit))
+                        .is_some_and(|m| (m & primary_channel_mask) == 0)
+                })
+                .cloned()
+                .collect();
+
+            let mut pools: Vec<&[ResidualFeature]> = Vec::new();
+            if !tier1_pool.is_empty() && tier1_pool.len() < masked_pool.len() {
+                pools.push(&tier1_pool);
+            }
+            pools.push(&masked_pool);
+
+            let mut evaluated_motifs = BTreeSet::<String>::new();
+            for pool in pools {
+                let Ok(diag_vals) = diagnose_stage3_values(
+                    circuit.width(),
+                    &truth_slice,
+                    pool,
+                    *growth_config,
+                    min_tau,
+                    max_tau,
+                ) else {
+                    continue;
+                };
+                if diag_vals.candidate_list_truncated {
+                    telemetry.candidate_list_truncated += 1;
+                }
+                for feat_score in &diag_vals.candidate_features {
+                    let Some(u1) = SourceFeature::parse(&pool[feat_score.feature_indices[0]].name)
+                    else {
+                        continue;
+                    };
+                    let u2 = feat_score
+                        .feature_indices
+                        .get(1)
+                        .and_then(|&idx| SourceFeature::parse(&pool[idx].name));
+                    let motifs = generate_candidate_motifs(
+                        &u1,
+                        u2.as_ref(),
+                        circuit.width(),
+                        diag_vals.constant_offset,
+                        true,
+                        circuit.num_inputs(),
+                    );
+                    for motif in motifs {
+                        if matches!(motif, CandidateMotif::ConstLoop(_)) {
+                            continue;
+                        }
+                        let key = format!("{motif:?}");
+                        if !evaluated_motifs.insert(key) {
+                            continue;
+                        }
+                        let mut staged = circuit.clone();
+                        let alt_src =
+                            materialize_motif_with_stack(&mut staged, &motif, out_port, false);
+                        let Some(spliced) =
+                            splice_comparator_onto_port(&mut staged, out_port, alt_src)
+                        else {
+                            continue;
+                        };
+                        match evaluate_stage3_candidate_pre(
+                            editable,
+                            obs_window,
+                            growth_config,
+                            economy_config,
+                            budget,
+                            out_port,
+                            primary_channel_mask,
+                            &excl,
+                            &baseline,
+                            e_null_diag,
+                            staged,
+                            spliced,
+                            alt_src,
+                            None,
+                            &mut blocked_by_max_nodes,
+                            telemetry,
+                        ) {
+                            Some(Ok(eval)) => candidates.push(eval),
+                            Some(Err(())) => {
+                                break 'band_loop;
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                if candidates.iter().any(|c| c.tier == 1 && c.e_alt_diag == 0) {
+                    break;
+                }
+            }
+
+            if candidates.iter().any(|c| c.tier == 1 && c.e_alt_diag == 0) {
+                break;
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        if blocked_by_max_nodes > 0 {
+            telemetry.sprout_blocked_max_nodes += 1;
+        }
+        return Ok(None);
+    }
+
+    // Rank candidates using Tier 1 > Tier 2 + error/J priority with a strict total order.
+    rank_stage3_candidates(&mut candidates);
+
+    for cand in candidates {
+        if let Some((d_alt, z_alt, eff_juv)) = stage3_measure_z_alt_and_survive(
+            editable,
+            obs_window,
+            growth_config,
+            economy_config,
+            out_port,
+            primary_channel_mask,
+            &cand,
+        ) {
+            let old_nodes = cand.old_to_new.len();
+            let new_nodes = (old_nodes..cand.staged.node_count())
+                .map(|i| NodeId(u32::try_from(i).expect("fits in u32")))
+                .collect();
+            return Ok(Some(RedundancySproutProposal {
+                circuit: cand.staged,
+                old_to_new: cand.old_to_new,
+                sub_node: cand.sub_node,
+                eqz_node: cand.eqz_node,
+                new_nodes,
+                d_alt,
+                z_alt,
+                effective_juvenile_ticks: eff_juv,
+                primary_channel_mask,
+                alt_channel_mask: cand.alt_channel_mask,
+                e_alt_diag: cand.e_alt_diag,
+                j_cand: cand.j_cand,
+                tier: cand.tier,
+                autonomous_ring: cand.autonomous_ring,
+                primary_tph_split: cand.primary_tph_split,
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -4632,5 +6350,136 @@ mod tests {
             None,
         );
         assert!(matches!(outcome, SproutMotifOutcome::Rejected));
+    }
+
+    #[test]
+    fn effective_comparator_juvenile_ticks_scales_and_backward_reduces() {
+        let econ = EconomyConfig::default();
+        let growth = GrowthConfig::default();
+        assert_eq!(COMPARATOR_PRIMITIVE_COUNT, 2);
+        for d in 0..=4usize {
+            let base = effective_juvenile_ticks(d, &econ, &growth);
+            assert_eq!(
+                effective_comparator_juvenile_ticks_with_primitives(d, 0.5, 0, &econ, &growth),
+                base
+            );
+            assert_eq!(
+                effective_comparator_juvenile_ticks(d, 0.0, &econ, &growth),
+                base
+            );
+            let scaled = effective_comparator_juvenile_ticks(d, 0.90, &econ, &growth);
+            let expected = ((f64::from(base) * ((0.90 + 2.0) / 0.90)).ceil()) as u32;
+            assert_eq!(scaled, expected);
+            assert!(scaled > base);
+        }
+    }
+
+    #[test]
+    fn growth_config_redundancy_sprouting_defaults_true_in_json() {
+        let legacy: GrowthConfig = serde_json::from_str("{}").expect("legacy json deserializes");
+        assert!(legacy.redundancy_sprouting);
+        let disabled: GrowthConfig =
+            serde_json::from_str(r#"{"redundancy_sprouting": false}"#).expect("disable flag");
+        assert!(!disabled.redundancy_sprouting);
+    }
+
+    #[test]
+    fn propose_redundancy_sprout_prefers_tier1_disjoint_channel_and_blocks_duplicate() {
+        let mut circuit = Circuit::new(Width::BITS_1, 3, 1, WireDelayMode::Combinational);
+        let eq0 = circuit.add_node(Primitive::Eqz);
+        circuit.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: eq0, port: 0 },
+        );
+        circuit.connect(
+            SignalSource::NodeOut { node: eq0, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+
+        let econ = EconomyConfig::default();
+        let growth = GrowthConfig::default();
+        let mut editable = EditableCircuit::new(circuit, econ).expect("editable");
+        let ledger = MarginalDebtLedger::new();
+        let mut ledger = ledger;
+        ledger.ensure_capacity(editable.circuit(), econ.split_code_tax);
+        editable
+            .economy_mut()
+            .assign_sprout_debts(&ledger.node_debts);
+        // Prime and mature primary node so Stage 3 sees live causal cone.
+        let mut preds = vec![0u64; 1];
+        for _ in 0..growth.diagnostic_window.max(32) {
+            let _ = editable.step(&[0, 0, 0], &mut preds);
+        }
+
+        let mut obs = ObservationWindow::new(3, 256);
+        for t in 0..160usize {
+            let b0 = ((t + 1) % 2) as u64;
+            let b1 = b0; // Channel 1 mirrors channel 0 on this window (redundant view).
+            let b2 = ((t / 2) % 2) as u64;
+            let frame = [b0, b1, b2];
+            obs.push_frame_with_state(&frame, 0, &[]);
+        }
+
+        let mut diag_buf = DiagnosticBuffer::new(growth.diagnostic_window);
+        let eval_start = obs.len() - growth.diagnostic_window;
+        for t in eval_start..obs.len() {
+            let prev = &obs.frames()[t - 1];
+            let truth_frame = &obs.frames()[t];
+            let pred = if prev[0] == 0 { 1 } else { 0 };
+            diag_buf.push_frame(prev, truth_frame, &[pred], &[0], &[pred], &[true]);
+        }
+
+        let mut budget = TickBudget::new(10_000);
+        let mut telemetry = SproutTelemetry::default();
+        let proposal = propose_redundancy_sprout(
+            &editable,
+            &obs,
+            &diag_buf,
+            &growth,
+            &econ,
+            &mut budget,
+            0,
+            &mut telemetry,
+        )
+        .expect("stage 3 result")
+        .expect("Stage 3 proposes cross-channel comparator");
+
+        assert_eq!(proposal.tier, 1);
+        assert_eq!(proposal.alt_channel_mask & 1u64, 0);
+        assert_ne!(proposal.alt_channel_mask & (1u64 << 1), 0);
+        assert_eq!(proposal.e_alt_diag, 0);
+        assert!(proposal.effective_juvenile_ticks >= effective_juvenile_ticks(0, &econ, &growth));
+
+        // Now repeat with channel 1 orthogonal to truth[0]: Stage 3 may only pick a causal-disjoint
+        // non-ch0 route (never duplicating ch0).
+        let mut obs_orth = ObservationWindow::new(3, 256);
+        for t in 0..160usize {
+            let b0 = ((t + 1) % 2) as u64;
+            let b1 = ((t / 2) % 2) as u64;
+            let b2 = ((t / 3) % 2) as u64;
+            obs_orth.push_frame_with_state(&[b0, b1, b2], 0, &[]);
+        }
+        let mut diag_buf_orth = DiagnosticBuffer::new(growth.diagnostic_window);
+        for t in eval_start..obs_orth.len() {
+            let prev = &obs_orth.frames()[t - 1];
+            let truth_frame = &obs_orth.frames()[t];
+            let pred = if prev[0] == 0 { 1 } else { 0 };
+            diag_buf_orth.push_frame(prev, truth_frame, &[pred], &[0], &[pred], &[true]);
+        }
+        let mut budget2 = TickBudget::new(10_000);
+        if let Some(prop) = propose_redundancy_sprout(
+            &editable,
+            &obs_orth,
+            &diag_buf_orth,
+            &growth,
+            &econ,
+            &mut budget2,
+            0,
+            &mut telemetry,
+        )
+        .expect("stage 3 result")
+        {
+            assert_eq!(prop.alt_channel_mask & 1u64, 0);
+        }
     }
 }

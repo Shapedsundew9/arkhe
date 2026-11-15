@@ -728,7 +728,10 @@ mod tests {
             seeds: 1,
             horizon: 256,
             economy: EconomyConfig::default(),
-            growth: GrowthConfig::default(),
+            growth: GrowthConfig {
+                redundancy_sprouting: false,
+                ..GrowthConfig::default()
+            },
         };
         for &target_nodes in &PROFILE_NODE_SCALES {
             for &channels in &[1u16, 4u16] {

@@ -12,8 +12,14 @@
       "details": "sprout_events=1"
     }
   ],
-  "trajectory_digest_fnv1a": "fb7491d27d1417a707a3bcdea8b1a402",
+  "trajectory_digest_fnv1a": "4edeb338e057eecfc8b4b8d26ccb1ed8",
   "final_circuit_nodes": [
+    "Eqz",
+    "Delay { init: 1 }",
+    "Delay { init: 0 }",
+    "Split",
+    "Split",
+    "Sub",
     "Eqz"
   ],
   "final_circuit_edges": [
@@ -23,8 +29,43 @@
       "hops": 0
     },
     {
-      "src": "NodeOut { node: NodeId(0), port: 0 }",
+      "src": "NodeOut { node: NodeId(1), port: 0 }",
+      "dst": "NodeIn { node: NodeId(2), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(2), port: 0 }",
+      "dst": "NodeIn { node: NodeId(3), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(3), port: 0 }",
+      "dst": "NodeIn { node: NodeId(1), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(4), port: 0 }",
       "dst": "BoundaryOut(0)",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(0), port: 0 }",
+      "dst": "NodeIn { node: NodeId(4), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(4), port: 1 }",
+      "dst": "NodeIn { node: NodeId(5), port: 0 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(3), port: 1 }",
+      "dst": "NodeIn { node: NodeId(5), port: 1 }",
+      "hops": 0
+    },
+    {
+      "src": "NodeOut { node: NodeId(5), port: 0 }",
+      "dst": "NodeIn { node: NodeId(6), port: 0 }",
       "hops": 0
     }
   ]

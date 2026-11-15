@@ -1,5 +1,7 @@
 //! Online closed-loop coordinate-free neurogenesis learner (Milestone 1b, Hypothesis H2).
 
+use std::collections::{BTreeSet, VecDeque};
+
 use serde::{Deserialize, Serialize};
 
 use crate::baselines::{ObservationWindow, PredictorBaseline, TickBudget};
@@ -7,16 +9,24 @@ use crate::config::ArkheM1Telemetry;
 use crate::metrics::circuit_code_bits_with_tax;
 use crate::metrics::facts_code_bits;
 use crate::rng::SeedBank;
-use crate::structural::economy::EconomyConfig;
+use crate::structural::economy::{ComparatorSite, EconomyConfig, EconomyState, ExecutionPhase};
+use crate::structural::graph_edit::{
+    advance_tph_autonomous_ring_phase, excise_comparator_branch, is_pure_boundary_split,
+    prune_starved_preserving_healthy_split_branches, swap_comparator_driver,
+};
 use crate::structural::growth::{
-    AutonomousRingProposal, DiagnosticBuffer, GrowthConfig, GrowthError, ScoredSproutProposal,
-    SproutTelemetry, check_deeper_lag_for_port, diagnose_residual, effective_juvenile_ticks,
-    port_cone_register_depth, propose_autonomous_delay_ring_scored_with_telemetry,
+    AutonomousRingProposal, DiagnosticBuffer, GrowthConfig, GrowthError, RedundancySproutProposal,
+    ScoredSproutProposal, SproutTelemetry, assign_stage3_juvenile_ticks, check_deeper_lag_for_port,
+    diagnose_residual, effective_juvenile_ticks, evaluate_comparator_ring_promotion,
+    port_cone_register_depth, port_primary_cone_is_mature,
+    propose_autonomous_delay_ring_scored_with_telemetry, propose_redundancy_sprout,
     propose_sprout_band_scored_internal,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
-    CausalAncestry, SensitivitySnapshot, assemble_causal_ancestry, counterfactual_sensitivity,
+    CausalAncestry, ComparatorCausalAncestry, ComparatorSensitivitySnapshot, SensitivitySnapshot,
+    assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
+    counterfactual_sensitivity, counterfactual_sensitivity_with_comparators,
 };
 use crate::structural::surgery::{
     EditableCircuit, MarginalDebtLedger, explicit_delay_register_index, port_cone_changed,
@@ -67,7 +77,117 @@ impl PortDevelopmentalState {
     }
 }
 
-type PendingPrediction = (Vec<u64>, CausalAncestry, SensitivitySnapshot, u64, Vec<u64>);
+/// Summary report returned by [`ArkheLearner::run_offline_loopback`] (`M2B-D3`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OfflineLoopbackReport {
+    /// Total unsupervised loopback sleep ticks executed.
+    pub ticks: u64,
+    /// Comparator agreement ticks (`eqz == 1`) observed during this loopback run.
+    pub comparator_agreement_ticks: u64,
+    /// Comparator disagreement ticks (`eqz == 0`) observed during this loopback run.
+    pub comparator_disagreement_ticks: u64,
+    /// Cumulative net comparator flux (in bits) accumulated during this loopback run.
+    pub sleep_comparator_flux: f64,
+    /// Maximum circular distance $d_{\mathbb{Z}_{2^k}}(\text{primary}, \text{alt})$ seen on any comparator.
+    pub max_circular_discrepancy: u64,
+    /// Number of minority faulty branches pruned during 3-route loopback consensus.
+    pub minority_routes_pruned: u64,
+    /// Whether any comparator disagreement was observed during this loopback run.
+    pub contradiction_detected: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ComparatorWakeWindow {
+    sub_node: NodeId,
+    capacity: usize,
+    disagree: VecDeque<bool>,
+    r_primary: VecDeque<f64>,
+    r_alt: VecDeque<f64>,
+    e_primary: VecDeque<bool>,
+    e_alt: VecDeque<bool>,
+}
+
+impl ComparatorWakeWindow {
+    fn new(sub_node: NodeId, capacity: usize) -> Self {
+        Self {
+            sub_node,
+            capacity,
+            disagree: VecDeque::with_capacity(capacity),
+            r_primary: VecDeque::with_capacity(capacity),
+            r_alt: VecDeque::with_capacity(capacity),
+            e_primary: VecDeque::with_capacity(capacity),
+            e_alt: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.disagree.clear();
+        self.r_primary.clear();
+        self.r_alt.clear();
+        self.e_primary.clear();
+        self.e_alt.clear();
+    }
+
+    fn is_full(&self) -> bool {
+        self.disagree.len() >= self.capacity
+    }
+
+    fn push(&mut self, disagree: bool, r_primary: f64, r_alt: f64, e_primary: bool, e_alt: bool) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.disagree.len() >= self.capacity {
+            self.disagree.pop_front();
+            self.r_primary.pop_front();
+            self.r_alt.pop_front();
+            self.e_primary.pop_front();
+            self.e_alt.pop_front();
+        }
+        self.disagree.push_back(disagree);
+        self.r_primary.push_back(r_primary);
+        self.r_alt.push_back(r_alt);
+        self.e_primary.push_back(e_primary);
+        self.e_alt.push_back(e_alt);
+    }
+
+    fn swap_primary_alt(&mut self) {
+        std::mem::swap(&mut self.r_primary, &mut self.r_alt);
+        std::mem::swap(&mut self.e_primary, &mut self.e_alt);
+    }
+
+    fn disagreement_count(&self) -> usize {
+        self.disagree.iter().filter(|&&d| d).count()
+    }
+
+    fn e_primary_count(&self) -> usize {
+        self.e_primary.iter().filter(|&&e| e).count()
+    }
+
+    fn e_alt_count(&self) -> usize {
+        self.e_alt.iter().filter(|&&e| e).count()
+    }
+
+    fn flux_primary(&self) -> f64 {
+        self.r_primary.iter().sum()
+    }
+
+    fn flux_alt(&self) -> f64 {
+        self.r_alt.iter().sum()
+    }
+}
+
+enum PendingSnapshot {
+    Base {
+        ancestry: CausalAncestry,
+        snapshot: SensitivitySnapshot,
+    },
+    WithComparators {
+        ancestry: ComparatorCausalAncestry,
+        snapshot: ComparatorSensitivitySnapshot,
+    },
+}
+
+type PendingPrediction = (Vec<u64>, PendingSnapshot, u64, Vec<u64>);
 
 /// Online gradient-free closed-loop learner driving coordinate-free structural neurogenesis and metabolic economy.
 pub struct ArkheLearner {
@@ -82,10 +202,14 @@ pub struct ArkheLearner {
     pending_prediction: Option<PendingPrediction>,
     obs_window: ObservationWindow,
     port_states: Vec<PortDevelopmentalState>,
+    comparator_windows: Vec<ComparatorWakeWindow>,
     sprout_events: u64,
     starvation_prune_events: u64,
     idle_prune_events: u64,
     ring_closure_events: u64,
+    redundancy_sprout_events: u64,
+    driver_handoff_events: u64,
+    disagreement_prune_events: u64,
     cumulative_net_flux: f64,
     cumulative_debt_paid: f64,
     reserve_clipped_count: u64,
@@ -164,10 +288,14 @@ impl ArkheLearner {
             pending_prediction: None,
             obs_window: ObservationWindow::new(channels, obs_capacity),
             port_states,
+            comparator_windows: Vec::new(),
             sprout_events: 0,
             starvation_prune_events: 0,
             idle_prune_events: 0,
             ring_closure_events: 0,
+            redundancy_sprout_events: 0,
+            driver_handoff_events: 0,
+            disagreement_prune_events: 0,
             cumulative_net_flux: 0.0,
             cumulative_debt_paid: 0.0,
             reserve_clipped_count: 0,
@@ -182,6 +310,87 @@ impl ArkheLearner {
             sprout_budget_exhausted: 0,
             total_budget_seen: None,
         })
+    }
+
+    /// Constructs a learner around a pre-populated [`EditableCircuit`] (e.g., for loopback or handoff tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrowthError::InvalidConfig`] if `growth_config` limits are invalid.
+    pub fn from_editable(
+        editable: EditableCircuit,
+        growth_config: GrowthConfig,
+        seed_bank: SeedBank,
+    ) -> Result<Self, GrowthError> {
+        if !growth_config.is_valid() {
+            return Err(GrowthError::InvalidConfig);
+        }
+        let economy_config = editable.economy().config();
+        let num_inputs = editable.circuit().num_inputs();
+        let num_outputs = usize::from(editable.circuit().num_outputs());
+        let obs_capacity =
+            crate::structural::growth::observation_horizon(&economy_config, &growth_config);
+        let mut ledger = MarginalDebtLedger::new();
+        ledger.ensure_capacity(editable.circuit(), economy_config.split_code_tax);
+        ledger.last_committed_code_bits =
+            circuit_code_bits_with_tax(editable.circuit(), 0, economy_config.split_code_tax);
+        for (i, node_econ) in editable.economy().nodes().iter().enumerate() {
+            if i < ledger.debt_paid.len() && (node_econ.debt_paid || node_econ.juvenile_ticks == 0)
+            {
+                ledger.debt_paid[i] = true;
+            }
+        }
+        let port_states = (0..num_outputs)
+            .map(|_| PortDevelopmentalState::new(growth_config.diagnostic_window))
+            .collect();
+        let comparator_windows = editable
+            .economy()
+            .comparators()
+            .iter()
+            .map(|c| ComparatorWakeWindow::new(c.sub_node, growth_config.diagnostic_window))
+            .collect();
+        Ok(Self {
+            editable,
+            ledger,
+            economy_config,
+            growth_config,
+            seed_bank,
+            sample_count: growth_config.sensitivity_sample_count,
+            tick: 0,
+            prev_observed_frame: vec![0; usize::from(num_inputs)],
+            pending_prediction: None,
+            obs_window: ObservationWindow::new(num_inputs, obs_capacity),
+            port_states,
+            comparator_windows,
+            sprout_events: 0,
+            starvation_prune_events: 0,
+            idle_prune_events: 0,
+            ring_closure_events: 0,
+            redundancy_sprout_events: 0,
+            driver_handoff_events: 0,
+            disagreement_prune_events: 0,
+            cumulative_net_flux: 0.0,
+            cumulative_debt_paid: 0.0,
+            reserve_clipped_count: 0,
+            reserve_clipped_bits: 0.0,
+            reserve_mismatch_floored: 0,
+            sprout_blocked_max_nodes: 0,
+            candidate_undecidable: 0,
+            candidate_list_truncated: 0,
+            lag_horizon_bound: 0,
+            ring_period_bound: 0,
+            lag_deepening_steps: 0,
+            sprout_budget_exhausted: 0,
+            total_budget_seen: None,
+        })
+    }
+
+    /// Sets the normalized previous observed input frame for closed-loop stepping.
+    pub fn set_prev_observed_frame(&mut self, frame: &[u64]) {
+        let width = self.editable.circuit().width();
+        for (slot, &val) in self.prev_observed_frame.iter_mut().zip(frame) {
+            *slot = width.normalize(val);
+        }
     }
 
     /// Active port developmental states.
@@ -241,6 +450,48 @@ impl ArkheLearner {
     #[must_use]
     pub const fn ring_closure_events(&self) -> u64 {
         self.ring_closure_events
+    }
+
+    /// Total Stage 3 causal-disjoint redundancy sprouts committed.
+    #[must_use]
+    pub const fn redundancy_sprout_events(&self) -> u64 {
+        self.redundancy_sprout_events
+    }
+
+    /// Total comparator driver handoff promotions committed in Wake.
+    #[must_use]
+    pub const fn driver_handoff_events(&self) -> u64 {
+        self.driver_handoff_events
+    }
+
+    /// Total comparator disagreement refutation prunings committed in Wake.
+    #[must_use]
+    pub const fn disagreement_prune_events(&self) -> u64 {
+        self.disagreement_prune_events
+    }
+
+    /// Current number of active registered comparators.
+    #[must_use]
+    pub fn active_comparator_count(&self) -> usize {
+        self.editable.economy().comparators().len()
+    }
+
+    /// Cumulative comparator agreement ticks (`eqz == 1`) recorded in the economy.
+    #[must_use]
+    pub const fn comparator_agreement_ticks(&self) -> u64 {
+        self.editable.economy().comparator_agreement_ticks()
+    }
+
+    /// Cumulative comparator disagreement ticks (`eqz == 0`) recorded in the economy.
+    #[must_use]
+    pub const fn comparator_disagreement_ticks(&self) -> u64 {
+        self.editable.economy().comparator_disagreement_ticks()
+    }
+
+    /// Cumulative net flux (in bits) credited through registered comparators.
+    #[must_use]
+    pub const fn cumulative_comparator_flux(&self) -> f64 {
+        self.editable.economy().cumulative_comparator_flux()
     }
 
     /// Diagnostic epoch snapshots captured for port 0 across developmental milestones.
@@ -537,6 +788,777 @@ impl ArkheLearner {
             sprout_budget_exhausted: self.sprout_budget_exhausted,
         }
     }
+
+    fn sync_comparator_windows(&mut self) {
+        let diag_cap = self.growth_config.diagnostic_window;
+        let comps = self.editable.economy().comparators();
+        let existing = std::mem::take(&mut self.comparator_windows);
+        let mut synced = Vec::with_capacity(comps.len());
+        for comp in comps {
+            if let Some(win) = existing.iter().find(|w| w.sub_node == comp.sub_node) {
+                synced.push(win.clone());
+            } else {
+                synced.push(ComparatorWakeWindow::new(comp.sub_node, diag_cap));
+            }
+        }
+        self.comparator_windows = synced;
+    }
+
+    fn apply_node_remap_to_windows(&mut self, old_to_new: &[Option<NodeId>]) {
+        for win in &mut self.comparator_windows {
+            if let Some(Some(mapped)) = old_to_new.get(win.sub_node.index()) {
+                win.sub_node = *mapped;
+            } else {
+                win.sub_node = NodeId(u32::MAX);
+            }
+        }
+        self.sync_comparator_windows();
+    }
+
+    fn is_port_driven(&self, target_port: u16) -> bool {
+        self.editable
+            .circuit()
+            .edges()
+            .iter()
+            .any(|e| e.dst == SignalSink::BoundaryOut(target_port))
+    }
+
+    fn port_comparators_primed(
+        &self,
+        comp_ancestry: Option<&ComparatorCausalAncestry>,
+        target_port: u16,
+    ) -> bool {
+        let comps = self.editable.economy().comparators();
+        let mut any_on_port = false;
+        let mut all_primed = true;
+        for (m, comp) in comps.iter().enumerate() {
+            if comp.target_port == target_port {
+                any_on_port = true;
+                let primed = comp_ancestry
+                    .and_then(|a| a.comparator_shares.get(m))
+                    .is_some_and(|shares| shares.iter().sum::<f64>() > 0.0);
+                if !primed {
+                    all_primed = false;
+                    break;
+                }
+            }
+        }
+        !any_on_port || all_primed
+    }
+
+    fn port_q_hat_exceeds_null(&self, port_idx: usize, prediction: u64) -> bool {
+        let scorer = &self.editable.economy().scorers()[port_idx];
+        let pred_norm = self.editable.circuit().width().normalize(prediction);
+        let p_null = scorer.null_model().probability(pred_norm);
+        scorer.q_hat() > p_null
+    }
+
+    fn port_redundancy_arity_eligible(&self, target_port: u16) -> bool {
+        let comps = self.editable.economy().comparators();
+        let port_comp_indices: Vec<usize> = comps
+            .iter()
+            .enumerate()
+            .filter_map(|(m, c)| (c.target_port == target_port).then_some(m))
+            .collect();
+        match port_comp_indices.len() {
+            0 => true,
+            1 => {
+                let m = port_comp_indices[0];
+                let min_gain = self.growth_config.min_match_gain;
+                self.comparator_windows.get(m).is_some_and(|w| {
+                    w.is_full()
+                        && w.disagreement_count() >= min_gain
+                        && w.disagreement_count().saturating_mul(2) >= w.disagree.len()
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn sibling_has_juvenile_nodes(&self, port_idx: usize) -> bool {
+        let num_ports = self.port_states.len();
+        let circuit = self.editable.circuit();
+        let economy = self.editable.economy();
+        for q in 0..num_ports {
+            if q == port_idx {
+                continue;
+            }
+            if !port_primary_cone_is_mature(circuit, economy, q as u16)
+                || !port_comparators_mature(circuit, economy, q as u16)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn swap_port_and_comparator_scorer(&mut self, port_idx: usize, comp_idx: usize) {
+        let width = self.editable.circuit().width();
+        let null_kind = self.economy_config.null_model;
+        let econ = self.editable.economy_mut();
+        let port_scorer = std::mem::replace(
+            econ.port_scorer_mut(port_idx),
+            crate::metrics::PointForecastScorer::new(width, null_kind),
+        );
+        let comp_scorer =
+            std::mem::replace(&mut econ.comparators_mut()[comp_idx].scorer, port_scorer);
+        *econ.port_scorer_mut(port_idx) = comp_scorer;
+    }
+
+    fn commit_redundancy_sprout(
+        &mut self,
+        port_idx: usize,
+        proposal: RedundancySproutProposal,
+    ) -> bool {
+        let pre_epoch = self.editable.structure_epoch();
+        let pre_circuit = self.editable.circuit().clone();
+        let Ok(pre_compiled) = pre_circuit.compile() else {
+            return false;
+        };
+        let pre_regs = self.editable.state().registers().to_vec();
+        let old_to_new = proposal.old_to_new;
+        let sub_node = proposal.sub_node;
+        let eqz_node = proposal.eqz_node;
+        let eff_juv = proposal.effective_juvenile_ticks;
+        let primary_mask = proposal.primary_channel_mask;
+        let alt_mask = proposal.alt_channel_mask;
+        let autonomous_ring = proposal.autonomous_ring;
+        let primary_tph_split = proposal.primary_tph_split;
+
+        if self
+            .editable
+            .recompile_preserving_state(proposal.circuit, &old_to_new)
+            .is_err()
+        {
+            return false;
+        }
+        self.ledger.on_sprout(
+            self.editable.circuit(),
+            self.economy_config.split_code_tax,
+            &old_to_new,
+        );
+        self.editable
+            .economy_mut()
+            .assign_sprout_debts(&self.ledger.node_debts);
+
+        let mut surviving = vec![false; self.editable.circuit().node_count()];
+        for new_id in old_to_new.iter().flatten() {
+            if let Some(slot) = surviving.get_mut(new_id.index()) {
+                *slot = true;
+            }
+        }
+        {
+            let circuit = self.editable.circuit().clone();
+            assign_stage3_juvenile_ticks(
+                &circuit,
+                self.editable.economy_mut(),
+                &surviving,
+                eff_juv,
+                &self.economy_config,
+                &self.growth_config,
+            );
+        }
+
+        if let Some(split_node) = primary_tph_split
+            && let Some(adj_regs) = advance_tph_autonomous_ring_phase(
+                &pre_circuit,
+                &pre_compiled,
+                &pre_regs,
+                self.editable.circuit(),
+                self.editable.compiled(),
+                &old_to_new,
+                port_idx as u16,
+                split_node,
+                sub_node,
+            )
+        {
+            let _ = self.editable.set_registers(&adj_regs);
+        }
+
+        // Prime newly added non-autonomous registers across recent obs_window frames so reactive
+        // Stage 3 derivations begin flush-aligned without spurious init=0 startup disagreements.
+        if !self.obs_window.is_empty() {
+            let reg_map = crate::structural::surgery::register_mapping(
+                &pre_circuit,
+                self.editable.circuit(),
+                &pre_compiled,
+                self.editable.compiled(),
+                &old_to_new,
+            );
+            let total_new_regs = self.editable.compiled().total_registers();
+            let mut is_surviving_reg = vec![false; total_new_regs];
+            for nr in reg_map.iter().flatten().copied() {
+                if nr < is_surviving_reg.len() {
+                    is_surviving_reg[nr] = true;
+                }
+            }
+            if is_surviving_reg.iter().any(|&s| !s) {
+                let compiled = self.editable.compiled();
+                let mut shadow = crate::substrate::ScalarState::new(compiled);
+                let w_replay = self
+                    .obs_window
+                    .len()
+                    .min(2 * self.growth_config.diagnostic_window);
+                let start_idx = self.obs_window.len() - w_replay;
+                if let Some((snap_epoch, snap_regs)) = self.obs_window.state_snapshot_at(start_idx)
+                    && snap_epoch == pre_epoch
+                {
+                    let mut shadow_regs = shadow.registers().to_vec();
+                    for (old_r, new_r) in reg_map.iter().enumerate() {
+                        if let Some(nr) = new_r
+                            && old_r < snap_regs.len()
+                            && *nr < shadow_regs.len()
+                        {
+                            shadow_regs[*nr] = snap_regs[old_r];
+                        }
+                    }
+                    let _ = shadow.set_registers(compiled, &shadow_regs);
+                }
+                let mut dummy_pred = vec![0u64; usize::from(compiled.num_outputs())];
+                for idx in start_idx..self.obs_window.len() {
+                    let input = if idx == 0 {
+                        self.obs_window.prior_frame()
+                    } else {
+                        &self.obs_window.frames()[idx - 1]
+                    };
+                    let _ = shadow.step(compiled, input, &mut dummy_pred);
+                }
+                let mut live_regs = self.editable.state().registers().to_vec();
+                let shadow_regs = shadow.registers();
+                for (r, surviving_reg) in is_surviving_reg.iter().enumerate() {
+                    if !*surviving_reg && r < live_regs.len() && r < shadow_regs.len() {
+                        live_regs[r] = shadow_regs[r];
+                    }
+                }
+                let _ = self.editable.set_registers(&live_regs);
+            }
+        }
+
+        if let Some((period, ref template, ref delay_nodes)) = autonomous_ring {
+            let mut regs = self.editable.state().registers().to_vec();
+            let mut ok_regs = true;
+            for (j, &delay_node) in delay_nodes.iter().enumerate() {
+                if let Some(reg_idx) =
+                    explicit_delay_register_index(self.editable.circuit(), delay_node)
+                {
+                    regs[reg_idx] =
+                        template[(((self.tick + 1) as usize) + (period - 1 - j)) % period];
+                } else {
+                    ok_regs = false;
+                    break;
+                }
+            }
+            if ok_regs {
+                let _ = self.editable.set_registers(&regs);
+            }
+        }
+
+        if self
+            .editable
+            .register_comparator(sub_node, eqz_node, port_idx as u16, primary_mask, alt_mask)
+            .is_err()
+        {
+            return false;
+        }
+        self.sync_comparator_windows();
+        self.port_states[port_idx].diagnostic_buffer.clear();
+        self.port_states[port_idx].ticks_since_last_check = 0;
+        self.redundancy_sprout_events += 1;
+        true
+    }
+
+    fn excise_port_comparator(&mut self, comp_idx: usize, prune_primary: bool) -> bool {
+        let comps = self.editable.economy().comparators();
+        if comp_idx >= comps.len() {
+            return false;
+        }
+        let comp = comps[comp_idx].clone();
+        let target_port = comp.target_port;
+        let target_idx = usize::from(target_port);
+        let new_primary_mask = if prune_primary {
+            comp.alt_channel_mask
+        } else {
+            comp.primary_channel_mask
+        };
+        let target_port_subs: Vec<NodeId> = comps
+            .iter()
+            .filter(|c| c.target_port == target_port)
+            .map(|c| c.sub_node)
+            .collect();
+        let surviving_comp_nodes: Vec<(NodeId, NodeId)> = comps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| (i != comp_idx).then_some((c.sub_node, c.eqz_node)))
+            .collect();
+
+        let Some((pruned, old_to_new)) = excise_comparator_branch(
+            self.editable.circuit(),
+            comp.sub_node,
+            comp.eqz_node,
+            target_port,
+            prune_primary,
+            &target_port_subs,
+            &surviving_comp_nodes,
+        ) else {
+            return false;
+        };
+
+        if prune_primary {
+            self.swap_port_and_comparator_scorer(target_idx, comp_idx);
+            for (idx, other) in self
+                .editable
+                .economy_mut()
+                .comparators_mut()
+                .iter_mut()
+                .enumerate()
+            {
+                if idx != comp_idx && other.target_port == target_port {
+                    other.primary_channel_mask = new_primary_mask;
+                }
+            }
+        }
+
+        if self
+            .editable
+            .recompile_preserving_state(pruned, &old_to_new)
+            .is_err()
+        {
+            return false;
+        }
+        self.ledger.on_prune(
+            self.editable.circuit(),
+            self.economy_config.split_code_tax,
+            &old_to_new,
+        );
+        self.apply_node_remap_to_windows(&old_to_new);
+        if prune_primary {
+            let remaining = self.editable.economy().comparators().to_vec();
+            for (i, other) in remaining.iter().enumerate() {
+                if other.target_port == target_port
+                    && let Some(win) = self.comparator_windows.get_mut(i)
+                {
+                    win.clear();
+                }
+            }
+        }
+        for state in &mut self.port_states {
+            state.diagnostic_buffer.clear();
+        }
+        self.port_states[target_idx].ticks_since_last_check = 0;
+        true
+    }
+
+    fn perform_comparator_handoff(&mut self, comp_idx: usize) -> bool {
+        let Some(comp) = self.editable.economy().comparators().get(comp_idx).cloned() else {
+            return false;
+        };
+        let split_tax = self.economy_config.split_code_tax;
+        let target_port = comp.target_port;
+        let target_idx = usize::from(target_port);
+        let target_port_subs: Vec<NodeId> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .filter(|c| c.target_port == target_port)
+            .map(|c| c.sub_node)
+            .collect();
+        let mut swapped = self.editable.circuit().clone();
+        if !swap_comparator_driver(&mut swapped, target_port, comp.sub_node, &target_port_subs) {
+            return false;
+        }
+        let pre_n = self.editable.circuit().node_count();
+        let old_to_new: Vec<Option<NodeId>> = (0..pre_n).map(|i| Some(NodeId(i as u32))).collect();
+        if self
+            .editable
+            .recompile_preserving_state(swapped, &old_to_new)
+            .is_err()
+        {
+            return false;
+        }
+        if self.editable.circuit().node_count() > pre_n {
+            self.ledger
+                .on_sprout(self.editable.circuit(), split_tax, &old_to_new);
+            self.editable
+                .economy_mut()
+                .assign_sprout_debts(&self.ledger.node_debts);
+        } else {
+            self.ledger.last_committed_code_bits =
+                circuit_code_bits_with_tax(self.editable.circuit(), 0, split_tax);
+        }
+        self.swap_port_and_comparator_scorer(target_idx, comp_idx);
+        let new_primary_mask = comp.alt_channel_mask;
+        {
+            let comps_mut = self.editable.economy_mut().comparators_mut();
+            comps_mut[comp_idx].primary_channel_mask = comp.alt_channel_mask;
+            comps_mut[comp_idx].alt_channel_mask = comp.primary_channel_mask;
+            for (i, other) in comps_mut.iter_mut().enumerate() {
+                if i != comp_idx && other.target_port == target_port {
+                    other.primary_channel_mask = new_primary_mask;
+                }
+            }
+        }
+        if let Some(w) = self.comparator_windows.get_mut(comp_idx) {
+            w.swap_primary_alt();
+        }
+        let sibling_subs: Vec<NodeId> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                (i != comp_idx && c.target_port == target_port).then_some(c.sub_node)
+            })
+            .collect();
+        for w in &mut self.comparator_windows {
+            if sibling_subs.contains(&w.sub_node) {
+                w.clear();
+            }
+        }
+        self.port_states[target_idx].diagnostic_buffer.clear();
+        self.port_states[target_idx].ticks_since_last_check = 0;
+        self.driver_handoff_events += 1;
+        true
+    }
+
+    fn process_wake_comparator_events(&mut self) -> bool {
+        let min_gain = self.growth_config.min_match_gain;
+        let split_tax = self.economy_config.split_code_tax;
+        let count = self.editable.economy().comparators().len();
+
+        for comp_idx in 0..count {
+            let comp = self.editable.economy().comparators()[comp_idx].clone();
+            if !comparator_cone_is_mature(self.editable.circuit(), self.editable.economy(), &comp) {
+                continue;
+            }
+            let Some(win) = self.comparator_windows.get(comp_idx) else {
+                continue;
+            };
+            if !win.is_full() {
+                continue;
+            }
+
+            let e_primary = win.e_primary_count();
+            let e_alt = win.e_alt_count();
+            let flux_primary = win.flux_primary();
+            let flux_alt = win.flux_alt();
+            let delta_l_comp =
+                comparator_marginal_code_bits(self.editable.circuit(), &comp, split_tax);
+
+            // Step A: Wake Driver Handoff.
+            if e_alt < e_primary && (flux_alt - flux_primary) > delta_l_comp {
+                let _ = self.perform_comparator_handoff(comp_idx);
+            }
+
+            // Step B: Two-Clause Refutation Pruning.
+            let Some(win_after) = self.comparator_windows.get(comp_idx) else {
+                continue;
+            };
+            let disagreements = win_after.disagreement_count();
+            if disagreements >= min_gain {
+                let f_pri = win_after.flux_primary();
+                let f_alt = win_after.flux_alt();
+                let prune_decision = if f_alt <= 0.0 && f_pri > 0.0 {
+                    Some(false)
+                } else if f_pri <= 0.0 && f_alt > 0.0 {
+                    Some(true)
+                } else {
+                    None
+                };
+                if let Some(prune_primary) = prune_decision
+                    && self.excise_port_comparator(comp_idx, prune_primary)
+                {
+                    self.disagreement_prune_events += 1;
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Runs unsupervised offline loopback (`M2B-D3`) by cutting external inputs
+    /// ($A(t+1) \leftarrow \hat{A}(t+1)$) under [`ExecutionPhase::Sleep`] for `loopback_ticks`.
+    ///
+    /// Preserves frozen wake null models and executes 3-route majority pruning when two agreed
+    /// routes conflict with one minority faulty route on a port.
+    pub fn run_offline_loopback(&mut self, loopback_ticks: u64) -> OfflineLoopbackReport {
+        self.pending_prediction = None;
+        let width = self.editable.circuit().width();
+        let num_in = usize::from(self.editable.compiled().num_inputs());
+        let num_out = usize::from(self.editable.compiled().num_outputs());
+        let mut curr_input = self.prev_observed_frame.clone();
+        curr_input.resize(num_in, 0);
+
+        let start_agree = self.editable.economy().comparator_agreement_ticks();
+        let start_disagree = self.editable.economy().comparator_disagreement_ticks();
+        let start_flux = self.editable.economy().cumulative_comparator_flux();
+
+        self.editable.economy_mut().set_phase(ExecutionPhase::Sleep);
+
+        let mut max_circular_discrepancy = 0u64;
+        let mut minority_routes_pruned = 0u64;
+        let zeros_port_rewards = vec![0.0; num_out];
+        let mut per_port_consensus: Vec<(u64, u64, u64)> = vec![(0, 0, 0); num_out];
+        let consensus_thr = self
+            .growth_config
+            .min_match_gain
+            .min(loopback_ticks.max(1) as usize) as u64;
+
+        for _ in 0..loopback_ticks {
+            let mut predictions = vec![0u64; num_out];
+            let _ = self.editable.step(&curr_input, &mut predictions);
+            for (slot, &pred) in curr_input.iter_mut().zip(&predictions) {
+                *slot = width.normalize(pred);
+            }
+
+            let node_outs = node_output_values(self.editable.circuit(), self.editable.state());
+            let wires = self.editable.state().wire_values().to_vec();
+            let _ = self.editable.economy_mut().record_activity(&node_outs);
+
+            let n = self.editable.circuit().node_count();
+            if self.ledger.node_debts.len() != n {
+                self.ledger
+                    .ensure_capacity(self.editable.circuit(), self.economy_config.split_code_tax);
+                self.editable
+                    .economy_mut()
+                    .assign_sprout_debts(&self.ledger.node_debts);
+            }
+            let mut maintenance_costs = vec![0.0; n];
+            for (i, cost) in maintenance_costs.iter_mut().enumerate().take(n) {
+                let node = &self.editable.economy().nodes()[i];
+                if node.juvenile_ticks == 0 && !self.ledger.debt_paid[i] {
+                    *cost = self.ledger.node_debts[i];
+                    self.ledger.debt_paid[i] = true;
+                    if let Some(n_mut) = self.editable.economy_mut().node_mut(i) {
+                        n_mut.debt_paid = true;
+                    }
+                }
+            }
+
+            let comp_count = self.editable.economy().comparators().len();
+            if comp_count == 0 {
+                let snapshot = counterfactual_sensitivity(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    self.seed_bank,
+                    self.tick,
+                    self.sample_count,
+                )
+                .expect("valid sensitivity snapshot");
+                let ancestry = assemble_causal_ancestry(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    &snapshot,
+                    &self.editable.economy().activity(),
+                    self.editable.economy().register_eligibility(),
+                    self.economy_config.trace_discount,
+                )
+                .expect("valid causal ancestry");
+                let econ_tick = self
+                    .editable
+                    .economy_mut()
+                    .apply_causal_tick(&zeros_port_rewards, &ancestry, &maintenance_costs)
+                    .expect("valid sleep tick");
+                self.cumulative_debt_paid += econ_tick.maintenance;
+            } else {
+                let targets = self.editable.comparator_targets();
+                let snapshot = counterfactual_sensitivity_with_comparators(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    self.seed_bank,
+                    self.tick,
+                    self.sample_count,
+                    &targets,
+                )
+                .expect("valid comparator sensitivity snapshot");
+                let ancestry = assemble_causal_ancestry_with_comparators(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    &snapshot,
+                    &self.editable.economy().activity(),
+                    self.editable.economy().register_eligibility(),
+                    self.economy_config.trace_discount,
+                    &targets,
+                    true,
+                )
+                .expect("valid sleep comparator ancestry");
+
+                let mut pri_vals = Vec::with_capacity(comp_count);
+                let mut alt_vals = Vec::with_capacity(comp_count);
+                let mut eqz_vals = Vec::with_capacity(comp_count);
+                for comp in self.editable.economy().comparators() {
+                    let sub_in =
+                        &self.editable.compiled().node_input_wires()[comp.sub_node.index()];
+                    let p_v = width.normalize(wires[sub_in[0]]);
+                    let a_v = width.normalize(wires[sub_in[1]]);
+                    max_circular_discrepancy =
+                        max_circular_discrepancy.max(width.circular_distance(p_v, a_v));
+                    pri_vals.push(p_v);
+                    alt_vals.push(a_v);
+                    eqz_vals.push(width.normalize(node_outs[comp.eqz_node.index()]));
+                }
+                let comp_obs = self
+                    .editable
+                    .economy_mut()
+                    .observe_comparators(&pri_vals, &alt_vals, &eqz_vals, None)
+                    .expect("valid sleep comparator observation");
+                let econ_tick = self
+                    .editable
+                    .economy_mut()
+                    .apply_causal_tick_with_comparators(
+                        &zeros_port_rewards,
+                        &comp_obs.rewards,
+                        comp_obs.agreements,
+                        comp_obs.disagreements,
+                        &ancestry,
+                        &maintenance_costs,
+                    )
+                    .expect("valid sleep causal tick");
+                self.cumulative_net_flux += econ_tick.net_flux;
+                self.cumulative_debt_paid += econ_tick.maintenance;
+
+                // 3-route majority pruning: when a port has 2 mature comparators (3 routes) and 2
+                // routes consistently agree while 1 minority route disagrees, prune only the minority.
+                for (p, counts) in per_port_consensus.iter_mut().enumerate() {
+                    let p_u16 = p as u16;
+                    let comps_on_p: Vec<usize> = self
+                        .editable
+                        .economy()
+                        .comparators()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| (c.target_port == p_u16).then_some(i))
+                        .collect();
+                    if comps_on_p.len() != 2 {
+                        *counts = (0, 0, 0);
+                        continue;
+                    }
+                    let idx_a = comps_on_p[0];
+                    let idx_b = comps_on_p[1];
+                    let comps = self.editable.economy().comparators();
+                    if !comparator_cone_is_mature(
+                        self.editable.circuit(),
+                        self.editable.economy(),
+                        &comps[idx_a],
+                    ) || !comparator_cone_is_mature(
+                        self.editable.circuit(),
+                        self.editable.economy(),
+                        &comps[idx_b],
+                    ) {
+                        continue;
+                    }
+                    let pri = pri_vals[idx_a];
+                    let alt_a = alt_vals[idx_a];
+                    let alt_b = alt_vals[idx_b];
+                    if pri != alt_a {
+                        counts.0 += 1;
+                    }
+                    if pri != alt_b {
+                        counts.1 += 1;
+                    }
+                    if alt_a != alt_b {
+                        counts.2 += 1;
+                    }
+                    let (d_pa, d_pb, d_ab) = *counts;
+                    let action = if d_pa == 0 && d_pb >= consensus_thr && d_ab >= consensus_thr {
+                        Some((idx_b, false))
+                    } else if d_pb == 0 && d_pa >= consensus_thr && d_ab >= consensus_thr {
+                        Some((idx_a, false))
+                    } else if d_ab == 0 && d_pa >= consensus_thr && d_pb >= consensus_thr {
+                        Some((idx_a, true))
+                    } else {
+                        None
+                    };
+                    if let Some((prune_idx, prune_primary)) = action
+                        && self.excise_port_comparator(prune_idx, prune_primary)
+                    {
+                        self.disagreement_prune_events += 1;
+                        minority_routes_pruned += 1;
+                        *counts = (0, 0, 0);
+                        break;
+                    }
+                }
+            }
+
+            self.tick += 1;
+        }
+
+        self.editable.economy_mut().set_phase(ExecutionPhase::Wake);
+        let comparator_agreement_ticks =
+            self.editable.economy().comparator_agreement_ticks() - start_agree;
+        let comparator_disagreement_ticks =
+            self.editable.economy().comparator_disagreement_ticks() - start_disagree;
+        let sleep_comparator_flux =
+            self.editable.economy().cumulative_comparator_flux() - start_flux;
+
+        OfflineLoopbackReport {
+            ticks: loopback_ticks,
+            comparator_agreement_ticks,
+            comparator_disagreement_ticks,
+            sleep_comparator_flux,
+            max_circular_discrepancy,
+            minority_routes_pruned,
+            contradiction_detected: comparator_disagreement_ticks > 0,
+        }
+    }
+}
+
+fn comparator_cone_is_mature(
+    circuit: &Circuit,
+    economy: &EconomyState,
+    comp: &ComparatorSite,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![comp.sub_node, comp.eqz_node];
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        let Some(econ) = economy.nodes().get(node.index()) else {
+            return false;
+        };
+        if !is_pure_boundary_split(circuit, node) && econ.juvenile_ticks > 0 {
+            return false;
+        }
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == node
+                && let crate::substrate::SignalSource::NodeOut { node: src, .. } = edge.src
+            {
+                stack.push(src);
+            }
+        }
+    }
+    true
+}
+
+fn port_comparators_mature(circuit: &Circuit, economy: &EconomyState, target_port: u16) -> bool {
+    economy
+        .comparators()
+        .iter()
+        .filter(|c| c.target_port == target_port)
+        .all(|c| comparator_cone_is_mature(circuit, economy, c))
+}
+
+fn comparator_marginal_code_bits(
+    circuit: &Circuit,
+    comp: &ComparatorSite,
+    split_code_tax: bool,
+) -> f64 {
+    let full = circuit_code_bits_with_tax(circuit, 0, split_code_tax);
+    let mut without = circuit.clone();
+    let mut removed = BTreeSet::new();
+    removed.insert(comp.sub_node);
+    removed.insert(comp.eqz_node);
+    without.remove_nodes(&removed);
+    let reduced = circuit_code_bits_with_tax(&without, 0, split_code_tax);
+    (full - reduced).max(0.0)
 }
 
 impl PredictorBaseline for ArkheLearner {
@@ -554,33 +1576,55 @@ impl PredictorBaseline for ArkheLearner {
             .step(&self.prev_observed_frame, &mut predictions);
         let node_outputs = node_output_values(self.editable.circuit(), self.editable.state());
         let _ = self.editable.economy_mut().record_activity(&node_outputs);
-        let snapshot = counterfactual_sensitivity(
-            self.editable.circuit(),
-            self.editable.compiled(),
-            self.editable.state(),
-            self.seed_bank,
-            self.tick,
-            self.sample_count,
-        )
-        .expect("valid sensitivity snapshot");
-        let ancestry = assemble_causal_ancestry(
-            self.editable.circuit(),
-            self.editable.compiled(),
-            self.editable.state(),
-            &snapshot,
-            &self.editable.economy().activity(),
-            self.editable.economy().register_eligibility(),
-            self.economy_config.trace_discount,
-        )
-        .expect("valid causal ancestry");
+        let snap = if self.editable.economy().comparators().is_empty() {
+            let snapshot = counterfactual_sensitivity(
+                self.editable.circuit(),
+                self.editable.compiled(),
+                self.editable.state(),
+                self.seed_bank,
+                self.tick,
+                self.sample_count,
+            )
+            .expect("valid sensitivity snapshot");
+            let ancestry = assemble_causal_ancestry(
+                self.editable.circuit(),
+                self.editable.compiled(),
+                self.editable.state(),
+                &snapshot,
+                &self.editable.economy().activity(),
+                self.editable.economy().register_eligibility(),
+                self.economy_config.trace_discount,
+            )
+            .expect("valid causal ancestry");
+            PendingSnapshot::Base { ancestry, snapshot }
+        } else {
+            let targets = self.editable.comparator_targets();
+            let snapshot = counterfactual_sensitivity_with_comparators(
+                self.editable.circuit(),
+                self.editable.compiled(),
+                self.editable.state(),
+                self.seed_bank,
+                self.tick,
+                self.sample_count,
+                &targets,
+            )
+            .expect("valid comparator sensitivity snapshot");
+            let ancestry = assemble_causal_ancestry_with_comparators(
+                self.editable.circuit(),
+                self.editable.compiled(),
+                self.editable.state(),
+                &snapshot,
+                &self.editable.economy().activity(),
+                self.editable.economy().register_eligibility(),
+                self.economy_config.trace_discount,
+                &targets,
+                false,
+            )
+            .expect("valid comparator causal ancestry");
+            PendingSnapshot::WithComparators { ancestry, snapshot }
+        };
 
-        self.pending_prediction = Some((
-            predictions.clone(),
-            ancestry,
-            snapshot,
-            pre_epoch,
-            pre_registers,
-        ));
+        self.pending_prediction = Some((predictions.clone(), snap, pre_epoch, pre_registers));
         predictions
     }
 
@@ -588,10 +1632,27 @@ impl PredictorBaseline for ArkheLearner {
         if self.total_budget_seen.is_none() {
             self.total_budget_seen = Some(budget.remaining().saturating_add(budget.consumed()));
         }
-        let (predictions, ancestry, snapshot, pre_epoch, pre_registers) = self
+        let (predictions, pending_snap, pre_epoch, pre_registers) = self
             .pending_prediction
             .take()
             .expect("observe called with pending prediction");
+        let (base_ancestry, comp_ancestry, output_by_node, latch_by_node, comp_eqz_by_node) =
+            match &pending_snap {
+                PendingSnapshot::Base { ancestry, snapshot } => (
+                    ancestry,
+                    None,
+                    &snapshot.output_by_node,
+                    &snapshot.latch_by_node,
+                    None,
+                ),
+                PendingSnapshot::WithComparators { ancestry, snapshot } => (
+                    &ancestry.base,
+                    Some(ancestry),
+                    &snapshot.base.output_by_node,
+                    &snapshot.base.latch_by_node,
+                    Some(&snapshot.comparator_eqz_by_node),
+                ),
+            };
 
         let input_frame = self.prev_observed_frame.clone();
         self.obs_window
@@ -599,6 +1660,9 @@ impl PredictorBaseline for ArkheLearner {
         for (slot, &val) in self.prev_observed_frame.iter_mut().zip(truth) {
             *slot = self.editable.circuit().width().normalize(val);
         }
+
+        let wires = self.editable.state().wire_values().to_vec();
+        let pre_step_node_outs = node_output_values(self.editable.circuit(), self.editable.state());
 
         let num_ports = self.editable.economy().scorers().len();
         let mut port_rewards = vec![0.0; num_ports];
@@ -609,7 +1673,7 @@ impl PredictorBaseline for ArkheLearner {
                 .edges()
                 .iter()
                 .any(|edge| edge.dst == SignalSink::BoundaryOut(p as u16));
-            let has_causal_ancestry = ancestry
+            let has_causal_ancestry = base_ancestry
                 .port_shares
                 .get(p)
                 .is_some_and(|shares| shares.iter().sum::<f64>() > 0.0);
@@ -648,27 +1712,119 @@ impl PredictorBaseline for ArkheLearner {
             }
         }
 
-        let econ_tick = self
-            .editable
-            .economy_mut()
-            .apply_causal_tick(&port_rewards, &ancestry, &maintenance_costs)
-            .expect("valid causal tick");
+        let mut comp_pri_vals = Vec::new();
+        let mut comp_alt_vals = Vec::new();
+        let mut comp_eqz_vals = Vec::new();
+        let mut comp_rewards = Vec::new();
+
+        let econ_tick = if let Some(comp_anc) = comp_ancestry {
+            let comps_count = self.editable.economy().comparators().len();
+            comp_pri_vals.reserve(comps_count);
+            comp_alt_vals.reserve(comps_count);
+            comp_eqz_vals.reserve(comps_count);
+            for comp in self.editable.economy().comparators() {
+                let sub_in = &self.editable.compiled().node_input_wires()[comp.sub_node.index()];
+                comp_pri_vals.push(wires[sub_in[0]]);
+                comp_alt_vals.push(wires[sub_in[1]]);
+                comp_eqz_vals.push(pre_step_node_outs[comp.eqz_node.index()]);
+            }
+            let comp_obs = self
+                .editable
+                .economy_mut()
+                .observe_comparators(&comp_pri_vals, &comp_alt_vals, &comp_eqz_vals, Some(truth))
+                .expect("valid comparator observation");
+            comp_rewards = comp_obs.rewards;
+            self.editable
+                .economy_mut()
+                .apply_causal_tick_with_comparators(
+                    &port_rewards,
+                    &comp_rewards,
+                    comp_obs.agreements,
+                    comp_obs.disagreements,
+                    comp_anc,
+                    &maintenance_costs,
+                )
+                .expect("valid comparator causal tick")
+        } else {
+            self.editable
+                .economy_mut()
+                .apply_causal_tick(&port_rewards, base_ancestry, &maintenance_costs)
+                .expect("valid causal tick")
+        };
         self.cumulative_net_flux += econ_tick.net_flux;
         self.cumulative_debt_paid += econ_tick.maintenance;
         self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
         self.reserve_clipped_bits += econ_tick.clipped_bits;
         self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
 
+        // Update mature comparator rolling diagnostic windows and check Wake handoff / refutation.
+        if !comp_rewards.is_empty() {
+            self.sync_comparator_windows();
+            let width = self.editable.circuit().width();
+            let comps: Vec<ComparatorSite> = self.editable.economy().comparators().to_vec();
+            for (m, comp) in comps.iter().enumerate() {
+                let mature = comparator_cone_is_mature(
+                    self.editable.circuit(),
+                    self.editable.economy(),
+                    comp,
+                );
+                let primed = comp_ancestry
+                    .and_then(|a| a.comparator_shares.get(m))
+                    .is_some_and(|s| s.iter().sum::<f64>() > 0.0);
+                if mature
+                    && primed
+                    && let Some(win) = self.comparator_windows.get_mut(m)
+                {
+                    let tp = usize::from(comp.target_port);
+                    let truth_norm = width.normalize(truth[tp]);
+                    let disagree = width.normalize(comp_eqz_vals[m]) == 0;
+                    let e_pri = width.normalize(comp_pri_vals[m]) != truth_norm;
+                    let e_alt = width.normalize(comp_alt_vals[m]) != truth_norm;
+                    win.push(disagree, port_rewards[tp], comp_rewards[m], e_pri, e_alt);
+                }
+            }
+            if self.process_wake_comparator_events() {
+                self.tick += 1;
+                return None;
+            }
+        }
+
         // Starvation pruning
         if !econ_tick.starved_nodes.is_empty() {
             let pre_prune_circuit = self.editable.circuit().clone();
-            if let Ok(old_to_new) = self.editable.prune_starved_nodes() {
+            let starved_set: BTreeSet<NodeId> = econ_tick
+                .starved_nodes
+                .iter()
+                .map(|&idx| NodeId(idx as u32))
+                .collect();
+            let juvenile_set: BTreeSet<NodeId> = self
+                .editable
+                .economy()
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, econ)| (econ.juvenile_ticks > 0).then_some(NodeId(idx as u32)))
+                .collect();
+            let prune_res = if let Some((pruned, old_to_new)) =
+                prune_starved_preserving_healthy_split_branches(
+                    self.editable.circuit(),
+                    &starved_set,
+                    &juvenile_set,
+                ) {
+                self.editable
+                    .recompile_preserving_state(pruned, &old_to_new)
+                    .map(|()| old_to_new)
+            } else {
+                self.editable.prune_starved_nodes()
+            };
+            if let Ok(old_to_new) = prune_res {
                 self.ledger.on_prune(
                     self.editable.circuit(),
                     self.economy_config.split_code_tax,
                     &old_to_new,
                 );
                 self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
+                self.apply_node_remap_to_windows(&old_to_new);
                 self.starvation_prune_events += 1;
             }
         }
@@ -682,19 +1838,30 @@ impl PredictorBaseline for ArkheLearner {
                 .width()
                 .sub(truth[p], predictions[p]);
         }
-        let node_outs = node_output_values(self.editable.circuit(), self.editable.state());
+        let node_outs = pre_step_node_outs;
         let node_count = self.editable.circuit().node_count();
         let mut sensitive = vec![false; node_count];
         for (i, sens) in sensitive.iter_mut().enumerate().take(node_count) {
-            *sens = snapshot.output_by_node[i].iter().any(|&s| s > 0.0)
-                || snapshot.latch_by_node[i].iter().any(|&s| s > 0.0);
+            *sens = output_by_node[i].iter().any(|&s| s > 0.0)
+                || latch_by_node[i].iter().any(|&s| s > 0.0)
+                || comp_eqz_by_node.is_some_and(|by_node| {
+                    by_node
+                        .get(i)
+                        .is_some_and(|scores| scores.iter().any(|&s| s > 0.0))
+                });
         }
 
         for p in 0..num_ports {
             let port_u16 = p as u16;
-            if port_is_cone_mature(self.editable.circuit(), self.editable.economy(), port_u16)
-                && port_is_primed(self.editable.circuit(), &ancestry, port_u16)
-            {
+            let diag_mature =
+                port_is_cone_mature(self.editable.circuit(), self.editable.economy(), port_u16)
+                    || (self.growth_config.redundancy_sprouting
+                        && port_primary_cone_is_mature(
+                            self.editable.circuit(),
+                            self.editable.economy(),
+                            port_u16,
+                        ));
+            if diag_mature && port_is_primed(self.editable.circuit(), base_ancestry, port_u16) {
                 self.port_states[p].diagnostic_buffer.push_frame(
                     &input_frame,
                     truth,
@@ -715,253 +1882,369 @@ impl PredictorBaseline for ArkheLearner {
 
             let is_cone_mature =
                 port_is_cone_mature(self.editable.circuit(), self.editable.economy(), port_u16);
-            let is_primed = port_is_primed(self.editable.circuit(), &ancestry, port_u16);
+            let is_primary_mature = port_primary_cone_is_mature(
+                self.editable.circuit(),
+                self.editable.economy(),
+                port_u16,
+            );
+            let diag_zero_res = self.port_states[p]
+                .diagnostic_buffer
+                .residuals
+                .iter()
+                .all(|frame| frame[p] == 0);
+            let ready_for_stage12 = is_cone_mature;
+            let ready_for_stage3_only =
+                self.growth_config.redundancy_sprouting && is_primary_mature && diag_zero_res;
+            let is_primed = port_is_primed(self.editable.circuit(), base_ancestry, port_u16);
             let buf_ready =
                 self.port_states[p].diagnostic_buffer.len() >= self.growth_config.diagnostic_window;
             let timer_ready =
                 self.port_states[p].ticks_since_last_check >= self.growth_config.sprout_interval;
 
-            if !(is_cone_mature && is_primed && buf_ready && timer_ready) {
+            if !((ready_for_stage12 || ready_for_stage3_only)
+                && is_primed
+                && buf_ready
+                && timer_ready)
+            {
                 continue;
             }
 
+            let prev_ticks_since_check = self.port_states[p].ticks_since_last_check;
             self.port_states[p].ticks_since_last_check = 0;
 
-            // 1. Idle mature node pruning (D1b.1)
-            let idle_nodes = self.port_states[p]
-                .diagnostic_buffer
-                .idle_mature_nodes(self.editable.economy());
-            if !idle_nodes.is_empty() {
-                let pre_prune_circuit = self.editable.circuit().clone();
-                if let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes(
-                    &idle_nodes,
-                    &self.port_states[p].diagnostic_buffer.inputs,
-                    &self.port_states[p].diagnostic_buffer.predictions,
-                    self.economy_config.split_code_tax,
-                ) {
-                    let any_pruned = old_to_new.iter().any(Option::is_none);
-                    if any_pruned {
-                        self.ledger.on_prune(
-                            self.editable.circuit(),
-                            self.economy_config.split_code_tax,
-                            &old_to_new,
-                        );
-                        self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
-                        self.idle_prune_events += 1;
-                        self.tick += 1;
-                        return None;
-                    }
-                }
-            }
-
-            // Check if Snapshot 2 needs to be recorded after this port's Sprout 2 has settled
-            if self.port_states[p].port_sprout_events == 2
-                && self.port_states[p].epoch_snapshots.len() == 2
-            {
-                self.record_epoch_snapshot(p, 2, false);
-            }
-
-            let port_zero_error = self.is_port_zero_error(p);
-            let mut port_budget = if num_ports == 1 {
-                *budget
-            } else {
-                TickBudget::new(self.port_budget_allowance(p, budget))
-            };
-
-            // 2a. Stage 0 candidate motif sprouting (up to GrowthConfig::max_reactive_lag)
-            enum DeferredProposal {
-                Sprout(ScoredSproutProposal),
-                Ring(AutonomousRingProposal, f64),
-            }
-            impl DeferredProposal {
-                fn j_score(&self) -> f64 {
-                    match self {
-                        Self::Sprout(prop) => prop.j_cand,
-                        Self::Ring(_, j) => *j,
-                    }
-                }
-            }
-
             let mut sprouted = false;
-            let mut stage0_tel = SproutTelemetry::default();
-            let can_potentially_deepen = num_ports > 1
-                && !port_zero_error
-                && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
-                && port_budget.remaining() > 0;
-            let mut deferred_lag_bound_tau: Option<u8> = None;
-            let (stage0_res, stage0_pending_bound) = match propose_sprout_band_scored_internal(
-                &self.editable,
-                &self.obs_window,
-                &self.port_states[p].diagnostic_buffer,
-                &self.growth_config,
-                &self.economy_config,
-                &mut port_budget,
-                port_u16,
-                1,
-                self.growth_config.max_reactive_lag,
-                &mut stage0_tel,
-                !can_potentially_deepen,
-            ) {
-                Ok((prop, pending)) => (Ok(prop), pending),
-                Err(e) => (Err(e), false),
-            };
-            if stage0_pending_bound {
-                deferred_lag_bound_tau = Some(self.growth_config.max_reactive_lag);
-            }
-            let can_deepen_eligible = num_ports > 1
-                && !port_zero_error
-                && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
-                && stage0_tel.sprout_blocked_max_nodes == 0
-                && stage0_tel.sprout_budget_exhausted == 0
-                && port_budget.remaining() > 0;
-
-            let mut deferred_best: Option<DeferredProposal> = match stage0_res {
-                Ok(Some(prop)) if prop.e_cand == 0 || !can_deepen_eligible => {
-                    sprouted = self.commit_sprout(p, prop.circuit);
-                    None
-                }
-                Ok(Some(prop)) => Some(DeferredProposal::Sprout(prop)),
-                _ => None,
-            };
-
-            // 2b. Autonomous delay ring proposal under noise (checked BEFORE lag deepening per C2-a)
-            let mut ring_tel = SproutTelemetry::default();
-            if !sprouted
-                && let Some((ring_prop, e_ring_diag, j_ring_diag)) =
-                    propose_autonomous_delay_ring_scored_with_telemetry(
-                        &self.editable,
-                        &self.obs_window,
-                        &self.growth_config,
-                        &self.economy_config,
-                        &mut port_budget,
-                        port_u16,
-                        &mut ring_tel,
-                    )
-            {
-                if deferred_best.is_none() || e_ring_diag == 0 {
-                    sprouted = self.commit_ring_proposal(ring_prop);
-                } else if deferred_best
-                    .as_ref()
-                    .is_none_or(|prev| j_ring_diag < prev.j_score())
-                {
-                    deferred_best = Some(DeferredProposal::Ring(ring_prop, j_ring_diag));
-                }
-            }
-
-            // 2c. Progressive lag-deepening incremental bands (3..=6], (6..=12] per C2-a
-            let mut last_band_tel: Option<SproutTelemetry> = None;
-            let mut band_blocked = 0u64;
-            let mut band_exhausted = 0u64;
-            if !sprouted && can_deepen_eligible {
-                let mut bands = Vec::new();
-                let mut prev_max = self.growth_config.max_reactive_lag;
-                for &cap in &[6u8, 12u8] {
-                    let band_max = cap.min(self.growth_config.deepening_max_lag);
-                    if band_max > prev_max {
-                        bands.push((prev_max + 1, band_max));
-                        prev_max = band_max;
-                    }
-                }
-                if self.growth_config.deepening_max_lag > prev_max {
-                    bands.push((prev_max + 1, self.growth_config.deepening_max_lag));
-                }
-
-                let num_bands = bands.len();
-                for (band_idx, &(min_tau, max_tau)) in bands.iter().enumerate() {
-                    if port_budget.remaining() == 0 {
-                        break;
-                    }
-                    self.lag_deepening_steps += 1;
-                    deferred_lag_bound_tau = None;
-                    let mut band_tel = SproutTelemetry::default();
-                    let is_last_band = band_idx + 1 == num_bands;
-                    let (band_res, band_pending_bound) = match propose_sprout_band_scored_internal(
-                        &self.editable,
-                        &self.obs_window,
-                        &self.port_states[p].diagnostic_buffer,
-                        &self.growth_config,
-                        &self.economy_config,
-                        &mut port_budget,
-                        port_u16,
-                        min_tau,
-                        max_tau,
-                        &mut band_tel,
-                        is_last_band,
+            if ready_for_stage12 {
+                // 1. Idle mature node pruning (D1b.1)
+                let idle_nodes = self.port_states[p]
+                    .diagnostic_buffer
+                    .idle_mature_nodes(self.editable.economy());
+                if !idle_nodes.is_empty() {
+                    let pre_prune_circuit = self.editable.circuit().clone();
+                    if let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes(
+                        &idle_nodes,
+                        &self.port_states[p].diagnostic_buffer.inputs,
+                        &self.port_states[p].diagnostic_buffer.predictions,
+                        self.economy_config.split_code_tax,
                     ) {
-                        Ok((prop, pending)) => (Ok(prop), pending),
-                        Err(e) => (Err(e), false),
-                    };
-                    if band_pending_bound {
-                        deferred_lag_bound_tau = Some(max_tau);
+                        let any_pruned = old_to_new.iter().any(Option::is_none);
+                        if any_pruned {
+                            self.ledger.on_prune(
+                                self.editable.circuit(),
+                                self.economy_config.split_code_tax,
+                                &old_to_new,
+                            );
+                            self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
+                            self.apply_node_remap_to_windows(&old_to_new);
+                            self.idle_prune_events += 1;
+                            self.tick += 1;
+                            return None;
+                        }
                     }
-                    band_blocked += band_tel.sprout_blocked_max_nodes;
-                    band_exhausted += band_tel.sprout_budget_exhausted;
-                    let band_stopped = band_tel.sprout_blocked_max_nodes > 0
-                        || band_tel.sprout_budget_exhausted > 0;
-                    last_band_tel = Some(band_tel);
+                }
 
-                    if let Ok(Some(band_prop)) = band_res {
-                        if band_prop.e_cand == 0 {
-                            sprouted = self.commit_sprout(p, band_prop.circuit);
+                // Check if Snapshot 2 needs to be recorded after this port's Sprout 2 has settled
+                if self.port_states[p].port_sprout_events == 2
+                    && self.port_states[p].epoch_snapshots.len() == 2
+                {
+                    self.record_epoch_snapshot(p, 2, false);
+                }
+
+                let port_zero_error = self.is_port_zero_error(p);
+                let mut port_budget = if num_ports == 1 {
+                    *budget
+                } else {
+                    TickBudget::new(self.port_budget_allowance(p, budget))
+                };
+
+                // 2a. Stage 0 candidate motif sprouting (up to GrowthConfig::max_reactive_lag)
+                enum DeferredProposal {
+                    Sprout(ScoredSproutProposal),
+                    Ring(AutonomousRingProposal, f64),
+                    ComparatorHandoff(usize, f64),
+                }
+                impl DeferredProposal {
+                    fn j_score(&self) -> f64 {
+                        match self {
+                            Self::Sprout(prop) => prop.j_cand,
+                            Self::Ring(_, j) | Self::ComparatorHandoff(_, j) => *j,
+                        }
+                    }
+                }
+
+                let mut stage0_tel = SproutTelemetry::default();
+                let can_potentially_deepen = num_ports > 1
+                    && !port_zero_error
+                    && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
+                    && port_budget.remaining() > 0;
+                let mut deferred_lag_bound_tau: Option<u8> = None;
+                let (stage0_res, stage0_pending_bound) = match propose_sprout_band_scored_internal(
+                    &self.editable,
+                    &self.obs_window,
+                    &self.port_states[p].diagnostic_buffer,
+                    &self.growth_config,
+                    &self.economy_config,
+                    &mut port_budget,
+                    port_u16,
+                    1,
+                    self.growth_config.max_reactive_lag,
+                    &mut stage0_tel,
+                    !can_potentially_deepen,
+                ) {
+                    Ok((prop, pending)) => (Ok(prop), pending),
+                    Err(e) => (Err(e), false),
+                };
+                if stage0_pending_bound {
+                    deferred_lag_bound_tau = Some(self.growth_config.max_reactive_lag);
+                }
+                let can_deepen_eligible = num_ports > 1
+                    && !port_zero_error
+                    && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
+                    && stage0_tel.sprout_blocked_max_nodes == 0
+                    && stage0_tel.sprout_budget_exhausted == 0
+                    && port_budget.remaining() > 0;
+
+                let mut deferred_best: Option<DeferredProposal> = match stage0_res {
+                    Ok(Some(prop)) if prop.e_cand == 0 || !can_deepen_eligible => {
+                        sprouted = self.commit_sprout(p, prop.circuit);
+                        None
+                    }
+                    Ok(Some(prop)) => Some(DeferredProposal::Sprout(prop)),
+                    _ => None,
+                };
+
+                // 2b. Autonomous delay ring proposal under noise (checked BEFORE lag deepening per C2-a)
+                let mut ring_tel = SproutTelemetry::default();
+                if !sprouted {
+                    if let Some((comp_idx, e_comp_diag, j_comp_diag)) =
+                        evaluate_comparator_ring_promotion(
+                            &self.editable,
+                            &self.obs_window,
+                            &self.growth_config,
+                            &self.economy_config,
+                            &mut port_budget,
+                            port_u16,
+                            &mut ring_tel,
+                        )
+                    {
+                        if deferred_best.is_none() || e_comp_diag == 0 {
+                            sprouted = self.perform_comparator_handoff(comp_idx);
+                        } else if deferred_best
+                            .as_ref()
+                            .is_none_or(|prev| j_comp_diag < prev.j_score())
+                        {
+                            deferred_best =
+                                Some(DeferredProposal::ComparatorHandoff(comp_idx, j_comp_diag));
+                        }
+                    } else if let Some((ring_prop, e_ring_diag, j_ring_diag)) =
+                        propose_autonomous_delay_ring_scored_with_telemetry(
+                            &self.editable,
+                            &self.obs_window,
+                            &self.growth_config,
+                            &self.economy_config,
+                            &mut port_budget,
+                            port_u16,
+                            &mut ring_tel,
+                        )
+                    {
+                        if deferred_best.is_none() || e_ring_diag == 0 {
+                            sprouted = self.commit_ring_proposal(ring_prop);
+                        } else if deferred_best
+                            .as_ref()
+                            .is_none_or(|prev| j_ring_diag < prev.j_score())
+                        {
+                            deferred_best = Some(DeferredProposal::Ring(ring_prop, j_ring_diag));
+                        }
+                    }
+                }
+
+                // 2c. Progressive lag-deepening incremental bands (3..=6], (6..=12] per C2-a
+                let mut last_band_tel: Option<SproutTelemetry> = None;
+                let mut band_blocked = 0u64;
+                let mut band_exhausted = 0u64;
+                if !sprouted && can_deepen_eligible {
+                    let mut bands = Vec::new();
+                    let mut prev_max = self.growth_config.max_reactive_lag;
+                    for &cap in &[6u8, 12u8] {
+                        let band_max = cap.min(self.growth_config.deepening_max_lag);
+                        if band_max > prev_max {
+                            bands.push((prev_max + 1, band_max));
+                            prev_max = band_max;
+                        }
+                    }
+                    if self.growth_config.deepening_max_lag > prev_max {
+                        bands.push((prev_max + 1, self.growth_config.deepening_max_lag));
+                    }
+
+                    let num_bands = bands.len();
+                    for (band_idx, &(min_tau, max_tau)) in bands.iter().enumerate() {
+                        if port_budget.remaining() == 0 {
                             break;
                         }
-                        if deferred_best
-                            .as_ref()
-                            .is_none_or(|prev| band_prop.j_cand < prev.j_score())
-                        {
-                            deferred_best = Some(DeferredProposal::Sprout(band_prop));
+                        self.lag_deepening_steps += 1;
+                        deferred_lag_bound_tau = None;
+                        let mut band_tel = SproutTelemetry::default();
+                        let is_last_band = band_idx + 1 == num_bands;
+                        let (band_res, band_pending_bound) =
+                            match propose_sprout_band_scored_internal(
+                                &self.editable,
+                                &self.obs_window,
+                                &self.port_states[p].diagnostic_buffer,
+                                &self.growth_config,
+                                &self.economy_config,
+                                &mut port_budget,
+                                port_u16,
+                                min_tau,
+                                max_tau,
+                                &mut band_tel,
+                                is_last_band,
+                            ) {
+                                Ok((prop, pending)) => (Ok(prop), pending),
+                                Err(e) => (Err(e), false),
+                            };
+                        if band_pending_bound {
+                            deferred_lag_bound_tau = Some(max_tau);
+                        }
+                        band_blocked += band_tel.sprout_blocked_max_nodes;
+                        band_exhausted += band_tel.sprout_budget_exhausted;
+                        let band_stopped = band_tel.sprout_blocked_max_nodes > 0
+                            || band_tel.sprout_budget_exhausted > 0;
+                        last_band_tel = Some(band_tel);
+
+                        if let Ok(Some(band_prop)) = band_res {
+                            if band_prop.e_cand == 0 {
+                                sprouted = self.commit_sprout(p, band_prop.circuit);
+                                break;
+                            }
+                            if deferred_best
+                                .as_ref()
+                                .is_none_or(|prev| band_prop.j_cand < prev.j_score())
+                            {
+                                deferred_best = Some(DeferredProposal::Sprout(band_prop));
+                            }
+                        }
+                        if band_stopped {
+                            break;
                         }
                     }
-                    if band_stopped {
-                        break;
+                }
+
+                if !sprouted && let Some(winner) = deferred_best {
+                    sprouted = match winner {
+                        DeferredProposal::Sprout(prop) => self.commit_sprout(p, prop.circuit),
+                        DeferredProposal::Ring(ring_prop, _) => {
+                            self.commit_ring_proposal(ring_prop)
+                        }
+                        DeferredProposal::ComparatorHandoff(comp_idx, _) => {
+                            self.perform_comparator_handoff(comp_idx)
+                        }
+                    };
+                }
+
+                if num_ports == 1 {
+                    *budget = port_budget;
+                } else {
+                    let spent = port_budget.consumed();
+                    let _ = budget.try_consume(spent);
+                    self.port_states[p].replay_ticks_consumed += spent;
+                }
+
+                self.sprout_blocked_max_nodes += stage0_tel.sprout_blocked_max_nodes
+                    + ring_tel.sprout_blocked_max_nodes
+                    + if sprouted { 0 } else { band_blocked };
+                self.sprout_budget_exhausted += stage0_tel.sprout_budget_exhausted
+                    + ring_tel.sprout_budget_exhausted
+                    + if sprouted { 0 } else { band_exhausted };
+                self.ring_period_bound += ring_tel.ring_period_bound;
+
+                let bound_tel = last_band_tel.as_ref().unwrap_or(&stage0_tel);
+                self.candidate_undecidable +=
+                    bound_tel.candidate_undecidable + ring_tel.candidate_undecidable;
+                self.candidate_list_truncated +=
+                    bound_tel.candidate_list_truncated + ring_tel.candidate_list_truncated;
+                if !sprouted {
+                    let mut bound = bound_tel.lag_horizon_bound + ring_tel.lag_horizon_bound;
+                    if let Some(tau_max) = deferred_lag_bound_tau
+                        && check_deeper_lag_for_port(
+                            &self.editable,
+                            &self.obs_window,
+                            &self.port_states[p].diagnostic_buffer,
+                            &self.growth_config,
+                            &self.economy_config,
+                            port_u16,
+                            tau_max,
+                        )
+                    {
+                        bound += 1;
                     }
+                    self.lag_horizon_bound += bound;
                 }
             }
 
-            if !sprouted && let Some(winner) = deferred_best {
-                sprouted = match winner {
-                    DeferredProposal::Sprout(prop) => self.commit_sprout(p, prop.circuit),
-                    DeferredProposal::Ring(ring_prop, _) => self.commit_ring_proposal(ring_prop),
-                };
-            }
-
-            if num_ports == 1 {
-                *budget = port_budget;
-            } else {
-                let spent = port_budget.consumed();
-                let _ = budget.try_consume(spent);
-                self.port_states[p].replay_ticks_consumed += spent;
-            }
-
-            self.sprout_blocked_max_nodes += stage0_tel.sprout_blocked_max_nodes
-                + ring_tel.sprout_blocked_max_nodes
-                + if sprouted { 0 } else { band_blocked };
-            self.sprout_budget_exhausted += stage0_tel.sprout_budget_exhausted
-                + ring_tel.sprout_budget_exhausted
-                + if sprouted { 0 } else { band_exhausted };
-            self.ring_period_bound += ring_tel.ring_period_bound;
-
-            let bound_tel = last_band_tel.as_ref().unwrap_or(&stage0_tel);
-            self.candidate_undecidable +=
-                bound_tel.candidate_undecidable + ring_tel.candidate_undecidable;
-            self.candidate_list_truncated +=
-                bound_tel.candidate_list_truncated + ring_tel.candidate_list_truncated;
-            if !sprouted {
-                let mut bound = bound_tel.lag_horizon_bound + ring_tel.lag_horizon_bound;
-                if let Some(tau_max) = deferred_lag_bound_tau
-                    && check_deeper_lag_for_port(
+            // 3. Causal-disjoint redundancy sprouting (M2B-D2): runs strictly AFTER Stage 2 returns None.
+            let stage3_eligible = !sprouted
+                && self.growth_config.redundancy_sprouting
+                && self.is_port_driven(port_u16)
+                && port_comparators_mature(
+                    self.editable.circuit(),
+                    self.editable.economy(),
+                    port_u16,
+                )
+                && self.port_comparators_primed(comp_ancestry, port_u16)
+                && self.port_q_hat_exceeds_null(p, predictions[p])
+                && self.port_redundancy_arity_eligible(port_u16);
+            if stage3_eligible && self.sibling_has_juvenile_nodes(p) {
+                self.port_states[p].ticks_since_last_check = prev_ticks_since_check;
+            } else if stage3_eligible {
+                let any_sibling_unsolved =
+                    (0..num_ports).any(|q| q != p && !self.is_port_zero_error(q));
+                let mut stage3_tel = SproutTelemetry::default();
+                if num_ports == 1 {
+                    if let Ok(Some(prop)) = propose_redundancy_sprout(
                         &self.editable,
                         &self.obs_window,
                         &self.port_states[p].diagnostic_buffer,
                         &self.growth_config,
                         &self.economy_config,
+                        budget,
                         port_u16,
-                        tau_max,
-                    )
-                {
-                    bound += 1;
+                        &mut stage3_tel,
+                    ) {
+                        sprouted = self.commit_redundancy_sprout(p, prop);
+                    }
+                } else {
+                    let total_budget = self
+                        .total_budget_seen
+                        .unwrap_or_else(|| budget.remaining().saturating_add(budget.consumed()));
+                    let base_share = total_budget / (num_ports as u64);
+                    let cap = if any_sibling_unsolved {
+                        base_share
+                            .saturating_sub(self.port_states[p].replay_ticks_consumed)
+                            .min(budget.remaining())
+                    } else {
+                        self.port_budget_allowance(p, budget)
+                    };
+                    let mut stage3_budget = TickBudget::new(cap);
+                    if let Ok(Some(prop)) = propose_redundancy_sprout(
+                        &self.editable,
+                        &self.obs_window,
+                        &self.port_states[p].diagnostic_buffer,
+                        &self.growth_config,
+                        &self.economy_config,
+                        &mut stage3_budget,
+                        port_u16,
+                        &mut stage3_tel,
+                    ) {
+                        sprouted = self.commit_redundancy_sprout(p, prop);
+                    }
+                    let spent = stage3_budget.consumed();
+                    let _ = budget.try_consume(spent);
+                    self.port_states[p].replay_ticks_consumed += spent;
                 }
-                self.lag_horizon_bound += bound;
+                if !sprouted {
+                    self.sprout_blocked_max_nodes += stage3_tel.sprout_blocked_max_nodes;
+                    self.sprout_budget_exhausted += stage3_tel.sprout_budget_exhausted;
+                }
+                self.candidate_list_truncated += stage3_tel.candidate_list_truncated;
             }
 
             if sprouted {
@@ -1599,5 +2882,1339 @@ mod tests {
         );
         assert!(tel.lag_deepening_steps >= 1);
         assert_eq!(tel.starvation_prune_events, 0);
+    }
+
+    #[test]
+    fn redundancy_sprouting_disabled_is_bit_identical_to_all_golden_fixtures() {
+        use crate::env::{GeneratorConfig, NoiseModel, NoisyEnvironment};
+
+        struct Fnv1a {
+            hash: u128,
+        }
+        impl Fnv1a {
+            fn new() -> Self {
+                Self {
+                    hash: 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d,
+                }
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+                for &b in bytes {
+                    self.hash ^= u128::from(b);
+                    self.hash = self.hash.wrapping_mul(PRIME);
+                }
+            }
+            fn finish_hex(&self) -> String {
+                format!("{:032x}", self.hash)
+            }
+        }
+
+        #[derive(Deserialize)]
+        struct GoldenStub {
+            trajectory_digest_fnv1a: String,
+        }
+
+        // Combinational fixtures are re-blessed under M2B-D3 + Rule 4 for Stage 3 comparators
+        // (`redundancy_sprouting: true`), so pin their exact pre-M2b (8ca68a2) digests here while
+        // keeping TicksPerHop fixtures checked directly against `tests/fixtures/golden/`.
+        let cases = [
+            (
+                "alt_k1_comb_s20",
+                GeneratorConfig::T1_Alternating { a: 0, b: 1 },
+                Width::BITS_1,
+                WireDelayMode::Combinational,
+                20u64,
+                400u64,
+                Some("fb7491d27d1417a707a3bcdea8b1a402"),
+            ),
+            (
+                "alt_k1_tph_s20",
+                GeneratorConfig::T1_Alternating { a: 0, b: 1 },
+                Width::BITS_1,
+                WireDelayMode::TicksPerHop,
+                20u64,
+                400u64,
+                None,
+            ),
+            (
+                "alt_k2_comb_s21",
+                GeneratorConfig::T1_Alternating { a: 0, b: 3 },
+                Width::BITS_2,
+                WireDelayMode::Combinational,
+                21u64,
+                400u64,
+                Some("6040a5b86c2b7aeb8b2e8cf18cb7bc0b"),
+            ),
+            (
+                "alt_k2_tph_s21",
+                GeneratorConfig::T1_Alternating { a: 0, b: 3 },
+                Width::BITS_2,
+                WireDelayMode::TicksPerHop,
+                21u64,
+                400u64,
+                None,
+            ),
+            (
+                "motif011_k1_comb_s22",
+                GeneratorConfig::T1_PeriodicMotif {
+                    motif: vec![0, 1, 1],
+                },
+                Width::BITS_1,
+                WireDelayMode::Combinational,
+                22u64,
+                500u64,
+                Some("bf33dc95e006382067d40ee87ce2dded"),
+            ),
+            (
+                "motif013_k2_comb_s22",
+                GeneratorConfig::T1_PeriodicMotif {
+                    motif: vec![0, 1, 3],
+                },
+                Width::BITS_2,
+                WireDelayMode::Combinational,
+                22u64,
+                500u64,
+                Some("d2268bc3dd78fc545a533ac2522e9850"),
+            ),
+            (
+                "affine_k2_comb_s23",
+                GeneratorConfig::T1_AffineLag1 {
+                    mul_a: 1,
+                    add_b: 1,
+                    init: 0,
+                },
+                Width::BITS_2,
+                WireDelayMode::Combinational,
+                23u64,
+                500u64,
+                Some("0bc8774428ff3a39aa4cf1a384953df1"),
+            ),
+            (
+                "affine_k2_tph_s23",
+                GeneratorConfig::T1_AffineLag1 {
+                    mul_a: 1,
+                    add_b: 1,
+                    init: 0,
+                },
+                Width::BITS_2,
+                WireDelayMode::TicksPerHop,
+                23u64,
+                500u64,
+                None,
+            ),
+        ];
+
+        for (name, gen_cfg, width, wire_delay, seed, horizon, pinned_phase1_digest) in cases {
+            let expected_digest = if let Some(pinned) = pinned_phase1_digest {
+                pinned.to_owned()
+            } else {
+                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests")
+                    .join("fixtures")
+                    .join("golden")
+                    .join(format!("{name}.json"));
+                let golden: GoldenStub =
+                    serde_json::from_str(&std::fs::read_to_string(&path).expect("read fixture"))
+                        .expect("parse fixture");
+                golden.trajectory_digest_fnv1a
+            };
+
+            let seed_bank = SeedBank::new(seed);
+            let generator = gen_cfg.build(width).expect("build generator");
+            let mut env =
+                NoisyEnvironment::new(generator, NoiseModel::None, seed_bank).expect("build env");
+            let mut learner = ArkheLearner::new_with_config(
+                width,
+                1,
+                wire_delay,
+                EconomyConfig::default(),
+                GrowthConfig {
+                    redundancy_sprouting: false,
+                    ..GrowthConfig::default()
+                },
+                seed_bank,
+            )
+            .expect("learner");
+            let mut budget = TickBudget::new(100_000);
+            let mut clean = [0u64; 1];
+            let mut obs = [0u64; 1];
+            let mut hasher = Fnv1a::new();
+            for t in 0..horizon {
+                env.step_frame(&mut clean, &mut obs);
+                let pred = learner.predict(&mut budget);
+                learner.observe(&obs, &mut budget);
+                hasher.write(&t.to_le_bytes());
+                for p in &pred {
+                    hasher.write(&p.to_le_bytes());
+                }
+                hasher.write(&learner.editable().structure_epoch().to_le_bytes());
+                for n in learner.editable().economy().nodes() {
+                    hasher.write(&n.energy.to_bits().to_le_bytes());
+                }
+            }
+            assert_eq!(learner.redundancy_sprout_events(), 0);
+            assert_eq!(learner.active_comparator_count(), 0);
+            assert_eq!(
+                hasher.finish_hex(),
+                expected_digest,
+                "redundancy_sprouting=false must be bit-identical on {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_k1_comb_s20_stage3_comparator_audit() {
+        use crate::env::{GeneratorConfig, NoiseModel, NoisyEnvironment};
+        use crate::structural::graph_edit::derivation_cone_info;
+
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
+        struct AuditEvent {
+            tick: u64,
+            kind: String,
+            node_count: usize,
+            details: String,
+        }
+        #[derive(Deserialize)]
+        struct GoldenEventsStub {
+            events: Vec<AuditEvent>,
+        }
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("golden")
+            .join("alt_k1_comb_s20.json");
+        let golden: GoldenEventsStub =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read fixture"))
+                .expect("parse fixture");
+
+        let seed_bank = SeedBank::new(20);
+        let generator = GeneratorConfig::T1_Alternating { a: 0, b: 1 }
+            .build(Width::BITS_1)
+            .expect("build generator");
+        let mut env =
+            NoisyEnvironment::new(generator, NoiseModel::None, seed_bank).expect("build env");
+        let mut learner = ArkheLearner::new_with_config(
+            Width::BITS_1,
+            1,
+            WireDelayMode::Combinational,
+            EconomyConfig::default(),
+            GrowthConfig::default(),
+            seed_bank,
+        )
+        .expect("learner");
+
+        let mut budget = TickBudget::new(100_000);
+        let mut clean = [0u64; 1];
+        let mut obs = [0u64; 1];
+        let mut events = Vec::new();
+        let mut prev_sprouts = 0;
+        let mut prev_prunes = 0;
+        let mut prev_rings = 0;
+
+        for t in 0..400u64 {
+            env.step_frame(&mut clean, &mut obs);
+            let _ = learner.predict(&mut budget);
+            learner.observe(&obs, &mut budget);
+
+            if learner.sprout_events() > prev_sprouts {
+                prev_sprouts = learner.sprout_events();
+                events.push(AuditEvent {
+                    tick: t,
+                    kind: "Sprout".to_owned(),
+                    node_count: learner.editable().circuit().node_count(),
+                    details: format!("sprout_events={}", learner.sprout_events()),
+                });
+            }
+            if learner.starvation_prune_events() > prev_prunes {
+                prev_prunes = learner.starvation_prune_events();
+                events.push(AuditEvent {
+                    tick: t,
+                    kind: "StarvationPrune".to_owned(),
+                    node_count: learner.editable().circuit().node_count(),
+                    details: format!("prune_events={}", learner.starvation_prune_events()),
+                });
+            }
+            if learner.ring_closure_events() > prev_rings {
+                prev_rings = learner.ring_closure_events();
+                events.push(AuditEvent {
+                    tick: t,
+                    kind: "RingClosure".to_owned(),
+                    node_count: learner.editable().circuit().node_count(),
+                    details: format!("ring_events={}", learner.ring_closure_events()),
+                });
+            }
+        }
+
+        assert_eq!(events, golden.events);
+        assert!(learner.redundancy_sprout_events() >= 1);
+        assert_eq!(learner.starvation_prune_events(), 0);
+        assert_eq!(learner.active_comparator_count(), 1);
+        assert_eq!(learner.comparator_disagreement_ticks(), 0);
+
+        let circ = learner.editable().circuit();
+        let comp = &learner.editable().economy().comparators()[0];
+        let pri_cone = derivation_cone_info(circ, &[SignalSink::BoundaryOut(0)]);
+        let alt_cone = derivation_cone_info(
+            circ,
+            &[SignalSink::NodeIn {
+                node: comp.sub_node,
+                port: 1,
+            }],
+        );
+        assert!(pri_cone.excl_nodes.is_disjoint(&alt_cone.excl_nodes));
+        assert!(
+            pri_cone
+                .excl_reactive_leaves
+                .is_disjoint(&alt_cone.excl_reactive_leaves)
+        );
+
+        let nodes: Vec<String> = circ.nodes().iter().map(|n| format!("{n:?}")).collect();
+        let edges: Vec<String> = circ
+            .edges()
+            .iter()
+            .map(|e| format!("{:?} -> {:?} (hops={})", e.src, e.dst, e.hops))
+            .collect();
+        eprintln!(
+            "alt_k1_comb_s20_audit: nodes={nodes:?} edges={edges:?} \
+             redundancy_sprout_events={} starvation_prune_events={} active_comparator_count={} \
+             primary_mask={} alt_mask={} agree={} disagree={}",
+            learner.redundancy_sprout_events(),
+            learner.starvation_prune_events(),
+            learner.active_comparator_count(),
+            comp.primary_channel_mask,
+            comp.alt_channel_mask,
+            learner.comparator_agreement_ticks(),
+            learner.comparator_disagreement_ticks(),
+        );
+    }
+
+    #[test]
+    fn stage3_forms_causal_disjoint_comparators_on_multiview_and_t1_preserving_epochs() {
+        use crate::env::{
+            GeneratorConfig, LfsrStage, MultiViewDriver, MultiViewTarget, MultiViewTransform,
+            NoiseModel, NoisyEnvironment,
+        };
+        use crate::structural::graph_edit::derivation_cone_info;
+
+        for width in [Width::BITS_1, Width::BITS_2] {
+            let wire_delay = WireDelayMode::Combinational;
+            let mv_cfg = GeneratorConfig::T2_MultiViewCoupled {
+                driver: MultiViewDriver::Lfsr {
+                    stage: LfsrStage {
+                        taps: vec![1, 1, 0, 1],
+                        init: vec![1, 0, 1, 1],
+                    },
+                },
+                view_0: MultiViewTransform {
+                    delay: 1,
+                    mul_a: 1,
+                    add_b: 0,
+                },
+                view_1: MultiViewTransform {
+                    delay: 0,
+                    mul_a: 1,
+                    add_b: 1,
+                },
+                target: MultiViewTarget::Affine {
+                    lag: 2,
+                    mul_a: 1,
+                    add_b: 0,
+                },
+            };
+            let sb = SeedBank::new(5);
+            let mut env =
+                NoisyEnvironment::new(mv_cfg.build(width).unwrap(), NoiseModel::None, sb).unwrap();
+            let mut learner =
+                ArkheLearner::new(width, 3, wire_delay, GrowthConfig::default(), sb).unwrap();
+            let mut budget = TickBudget::new(200_000);
+            let mut clean = [0u64; 3];
+            let mut obs = [0u64; 3];
+            let mut post_mismatches = 0usize;
+            for t in 0..1200 {
+                env.step_frame(&mut clean, &mut obs);
+                let pred = learner.predict(&mut budget);
+                if t >= 700 && pred[2] != obs[2] {
+                    post_mismatches += 1;
+                }
+                learner.observe(&obs, &mut budget);
+            }
+            assert_eq!(
+                post_mismatches, 0,
+                "T2_MultiViewCoupled ({width:?}, {wire_delay:?}) must maintain 0 clean mismatches"
+            );
+            assert!(
+                learner.redundancy_sprout_events() >= 1,
+                "T2_MultiViewCoupled ({width:?}, {wire_delay:?}) must sprout Stage 3 redundancy"
+            );
+            assert_eq!(learner.starvation_prune_events(), 0);
+            assert_eq!(learner.telemetry().sprout_blocked_max_nodes, 0);
+
+            // Audit causal-support disjointness on comparator protecting port 2.
+            let comp = learner
+                .editable()
+                .economy()
+                .comparators()
+                .iter()
+                .find(|c| c.target_port == 2)
+                .expect("comparator on port 2");
+            assert_eq!(
+                comp.primary_channel_mask & comp.alt_channel_mask,
+                0,
+                "T2_MultiViewCoupled comparator must pick channel-disjoint Tier 1 route"
+            );
+            let circ = learner.editable().circuit();
+            let pri_cone = derivation_cone_info(circ, &[SignalSink::BoundaryOut(2)]);
+            let alt_cone = derivation_cone_info(
+                circ,
+                &[SignalSink::NodeIn {
+                    node: comp.sub_node,
+                    port: 1,
+                }],
+            );
+            assert!(pri_cone.excl_nodes.is_disjoint(&alt_cone.excl_nodes));
+            assert!(
+                pri_cone
+                    .excl_reactive_leaves
+                    .is_disjoint(&alt_cone.excl_reactive_leaves)
+            );
+        }
+
+        // Causal Split-primary TicksPerHop on T2_MultiViewCoupled (G2B.2 & Invariant 2).
+        for width in [Width::BITS_1, Width::BITS_2] {
+            let mv_cfg = GeneratorConfig::T2_MultiViewCoupled {
+                driver: MultiViewDriver::Lfsr {
+                    stage: LfsrStage {
+                        taps: vec![1, 1, 0, 0, 1, 1],
+                        init: vec![1, 0, 1, 1, 0, 1],
+                    },
+                },
+                view_0: MultiViewTransform {
+                    delay: 1,
+                    mul_a: 1,
+                    add_b: 0,
+                },
+                view_1: MultiViewTransform {
+                    delay: 0,
+                    mul_a: 1,
+                    add_b: 0,
+                },
+                target: MultiViewTarget::Affine {
+                    lag: 4,
+                    mul_a: 1,
+                    add_b: 0,
+                },
+            };
+            let sb = SeedBank::new(5);
+            let mut env =
+                NoisyEnvironment::new(mv_cfg.build(width).unwrap(), NoiseModel::None, sb).unwrap();
+            let mut tph_circ = Circuit::new(width, 3, 3, WireDelayMode::TicksPerHop);
+            let split_p = tph_circ.add_node(Primitive::Split);
+            tph_circ.connect(
+                crate::substrate::SignalSource::BoundaryIn(0),
+                SignalSink::NodeIn {
+                    node: split_p,
+                    port: 0,
+                },
+            );
+            tph_circ.connect(
+                crate::substrate::SignalSource::NodeOut {
+                    node: split_p,
+                    port: 0,
+                },
+                SignalSink::BoundaryOut(2),
+            );
+            let econ = EconomyConfig::default();
+            let mut editable = EditableCircuit::new(tph_circ, econ).unwrap();
+            if let Some(node_econ) = editable.economy_mut().node_mut(split_p.index()) {
+                node_econ.juvenile_ticks = econ.juvenile_ticks;
+            }
+            let mut learner =
+                ArkheLearner::from_editable(editable, GrowthConfig::default(), sb).unwrap();
+            let mut budget = TickBudget::new(200_000);
+            let mut clean = [0u64; 3];
+            let mut obs = [0u64; 3];
+            let mut post_mismatches = 0usize;
+            for t in 0..1200 {
+                env.step_frame(&mut clean, &mut obs);
+                let pred = learner.predict(&mut budget);
+                if t >= 700 && pred[2] != obs[2] {
+                    post_mismatches += 1;
+                }
+                learner.observe(&obs, &mut budget);
+            }
+            assert_eq!(
+                post_mismatches, 0,
+                "Split-primary T2_MultiViewCoupled ({width:?}, TicksPerHop) must maintain 0 clean mismatches"
+            );
+            assert!(
+                learner.redundancy_sprout_events() >= 1,
+                "Split-primary T2_MultiViewCoupled ({width:?}, TicksPerHop) must sprout Stage 3 redundancy"
+            );
+            assert_eq!(learner.starvation_prune_events(), 0);
+            assert_eq!(learner.telemetry().sprout_blocked_max_nodes, 0);
+            let comp = learner
+                .editable()
+                .economy()
+                .comparators()
+                .iter()
+                .find(|c| c.target_port == 2)
+                .expect("comparator on port 2 in Split-primary TicksPerHop");
+            assert_eq!(comp.primary_channel_mask & comp.alt_channel_mask, 0);
+            let circ = learner.editable().circuit();
+            assert!(circ.edges().iter().all(|e| e.hops == 1));
+            let pri_cone = derivation_cone_info(circ, &[SignalSink::BoundaryOut(2)]);
+            let alt_cone = derivation_cone_info(
+                circ,
+                &[SignalSink::NodeIn {
+                    node: comp.sub_node,
+                    port: 1,
+                }],
+            );
+            assert!(pri_cone.excl_nodes.is_disjoint(&alt_cone.excl_nodes));
+            assert!(
+                pri_cone
+                    .excl_reactive_leaves
+                    .is_disjoint(&alt_cone.excl_reactive_leaves)
+            );
+        }
+
+        // K=1 multi-route T1 preserves Stage 2 epoch_snapshots identically vs redundancy_sprouting: false.
+        for (is_alternating, t1_cfg) in [
+            (true, GeneratorConfig::T1_Alternating { a: 0, b: 1 }),
+            (
+                false,
+                GeneratorConfig::T1_PeriodicMotif {
+                    motif: vec![0, 1, 1],
+                },
+            ),
+        ] {
+            let run_t1 = |redundancy_sprouting: bool| {
+                let sb = SeedBank::new(2);
+                let mut env = NoisyEnvironment::new(
+                    t1_cfg.build(Width::BITS_1).unwrap(),
+                    NoiseModel::None,
+                    sb,
+                )
+                .unwrap();
+                let mut learner = ArkheLearner::new(
+                    Width::BITS_1,
+                    1,
+                    WireDelayMode::Combinational,
+                    GrowthConfig {
+                        redundancy_sprouting,
+                        ..GrowthConfig::default()
+                    },
+                    sb,
+                )
+                .unwrap();
+                let mut budget = TickBudget::new(200_000);
+                let mut clean = [0u64; 1];
+                let mut obs = [0u64; 1];
+                for _ in 0..800 {
+                    env.step_frame(&mut clean, &mut obs);
+                    let _ = learner.predict(&mut budget);
+                    learner.observe(&obs, &mut budget);
+                }
+                learner
+            };
+
+            let learner = run_t1(true);
+            let baseline_learner = run_t1(false);
+            assert!(learner.redundancy_sprout_events() >= 1);
+            assert_eq!(learner.active_comparator_count(), 1);
+            assert_eq!(learner.starvation_prune_events(), 0);
+
+            let snapshots_with_stage3 = learner.epoch_snapshots();
+            let snapshots_without_stage3 = baseline_learner.epoch_snapshots();
+            assert!(!snapshots_with_stage3.is_empty());
+            assert_eq!(snapshots_with_stage3, snapshots_without_stage3);
+            let epochs: Vec<usize> = snapshots_with_stage3.iter().map(|s| s.epoch).collect();
+            if is_alternating {
+                assert_eq!(epochs, vec![0]);
+            } else {
+                assert!(snapshots_with_stage3.len() >= 2);
+            }
+            assert_eq!(learner.comparator_disagreement_ticks(), 0);
+            assert!(learner.comparator_agreement_ticks() > 0);
+        }
+    }
+
+    #[test]
+    fn stage3_halts_cleanly_on_noisy_constant_non_redundant_t2_and_resists_5pct_thrashing() {
+        use crate::env::{
+            CrossNonlinearOp, GeneratorConfig, LfsrStage, NoiseModel, NoisyEnvironment,
+        };
+
+        // 1. NoisyConstant halts at 0 nodes / 0 redundancy sprouts.
+        for value in [0u64, 1] {
+            let sb = SeedBank::new(3);
+            let mut env = NoisyEnvironment::new(
+                GeneratorConfig::T1_Constant { value }
+                    .build(Width::BITS_1)
+                    .unwrap(),
+                NoiseModel::IndependentSubstitution {
+                    epsilon: 0.05,
+                    channels: vec![0],
+                },
+                sb,
+            )
+            .unwrap();
+            let mut learner = ArkheLearner::new(
+                Width::BITS_1,
+                1,
+                WireDelayMode::Combinational,
+                GrowthConfig::default(),
+                sb,
+            )
+            .unwrap();
+            let mut budget = TickBudget::new(100_000);
+            let mut clean = [0u64; 1];
+            let mut obs = [0u64; 1];
+            for _ in 0..500 {
+                env.step_frame(&mut clean, &mut obs);
+                let _ = learner.predict(&mut budget);
+                learner.observe(&obs, &mut budget);
+            }
+            assert_eq!(learner.editable().circuit().node_count(), 0);
+            assert_eq!(learner.redundancy_sprout_events(), 0);
+            assert_eq!(learner.active_comparator_count(), 0);
+        }
+
+        // 2. Non-redundant T2_CrossNonlinear (deg 4 x deg 4 and deg 11 x deg 9) halts at 0 comparators on channel 2.
+        for (driver_0, driver_1) in [
+            (
+                LfsrStage {
+                    taps: vec![1, 1, 0, 1],
+                    init: vec![1, 0, 0, 1],
+                },
+                LfsrStage {
+                    taps: vec![1, 0, 1, 1],
+                    init: vec![1, 1, 0, 1],
+                },
+            ),
+            (
+                LfsrStage {
+                    taps: vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1],
+                    init: vec![1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+                },
+                LfsrStage {
+                    taps: vec![0, 0, 0, 1, 0, 0, 0, 0, 1],
+                    init: vec![1, 1, 0, 1, 0, 1, 1, 0, 1],
+                },
+            ),
+        ] {
+            let non_red_cfg = GeneratorConfig::T2_CrossNonlinear {
+                driver_0,
+                driver_1,
+                lag_0: 1,
+                lag_1: 2,
+                op: CrossNonlinearOp::MulEqz,
+            };
+            let sb_nr = SeedBank::new(4);
+            let mut env_nr = NoisyEnvironment::new(
+                non_red_cfg.build(Width::BITS_1).unwrap(),
+                NoiseModel::None,
+                sb_nr,
+            )
+            .unwrap();
+            let mut learner_nr = ArkheLearner::new(
+                Width::BITS_1,
+                3,
+                WireDelayMode::Combinational,
+                GrowthConfig::default(),
+                sb_nr,
+            )
+            .unwrap();
+            let mut budget_nr = TickBudget::new(200_000);
+            let mut clean_nr = [0u64; 3];
+            let mut obs_nr = [0u64; 3];
+            for _ in 0..800 {
+                env_nr.step_frame(&mut clean_nr, &mut obs_nr);
+                let _ = learner_nr.predict(&mut budget_nr);
+                learner_nr.observe(&obs_nr, &mut budget_nr);
+            }
+            assert!(
+                learner_nr
+                    .editable()
+                    .economy()
+                    .comparators()
+                    .iter()
+                    .all(|c| c.target_port != 2),
+                "non-redundant T2_CrossNonlinear target port 2 must form 0 comparators"
+            );
+        }
+
+        // 3. NoisyAlternating (eps=0.05) forms comparator without sprout/prune thrashing.
+        let sb_na = SeedBank::new(0);
+        let mut env_na = NoisyEnvironment::new(
+            GeneratorConfig::T1_Alternating { a: 0, b: 1 }
+                .build(Width::BITS_1)
+                .unwrap(),
+            NoiseModel::IndependentSubstitution {
+                epsilon: 0.05,
+                channels: vec![0],
+            },
+            sb_na,
+        )
+        .unwrap();
+        let mut learner_na = ArkheLearner::new(
+            Width::BITS_1,
+            1,
+            WireDelayMode::Combinational,
+            GrowthConfig::default(),
+            sb_na,
+        )
+        .unwrap();
+        let mut budget_na = TickBudget::new(200_000);
+        let mut clean_na = [0u64; 1];
+        let mut obs_na = [0u64; 1];
+        for _ in 0..1600 {
+            env_na.step_frame(&mut clean_na, &mut obs_na);
+            let _ = learner_na.predict(&mut budget_na);
+            learner_na.observe(&obs_na, &mut budget_na);
+        }
+        assert_eq!(learner_na.redundancy_sprout_events(), 1);
+        assert_eq!(learner_na.active_comparator_count(), 1);
+        assert_eq!(learner_na.disagreement_prune_events(), 0);
+        assert_eq!(learner_na.starvation_prune_events(), 0);
+    }
+
+    #[test]
+    fn stage3_respects_cross_port_budget_and_juvenile_sibling_non_starvation() {
+        use crate::substrate::SignalSource;
+        // Port 0 solved (mature); Port 1 unsolved with juvenile node blocks Stage 3 on Port 0.
+        let width = Width::BITS_1;
+        let mut circ = Circuit::new(width, 2, 2, WireDelayMode::Combinational);
+        let eq0 = circ.add_node(Primitive::Eqz);
+        circ.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: eq0, port: 0 },
+        );
+        circ.connect(
+            SignalSource::NodeOut { node: eq0, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+        let d1 = circ.add_node(Primitive::Delay { init: 0 });
+        circ.connect(
+            SignalSource::BoundaryIn(1),
+            SignalSink::NodeIn { node: d1, port: 0 },
+        );
+        circ.connect(
+            SignalSource::NodeOut { node: d1, port: 0 },
+            SignalSink::BoundaryOut(1),
+        );
+
+        let econ = EconomyConfig::default();
+        let growth = GrowthConfig::default();
+        let mut editable = EditableCircuit::new(circ, econ).unwrap();
+        // Make node 0 (port 0) mature and node 1 (port 1) juvenile.
+        editable.economy_mut().node_mut(0).unwrap().juvenile_ticks = 0;
+        editable.economy_mut().node_mut(1).unwrap().juvenile_ticks = 128;
+
+        let mut learner = ArkheLearner::from_editable(editable, growth, SeedBank::new(7)).unwrap();
+        assert!(learner.sibling_has_juvenile_nodes(0));
+
+        // Feed alternating port 0 and noisy/unsolved port 1; Stage 3 must wait until sibling matures.
+        let mut budget = TickBudget::new(20_000);
+        for t in 0..80u64 {
+            let a = t % 2;
+            let b = if t % 3 == 0 { 1 } else { 0 };
+            let _ = learner.predict(&mut budget);
+            learner.observe(&[a, b], &mut budget);
+            if learner.sibling_has_juvenile_nodes(0) {
+                assert_eq!(learner.redundancy_sprout_events(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn wake_disagreement_triggers_handoff_and_refutation_prune_within_64_ticks() {
+        use crate::env::{
+            GeneratorConfig, LfsrStage, MultiViewDriver, MultiViewTarget, MultiViewTransform,
+            NoiseModel, NoisyEnvironment,
+        };
+
+        for width in [Width::BITS_1, Width::BITS_2] {
+            let fault_tick = 1000u64;
+            let cfg = GeneratorConfig::T2_MultiViewCoupled {
+                driver: MultiViewDriver::Lfsr {
+                    stage: LfsrStage {
+                        taps: vec![1, 1, 0, 1],
+                        init: vec![1, 0, 1, 1],
+                    },
+                },
+                // ch0 has shorter lag (tau = 1) so Stage 2 locks ch0 first; ch1 has tau = 2 so Stage 3 uses ch1.
+                view_0: MultiViewTransform {
+                    delay: 1,
+                    mul_a: 1,
+                    add_b: 0,
+                },
+                view_1: MultiViewTransform {
+                    delay: 0,
+                    mul_a: 1,
+                    add_b: 1,
+                },
+                target: MultiViewTarget::Affine {
+                    lag: 2,
+                    mul_a: 1,
+                    add_b: 0,
+                },
+            };
+            let fault_eps = 1.0 - 1.0 / (2.0f64.powi(i32::from(width.bits())));
+            let noise = NoiseModel::ChannelFaultSchedule {
+                base_epsilon: 0.0,
+                base_channels: Vec::new(),
+                fault_tick,
+                fault_epsilon: fault_eps,
+                fault_channels: vec![0],
+            };
+            let sb = SeedBank::new(11);
+            let mut env = NoisyEnvironment::new(cfg.build(width).unwrap(), noise, sb).unwrap();
+            let mut learner = ArkheLearner::new(
+                width,
+                3,
+                WireDelayMode::Combinational,
+                GrowthConfig::default(),
+                sb,
+            )
+            .unwrap();
+            let mut budget = TickBudget::new(200_000);
+            let mut clean = [0u64; 3];
+            let mut obs = [0u64; 3];
+            let mut recovered_mismatches = 0usize;
+            for t in 0..1400 {
+                env.step_frame(&mut clean, &mut obs);
+                let pred = learner.predict(&mut budget);
+                if t >= fault_tick + 64 && pred[2] != clean[2] {
+                    recovered_mismatches += 1;
+                }
+                learner.observe(&obs, &mut budget);
+            }
+            assert!(
+                learner.redundancy_sprout_events() >= 1,
+                "pre-fault redundancy must form"
+            );
+            assert!(
+                learner.driver_handoff_events() >= 1,
+                "fault on primary ch0 must trigger driver handoff ({width:?})"
+            );
+            assert!(
+                learner.disagreement_prune_events() >= 1,
+                "fault on primary ch0 must prune broken ch0 route ({width:?})"
+            );
+            assert_eq!(
+                recovered_mismatches, 0,
+                "target port 2 must recover 0 clean error within <= 64 ticks ({width:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_loopback_detects_deceptive_contradiction_freezes_null_and_prunes_minority_of_3() {
+        use crate::structural::build_autonomous_ring_source;
+        use crate::structural::graph_edit::splice_comparator_onto_port;
+        use crate::substrate::SignalSource;
+
+        // 1. Deceptive lag-2 vs period-6 [0, 1, 0, 1, 0, 0] (Charter §1.3) offline falsification + frozen null.
+        {
+            let width = Width::BITS_1;
+            let mut circ = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
+            // Primary: deceptive lag-2 reactive predictor Delay(Delay(BoundaryIn(0)))
+            let d1 = circ.add_node(Primitive::Delay { init: 0 });
+            let d2 = circ.add_node(Primitive::Delay { init: 1 });
+            circ.connect(
+                SignalSource::BoundaryIn(0),
+                SignalSink::NodeIn { node: d1, port: 0 },
+            );
+            circ.connect(
+                SignalSource::NodeOut { node: d1, port: 0 },
+                SignalSink::NodeIn { node: d2, port: 0 },
+            );
+            circ.connect(
+                SignalSource::NodeOut { node: d2, port: 0 },
+                SignalSink::BoundaryOut(0),
+            );
+            // Alt: exact period-6 autonomous delay ring [0, 1, 0, 1, 0, 0]
+            let motif = [0u64, 1, 0, 1, 0, 0];
+            let (_, _, ring_src) = build_autonomous_ring_source(&mut circ, 6, &motif);
+            let spliced = splice_comparator_onto_port(&mut circ, 0, ring_src).unwrap();
+            let econ = EconomyConfig {
+                juvenile_ticks: 0,
+                ..EconomyConfig::default()
+            };
+            let mut editable = EditableCircuit::new(circ, econ).unwrap();
+            let comp_idx = editable
+                .register_comparator(spliced.sub_node, spliced.eqz_node, 0, 1, 0)
+                .unwrap();
+            let _ = comp_idx;
+
+            let mut learner =
+                ArkheLearner::from_editable(editable, GrowthConfig::default(), SeedBank::new(0))
+                    .unwrap();
+            let mut budget = TickBudget::new(20_000);
+            // Seed wake null model cleanly over 24 ticks (before W_diag=64 refutation prunes lag-2).
+            for t in 0..24 {
+                let _ = learner.predict(&mut budget);
+                learner.observe(&[motif[t % 6]], &mut budget);
+            }
+            let wake_null_before = (
+                learner.editable().economy().scorers()[0]
+                    .null_model()
+                    .probability(0)
+                    .to_bits(),
+                learner.editable().economy().scorers()[0]
+                    .null_model()
+                    .probability(1)
+                    .to_bits(),
+                learner.editable().economy().scorers()[0]
+                    .null_model()
+                    .last_symbol(),
+            );
+
+            let report = learner.run_offline_loopback(128);
+            let wake_null_after = (
+                learner.editable().economy().scorers()[0]
+                    .null_model()
+                    .probability(0)
+                    .to_bits(),
+                learner.editable().economy().scorers()[0]
+                    .null_model()
+                    .probability(1)
+                    .to_bits(),
+                learner.editable().economy().scorers()[0]
+                    .null_model()
+                    .last_symbol(),
+            );
+            assert_eq!(
+                wake_null_before, wake_null_after,
+                "Sleep loopback must keep wake NullModel frozen"
+            );
+            assert!(report.contradiction_detected);
+            assert!(report.comparator_disagreement_ticks >= 1);
+            assert!(report.max_circular_discrepancy >= 1);
+            assert!(report.sleep_comparator_flux < 0.0);
+        }
+
+        // 2. 3-route majority pruning: tests BOTH minority faulty alt AND minority faulty primary.
+        for primary_is_minority in [false, true] {
+            let width = Width::BITS_1;
+            let mut circ = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
+            let (_, _, r1) = build_autonomous_ring_source(&mut circ, 2, &[0, 1]);
+            let (_, _, r2) = build_autonomous_ring_source(&mut circ, 2, &[0, 1]);
+            // Faulty 3rd route: constant-0 delay loop `[0, 0]` (disagrees on odd ticks).
+            let (_, _, r_fault) = build_autonomous_ring_source(&mut circ, 2, &[0, 0]);
+
+            let (pri, alt_a, alt_b) = if primary_is_minority {
+                (r_fault, r1, r2)
+            } else {
+                (r1, r2, r_fault)
+            };
+            circ.connect(pri, SignalSink::BoundaryOut(0));
+            let sp_a = splice_comparator_onto_port(&mut circ, 0, alt_a).unwrap();
+            let sp_b = splice_comparator_onto_port(&mut circ, 0, alt_b).unwrap();
+
+            let econ = EconomyConfig {
+                juvenile_ticks: 0,
+                ..EconomyConfig::default()
+            };
+            let mut editable = EditableCircuit::new(circ, econ).unwrap();
+            editable
+                .register_comparator(sp_a.sub_node, sp_a.eqz_node, 0, 1 << 60, 1 << 61)
+                .unwrap();
+            editable
+                .register_comparator(sp_b.sub_node, sp_b.eqz_node, 0, 1 << 60, 1 << 62)
+                .unwrap();
+            let mut learner =
+                ArkheLearner::from_editable(editable, GrowthConfig::default(), SeedBank::new(9))
+                    .unwrap();
+            let mut budget = TickBudget::new(20_000);
+            // Warm wake NullModel for 16 ticks (< W_diag=64) so comparators stay intact until Sleep.
+            for t in 0..16 {
+                let _ = learner.predict(&mut budget);
+                learner.observe(&[(t % 2) as u64], &mut budget);
+            }
+            assert_eq!(learner.active_comparator_count(), 2);
+
+            let report = learner.run_offline_loopback(128);
+            assert_eq!(report.minority_routes_pruned, 1);
+            assert_eq!(
+                learner.active_comparator_count(),
+                1,
+                "exact 1 surviving comparator between the 2 agreeing true routes must remain"
+            );
+            // After pruning the faulty minority route, a second loopback sees zero disagreement.
+            let clean_report = learner.run_offline_loopback(64);
+            assert!(!clean_report.contradiction_detected);
+            assert_eq!(clean_report.comparator_disagreement_ticks, 0);
+            assert_eq!(clean_report.max_circular_discrepancy, 0);
+        }
+    }
+
+    #[test]
+    fn stage2_promotes_autonomous_ring_comparator_on_noisy_alternating() {
+        for seed in [1u64, 3u64] {
+            let sb = SeedBank::new(seed);
+            let cfg = GeneratorConfig::T1_Alternating { a: 0, b: 3 };
+            let generator = cfg.build(Width::BITS_2).unwrap();
+            let mut env = NoisyEnvironment::new(
+                generator,
+                NoiseModel::IndependentSubstitution {
+                    epsilon: 0.05,
+                    channels: vec![0],
+                },
+                sb,
+            )
+            .unwrap();
+            let mut learner = ArkheLearner::new_with_config(
+                Width::BITS_2,
+                1,
+                WireDelayMode::Combinational,
+                EconomyConfig::default(),
+                GrowthConfig::default(),
+                sb,
+            )
+            .unwrap();
+            let mut budget = TickBudget::new(50_000);
+            let mut clean = [0u64];
+            let mut obs = [0u64];
+            let mut post_warmup_clean_mismatches = 0u64;
+            for t in 0..2_000u64 {
+                env.step_frame(&mut clean, &mut obs);
+                let pred = learner.predict(&mut budget);
+                if t >= 600 && pred[0] != clean[0] {
+                    post_warmup_clean_mismatches += 1;
+                }
+                learner.observe(&obs, &mut budget);
+            }
+            assert!(
+                learner.active_comparator_count() >= 1,
+                "seed={seed} should retain autonomous-vs-reactive comparator"
+            );
+            assert!(
+                learner.driver_handoff_events() >= 1 || learner.ring_closure_events() >= 1,
+                "seed={seed} must promote autonomous ring over noisy reactive driver"
+            );
+            assert_eq!(learner.starvation_prune_events(), 0);
+            if seed == 3 {
+                assert_eq!(
+                    learner.disagreement_prune_events(),
+                    0,
+                    "seed={seed} should avoid false refutation pruning of reactive peer"
+                );
+            }
+            assert_eq!(
+                post_warmup_clean_mismatches, 0,
+                "seed={seed} must settle cleanly to zero clean mismatches after ring handoff"
+            );
+        }
+    }
+
+    #[test]
+    fn all_golden_trace_configs_comparator_audit() {
+        use crate::env::{GeneratorConfig, NoiseModel, NoisyEnvironment};
+        use crate::structural::graph_edit::derivation_cone_info;
+
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
+        struct AuditEdge {
+            src: String,
+            dst: String,
+            hops: u16,
+        }
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
+        struct AuditEvent {
+            tick: u64,
+            kind: String,
+            node_count: usize,
+            details: String,
+        }
+        #[derive(Deserialize)]
+        struct GoldenFixtureStub {
+            events: Vec<AuditEvent>,
+            final_circuit_nodes: Vec<String>,
+            final_circuit_edges: Vec<AuditEdge>,
+        }
+
+        let cases = [
+            (
+                "alt_k1_comb_s20",
+                GeneratorConfig::T1_Alternating { a: 0, b: 1 },
+                Width::BITS_1,
+                WireDelayMode::Combinational,
+                20u64,
+                400u64,
+            ),
+            (
+                "alt_k1_tph_s20",
+                GeneratorConfig::T1_Alternating { a: 0, b: 1 },
+                Width::BITS_1,
+                WireDelayMode::TicksPerHop,
+                20u64,
+                400u64,
+            ),
+            (
+                "alt_k2_comb_s21",
+                GeneratorConfig::T1_Alternating { a: 0, b: 3 },
+                Width::BITS_2,
+                WireDelayMode::Combinational,
+                21u64,
+                400u64,
+            ),
+            (
+                "alt_k2_tph_s21",
+                GeneratorConfig::T1_Alternating { a: 0, b: 3 },
+                Width::BITS_2,
+                WireDelayMode::TicksPerHop,
+                21u64,
+                400u64,
+            ),
+            (
+                "motif011_k1_comb_s22",
+                GeneratorConfig::T1_PeriodicMotif {
+                    motif: vec![0, 1, 1],
+                },
+                Width::BITS_1,
+                WireDelayMode::Combinational,
+                22u64,
+                500u64,
+            ),
+            (
+                "motif013_k2_comb_s22",
+                GeneratorConfig::T1_PeriodicMotif {
+                    motif: vec![0, 1, 3],
+                },
+                Width::BITS_2,
+                WireDelayMode::Combinational,
+                22u64,
+                500u64,
+            ),
+            (
+                "affine_k2_comb_s23",
+                GeneratorConfig::T1_AffineLag1 {
+                    mul_a: 1,
+                    add_b: 1,
+                    init: 0,
+                },
+                Width::BITS_2,
+                WireDelayMode::Combinational,
+                23u64,
+                500u64,
+            ),
+            (
+                "affine_k2_tph_s23",
+                GeneratorConfig::T1_AffineLag1 {
+                    mul_a: 1,
+                    add_b: 1,
+                    init: 0,
+                },
+                Width::BITS_2,
+                WireDelayMode::TicksPerHop,
+                23u64,
+                500u64,
+            ),
+        ];
+
+        for (name, gen_cfg, width, wire_delay, seed, horizon) in cases {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("golden")
+                .join(format!("{name}.json"));
+            let golden: GoldenFixtureStub =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read fixture"))
+                    .expect("parse fixture");
+
+            let sb = SeedBank::new(seed);
+            let generator = gen_cfg.build(width).expect("build generator");
+            let mut env =
+                NoisyEnvironment::new(generator, NoiseModel::None, sb).expect("build env");
+            let mut learner = ArkheLearner::new_with_config(
+                width,
+                1,
+                wire_delay,
+                EconomyConfig::default(),
+                GrowthConfig::default(),
+                sb,
+            )
+            .expect("learner");
+            let mut budget = TickBudget::new(100_000);
+            let mut clean = [0u64; 1];
+            let mut obs = [0u64; 1];
+            let mut events = Vec::new();
+            let mut prev_sprouts = 0u64;
+            let mut prev_prunes = 0u64;
+            let mut prev_rings = 0u64;
+
+            for t in 0..horizon {
+                env.step_frame(&mut clean, &mut obs);
+                let _ = learner.predict(&mut budget);
+                learner.observe(&obs, &mut budget);
+
+                if learner.sprout_events() > prev_sprouts {
+                    prev_sprouts = learner.sprout_events();
+                    events.push(AuditEvent {
+                        tick: t,
+                        kind: "Sprout".to_owned(),
+                        node_count: learner.editable().circuit().node_count(),
+                        details: format!("sprout_events={}", learner.sprout_events()),
+                    });
+                }
+                if learner.starvation_prune_events() > prev_prunes {
+                    prev_prunes = learner.starvation_prune_events();
+                    events.push(AuditEvent {
+                        tick: t,
+                        kind: "StarvationPrune".to_owned(),
+                        node_count: learner.editable().circuit().node_count(),
+                        details: format!("prune_events={}", learner.starvation_prune_events()),
+                    });
+                }
+                if learner.ring_closure_events() > prev_rings {
+                    prev_rings = learner.ring_closure_events();
+                    events.push(AuditEvent {
+                        tick: t,
+                        kind: "RingClosure".to_owned(),
+                        node_count: learner.editable().circuit().node_count(),
+                        details: format!("ring_events={}", learner.ring_closure_events()),
+                    });
+                }
+            }
+
+            assert_eq!(events, golden.events, "{name} events must match golden");
+            assert_eq!(
+                learner.starvation_prune_events(),
+                0,
+                "{name} must not starve"
+            );
+
+            let circ = learner.editable().circuit();
+            let nodes: Vec<String> = circ.nodes().iter().map(|n| format!("{n:?}")).collect();
+            let edges: Vec<AuditEdge> = circ
+                .edges()
+                .iter()
+                .map(|e| AuditEdge {
+                    src: format!("{:?}", e.src),
+                    dst: format!("{:?}", e.dst),
+                    hops: e.hops,
+                })
+                .collect();
+
+            if learner.active_comparator_count() == 0 {
+                assert_eq!(nodes, golden.final_circuit_nodes, "{name} nodes");
+                assert_eq!(edges, golden.final_circuit_edges, "{name} edges");
+            } else {
+                for comp in learner.editable().economy().comparators() {
+                    let pri_cone =
+                        derivation_cone_info(circ, &[SignalSink::BoundaryOut(comp.target_port)]);
+                    let alt_cone = derivation_cone_info(
+                        circ,
+                        &[SignalSink::NodeIn {
+                            node: comp.sub_node,
+                            port: 1,
+                        }],
+                    );
+                    assert!(
+                        pri_cone.excl_nodes.is_disjoint(&alt_cone.excl_nodes),
+                        "{name} comparator must have disjoint interior cones"
+                    );
+                    assert!(
+                        pri_cone
+                            .excl_reactive_leaves
+                            .is_disjoint(&alt_cone.excl_reactive_leaves),
+                        "{name} comparator must have disjoint causal leaves"
+                    );
+                }
+            }
+
+            let masks: Vec<(u64, u64)> = learner
+                .editable()
+                .economy()
+                .comparators()
+                .iter()
+                .map(|c| (c.primary_channel_mask, c.alt_channel_mask))
+                .collect();
+            eprintln!(
+                "golden_audit case={name} events_eq={} redundancy_sprout_events={} \
+                 starvation_prune_events={} active_comparator_count={} masks={masks:?} \
+                 agree={} disagree={} final_nodes={nodes:?}",
+                events == golden.events,
+                learner.redundancy_sprout_events(),
+                learner.starvation_prune_events(),
+                learner.active_comparator_count(),
+                learner.comparator_agreement_ticks(),
+                learner.comparator_disagreement_ticks(),
+            );
+        }
+    }
+
+    #[test]
+    fn t2_cross_nonlinear_deg11_deg9_zero_redundancy_sprouts() {
+        use crate::env::{
+            CrossNonlinearOp, GeneratorConfig, LfsrStage, NoiseModel, NoisyEnvironment,
+        };
+
+        let driver_0 = LfsrStage {
+            taps: vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1],
+            init: vec![1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+        };
+        let driver_1 = LfsrStage {
+            taps: vec![0, 0, 0, 1, 0, 0, 0, 0, 1],
+            init: vec![1, 1, 0, 1, 0, 1, 1, 0, 1],
+        };
+        for (label, op, lag_0, lag_1, wire_delay) in [
+            (
+                "MulEqz(1,2,Comb)",
+                CrossNonlinearOp::MulEqz,
+                1,
+                2,
+                WireDelayMode::Combinational,
+            ),
+            (
+                "MulEqzPair(4,4,Comb)",
+                CrossNonlinearOp::MulEqzPair,
+                4,
+                4,
+                WireDelayMode::Combinational,
+            ),
+            (
+                "MulEqzPair(4,4,TPH)",
+                CrossNonlinearOp::MulEqzPair,
+                4,
+                4,
+                WireDelayMode::TicksPerHop,
+            ),
+        ] {
+            let cfg = GeneratorConfig::T2_CrossNonlinear {
+                driver_0: driver_0.clone(),
+                driver_1: driver_1.clone(),
+                lag_0,
+                lag_1,
+                op,
+            };
+            let sb = SeedBank::new(0);
+            let mut env =
+                NoisyEnvironment::new(cfg.build(Width::BITS_1).unwrap(), NoiseModel::None, sb)
+                    .unwrap();
+            let mut learner =
+                ArkheLearner::new(Width::BITS_1, 3, wire_delay, GrowthConfig::default(), sb)
+                    .unwrap();
+            let mut budget = TickBudget::new(200_000);
+            let mut clean = [0u64; 3];
+            let mut obs = [0u64; 3];
+            for _ in 0..2_000 {
+                env.step_frame(&mut clean, &mut obs);
+                let _ = learner.predict(&mut budget);
+                learner.observe(&obs, &mut budget);
+            }
+            assert_eq!(
+                learner.redundancy_sprout_events(),
+                0,
+                "{label} (deg 11 x deg 9) must have zero redundancy_sprout_events"
+            );
+            assert_eq!(
+                learner.active_comparator_count(),
+                0,
+                "{label} (deg 11 x deg 9) must have zero active comparators"
+            );
+        }
     }
 }

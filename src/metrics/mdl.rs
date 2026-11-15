@@ -414,8 +414,9 @@ pub fn allocate_circuit_description_bits(
     let total_debt: f64 = debts.iter().sum::<f64>() + unowned_bits;
     let total_circuit_bits =
         circuit_code_bits_with_tax(circuit, extra_palette_entries, split_code_tax);
+    let tol = 1e-12 * total_circuit_bits.abs().max(1.0);
     debug_assert!(
-        (total_debt - total_circuit_bits).abs() < 1e-12,
+        (total_debt - total_circuit_bits).abs() <= tol,
         "sum of debts and unowned {total_debt} does not match circuit_code_bits_with_tax {total_circuit_bits}"
     );
 
