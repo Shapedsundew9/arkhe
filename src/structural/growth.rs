@@ -187,6 +187,18 @@ pub fn port_cone_register_depth(circuit: &Circuit, out_port: u16) -> usize {
     max_depth
 }
 
+/// Wake structural excision mode (`M3-E1` + `M3-E2` vs. unamended `M2b` baseline ablation).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExcisionMode {
+    /// Unified zero-free-parameter wake excision (`M3-E1` target-anchored reachability &
+    /// `W_diag` ring-identity bypass + `M3-E2` verified local pass-through excision).
+    #[default]
+    VerifiedLocalExcision,
+    /// Unamended `M2b` D1b.1 single-node zero-sensitivity and `Delay{init:0}` `!ever_nonzero`
+    /// bypass (retained solely for `G3.5(a)` paired comparative ablation).
+    BaselineD1b1,
+}
+
 /// Growth thresholds and resource bounds used by an online M1 learner.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -216,6 +228,9 @@ pub struct GrowthConfig {
     /// Enable Stage 3 causal-disjoint redundancy sprouting and comparator formation (`M2b`).
     #[serde(default = "default_redundancy_sprouting")]
     pub redundancy_sprouting: bool,
+    /// Wake structural excision policy (`M3-E1` + `M3-E2` vs. `BaselineD1b1` ablation).
+    #[serde(default)]
+    pub excision_mode: ExcisionMode,
 }
 
 const fn default_redundancy_sprouting() -> bool {
@@ -237,6 +252,7 @@ impl Default for GrowthConfig {
             max_ring_period: 6,
             sensitivity_sample_count: 8,
             redundancy_sprouting: true,
+            excision_mode: ExcisionMode::VerifiedLocalExcision,
         }
     }
 }
@@ -1046,6 +1062,7 @@ pub struct DiagnosticBuffer {
     pub residuals: Vec<Vec<u64>>,
     pub node_outputs: Vec<Vec<u64>>,
     pub counterfactual_sensitivity: Vec<Vec<bool>>,
+    pub pre_step_snapshots: Vec<Option<(u64, Vec<u64>)>>,
 }
 
 impl DiagnosticBuffer {
@@ -1060,6 +1077,7 @@ impl DiagnosticBuffer {
             residuals: Vec::with_capacity(capacity),
             node_outputs: Vec::with_capacity(capacity),
             counterfactual_sensitivity: Vec::with_capacity(capacity),
+            pre_step_snapshots: Vec::with_capacity(capacity),
         }
     }
 
@@ -1073,6 +1091,46 @@ impl DiagnosticBuffer {
         node_outs: &[u64],
         sensitive: &[bool],
     ) {
+        self.push_frame_inner(
+            input, truth, prediction, residual, node_outs, sensitive, None,
+        );
+    }
+
+    /// Appends a newly observed frame together with the pre-step `(structure_epoch, registers)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_frame_with_snapshot(
+        &mut self,
+        input: &[u64],
+        truth: &[u64],
+        prediction: &[u64],
+        residual: &[u64],
+        node_outs: &[u64],
+        sensitive: &[bool],
+        pre_epoch: u64,
+        pre_registers: &[u64],
+    ) {
+        self.push_frame_inner(
+            input,
+            truth,
+            prediction,
+            residual,
+            node_outs,
+            sensitive,
+            Some((pre_epoch, pre_registers.to_vec())),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_frame_inner(
+        &mut self,
+        input: &[u64],
+        truth: &[u64],
+        prediction: &[u64],
+        residual: &[u64],
+        node_outs: &[u64],
+        sensitive: &[bool],
+        snapshot: Option<(u64, Vec<u64>)>,
+    ) {
         if self.inputs.len() >= self.capacity {
             self.inputs.remove(0);
             self.truth.remove(0);
@@ -1080,6 +1138,9 @@ impl DiagnosticBuffer {
             self.residuals.remove(0);
             self.node_outputs.remove(0);
             self.counterfactual_sensitivity.remove(0);
+            if !self.pre_step_snapshots.is_empty() {
+                self.pre_step_snapshots.remove(0);
+            }
         }
         self.inputs.push(input.to_vec());
         self.truth.push(truth.to_vec());
@@ -1087,6 +1148,51 @@ impl DiagnosticBuffer {
         self.residuals.push(residual.to_vec());
         self.node_outputs.push(node_outs.to_vec());
         self.counterfactual_sensitivity.push(sensitive.to_vec());
+        self.pre_step_snapshots.push(snapshot);
+    }
+
+    /// Returns the pre-step `(structure_epoch, registers)` captured at frame 0, if present.
+    #[must_use]
+    pub fn first_frame_snapshot(&self) -> Option<(u64, &[u64])> {
+        self.pre_step_snapshots
+            .first()?
+            .as_ref()
+            .map(|(epoch, regs)| (*epoch, regs.as_slice()))
+    }
+
+    /// Remaps buffered node-indexed columns across a structural prune `old_to_new`.
+    pub fn remap_nodes(&mut self, old_to_new: &[Option<NodeId>], new_node_count: usize) {
+        for frame in &mut self.node_outputs {
+            let mut remapped = vec![0u64; new_node_count];
+            for (old_idx, &new_opt) in old_to_new.iter().enumerate() {
+                if let Some(new_id) = new_opt
+                    && let Some(&val) = frame.get(old_idx)
+                    && new_id.index() < new_node_count
+                {
+                    remapped[new_id.index()] = val;
+                }
+            }
+            *frame = remapped;
+        }
+        for frame in &mut self.counterfactual_sensitivity {
+            let mut remapped = vec![false; new_node_count];
+            for (old_idx, &new_opt) in old_to_new.iter().enumerate() {
+                if let Some(new_id) = new_opt
+                    && let Some(&val) = frame.get(old_idx)
+                    && new_id.index() < new_node_count
+                {
+                    remapped[new_id.index()] = val;
+                }
+            }
+            *frame = remapped;
+        }
+        if old_to_new
+            .iter()
+            .enumerate()
+            .any(|(idx, mapped)| mapped.map(NodeId::index) != Some(idx))
+        {
+            self.pre_step_snapshots.fill(None);
+        }
     }
 
     /// Clears all buffered frames.
@@ -1097,6 +1203,7 @@ impl DiagnosticBuffer {
         self.residuals.clear();
         self.node_outputs.clear();
         self.counterfactual_sensitivity.clear();
+        self.pre_step_snapshots.clear();
     }
 
     /// Number of buffered frames.
@@ -1136,6 +1243,211 @@ impl DiagnosticBuffer {
             }
         }
         idle
+    }
+
+    /// Returns mature nodes eligible for `M3-E1` idle/ring-identity pruning, including any
+    /// mature nodes emitting constant ring-identity values (`0` for `Add`/`Sub.in(1)`/`Mul` or
+    /// `1` for `Mul`) across all `W_diag` frames together with their exclusive upstream cones.
+    #[must_use]
+    pub fn idle_mature_nodes_for_circuit(
+        &self,
+        circuit: &Circuit,
+        economy: &EconomyState,
+    ) -> BTreeSet<NodeId> {
+        let mut seed_idle = self.idle_mature_nodes(economy);
+        if !self.is_full() {
+            return seed_idle;
+        }
+        let node_count = circuit.node_count();
+        if node_count == 0 {
+            return seed_idle;
+        }
+
+        let protected: BTreeSet<NodeId> = economy
+            .comparators()
+            .iter()
+            .flat_map(|c| [c.sub_node, c.eqz_node])
+            .collect();
+        // Never mark registered comparator nodes as idle seeds.
+        seed_idle.retain(|n| !protected.contains(n));
+
+        let width = circuit.width();
+        let w_diag = self.len();
+        let gamma = economy.config().trace_discount;
+        let decay_floor = gamma.powi(w_diag as i32) * (1.0 + 1e-9);
+
+        let mut out_edges: Vec<Vec<SignalSink>> = vec![Vec::new(); node_count];
+        let mut in_sources: Vec<Vec<NodeId>> = vec![Vec::new(); node_count];
+        for edge in circuit.edges() {
+            if let SignalSource::NodeOut { node: src, .. } = edge.src
+                && src.index() < node_count
+            {
+                out_edges[src.index()].push(edge.dst);
+                if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                    && dst.index() < node_count
+                {
+                    in_sources[dst.index()].push(src);
+                }
+            }
+        }
+
+        let mut valid_zero = BTreeSet::new();
+        let mut valid_one = BTreeSet::new();
+        for (node_idx, node_econ) in economy.nodes().iter().enumerate().take(node_count) {
+            let node = NodeId(u32::try_from(node_idx).expect("fits in u32"));
+            if node_econ.juvenile_ticks > 0 || protected.contains(&node) {
+                continue;
+            }
+            let all_zero = self.node_outputs.iter().all(|frame| {
+                frame
+                    .get(node_idx)
+                    .is_some_and(|&v| width.normalize(v) == 0)
+            });
+            let all_one = self.node_outputs.iter().all(|frame| {
+                frame
+                    .get(node_idx)
+                    .is_some_and(|&v| width.normalize(v) == 1)
+            });
+            if all_zero && (node_econ.activity.nonzero_weight <= decay_floor || all_zero) {
+                valid_zero.insert(node);
+            }
+            if all_one && (node_econ.activity.non_one_weight <= decay_floor || all_one) {
+                valid_one.insert(node);
+            }
+        }
+
+        loop {
+            let mut removed_any = false;
+            let current: Vec<NodeId> = valid_zero.iter().copied().collect();
+            for node in current {
+                let sinks = &out_edges[node.index()];
+                let ok = !sinks.is_empty()
+                    && sinks.iter().all(|&dst| match dst {
+                        SignalSink::NodeIn { node: c, port } => {
+                            if protected.contains(&c) {
+                                return false;
+                            }
+                            match circuit.nodes().get(c.index()) {
+                                Some(Primitive::Add | Primitive::Mul) => true,
+                                Some(Primitive::Sub) => port == 1,
+                                Some(Primitive::Split | Primitive::Delay { .. }) => {
+                                    port == 0 && valid_zero.contains(&c)
+                                }
+                                _ => false,
+                            }
+                        }
+                        SignalSink::BoundaryOut(_) => false,
+                    });
+                if !ok {
+                    valid_zero.remove(&node);
+                    removed_any = true;
+                }
+            }
+            if !removed_any {
+                break;
+            }
+        }
+
+        loop {
+            let mut removed_any = false;
+            let current: Vec<NodeId> = valid_one.iter().copied().collect();
+            for node in current {
+                let sinks = &out_edges[node.index()];
+                let ok = !sinks.is_empty()
+                    && sinks.iter().all(|&dst| match dst {
+                        SignalSink::NodeIn { node: c, port } => {
+                            if protected.contains(&c) {
+                                return false;
+                            }
+                            match circuit.nodes().get(c.index()) {
+                                Some(Primitive::Mul) => true,
+                                Some(Primitive::Split | Primitive::Delay { .. }) => {
+                                    port == 0 && valid_one.contains(&c)
+                                }
+                                _ => false,
+                            }
+                        }
+                        SignalSink::BoundaryOut(_) => false,
+                    });
+                if !ok {
+                    valid_one.remove(&node);
+                    removed_any = true;
+                }
+            }
+            if !removed_any {
+                break;
+            }
+        }
+
+        seed_idle.extend(valid_zero);
+        seed_idle.extend(valid_one);
+
+        if seed_idle.is_empty() {
+            return seed_idle;
+        }
+
+        // Expand `seed_idle` to include mature nodes in its exclusive upstream cone
+        // (nodes upstream of `seed_idle` that cannot reach any BoundaryOut or ComparatorSite
+        // without passing through `seed_idle`).
+        let mut live_without_seed = vec![false; node_count];
+        let mut stack: Vec<NodeId> = Vec::new();
+        for edge in circuit.edges() {
+            if let SignalSink::BoundaryOut(_) = edge.dst
+                && let SignalSource::NodeOut { node, .. } = edge.src
+                && node.index() < node_count
+                && !seed_idle.contains(&node)
+                && !live_without_seed[node.index()]
+            {
+                live_without_seed[node.index()] = true;
+                stack.push(node);
+            }
+        }
+        for &p_node in &protected {
+            if p_node.index() < node_count
+                && !seed_idle.contains(&p_node)
+                && !live_without_seed[p_node.index()]
+            {
+                live_without_seed[p_node.index()] = true;
+                stack.push(p_node);
+            }
+        }
+        while let Some(node) = stack.pop() {
+            for &pred in &in_sources[node.index()] {
+                if !seed_idle.contains(&pred) && !live_without_seed[pred.index()] {
+                    live_without_seed[pred.index()] = true;
+                    stack.push(pred);
+                }
+            }
+        }
+
+        let mut upstream_of_seed = vec![false; node_count];
+        let mut up_stack: Vec<NodeId> = seed_idle.iter().copied().collect();
+        for &n in &up_stack {
+            if n.index() < node_count {
+                upstream_of_seed[n.index()] = true;
+            }
+        }
+        while let Some(node) = up_stack.pop() {
+            for &pred in &in_sources[node.index()] {
+                if !upstream_of_seed[pred.index()] {
+                    upstream_of_seed[pred.index()] = true;
+                    up_stack.push(pred);
+                }
+            }
+        }
+
+        for (node_idx, node_econ) in economy.nodes().iter().enumerate().take(node_count) {
+            let node = NodeId(u32::try_from(node_idx).expect("fits in u32"));
+            if upstream_of_seed[node_idx]
+                && !live_without_seed[node_idx]
+                && !protected.contains(&node)
+                && node_econ.juvenile_ticks == 0
+            {
+                seed_idle.insert(node);
+            }
+        }
+
+        seed_idle
     }
 
     /// Builds the causal signal pool $\mathcal{U}$ over buffered ticks (§4.2).
@@ -1860,9 +2172,18 @@ fn replay_current_baseline(
     is_epoch_1: bool,
 ) -> BaselineReplayMetrics {
     let w_diag = growth_config.diagnostic_window;
-    let w_replay = obs_window.len().min(2 * w_diag);
-    let start_idx = obs_window.len() - w_replay;
+    let max_w_replay = obs_window.len().min(2 * w_diag);
+    let raw_start_idx = obs_window.len() - max_w_replay;
     let eval_start_idx = obs_window.len() - w_diag;
+    let cur_epoch = editable.structure_epoch();
+    let start_idx = (raw_start_idx..=eval_start_idx)
+        .find(|&idx| {
+            obs_window
+                .state_snapshot_at(idx)
+                .is_some_and(|(snap_epoch, _)| snap_epoch == cur_epoch)
+        })
+        .unwrap_or(raw_start_idx);
+    let w_replay = obs_window.len() - start_idx;
     let width = editable.circuit().width();
 
     let max_sym_count = frequencies(

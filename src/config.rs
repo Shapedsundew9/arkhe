@@ -343,6 +343,10 @@ pub struct ArkheM1Telemetry {
     pub driver_handoff_events: u64,
     #[serde(default)]
     pub disagreement_prune_events: u64,
+    #[serde(default)]
+    pub local_excision_events: usize,
+    #[serde(default)]
+    pub exogenous_injection_bits: f64,
 }
 
 /// Aggregated cliff, bound, and guardrail telemetry across one or more learner runs (§B3).
@@ -820,6 +824,8 @@ mod tests {
         assert_eq!(parsed.cumulative_comparator_flux, 0.0);
         assert_eq!(parsed.driver_handoff_events, 0);
         assert_eq!(parsed.disagreement_prune_events, 0);
+        assert_eq!(parsed.local_excision_events, 0);
+        assert_eq!(parsed.exogenous_injection_bits, 0.0);
 
         let full = ArkheM1Telemetry {
             redundancy_sprout_events: 2,
@@ -829,6 +835,8 @@ mod tests {
             cumulative_comparator_flux: 18.75,
             driver_handoff_events: 1,
             disagreement_prune_events: 1,
+            local_excision_events: 3,
+            exogenous_injection_bits: 14.5,
             ..parsed
         };
         let encoded = serde_json::to_string(&full).expect("serialize ArkheM1Telemetry");

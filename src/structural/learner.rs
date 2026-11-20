@@ -16,11 +16,12 @@ use crate::structural::graph_edit::{
     swap_comparator_driver,
 };
 use crate::structural::growth::{
-    AutonomousRingProposal, DiagnosticBuffer, GrowthConfig, GrowthError, RedundancySproutProposal,
-    ScoredSproutProposal, SproutTelemetry, assign_stage3_juvenile_ticks, check_deeper_lag_for_port,
-    diagnose_residual, evaluate_comparator_ring_promotion, observation_horizon,
-    port_primary_cone_is_mature, propose_autonomous_delay_ring_scored_with_telemetry,
-    propose_redundancy_sprout, propose_sprout_band_scored_internal,
+    AutonomousRingProposal, DiagnosticBuffer, ExcisionMode, GrowthConfig, GrowthError,
+    RedundancySproutProposal, ScoredSproutProposal, SproutTelemetry, assign_stage3_juvenile_ticks,
+    check_deeper_lag_for_port, diagnose_residual, effective_juvenile_ticks,
+    evaluate_comparator_ring_promotion, observation_horizon, port_primary_cone_is_mature,
+    propose_autonomous_delay_ring_scored_with_telemetry, propose_redundancy_sprout,
+    propose_sprout_band_scored_internal,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
@@ -214,6 +215,18 @@ enum PendingSnapshot {
     },
 }
 
+/// Mode governing maturation and description-debt billing for externally injected edits (`M3-E3`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InjectionMode {
+    /// Injected nodes enter mature (`juvenile_ticks = 0`, `debt_paid = true`,
+    /// `energy = initial_energy`), and $L(C_{\text{post}}) - L(C_{\text{pre}})$ is credited
+    /// to `exogenous_injection_bits`.
+    Established,
+    /// Injected nodes enter as juveniles (`debt_paid = false`), charged marginal debt via
+    /// [`MarginalDebtLedger::on_sprout`], leaving `exogenous_injection_bits` unchanged.
+    Juvenile,
+}
+
 type PendingPrediction = (Vec<u64>, PendingSnapshot, u64, Vec<u64>);
 
 /// Online gradient-free closed-loop learner driving coordinate-free structural neurogenesis and metabolic economy.
@@ -235,6 +248,8 @@ pub struct ArkheLearner {
     port_starvation_prune_events: Vec<u64>,
     comparator_starvation_prune_events: u64,
     idle_prune_events: u64,
+    local_excision_events: usize,
+    exogenous_injection_bits: f64,
     ring_closure_events: u64,
     redundancy_sprout_events: u64,
     driver_handoff_events: u64,
@@ -323,6 +338,8 @@ impl ArkheLearner {
             port_starvation_prune_events: vec![0; channels_usize],
             comparator_starvation_prune_events: 0,
             idle_prune_events: 0,
+            local_excision_events: 0,
+            exogenous_injection_bits: 0.0,
             ring_closure_events: 0,
             redundancy_sprout_events: 0,
             driver_handoff_events: 0,
@@ -411,6 +428,8 @@ impl ArkheLearner {
             port_starvation_prune_events: vec![0; num_outputs],
             comparator_starvation_prune_events: 0,
             idle_prune_events: 0,
+            local_excision_events: 0,
+            exogenous_injection_bits: 0.0,
             ring_closure_events: 0,
             redundancy_sprout_events: 0,
             driver_handoff_events: 0,
@@ -506,6 +525,159 @@ impl ArkheLearner {
         self.idle_prune_events
     }
 
+    /// Total `M3-E2` verified local pass-through excisions committed.
+    #[must_use]
+    pub const fn local_excision_events(&self) -> usize {
+        self.local_excision_events
+    }
+
+    /// Cumulative exogenous description debt bits prepaid by `InjectionMode::Established` edits.
+    #[must_use]
+    pub const fn exogenous_injection_bits(&self) -> f64 {
+        self.exogenous_injection_bits
+    }
+
+    /// Applies an external structural edit (`M3-E3`) preserving surviving register states and node
+    /// economies via `old_to_new`, billing injected nodes according to `mode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrowthError::InvalidConfig`] if `old_to_new` or `injected` are malformed or
+    /// `edited` fails substrate invariant compilation.
+    pub fn apply_external_edit(
+        &mut self,
+        edited: Circuit,
+        old_to_new: &[Option<NodeId>],
+        injected: &[NodeId],
+        mode: InjectionMode,
+    ) -> Result<(), GrowthError> {
+        let n_post = edited.node_count();
+        let mut is_surviving = vec![false; n_post];
+        for mapped in old_to_new.iter().flatten() {
+            let idx = mapped.index();
+            if idx >= n_post || is_surviving[idx] {
+                return Err(GrowthError::InvalidConfig);
+            }
+            is_surviving[idx] = true;
+        }
+        for &inj in injected {
+            let idx = inj.index();
+            if idx >= n_post || is_surviving[idx] {
+                return Err(GrowthError::InvalidConfig);
+            }
+        }
+
+        let split_tax = self.economy_config.split_code_tax;
+        let pre_circuit = self.editable.circuit().clone();
+        let l_pre = circuit_code_bits_with_tax(&pre_circuit, 0, split_tax);
+        let prev_debts = self.ledger.node_debts.clone();
+        let prev_paid = self.ledger.debt_paid.clone();
+
+        self.editable
+            .recompile_preserving_state(edited, old_to_new)
+            .map_err(|_| GrowthError::InvalidConfig)?;
+
+        let l_post = circuit_code_bits_with_tax(self.editable.circuit(), 0, split_tax);
+        let post_circuit = self.editable.circuit().clone();
+
+        match mode {
+            InjectionMode::Established => {
+                let mut next_debts = vec![0.0; n_post];
+                let mut next_paid = vec![true; n_post];
+                for (old_idx, new_opt) in old_to_new.iter().enumerate() {
+                    if let Some(new_id) = new_opt {
+                        let idx = new_id.index();
+                        if old_idx < prev_debts.len() {
+                            next_debts[idx] = prev_debts[old_idx];
+                            next_paid[idx] = prev_paid[old_idx];
+                        }
+                    }
+                }
+                self.ledger.node_debts = next_debts;
+                self.ledger.debt_paid = next_paid;
+                self.ledger.last_committed_code_bits = l_post;
+
+                let initial_energy = self.economy_config.initial_energy;
+                let econ_nodes = self.editable.economy_mut().nodes_mut();
+                for (idx, node_econ) in econ_nodes.iter_mut().enumerate() {
+                    if !is_surviving[idx] {
+                        node_econ.juvenile_ticks = 0;
+                        node_econ.debt_paid = true;
+                        node_econ.description_debt = 0.0;
+                        node_econ.energy = initial_energy;
+                    }
+                }
+                for &inj in injected {
+                    let idx = inj.index();
+                    self.ledger.debt_paid[idx] = true;
+                    if let Some(node_econ) = econ_nodes.get_mut(idx) {
+                        node_econ.juvenile_ticks = 0;
+                        node_econ.debt_paid = true;
+                        node_econ.energy = initial_energy;
+                    }
+                }
+                self.exogenous_injection_bits += l_post - l_pre;
+            }
+            InjectionMode::Juvenile => {
+                self.ledger.last_committed_code_bits = l_pre;
+                self.ledger.on_sprout(&post_circuit, split_tax, old_to_new);
+
+                let max_depth = (0..n_post)
+                    .filter(|&i| !is_surviving[i])
+                    .map(|i| {
+                        injected_subgraph_register_depth(
+                            &post_circuit,
+                            &is_surviving,
+                            NodeId(u32::try_from(i).expect("fits in u32")),
+                        )
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let max_juv = u32::try_from(
+                    observation_horizon(&self.economy_config, &self.growth_config)
+                        .saturating_mul(2),
+                )
+                .unwrap_or(u32::MAX);
+                let eff_juv =
+                    effective_juvenile_ticks(max_depth, &self.economy_config, &self.growth_config)
+                        .min(max_juv);
+                let initial_energy = self.economy_config.initial_energy;
+                let econ_nodes = self.editable.economy_mut().nodes_mut();
+                for (idx, node_econ) in econ_nodes.iter_mut().enumerate() {
+                    if idx < self.ledger.node_debts.len() {
+                        node_econ.description_debt = self.ledger.node_debts[idx];
+                        node_econ.debt_paid = self.ledger.debt_paid[idx];
+                    }
+                    if !is_surviving[idx] {
+                        node_econ.juvenile_ticks = eff_juv;
+                        node_econ.debt_paid = false;
+                        node_econ.energy = initial_energy;
+                        if idx < self.ledger.debt_paid.len() {
+                            self.ledger.debt_paid[idx] = false;
+                        }
+                    }
+                }
+                for (q, state) in self.port_states.iter_mut().enumerate() {
+                    if port_cone_changed(&pre_circuit, &post_circuit, old_to_new, q as u16) {
+                        state.stage2_mature_at_tick = self.tick.saturating_add(u64::from(eff_juv));
+                    }
+                }
+            }
+        }
+
+        // In TicksPerHop, pre-settle newly injected Delay-free constant subgraphs (e.g. ConstLoop(1/3)).
+        if post_circuit.wire_delay() == WireDelayMode::TicksPerHop {
+            settle_injected_tph_constant_subgraphs(&mut self.editable, &is_surviving);
+        }
+
+        for state in &mut self.port_states {
+            state.diagnostic_buffer.clear();
+            state.ticks_since_last_check = 0;
+        }
+        self.apply_node_remap_to_windows(old_to_new);
+        Ok(())
+    }
+
     /// Total autonomous ring-closure events committed.
     #[must_use]
     pub const fn ring_closure_events(&self) -> u64 {
@@ -571,6 +743,23 @@ impl ArkheLearner {
     }
 
     fn reset_changed_ports(&mut self, pre_circuit: &Circuit, old_to_new: &[Option<NodeId>]) {
+        self.clear_changed_ports_internal(pre_circuit, old_to_new, true);
+    }
+
+    fn clear_changed_port_diagnostics_preserving_scorer(
+        &mut self,
+        pre_circuit: &Circuit,
+        old_to_new: &[Option<NodeId>],
+    ) {
+        self.clear_changed_ports_internal(pre_circuit, old_to_new, false);
+    }
+
+    fn clear_changed_ports_internal(
+        &mut self,
+        pre_circuit: &Circuit,
+        old_to_new: &[Option<NodeId>],
+        reset_scorer_counts: bool,
+    ) {
         let num_ports = self.port_states.len();
         let changed_ports: Vec<usize> = (0..num_ports)
             .filter(|&q| {
@@ -578,10 +767,12 @@ impl ArkheLearner {
             })
             .collect();
         for q in changed_ports {
-            self.editable
-                .economy_mut()
-                .port_scorer_mut(q)
-                .reset_predictor_counts();
+            if reset_scorer_counts {
+                self.editable
+                    .economy_mut()
+                    .port_scorer_mut(q)
+                    .reset_predictor_counts();
+            }
             self.port_states[q].diagnostic_buffer.clear();
             self.port_states[q].ticks_since_last_check = 0;
             self.port_states[q].stage2_mature_at_tick = 0;
@@ -882,6 +1073,8 @@ impl ArkheLearner {
             cumulative_comparator_flux: self.cumulative_comparator_flux(),
             driver_handoff_events: self.driver_handoff_events,
             disagreement_prune_events: self.disagreement_prune_events,
+            local_excision_events: self.local_excision_events,
+            exogenous_injection_bits: self.exogenous_injection_bits,
         }
     }
 
@@ -902,6 +1095,12 @@ impl ArkheLearner {
     }
 
     fn apply_node_remap_to_windows(&mut self, old_to_new: &[Option<NodeId>]) {
+        let new_node_count = self.editable.circuit().node_count();
+        for state in &mut self.port_states {
+            state
+                .diagnostic_buffer
+                .remap_nodes(old_to_new, new_node_count);
+        }
         for win in &mut self.comparator_windows {
             if let Some(Some(mapped)) = old_to_new.get(win.sub_node.index()) {
                 win.sub_node = *mapped;
@@ -1807,6 +2006,207 @@ fn comparator_marginal_code_bits(
     (full - reduced).max(0.0)
 }
 
+fn compute_register_target_reachability(
+    circuit: &Circuit,
+    compiled: &crate::substrate::CompiledCircuit,
+    economy: &EconomyState,
+) -> Vec<bool> {
+    let node_count = circuit.node_count();
+    let mut target_reachable = vec![false; node_count];
+    let mut reverse_adj = vec![Vec::new(); node_count];
+    let mut stack = Vec::new();
+
+    for edge in circuit.edges() {
+        if let SignalSource::NodeOut { node: src, .. } = edge.src
+            && src.index() < node_count
+        {
+            match edge.dst {
+                SignalSink::BoundaryOut(_) => {
+                    if !target_reachable[src.index()] {
+                        target_reachable[src.index()] = true;
+                        stack.push(src.index());
+                    }
+                }
+                SignalSink::NodeIn { node: dst, .. } if dst.index() < node_count => {
+                    reverse_adj[dst.index()].push(src.index());
+                }
+                _ => {}
+            }
+        }
+    }
+    for comp in economy.comparators() {
+        for root in [comp.eqz_node, comp.sub_node] {
+            if root.index() < node_count && !target_reachable[root.index()] {
+                target_reachable[root.index()] = true;
+                stack.push(root.index());
+            }
+        }
+    }
+    while let Some(node) = stack.pop() {
+        for &pred in &reverse_adj[node] {
+            if !target_reachable[pred] {
+                target_reachable[pred] = true;
+                stack.push(pred);
+            }
+        }
+    }
+
+    let mut reg_reachable = vec![false; compiled.total_registers()];
+    let mut reg_idx = 0usize;
+    for (idx, prim) in circuit.nodes().iter().enumerate() {
+        if prim.is_stateful() {
+            if reg_idx < reg_reachable.len() {
+                reg_reachable[reg_idx] = target_reachable[idx];
+            }
+            reg_idx += 1;
+        }
+    }
+    if circuit.wire_delay() == WireDelayMode::TicksPerHop {
+        let mut base = compiled.explicit_delay_count();
+        for edge in circuit.edges() {
+            let reaches = match edge.dst {
+                SignalSink::BoundaryOut(_) => true,
+                SignalSink::NodeIn { node, .. } => {
+                    target_reachable.get(node.index()).copied().unwrap_or(false)
+                }
+            };
+            for s in 0..usize::from(edge.hops) {
+                if base + s < reg_reachable.len() {
+                    reg_reachable[base + s] = reaches;
+                }
+            }
+            base += usize::from(edge.hops);
+        }
+    }
+    reg_reachable
+}
+
+fn injected_subgraph_register_depth(
+    circuit: &Circuit,
+    is_surviving: &[bool],
+    start: NodeId,
+) -> usize {
+    fn rec(circuit: &Circuit, is_surviving: &[bool], node: NodeId, on_path: &mut [bool]) -> usize {
+        if is_surviving.get(node.index()).copied().unwrap_or(false) || on_path[node.index()] {
+            return 0;
+        }
+        on_path[node.index()] = true;
+        let self_reg = usize::from(matches!(
+            circuit.nodes().get(node.index()),
+            Some(Primitive::Delay { .. })
+        ));
+        let is_tph = circuit.wire_delay() == WireDelayMode::TicksPerHop;
+        let mut max_up = 0usize;
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == node
+            {
+                let hop_regs = if is_tph { usize::from(edge.hops) } else { 0 };
+                let up = match edge.src {
+                    SignalSource::BoundaryIn(_) => hop_regs,
+                    SignalSource::NodeOut { node: src_node, .. } => {
+                        if on_path[src_node.index()] {
+                            0
+                        } else if is_surviving.get(src_node.index()).copied().unwrap_or(false) {
+                            hop_regs
+                        } else {
+                            hop_regs + rec(circuit, is_surviving, src_node, on_path)
+                        }
+                    }
+                };
+                max_up = max_up.max(up);
+            }
+        }
+        on_path[node.index()] = false;
+        self_reg + max_up
+    }
+
+    let mut on_path = vec![false; circuit.node_count()];
+    rec(circuit, is_surviving, start, &mut on_path)
+}
+
+fn settle_injected_tph_constant_subgraphs(editable: &mut EditableCircuit, is_surviving: &[bool]) {
+    let circuit = editable.circuit().clone();
+    let compiled = editable.compiled().clone();
+    if circuit.wire_delay() != WireDelayMode::TicksPerHop {
+        return;
+    }
+    let node_count = circuit.node_count();
+    let mut const_eligible = vec![false; node_count];
+    for i in 0..node_count {
+        if !is_surviving[i] && !circuit.nodes()[i].is_stateful() {
+            const_eligible[i] = true;
+        }
+    }
+    // Any node fed by BoundaryIn, a surviving node, or a Delay primitive is not a pure
+    // newly-injected constant subgraph.
+    let mut queue = Vec::new();
+    for edge in circuit.edges() {
+        if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+            && dst.index() < node_count
+            && const_eligible[dst.index()]
+        {
+            let disqualified_src = match edge.src {
+                SignalSource::BoundaryIn(_) => true,
+                SignalSource::NodeOut { node: src, .. } => !const_eligible[src.index()],
+            };
+            if disqualified_src {
+                const_eligible[dst.index()] = false;
+                queue.push(dst);
+            }
+        }
+    }
+    while let Some(bad) = queue.pop() {
+        for edge in circuit.edges() {
+            if let SignalSource::NodeOut { node: src, .. } = edge.src
+                && src == bad
+                && let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst.index() < node_count
+                && const_eligible[dst.index()]
+            {
+                const_eligible[dst.index()] = false;
+                queue.push(dst);
+            }
+        }
+    }
+
+    let mut settle_reg_indices = Vec::new();
+    let mut base = compiled.explicit_delay_count();
+    for edge in circuit.edges() {
+        let hops = usize::from(edge.hops);
+        if let SignalSource::NodeOut { node: src, .. } = edge.src
+            && src.index() < node_count
+            && const_eligible[src.index()]
+        {
+            for s in 0..hops {
+                settle_reg_indices.push(base + s);
+            }
+        }
+        base += hops;
+    }
+    if settle_reg_indices.is_empty() {
+        return;
+    }
+
+    let mut probe = crate::substrate::ScalarState::new(&compiled);
+    let _ = probe.set_registers(&compiled, editable.state().registers());
+    let zeros_in = vec![0u64; usize::from(compiled.num_inputs())];
+    let mut out = vec![0u64; usize::from(compiled.num_outputs())];
+    for _ in 0..(node_count + 4) {
+        if probe.step(&compiled, &zeros_in, &mut out).is_err() {
+            return;
+        }
+    }
+    let mut live_regs = editable.state().registers().to_vec();
+    let probe_regs = probe.registers();
+    for r in settle_reg_indices {
+        if r < live_regs.len() && r < probe_regs.len() {
+            live_regs[r] = probe_regs[r];
+        }
+    }
+    let _ = editable.set_registers(&live_regs);
+}
+
 impl PredictorBaseline for ArkheLearner {
     fn name(&self) -> &str {
         "ArkheM1"
@@ -1974,10 +2374,16 @@ impl PredictorBaseline for ArkheLearner {
                 comp_alt_vals.push(wires[sub_in[1]]);
                 comp_eqz_vals.push(pre_step_node_outs[comp.eqz_node.index()]);
             }
+            let fact_slice = truth.get(..num_ports).unwrap_or(truth);
             let comp_obs = self
                 .editable
                 .economy_mut()
-                .observe_comparators(&comp_pri_vals, &comp_alt_vals, &comp_eqz_vals, Some(truth))
+                .observe_comparators(
+                    &comp_pri_vals,
+                    &comp_alt_vals,
+                    &comp_eqz_vals,
+                    Some(fact_slice),
+                )
                 .expect("valid comparator observation");
             comp_rewards = comp_obs.rewards;
             self.editable
@@ -2056,17 +2462,32 @@ impl PredictorBaseline for ArkheLearner {
                 .enumerate()
                 .filter_map(|(idx, econ)| (econ.juvenile_ticks > 0).then_some(NodeId(idx as u32)))
                 .collect();
+            let mut used_split_preserving = false;
+            let mut excised_starved_passthrough = false;
             let prune_res = if let Some((pruned, old_to_new)) =
                 prune_starved_preserving_healthy_split_branches(
                     self.editable.circuit(),
                     &starved_set,
                     &juvenile_set,
                 ) {
+                used_split_preserving = true;
                 self.editable
                     .recompile_preserving_state(pruned, &old_to_new)
                     .map(|()| old_to_new)
+            } else if self.growth_config.excision_mode == ExcisionMode::VerifiedLocalExcision
+                && let Ok(Some(old_to_new)) =
+                    self.editable.excise_verified_passthrough_for_starved_cone(
+                        &starved_set,
+                        self.economy_config.split_code_tax,
+                    )
+            {
+                excised_starved_passthrough = true;
+                Ok(old_to_new)
             } else {
-                self.editable.prune_starved_nodes()
+                self.editable.prune_starved_nodes_with_mode(
+                    self.growth_config.excision_mode,
+                    self.growth_config.diagnostic_window,
+                )
             };
             if let Ok(old_to_new) = prune_res {
                 self.ledger.on_prune(
@@ -2074,10 +2495,50 @@ impl PredictorBaseline for ArkheLearner {
                     self.economy_config.split_code_tax,
                     &old_to_new,
                 );
-                self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
+                let preserve_scorer = self.growth_config.excision_mode
+                    == ExcisionMode::VerifiedLocalExcision
+                    && (used_split_preserving
+                        || excised_starved_passthrough
+                        || (0..num_ports).all(|q| {
+                            let sink = SignalSink::BoundaryOut(q as u16);
+                            let pre_drv = pre_prune_circuit.edges().iter().find(|e| e.dst == sink);
+                            let post_drv = self
+                                .editable
+                                .circuit()
+                                .edges()
+                                .iter()
+                                .find(|e| e.dst == sink);
+                            match (pre_drv, post_drv) {
+                                (Some(pe), Some(_)) => match pe.src {
+                                    SignalSource::NodeOut { node, .. } => {
+                                        !starved_set.contains(&node)
+                                    }
+                                    SignalSource::BoundaryIn(_) => true,
+                                },
+                                (None, None) => true,
+                                _ => false,
+                            }
+                        }));
+                if preserve_scorer {
+                    self.clear_changed_port_diagnostics_preserving_scorer(
+                        &pre_prune_circuit,
+                        &old_to_new,
+                    );
+                } else {
+                    self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
+                }
                 self.apply_node_remap_to_windows(&old_to_new);
-                self.starvation_prune_events += 1;
-                self.record_scoped_starvation_prune(&pre_prune_circuit, &pre_comps, &starved_set);
+                if excised_starved_passthrough {
+                    self.idle_prune_events += 1;
+                    self.local_excision_events += 1;
+                } else {
+                    self.starvation_prune_events += 1;
+                    self.record_scoped_starvation_prune(
+                        &pre_prune_circuit,
+                        &pre_comps,
+                        &starved_set,
+                    );
+                }
             }
         }
 
@@ -2093,14 +2554,60 @@ impl PredictorBaseline for ArkheLearner {
         let node_outs = pre_step_node_outs;
         let node_count = self.editable.circuit().node_count();
         let mut sensitive = vec![false; node_count];
-        for (i, sens) in sensitive.iter_mut().enumerate().take(node_count) {
-            *sens = output_by_node[i].iter().any(|&s| s > 0.0)
-                || latch_by_node[i].iter().any(|&s| s > 0.0)
-                || comp_eqz_by_node.is_some_and(|by_node| {
-                    by_node
-                        .get(i)
-                        .is_some_and(|scores| scores.iter().any(|&s| s > 0.0))
-                });
+        match self.growth_config.excision_mode {
+            ExcisionMode::BaselineD1b1 => {
+                for (i, sens) in sensitive.iter_mut().enumerate().take(node_count) {
+                    if i >= output_by_node.len() || i >= latch_by_node.len() {
+                        continue;
+                    }
+                    *sens = output_by_node[i].iter().any(|&s| s > 0.0)
+                        || latch_by_node[i].iter().any(|&s| s > 0.0)
+                        || comp_eqz_by_node.is_some_and(|by_node| {
+                            by_node
+                                .get(i)
+                                .is_some_and(|scores| scores.iter().any(|&s| s > 0.0))
+                        });
+                }
+            }
+            ExcisionMode::VerifiedLocalExcision => {
+                let reg_reaches_target = compute_register_target_reachability(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.economy(),
+                );
+                for (i, sens) in sensitive.iter_mut().enumerate().take(node_count) {
+                    if i >= output_by_node.len() || i >= latch_by_node.len() {
+                        continue;
+                    }
+                    let direct_port = output_by_node[i].iter().enumerate().any(|(p, &s)| {
+                        s > 0.0
+                            && base_ancestry
+                                .port_shares
+                                .get(p)
+                                .and_then(|sh| sh.get(i))
+                                .copied()
+                                .unwrap_or(0.0)
+                                > 0.0
+                    });
+                    let direct_comp = comp_eqz_by_node.is_some_and(|by_node| {
+                        by_node.get(i).is_some_and(|scores| {
+                            scores.iter().enumerate().any(|(m, &s)| {
+                                s > 0.0
+                                    && comp_ancestry
+                                        .and_then(|ca| ca.comparator_shares.get(m))
+                                        .and_then(|sh| sh.get(i))
+                                        .copied()
+                                        .unwrap_or(0.0)
+                                        > 0.0
+                            })
+                        })
+                    });
+                    let anchored_latch = latch_by_node[i].iter().enumerate().any(|(r, &s)| {
+                        s > 0.0 && reg_reaches_target.get(r).copied().unwrap_or(false)
+                    });
+                    *sens = direct_port || direct_comp || anchored_latch;
+                }
+            }
         }
 
         for p in 0..num_ports {
@@ -2113,15 +2620,22 @@ impl PredictorBaseline for ArkheLearner {
                             self.editable.economy(),
                             port_u16,
                         ));
-            if diag_mature && port_is_primed(self.editable.circuit(), base_ancestry, port_u16) {
-                self.port_states[p].diagnostic_buffer.push_frame(
-                    &input_frame,
-                    truth,
-                    &predictions,
-                    &res,
-                    &node_outs,
-                    &sensitive,
-                );
+            if pre_epoch == self.editable.structure_epoch()
+                && diag_mature
+                && port_is_primed(self.editable.circuit(), base_ancestry, port_u16)
+            {
+                self.port_states[p]
+                    .diagnostic_buffer
+                    .push_frame_with_snapshot(
+                        &input_frame,
+                        truth,
+                        &predictions,
+                        &res,
+                        &node_outs,
+                        &sensitive,
+                        pre_epoch,
+                        &pre_registers,
+                    );
                 self.port_states[p].ticks_since_last_check += 1;
             }
         }
@@ -2150,17 +2664,40 @@ impl PredictorBaseline for ArkheLearner {
             self.port_states[p].ticks_since_last_check = 0;
             pass1_timers[p] = Some(prev_ticks_since_check);
 
-            // 1. Idle mature node pruning (D1b.1)
-            let idle_nodes = self.port_states[p]
+            // 1. Idle / ring-identity / pass-through excision (M3-E1 + M3-E2)
+            let replay_initial_regs: Option<Vec<u64>> = self.port_states[p]
                 .diagnostic_buffer
-                .idle_mature_nodes(self.editable.economy());
+                .first_frame_snapshot()
+                .and_then(|(epoch, regs)| {
+                    (epoch == self.editable.structure_epoch()
+                        && regs.len() == self.editable.compiled().total_registers())
+                    .then(|| regs.to_vec())
+                });
+            let idle_nodes = match self.growth_config.excision_mode {
+                ExcisionMode::BaselineD1b1 => self.port_states[p]
+                    .diagnostic_buffer
+                    .idle_mature_nodes(self.editable.economy()),
+                ExcisionMode::VerifiedLocalExcision => self.port_states[p]
+                    .diagnostic_buffer
+                    .idle_mature_nodes_for_circuit(
+                        self.editable.circuit(),
+                        self.editable.economy(),
+                    ),
+            };
             if !idle_nodes.is_empty() {
                 let pre_prune_circuit = self.editable.circuit().clone();
-                if let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes(
+                let past_inputs = self.port_states[p].diagnostic_buffer.inputs.clone();
+                let past_preds = self.port_states[p].diagnostic_buffer.predictions.clone();
+                let past_node_outs = self.port_states[p].diagnostic_buffer.node_outputs.clone();
+                if let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes_with_mode(
                     &idle_nodes,
-                    &self.port_states[p].diagnostic_buffer.inputs,
-                    &self.port_states[p].diagnostic_buffer.predictions,
+                    &past_inputs,
+                    &past_preds,
                     self.economy_config.split_code_tax,
+                    self.growth_config.excision_mode,
+                    self.growth_config.diagnostic_window,
+                    Some(&past_node_outs),
+                    replay_initial_regs.as_deref(),
                 ) {
                     let any_pruned = old_to_new.iter().any(Option::is_none);
                     if any_pruned {
@@ -2169,12 +2706,51 @@ impl PredictorBaseline for ArkheLearner {
                             self.economy_config.split_code_tax,
                             &old_to_new,
                         );
-                        self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
+                        match self.growth_config.excision_mode {
+                            ExcisionMode::BaselineD1b1 => {
+                                self.reset_changed_ports(&pre_prune_circuit, &old_to_new);
+                            }
+                            ExcisionMode::VerifiedLocalExcision => {
+                                self.clear_changed_port_diagnostics_preserving_scorer(
+                                    &pre_prune_circuit,
+                                    &old_to_new,
+                                );
+                            }
+                        }
                         self.apply_node_remap_to_windows(&old_to_new);
                         self.idle_prune_events += 1;
                         self.tick += 1;
                         return None;
                     }
+                }
+            }
+            if self.growth_config.excision_mode == ExcisionMode::VerifiedLocalExcision {
+                let pre_prune_circuit = self.editable.circuit().clone();
+                let past_inputs = self.port_states[p].diagnostic_buffer.inputs.clone();
+                let past_preds = self.port_states[p].diagnostic_buffer.predictions.clone();
+                let past_node_outs = self.port_states[p].diagnostic_buffer.node_outputs.clone();
+                if let Ok(Some(old_to_new)) = self.editable.excise_verified_passthrough_subgraphs(
+                    port_u16,
+                    &past_inputs,
+                    &past_preds,
+                    &past_node_outs,
+                    replay_initial_regs.as_deref(),
+                    self.economy_config.split_code_tax,
+                ) {
+                    self.ledger.on_prune(
+                        self.editable.circuit(),
+                        self.economy_config.split_code_tax,
+                        &old_to_new,
+                    );
+                    self.clear_changed_port_diagnostics_preserving_scorer(
+                        &pre_prune_circuit,
+                        &old_to_new,
+                    );
+                    self.apply_node_remap_to_windows(&old_to_new);
+                    self.idle_prune_events += 1;
+                    self.local_excision_events += 1;
+                    self.tick += 1;
+                    return None;
                 }
             }
 

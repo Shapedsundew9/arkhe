@@ -1,16 +1,20 @@
 //! Transactional graph edits that preserve live register phases and node economy.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+use crate::baselines::DEFAULT_MAX_CERTIFY_JOINT_STEPS;
 use crate::metrics::{allocate_circuit_description_bits, circuit_code_bits_with_tax};
 use crate::rng::SeedBank;
 use crate::structural::economy::{EconomyConfig, EconomyError, EconomyState};
+use crate::structural::graph_edit::{cone_channel_mask, source_has_cycle};
+use crate::structural::growth::ExcisionMode;
 use crate::structural::sensitivity::{
     ComparatorTarget, EXACT_SENSITIVITY_MAX_BITS, counterfactual_sensitivity_with_comparators,
 };
 use crate::substrate::{
     Circuit, CompiledCircuit, EvalError, NodeId, Primitive, ScalarState, SignalSink, SignalSource,
+    WireDelayMode,
 };
 
 /// Errors returned by a state-preserving circuit edit.
@@ -65,6 +69,7 @@ pub struct EditableCircuit {
     state: ScalarState,
     economy: EconomyState,
     structure_epoch: u64,
+    diagnostic_window: usize,
 }
 
 impl EditableCircuit {
@@ -101,7 +106,14 @@ impl EditableCircuit {
             state,
             economy,
             structure_epoch: 0,
+            diagnostic_window: growth_config.diagnostic_window,
         })
+    }
+
+    /// Diagnostic window $W_{\text{diag}}$ tied to this editable circuit.
+    #[must_use]
+    pub const fn diagnostic_window(&self) -> usize {
+        self.diagnostic_window
     }
 
     /// Monotonic structural edit / explicit register-overwrite epoch counter.
@@ -274,6 +286,18 @@ impl EditableCircuit {
     /// Excises mature depleted nodes, collapses single-use `Split` nodes, and bypasses inactive
     /// zero-valued correctors. Returns the old-to-new mapping for the pre-prune nodes.
     pub fn prune_starved_nodes(&mut self) -> Result<Vec<Option<NodeId>>, SurgeryError> {
+        self.prune_starved_nodes_with_mode(
+            ExcisionMode::VerifiedLocalExcision,
+            self.diagnostic_window,
+        )
+    }
+
+    /// Excises mature depleted nodes using the selected [`ExcisionMode`] and diagnostic window.
+    pub fn prune_starved_nodes_with_mode(
+        &mut self,
+        excision_mode: ExcisionMode,
+        diagnostic_window: usize,
+    ) -> Result<Vec<Option<NodeId>>, SurgeryError> {
         let removed: BTreeSet<NodeId> = self
             .economy
             .nodes()
@@ -291,8 +315,44 @@ impl EditableCircuit {
                 })
                 .collect());
         }
-        let (staged, old_to_new) = self.build_pruned_circuit(&removed)?;
+        let pre_circuit = self.circuit.clone();
+        let pre_compiled = self.compiled.clone();
+        let pre_regs = self.state.registers().to_vec();
+        let (staged, old_to_new) =
+            self.build_pruned_circuit_with_mode(&removed, excision_mode, diagnostic_window, None)?;
+        let staged_compiled = staged.compile()?;
+        let shifted_live = (excision_mode == ExcisionMode::VerifiedLocalExcision
+            && pre_circuit.wire_delay() == WireDelayMode::TicksPerHop)
+            .then(|| {
+                let reg_map = register_mapping(
+                    &pre_circuit,
+                    &staged,
+                    &pre_compiled,
+                    &staged_compiled,
+                    &old_to_new,
+                );
+                let mut remapped = ScalarState::new(&staged_compiled).registers().to_vec();
+                for (old_r, new_r) in reg_map.iter().enumerate() {
+                    if let Some(nr) = new_r
+                        && old_r < pre_regs.len()
+                    {
+                        remapped[*nr] = pre_regs[old_r];
+                    }
+                }
+                align_tph_autonomous_after_prune(
+                    &pre_circuit,
+                    &pre_compiled,
+                    &pre_regs,
+                    &staged,
+                    &staged_compiled,
+                    &remapped,
+                )
+            })
+            .flatten();
         self.recompile_preserving_state(staged, &old_to_new)?;
+        if let Some(regs) = shifted_live {
+            self.set_registers(&regs)?;
+        }
         Ok(old_to_new)
     }
 
@@ -305,6 +365,31 @@ impl EditableCircuit {
         past_inputs: &[Vec<u64>],
         past_predictions: &[Vec<u64>],
         split_code_tax: bool,
+    ) -> Result<Vec<Option<NodeId>>, SurgeryError> {
+        self.prune_zero_sensitivity_mature_nodes_with_mode(
+            idle_nodes,
+            past_inputs,
+            past_predictions,
+            split_code_tax,
+            ExcisionMode::VerifiedLocalExcision,
+            self.diagnostic_window,
+            None,
+            None,
+        )
+    }
+
+    /// Excises causally idle / ring-identity mature nodes under the specified [`ExcisionMode`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn prune_zero_sensitivity_mature_nodes_with_mode(
+        &mut self,
+        idle_nodes: &BTreeSet<NodeId>,
+        past_inputs: &[Vec<u64>],
+        past_predictions: &[Vec<u64>],
+        split_code_tax: bool,
+        excision_mode: ExcisionMode,
+        diagnostic_window: usize,
+        past_node_outputs: Option<&[Vec<u64>]>,
+        replay_initial_regs: Option<&[u64]>,
     ) -> Result<Vec<Option<NodeId>>, SurgeryError> {
         let identity_map = || -> Vec<Option<NodeId>> {
             (0..self.circuit.node_count())
@@ -322,6 +407,22 @@ impl EditableCircuit {
         let comp_targets = self.comparator_targets();
         let filtered_idle: std::borrow::Cow<'_, BTreeSet<NodeId>> = if comp_targets.is_empty() {
             std::borrow::Cow::Borrowed(idle_nodes)
+        } else if excision_mode == ExcisionMode::VerifiedLocalExcision {
+            let mut protected_comp: BTreeSet<NodeId> =
+                comparator_exclusive_nodes(&self.circuit, &self.economy);
+            for comp in self.economy.comparators() {
+                protected_comp.insert(comp.sub_node);
+                protected_comp.insert(comp.eqz_node);
+            }
+            let retained: BTreeSet<NodeId> = idle_nodes
+                .iter()
+                .copied()
+                .filter(|node| !protected_comp.contains(node))
+                .collect();
+            if retained.is_empty() {
+                return Ok(identity_map());
+            }
+            std::borrow::Cow::Owned(retained)
         } else {
             let active = self.comparator_and_boundary_active_nodes(past_inputs, &comp_targets);
             let retained: BTreeSet<NodeId> = idle_nodes
@@ -335,7 +436,12 @@ impl EditableCircuit {
             std::borrow::Cow::Owned(retained)
         };
 
-        let Ok((staged, old_to_new)) = self.build_pruned_circuit(filtered_idle.as_ref()) else {
+        let Ok((staged, old_to_new)) = self.build_pruned_circuit_with_mode(
+            filtered_idle.as_ref(),
+            excision_mode,
+            diagnostic_window,
+            past_node_outputs,
+        ) else {
             return Ok(identity_map());
         };
 
@@ -343,6 +449,7 @@ impl EditableCircuit {
             return Ok(identity_map());
         };
 
+        let base_regs = replay_initial_regs.unwrap_or_else(|| self.state.registers());
         let reg_map = register_mapping(
             &self.circuit,
             &staged,
@@ -354,10 +461,23 @@ impl EditableCircuit {
         let mut staged_regs = staged_state.registers().to_vec();
         for (old_r, new_r) in reg_map.iter().enumerate() {
             if let Some(nr) = new_r
-                && old_r < self.state.registers().len()
+                && old_r < base_regs.len()
             {
-                staged_regs[*nr] = self.state.registers()[old_r];
+                staged_regs[*nr] = base_regs[old_r];
             }
+        }
+        if excision_mode == ExcisionMode::VerifiedLocalExcision
+            && self.circuit.wire_delay() == WireDelayMode::TicksPerHop
+            && let Some(aligned) = align_tph_autonomous_after_prune(
+                &self.circuit,
+                &self.compiled,
+                base_regs,
+                &staged,
+                &staged_compiled,
+                &staged_regs,
+            )
+        {
+            staged_regs = aligned;
         }
         if staged_state
             .set_registers(&staged_compiled, &staged_regs)
@@ -386,7 +506,11 @@ impl EditableCircuit {
         let mut orig_probe_state = if surviving_eqz_wires.is_empty() {
             None
         } else {
-            Some(self.state.clone())
+            let mut st = ScalarState::new(&self.compiled);
+            if st.set_registers(&self.compiled, base_regs).is_err() {
+                return Ok(identity_map());
+            }
+            Some(st)
         };
         let mut orig_pred_buf = vec![0u64; usize::from(self.circuit.num_outputs())];
         let mut staged_pred = vec![0u64; usize::from(staged.num_outputs())];
@@ -423,8 +547,522 @@ impl EditableCircuit {
             return Ok(identity_map());
         }
 
+        let live_shifted = (excision_mode == ExcisionMode::VerifiedLocalExcision
+            && self.circuit.wire_delay() == WireDelayMode::TicksPerHop)
+            .then(|| {
+                let live_regs = self.state.registers();
+                let mut remapped = ScalarState::new(&staged_compiled).registers().to_vec();
+                for (old_r, new_r) in reg_map.iter().enumerate() {
+                    if let Some(nr) = new_r
+                        && old_r < live_regs.len()
+                    {
+                        remapped[*nr] = live_regs[old_r];
+                    }
+                }
+                align_tph_autonomous_after_prune(
+                    &self.circuit,
+                    &self.compiled,
+                    live_regs,
+                    &staged,
+                    &staged_compiled,
+                    &remapped,
+                )
+            })
+            .flatten();
+
         self.recompile_preserving_state(staged, &old_to_new)?;
+        if let Some(regs) = live_shifted {
+            self.set_registers(&regs)?;
+        }
         Ok(old_to_new)
+    }
+
+    /// Attempts `M3-E2` verified local pass-through excision on `port`'s mature primary cone.
+    ///
+    /// Finds a mature primary-cone node `v` and upstream source `x` (`x in UpstreamCone(v)`)
+    /// empirically matching over `W_diag` frames, proves formal equivalence (`v === x`) over
+    /// `S = ExcisedSubgraph(v, x)` via `ConstLoop(c)` fixed-point binding + exhaustive truth-table
+    /// evaluation (or bounded joint-state certification + replay for stateful/`TicksPerHop` cones),
+    /// verifies strict MDL reduction `L(C') < L(C)`, and commits atomically preserving state.
+    pub fn excise_verified_passthrough_subgraphs(
+        &mut self,
+        port: u16,
+        past_inputs: &[Vec<u64>],
+        past_predictions: &[Vec<u64>],
+        past_node_outputs: &[Vec<u64>],
+        replay_initial_regs: Option<&[u64]>,
+        split_code_tax: bool,
+    ) -> Result<Option<Vec<Option<NodeId>>>, SurgeryError> {
+        let w_diag = past_node_outputs.len();
+        if w_diag == 0 || past_inputs.len() != w_diag {
+            return Ok(None);
+        }
+        let primary_nodes = primary_cone_nodes(&self.circuit, &self.economy, port);
+        if primary_nodes.is_empty() {
+            return Ok(None);
+        }
+
+        let protected: BTreeSet<NodeId> = self
+            .economy
+            .comparators()
+            .iter()
+            .flat_map(|c| [c.sub_node, c.eqz_node])
+            .collect();
+        let comp_exclusive = comparator_exclusive_nodes(&self.circuit, &self.economy);
+        let const_loops =
+            detect_fixed_point_const_loops(&self.circuit, &self.compiled, &self.state);
+        let width = self.circuit.width();
+        let l_old = circuit_code_bits_with_tax(&self.circuit, 0, split_code_tax);
+        let comp_targets = self.comparator_targets();
+
+        // Order candidate `v` by topological output proximity (outermost primary nodes first).
+        let mut candidates_v: Vec<NodeId> = primary_nodes
+            .iter()
+            .copied()
+            .filter(|&v| {
+                !protected.contains(&v)
+                    && self.circuit.nodes().get(v.index()) != Some(&Primitive::Split)
+                    && self
+                        .economy
+                        .nodes()
+                        .get(v.index())
+                        .is_some_and(|n| n.juvenile_ticks == 0)
+            })
+            .collect();
+        candidates_v.sort_by_key(|v| std::cmp::Reverse(v.index()));
+
+        for v in candidates_v {
+            // Collect upstream sources `x` in BFS order, prioritizing maximal excised region size
+            // so shared/comparator-cone roots are tested ahead of shallower cloned branches (`D7b`).
+            let upstream_sources = collect_upstream_sources_bfs(&self.circuit, v);
+            for x in
+                self.prioritize_passthrough_sources(v, upstream_sources, &protected, split_code_tax)
+            {
+                if let SignalSource::NodeOut { node: u, .. } = x
+                    && (u == v
+                        || protected.contains(&u)
+                        || comp_exclusive.contains(&u)
+                        || self
+                            .economy
+                            .nodes()
+                            .get(u.index())
+                            .is_some_and(|n| n.juvenile_ticks > 0))
+                {
+                    continue;
+                }
+
+                // Step 1: Empirical W_diag screen.
+                let delta_h = match self.circuit.wire_delay() {
+                    WireDelayMode::Combinational => {
+                        let matched = (0..w_diag).all(|t| {
+                            let v_val = past_node_outputs[t]
+                                .get(v.index())
+                                .map(|&val| width.normalize(val));
+                            let x_val = signal_source_frame_value(
+                                x,
+                                &past_inputs[t],
+                                &past_node_outputs[t],
+                                width,
+                            );
+                            v_val.is_some() && v_val == x_val
+                        });
+                        if !matched {
+                            continue;
+                        }
+                        0usize
+                    }
+                    WireDelayMode::TicksPerHop => {
+                        let direct_match = (0..w_diag).all(|t| {
+                            let v_val = past_node_outputs[t]
+                                .get(v.index())
+                                .map(|&val| width.normalize(val));
+                            let x_val = signal_source_frame_value(
+                                x,
+                                &past_inputs[t],
+                                &past_node_outputs[t],
+                                width,
+                            );
+                            v_val.is_some() && v_val == x_val
+                        });
+                        if direct_match {
+                            0usize
+                        } else if cone_channel_mask(&self.circuit, x) == 0
+                            && source_has_cycle(&self.circuit, x)
+                        {
+                            let Some(h) = min_hop_distance(&self.circuit, x, v) else {
+                                continue;
+                            };
+                            if h == 0 || h >= w_diag {
+                                continue;
+                            }
+                            let shifted_match = (h..w_diag).all(|t| {
+                                let v_val = past_node_outputs[t]
+                                    .get(v.index())
+                                    .map(|&val| width.normalize(val));
+                                let x_val = signal_source_frame_value(
+                                    x,
+                                    &past_inputs[t - h],
+                                    &past_node_outputs[t - h],
+                                    width,
+                                );
+                                v_val.is_some() && v_val == x_val
+                            });
+                            if !shifted_match {
+                                continue;
+                            }
+                            h
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+
+                // Steps 2 & 3: build candidate C', verify equivalence over S, verify strict MDL reduction, commit.
+                if let Some(old_to_new) = self.try_certify_and_commit_passthrough_bypass(
+                    v,
+                    x,
+                    &protected,
+                    &const_loops,
+                    &comp_targets,
+                    past_inputs,
+                    past_predictions,
+                    replay_initial_regs,
+                    delta_h,
+                    l_old,
+                    split_code_tax,
+                    false,
+                )? {
+                    return Ok(Some(old_to_new));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn prioritize_passthrough_sources(
+        &self,
+        v: NodeId,
+        mut upstream_sources: Vec<SignalSource>,
+        protected: &BTreeSet<NodeId>,
+        split_code_tax: bool,
+    ) -> Vec<SignalSource> {
+        upstream_sources.reverse();
+        let mut scored: Vec<(f64, usize, usize, SignalSource)> = upstream_sources
+            .into_iter()
+            .enumerate()
+            .map(|(rev_idx, x)| {
+                let (l_new, exc_len) = self
+                    .build_passthrough_bypass_candidate(v, x, protected)
+                    .map_or((f64::INFINITY, 0), |(staged, _, exc)| {
+                        (
+                            circuit_code_bits_with_tax(&staged, 0, split_code_tax),
+                            exc.len(),
+                        )
+                    });
+                (l_new, exc_len, rev_idx, x)
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        scored.into_iter().map(|(_, _, _, x)| x).collect()
+    }
+
+    /// Attempts M3-E2 local pass-through excision when `starved_set` threatens a node inside
+    /// a primary cone under `ExcisionMode::VerifiedLocalExcision`, preventing destructive primary
+    /// cone collapse when a side-arm or pass-through operator starves before `W_diag` completes.
+    pub fn excise_verified_passthrough_for_starved_cone(
+        &mut self,
+        starved_set: &BTreeSet<NodeId>,
+        split_code_tax: bool,
+    ) -> Result<Option<Vec<Option<NodeId>>>, SurgeryError> {
+        if starved_set.is_empty() {
+            return Ok(None);
+        }
+        let protected: BTreeSet<NodeId> = self
+            .economy
+            .comparators()
+            .iter()
+            .flat_map(|c| [c.sub_node, c.eqz_node])
+            .collect();
+        let comp_exclusive = comparator_exclusive_nodes(&self.circuit, &self.economy);
+        let const_loops =
+            detect_fixed_point_const_loops(&self.circuit, &self.compiled, &self.state);
+        let l_old = circuit_code_bits_with_tax(&self.circuit, 0, split_code_tax);
+        let comp_targets = self.comparator_targets();
+        let num_outputs = self.circuit.num_outputs();
+
+        for port in 0..num_outputs {
+            let primary_nodes = primary_cone_nodes(&self.circuit, &self.economy, port);
+            if primary_nodes.is_empty() || primary_nodes.is_disjoint(starved_set) {
+                continue;
+            }
+            let mut candidates_v: Vec<NodeId> = primary_nodes
+                .iter()
+                .copied()
+                .filter(|&v| {
+                    !protected.contains(&v)
+                        && self.circuit.nodes().get(v.index()) != Some(&Primitive::Split)
+                        && self
+                            .economy
+                            .nodes()
+                            .get(v.index())
+                            .is_some_and(|n| n.juvenile_ticks == 0)
+                })
+                .collect();
+            candidates_v.sort_by_key(|v| std::cmp::Reverse(v.index()));
+
+            for v in candidates_v {
+                let upstream_sources = collect_upstream_sources_bfs(&self.circuit, v);
+                // Only inspect `v` if `v` itself or its upstream cone contains a starved node.
+                let touches_starved = starved_set.contains(&v)
+                    || upstream_sources.iter().any(|src| {
+                        matches!(src, SignalSource::NodeOut { node, .. } if starved_set.contains(node))
+                    });
+                if !touches_starved {
+                    continue;
+                }
+                for x in self.prioritize_passthrough_sources(
+                    v,
+                    upstream_sources,
+                    &protected,
+                    split_code_tax,
+                ) {
+                    if let SignalSource::NodeOut { node: u, .. } = x {
+                        if u == v
+                            || starved_set.contains(&u)
+                            || protected.contains(&u)
+                            || comp_exclusive.contains(&u)
+                            || self
+                                .economy
+                                .nodes()
+                                .get(u.index())
+                                .is_some_and(|n| n.juvenile_ticks > 0)
+                        {
+                            continue;
+                        }
+                        let x_anc = collect_upstream_sources_bfs(&self.circuit, u);
+                        if x_anc.iter().any(|src| {
+                            matches!(src, SignalSource::NodeOut { node, .. } if starved_set.contains(node))
+                        }) {
+                            continue;
+                        }
+                    }
+                    if let Some(old_to_new) = self.try_certify_and_commit_passthrough_bypass(
+                        v,
+                        x,
+                        &protected,
+                        &const_loops,
+                        &comp_targets,
+                        &[],
+                        &[],
+                        None,
+                        0,
+                        l_old,
+                        split_code_tax,
+                        false,
+                    )? {
+                        return Ok(Some(old_to_new));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_certify_and_commit_passthrough_bypass(
+        &mut self,
+        v: NodeId,
+        x: SignalSource,
+        protected: &BTreeSet<NodeId>,
+        const_loops: &BTreeMap<NodeId, u64>,
+        comp_targets: &[ComparatorTarget],
+        past_inputs: &[Vec<u64>],
+        past_predictions: &[Vec<u64>],
+        replay_initial_regs: Option<&[u64]>,
+        delta_h: usize,
+        l_old: f64,
+        split_code_tax: bool,
+        allow_juvenile: bool,
+    ) -> Result<Option<Vec<Option<NodeId>>>, SurgeryError> {
+        // Build candidate bypassed circuit C' and S = ExcisedSubgraph(v, x).
+        let Some((staged, old_to_new, excised_set)) =
+            self.build_passthrough_bypass_candidate(v, x, protected)
+        else {
+            return Ok(None);
+        };
+        if !excised_set.contains(&v) {
+            return Ok(None);
+        }
+        // Never excise juvenile nodes (unless explicitly enabled) or protected comparator nodes.
+        if excised_set.iter().any(|n| {
+            protected.contains(n)
+                || (!allow_juvenile
+                    && self
+                        .economy
+                        .nodes()
+                        .get(n.index())
+                        .is_some_and(|e| e.juvenile_ticks > 0))
+        }) {
+            return Ok(None);
+        }
+        let Ok(staged_compiled) = staged.compile() else {
+            return Ok(None);
+        };
+
+        // Step 3 pre-filter: strict MDL reduction L(C') < L(C).
+        let l_new = circuit_code_bits_with_tax(&staged, 0, split_code_tax);
+        if l_new >= l_old {
+            return Ok(None);
+        }
+
+        // Step 2: Exact functional equivalence certification over S = ExcisedSubgraph(v, x).
+        let has_non_const_stateful = excised_set.iter().any(|n| {
+            !const_loops.contains_key(n)
+                && self
+                    .circuit
+                    .nodes()
+                    .get(n.index())
+                    .is_some_and(|p| p.is_stateful())
+        });
+        let comb_cert = if self.circuit.wire_delay() == WireDelayMode::Combinational {
+            certify_combinational_passthrough(&self.circuit, v, x, &excised_set, const_loops)
+        } else {
+            None
+        };
+
+        if comb_cert == Some(false)
+            && !has_non_const_stateful
+            && cone_channel_mask(&self.circuit, x) != 0
+        {
+            return Ok(None);
+        }
+
+        let reg_map = register_mapping(
+            &self.circuit,
+            &staged,
+            &self.compiled,
+            &staged_compiled,
+            &old_to_new,
+        );
+        let live_regs = self.state.registers();
+        let mut staged_live_regs = ScalarState::new(&staged_compiled).registers().to_vec();
+        for (old_r, new_r) in reg_map.iter().enumerate() {
+            if let Some(nr) = new_r
+                && old_r < live_regs.len()
+            {
+                staged_live_regs[*nr] = live_regs[old_r];
+            }
+        }
+        if self.circuit.wire_delay() == WireDelayMode::TicksPerHop
+            && let Some(aligned) = align_tph_autonomous_after_prune(
+                &self.circuit,
+                &self.compiled,
+                live_regs,
+                &staged,
+                &staged_compiled,
+                &staged_live_regs,
+            )
+        {
+            staged_live_regs = aligned;
+        }
+
+        let replay_ok = if let Some(init_regs) = replay_initial_regs {
+            let mut staged_start_regs = ScalarState::new(&staged_compiled).registers().to_vec();
+            for (old_r, new_r) in reg_map.iter().enumerate() {
+                if let Some(nr) = new_r
+                    && old_r < init_regs.len()
+                {
+                    staged_start_regs[*nr] = init_regs[old_r];
+                }
+            }
+            if self.circuit.wire_delay() == WireDelayMode::TicksPerHop
+                && let Some(aligned) = align_tph_autonomous_after_prune(
+                    &self.circuit,
+                    &self.compiled,
+                    init_regs,
+                    &staged,
+                    &staged_compiled,
+                    &staged_start_regs,
+                )
+            {
+                staged_start_regs = aligned;
+            }
+            verify_replay_and_comparators(
+                &self.circuit,
+                &self.compiled,
+                init_regs,
+                &staged,
+                &staged_compiled,
+                &staged_start_regs,
+                &old_to_new,
+                comp_targets,
+                past_inputs,
+                past_predictions,
+            )
+        } else {
+            true
+        };
+        if !replay_ok {
+            return Ok(None);
+        }
+
+        let certified = if comb_cert == Some(true) {
+            true
+        } else {
+            let _ = delta_h;
+            let joint_start_orig = replay_initial_regs.unwrap_or(live_regs);
+            let joint_start_staged = if let Some(init_regs) = replay_initial_regs {
+                let mut regs = ScalarState::new(&staged_compiled).registers().to_vec();
+                for (old_r, new_r) in reg_map.iter().enumerate() {
+                    if let Some(nr) = new_r
+                        && old_r < init_regs.len()
+                    {
+                        regs[*nr] = init_regs[old_r];
+                    }
+                }
+                if self.circuit.wire_delay() == WireDelayMode::TicksPerHop
+                    && let Some(aligned) = align_tph_autonomous_after_prune(
+                        &self.circuit,
+                        &self.compiled,
+                        init_regs,
+                        &staged,
+                        &staged_compiled,
+                        &regs,
+                    )
+                {
+                    regs = aligned;
+                }
+                regs
+            } else {
+                staged_live_regs.clone()
+            };
+            certify_bounded_joint_state_equivalence(
+                &self.circuit,
+                &self.compiled,
+                joint_start_orig,
+                &staged,
+                &staged_compiled,
+                &joint_start_staged,
+                &old_to_new,
+                comp_targets,
+            )
+        };
+
+        if !certified {
+            return Ok(None);
+        }
+
+        // Step 3: Commit state-preserving bypass.
+        self.recompile_preserving_state(staged, &old_to_new)?;
+        if self.circuit.wire_delay() == WireDelayMode::TicksPerHop {
+            self.set_registers(&staged_live_regs)?;
+        }
+        Ok(Some(old_to_new))
     }
 
     fn comparator_and_boundary_active_nodes(
@@ -497,7 +1135,389 @@ impl EditableCircuit {
         active
     }
 
-    fn build_pruned_circuit(
+    fn build_pruned_circuit_with_mode(
+        &self,
+        initially_removed: &BTreeSet<NodeId>,
+        excision_mode: ExcisionMode,
+        diagnostic_window: usize,
+        past_node_outputs: Option<&[Vec<u64>]>,
+    ) -> Result<(Circuit, Vec<Option<NodeId>>), SurgeryError> {
+        if excision_mode == ExcisionMode::BaselineD1b1 {
+            return self.build_pruned_circuit_baseline_d1b1(initially_removed);
+        }
+
+        let node_count = self.circuit.node_count();
+        let width = self.circuit.width();
+        let w_diag = diagnostic_window.max(1);
+        let gamma = self.economy.config().trace_discount;
+        let decay_floor = gamma.powi(w_diag as i32) * (1.0 + 1e-9);
+
+        let protected_sub_nodes: BTreeSet<NodeId> = self
+            .economy
+            .comparators()
+            .iter()
+            .map(|comp| comp.sub_node)
+            .collect();
+        let protected_comp_nodes: BTreeSet<NodeId> = self
+            .economy
+            .comparators()
+            .iter()
+            .flat_map(|comp| [comp.sub_node, comp.eqz_node])
+            .collect();
+
+        let mut removed = initially_removed.clone();
+        let mut logical_edges: Vec<(SignalSource, SignalSink)> = self
+            .circuit
+            .edges()
+            .iter()
+            .map(|e| (e.src, e.dst))
+            .collect();
+        let mut bypasses = Vec::new();
+        let mut direct_bypass_ports: BTreeSet<u16> = BTreeSet::new();
+
+        let mut orig_split_out_count = vec![0usize; node_count];
+        for edge in self.circuit.edges() {
+            if let SignalSource::NodeOut { node, .. } = edge.src
+                && node.index() < node_count
+            {
+                orig_split_out_count[node.index()] += 1;
+            }
+        }
+
+        let mut additive_zero_sources = BTreeSet::new();
+        let mut multiplicative_one_sources = BTreeSet::new();
+        for &node in initially_removed {
+            if protected_comp_nodes.contains(&node) {
+                continue;
+            }
+            let act = self
+                .economy
+                .nodes()
+                .get(node.index())
+                .map(|n| n.activity)
+                .unwrap_or_default();
+            let act_recorded = act.ever_nonzero() || act.ever_non_one();
+            let buf_zero = past_node_outputs.is_some_and(|frames| {
+                !frames.is_empty()
+                    && frames
+                        .iter()
+                        .all(|f| f.get(node.index()).map(|&v| width.normalize(v)) == Some(0))
+            });
+            let buf_one = past_node_outputs.is_some_and(|frames| {
+                !frames.is_empty()
+                    && frames
+                        .iter()
+                        .all(|f| f.get(node.index()).map(|&v| width.normalize(v)) == Some(1))
+            });
+            let is_zero = buf_zero
+                || (act_recorded && (!act.ever_nonzero() || act.nonzero_weight <= decay_floor))
+                || (!act_recorded
+                    && matches!(
+                        self.circuit.nodes().get(node.index()),
+                        Some(Primitive::Delay { init: 0 })
+                    ));
+            let is_one = buf_one
+                || (act_recorded && (!act.ever_non_one() || act.non_one_weight <= decay_floor))
+                || (!act_recorded
+                    && matches!(
+                        self.circuit.nodes().get(node.index()),
+                        Some(Primitive::Delay { init: 1 })
+                    ));
+            if is_zero && !is_one {
+                additive_zero_sources.insert(node);
+            } else if is_one && !is_zero {
+                multiplicative_one_sources.insert(node);
+            } else if is_zero {
+                additive_zero_sources.insert(node);
+            }
+        }
+
+        loop {
+            let mut outer_changed = false;
+
+            // 1. Propagate additive-0 and multiplicative-1 sources forward through Split and zero-Mul.
+            loop {
+                let mut propagated = false;
+                for (index, &primitive) in self.circuit.nodes().iter().enumerate() {
+                    let node = NodeId(u32::try_from(index).expect("node count fits in u32"));
+                    if protected_comp_nodes.contains(&node) {
+                        continue;
+                    }
+                    match primitive {
+                        Primitive::Split => {
+                            if let Some(src_node) =
+                                input_source(&logical_edges, node, 0).and_then(source_node)
+                            {
+                                if additive_zero_sources.contains(&src_node) {
+                                    propagated |= additive_zero_sources.insert(node);
+                                    propagated |= removed.insert(node);
+                                } else if multiplicative_one_sources.contains(&src_node) {
+                                    propagated |= multiplicative_one_sources.insert(node);
+                                    propagated |= removed.insert(node);
+                                }
+                            }
+                        }
+                        Primitive::Mul => {
+                            let zero_in = (0..2).any(|p| {
+                                input_source(&logical_edges, node, p)
+                                    .and_then(source_node)
+                                    .is_some_and(|s| additive_zero_sources.contains(&s))
+                            });
+                            if zero_in {
+                                propagated |= additive_zero_sources.insert(node);
+                                propagated |= removed.insert(node);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !propagated {
+                    break;
+                }
+            }
+
+            // 2. Bypass Add/Sub consumers of additive-0 and Mul consumers of multiplicative-1.
+            for (index, &primitive) in self.circuit.nodes().iter().enumerate() {
+                let consumer = NodeId(u32::try_from(index).expect("node count fits in u32"));
+                if removed.contains(&consumer) || protected_sub_nodes.contains(&consumer) {
+                    continue;
+                }
+                let (Some(s0), Some(s1)) = (
+                    input_source(&logical_edges, consumer, 0),
+                    input_source(&logical_edges, consumer, 1),
+                ) else {
+                    continue;
+                };
+                let s0_zero = source_node(s0).is_some_and(|n| additive_zero_sources.contains(&n));
+                let s1_zero = source_node(s1).is_some_and(|n| additive_zero_sources.contains(&n));
+                let s0_one =
+                    source_node(s0).is_some_and(|n| multiplicative_one_sources.contains(&n));
+                let s1_one =
+                    source_node(s1).is_some_and(|n| multiplicative_one_sources.contains(&n));
+                let s0_removed = source_node(s0).is_some_and(|n| removed.contains(&n));
+                let s1_removed = source_node(s1).is_some_and(|n| removed.contains(&n));
+
+                let bypass_survivor = match primitive {
+                    Primitive::Add => {
+                        if s0_zero && s1_zero {
+                            additive_zero_sources.insert(consumer);
+                            removed.insert(consumer);
+                            outer_changed = true;
+                            None
+                        } else if s1_zero && !s0_removed {
+                            Some(s0)
+                        } else if s0_zero && !s1_removed {
+                            Some(s1)
+                        } else {
+                            None
+                        }
+                    }
+                    Primitive::Sub => {
+                        if s0_zero && s1_zero {
+                            additive_zero_sources.insert(consumer);
+                            removed.insert(consumer);
+                            outer_changed = true;
+                            None
+                        } else if s1_zero && !s0_removed {
+                            Some(s0)
+                        } else {
+                            None
+                        }
+                    }
+                    Primitive::Mul => {
+                        if s0_one && s1_one {
+                            multiplicative_one_sources.insert(consumer);
+                            removed.insert(consumer);
+                            outer_changed = true;
+                            None
+                        } else if s1_one && !s0_removed {
+                            Some(s0)
+                        } else if s0_one && !s1_removed {
+                            Some(s1)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+
+                let Some(survivor) = bypass_survivor else {
+                    continue;
+                };
+                let outputs = output_sinks(&logical_edges, consumer);
+                if outputs.len() > 1 {
+                    continue;
+                }
+                removed.insert(consumer);
+                logical_edges
+                    .retain(|(source, sink)| !edge_touches_nodes(*source, *sink, &removed));
+                for output in outputs {
+                    if let (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(p)) =
+                        (survivor, output)
+                    {
+                        direct_bypass_ports.insert(p);
+                    }
+                    logical_edges.push((survivor, output));
+                    bypasses.push((survivor, output));
+                }
+                outer_changed = true;
+            }
+
+            logical_edges.retain(|(source, sink)| !edge_touches_nodes(*source, *sink, &removed));
+
+            // 3. Remove any node missing an input.
+            for (index, &primitive) in self.circuit.nodes().iter().enumerate() {
+                let node = NodeId(u32::try_from(index).expect("node count fits in u32"));
+                if removed.contains(&node) {
+                    continue;
+                }
+                if (0..primitive.input_arity())
+                    .any(|port| input_source(&logical_edges, node, port).is_none())
+                {
+                    removed.insert(node);
+                    outer_changed = true;
+                }
+            }
+            logical_edges.retain(|(source, sink)| !edge_touches_nodes(*source, *sink, &removed));
+
+            // 4. Transitive dead-cone sweep: mature non-comparator nodes that can no longer
+            // reach any BoundaryOut or registered ComparatorSite.
+            let live_from_targets =
+                compute_live_target_reachable(&logical_edges, node_count, &protected_comp_nodes);
+            for (index, live) in live_from_targets.iter().enumerate() {
+                let node = NodeId(u32::try_from(index).expect("node count fits in u32"));
+                if removed.contains(&node) || protected_comp_nodes.contains(&node) {
+                    continue;
+                }
+                let is_mature = self
+                    .economy
+                    .nodes()
+                    .get(index)
+                    .is_none_or(|n| n.juvenile_ticks == 0);
+                if is_mature && !*live {
+                    removed.insert(node);
+                    outer_changed = true;
+                }
+            }
+            logical_edges.retain(|(source, sink)| !edge_touches_nodes(*source, *sink, &removed));
+
+            // 5. Collapse any Primitive::Split left with <= 1 surviving output sink.
+            for (index, &primitive) in self.circuit.nodes().iter().enumerate() {
+                let node = NodeId(u32::try_from(index).expect("node count fits in u32"));
+                if removed.contains(&node) || primitive != Primitive::Split {
+                    continue;
+                }
+                let outputs = output_sinks(&logical_edges, node);
+                if outputs.len() > 1 {
+                    continue;
+                }
+                if let Some(output) = outputs.first().copied() {
+                    let Some(input) = input_source(&logical_edges, node, 0) else {
+                        removed.insert(node);
+                        outer_changed = true;
+                        continue;
+                    };
+                    if source_node(input).is_some_and(|src| removed.contains(&src)) {
+                        continue;
+                    }
+                    if matches!(
+                        (input, output),
+                        (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(_))
+                    ) && !initially_removed.contains(&node)
+                    {
+                        continue;
+                    }
+                    if self.circuit.wire_delay() == WireDelayMode::TicksPerHop {
+                        let lost_branch = orig_split_out_count[index] > 1;
+                        let auto_in = cone_channel_mask(&self.circuit, input) == 0
+                            && source_has_cycle(&self.circuit, input);
+                        if !initially_removed.contains(&node) && !(lost_branch && auto_in) {
+                            continue;
+                        }
+                    }
+                    logical_edges.retain(|(source, sink)| {
+                        !matches!(source, SignalSource::NodeOut { node: cur, .. } if *cur == node)
+                            && !matches!(sink, SignalSink::NodeIn { node: cur, .. } if *cur == node)
+                    });
+                    if matches!(
+                        (input, output),
+                        (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(_))
+                    ) {
+                        removed.insert(node);
+                        outer_changed = true;
+                        break;
+                    }
+                    logical_edges.push((input, output));
+                    bypasses.push((input, output));
+                    removed.insert(node);
+                    outer_changed = true;
+                    break;
+                } else {
+                    removed.insert(node);
+                    outer_changed = true;
+                    break;
+                }
+            }
+
+            if !outer_changed {
+                break;
+            }
+        }
+
+        let mut staged = self.circuit.clone();
+        let old_to_new = staged.remove_nodes(&removed);
+        for (source, sink) in bypasses {
+            let Some(source) = remap_source(source, &old_to_new) else {
+                continue;
+            };
+            let Some(sink) = remap_sink(sink, &old_to_new) else {
+                continue;
+            };
+            if !staged
+                .edges()
+                .iter()
+                .any(|e| e.src == source && e.dst == sink)
+            {
+                staged.connect(source, sink);
+            }
+        }
+
+        let mut direct_wires = Vec::new();
+        for edge in staged.edges() {
+            if matches!(
+                (edge.src, edge.dst),
+                (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(_))
+            ) {
+                direct_wires.push((edge.src, edge.dst));
+            }
+        }
+        for (src, dst) in direct_wires {
+            staged.disconnect(src, dst);
+            let wrap_bypass =
+                matches!(dst, SignalSink::BoundaryOut(p) if direct_bypass_ports.contains(&p));
+            if wrap_bypass || !staged.nodes().is_empty() {
+                let split = staged.add_node(Primitive::Split);
+                staged.connect(
+                    src,
+                    SignalSink::NodeIn {
+                        node: split,
+                        port: 0,
+                    },
+                );
+                staged.connect(
+                    SignalSource::NodeOut {
+                        node: split,
+                        port: 0,
+                    },
+                    dst,
+                );
+            }
+        }
+
+        Ok((staged, old_to_new))
+    }
+
+    fn build_pruned_circuit_baseline_d1b1(
         &self,
         initially_removed: &BTreeSet<NodeId>,
     ) -> Result<(Circuit, Vec<Option<NodeId>>), SurgeryError> {
@@ -721,6 +1741,1191 @@ impl EditableCircuit {
 
         Ok((staged, old_to_new))
     }
+
+    fn build_passthrough_bypass_candidate(
+        &self,
+        v: NodeId,
+        x: SignalSource,
+        protected: &BTreeSet<NodeId>,
+    ) -> Option<(Circuit, Vec<Option<NodeId>>, BTreeSet<NodeId>)> {
+        let node_count = self.circuit.node_count();
+        let mut logical_edges: Vec<(SignalSource, SignalSink)> = self
+            .circuit
+            .edges()
+            .iter()
+            .map(|e| (e.src, e.dst))
+            .collect();
+        let v_sinks = output_sinks(&logical_edges, v);
+        if v_sinks.is_empty() {
+            return None;
+        }
+
+        let mut orig_split_out_count = vec![0usize; node_count];
+        for edge in self.circuit.edges() {
+            if let SignalSource::NodeOut { node, .. } = edge.src
+                && node.index() < node_count
+            {
+                orig_split_out_count[node.index()] += 1;
+            }
+        }
+
+        logical_edges
+            .retain(|(src, _)| !matches!(src, SignalSource::NodeOut { node, .. } if *node == v));
+        for &sink in &v_sinks {
+            logical_edges.push((x, sink));
+        }
+
+        // Compute nodes no longer reaching any BoundaryOut or protected comparator site.
+        let live = compute_live_target_reachable(&logical_edges, node_count, protected);
+        let mut removed = BTreeSet::new();
+        for (idx, &is_live) in live.iter().enumerate() {
+            if !is_live {
+                removed.insert(NodeId(u32::try_from(idx).expect("fits in u32")));
+            }
+        }
+        logical_edges.retain(|(src, dst)| !edge_touches_nodes(*src, *dst, &removed));
+
+        // Ensure surviving fanout on `x` is valid (switching free Split port or inserting Split).
+        let mut x_chosen = x;
+        let x_out_edges: Vec<SignalSink> = logical_edges
+            .iter()
+            .filter_map(|(src, dst)| (*src == x_chosen).then_some(*dst))
+            .collect();
+        let mut need_extra_split = false;
+        if x_out_edges.len() > 1 {
+            if let SignalSource::NodeOut { node: xn, port: xp } = x_chosen
+                && self.circuit.nodes().get(xn.index()) == Some(&Primitive::Split)
+            {
+                let other_src = SignalSource::NodeOut {
+                    node: xn,
+                    port: 1 - xp,
+                };
+                if !logical_edges.iter().any(|(src, _)| *src == other_src) && v_sinks.len() == 1 {
+                    logical_edges.retain(|(src, dst)| !(*src == x_chosen && *dst == v_sinks[0]));
+                    logical_edges.push((other_src, v_sinks[0]));
+                    x_chosen = other_src;
+                } else {
+                    need_extra_split = true;
+                }
+            } else {
+                need_extra_split = true;
+            }
+        }
+        if need_extra_split && self.circuit.wire_delay() == WireDelayMode::TicksPerHop {
+            return None;
+        }
+
+        let excised_set = removed.clone();
+        let mut bypasses: Vec<(SignalSource, SignalSink)> =
+            v_sinks.iter().map(|&sink| (x_chosen, sink)).collect();
+        let mut direct_bypass_ports = BTreeSet::new();
+        for &sink in &v_sinks {
+            if let (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(p)) = (x_chosen, sink) {
+                direct_bypass_ports.insert(p);
+            }
+        }
+
+        // Iteratively remove disconnected nodes and collapse degenerate Split nodes.
+        loop {
+            logical_edges.retain(|(src, dst)| !edge_touches_nodes(*src, *dst, &removed));
+            let mut changed = false;
+            for (index, &primitive) in self.circuit.nodes().iter().enumerate() {
+                let node = NodeId(u32::try_from(index).expect("node count fits in u32"));
+                if removed.contains(&node) {
+                    continue;
+                }
+                if (0..primitive.input_arity())
+                    .any(|port| input_source(&logical_edges, node, port).is_none())
+                {
+                    removed.insert(node);
+                    changed = true;
+                }
+            }
+            if changed {
+                continue;
+            }
+            if !need_extra_split {
+                for (index, &primitive) in self.circuit.nodes().iter().enumerate() {
+                    let node = NodeId(u32::try_from(index).expect("node count fits in u32"));
+                    if removed.contains(&node) || primitive != Primitive::Split {
+                        continue;
+                    }
+                    let outputs = output_sinks(&logical_edges, node);
+                    if outputs.len() > 1 {
+                        continue;
+                    }
+                    if let Some(output) = outputs.first().copied() {
+                        let Some(input) = input_source(&logical_edges, node, 0) else {
+                            removed.insert(node);
+                            changed = true;
+                            break;
+                        };
+                        if source_node(input).is_some_and(|src| removed.contains(&src)) {
+                            continue;
+                        }
+                        if matches!(
+                            (input, output),
+                            (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(_))
+                        ) {
+                            continue;
+                        }
+                        if self.circuit.wire_delay() == WireDelayMode::TicksPerHop {
+                            let lost_branch = orig_split_out_count[index] > 1;
+                            let auto_in = cone_channel_mask(&self.circuit, input) == 0
+                                && source_has_cycle(&self.circuit, input);
+                            if !(lost_branch && auto_in) {
+                                continue;
+                            }
+                        }
+                        logical_edges.retain(|(src, dst)| {
+                            !matches!(src, SignalSource::NodeOut { node: cur, .. } if *cur == node)
+                                && !matches!(dst, SignalSink::NodeIn { node: cur, .. } if *cur == node)
+                        });
+                        logical_edges.push((input, output));
+                        bypasses.push((input, output));
+                    }
+                    removed.insert(node);
+                    changed = true;
+                    break;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut staged = self.circuit.clone();
+        let old_to_new = staged.remove_nodes(&removed);
+        if need_extra_split {
+            let mapped_x = remap_source(x_chosen, &old_to_new)?;
+            let existing_sinks: Vec<SignalSink> = staged
+                .edges()
+                .iter()
+                .filter_map(|e| (e.src == mapped_x).then_some(e.dst))
+                .collect();
+            let sp = staged.add_node(Primitive::Split);
+            for old_dst in existing_sinks {
+                staged.disconnect(mapped_x, old_dst);
+                staged.connect(SignalSource::NodeOut { node: sp, port: 0 }, old_dst);
+            }
+            staged.connect(mapped_x, SignalSink::NodeIn { node: sp, port: 0 });
+            for &sink in &v_sinks {
+                let mapped_sink = remap_sink(sink, &old_to_new)?;
+                staged.connect(SignalSource::NodeOut { node: sp, port: 1 }, mapped_sink);
+            }
+        } else {
+            for (src, sink) in bypasses {
+                let Some(r_src) = remap_source(src, &old_to_new) else {
+                    continue;
+                };
+                let Some(r_sink) = remap_sink(sink, &old_to_new) else {
+                    continue;
+                };
+                if !staged
+                    .edges()
+                    .iter()
+                    .any(|e| e.src == r_src && e.dst == r_sink)
+                {
+                    staged.connect(r_src, r_sink);
+                }
+            }
+        }
+
+        let mut direct_wires = Vec::new();
+        for edge in staged.edges() {
+            if matches!(
+                (edge.src, edge.dst),
+                (SignalSource::BoundaryIn(_), SignalSink::BoundaryOut(_))
+            ) {
+                direct_wires.push((edge.src, edge.dst));
+            }
+        }
+        for (src, dst) in direct_wires {
+            staged.disconnect(src, dst);
+            let wrap_bypass =
+                matches!(dst, SignalSink::BoundaryOut(p) if direct_bypass_ports.contains(&p));
+            if wrap_bypass || !staged.nodes().is_empty() {
+                let split = staged.add_node(Primitive::Split);
+                staged.connect(
+                    src,
+                    SignalSink::NodeIn {
+                        node: split,
+                        port: 0,
+                    },
+                );
+                staged.connect(
+                    SignalSource::NodeOut {
+                        node: split,
+                        port: 0,
+                    },
+                    dst,
+                );
+            }
+        }
+
+        Some((staged, old_to_new, excised_set))
+    }
+}
+
+/// Returns the primary-derivation upstream cone of `BoundaryOut(port)` minus all registered
+/// `ComparatorSite` subgraphs (`sub_node`, `eqz_node`, and exclusive `alt` nodes).
+#[must_use]
+pub fn primary_cone_nodes(
+    circuit: &Circuit,
+    economy: &EconomyState,
+    port: u16,
+) -> BTreeSet<NodeId> {
+    let (mut cone, _) = port_upstream_cone_and_edges(circuit, port);
+    for comp in economy.comparators() {
+        cone.remove(&comp.sub_node);
+        cone.remove(&comp.eqz_node);
+    }
+    let comp_excl = comparator_exclusive_nodes(circuit, economy);
+    for node in comp_excl {
+        cone.remove(&node);
+    }
+    cone
+}
+
+fn comparator_exclusive_nodes(circuit: &Circuit, economy: &EconomyState) -> BTreeSet<NodeId> {
+    let comps = economy.comparators();
+    if comps.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut boundary_live = BTreeSet::new();
+    let mut stack = Vec::new();
+    for edge in circuit.edges() {
+        if let SignalSink::BoundaryOut(_) = edge.dst
+            && let SignalSource::NodeOut { node, .. } = edge.src
+            && boundary_live.insert(node)
+        {
+            stack.push(node);
+        }
+    }
+    while let Some(node) = stack.pop() {
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == node
+                && let SignalSource::NodeOut { node: src, .. } = edge.src
+                && boundary_live.insert(src)
+            {
+                stack.push(src);
+            }
+        }
+    }
+
+    let mut excl = BTreeSet::new();
+    let mut c_stack: Vec<NodeId> = comps
+        .iter()
+        .flat_map(|c| [c.sub_node, c.eqz_node])
+        .collect();
+    while let Some(node) = c_stack.pop() {
+        if boundary_live.contains(&node) || !excl.insert(node) {
+            continue;
+        }
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == node
+                && let SignalSource::NodeOut { node: src, .. } = edge.src
+            {
+                c_stack.push(src);
+            }
+        }
+    }
+    excl
+}
+
+fn compute_live_target_reachable(
+    edges: &[(SignalSource, SignalSink)],
+    node_count: usize,
+    protected: &BTreeSet<NodeId>,
+) -> Vec<bool> {
+    let mut live = vec![false; node_count];
+    let mut stack = Vec::new();
+    let mut reverse_adj: Vec<Vec<NodeId>> = vec![Vec::new(); node_count];
+    for &(src, dst) in edges {
+        if let SignalSource::NodeOut { node: src_n, .. } = src
+            && src_n.index() < node_count
+        {
+            match dst {
+                SignalSink::BoundaryOut(_) => {
+                    if !live[src_n.index()] {
+                        live[src_n.index()] = true;
+                        stack.push(src_n);
+                    }
+                }
+                SignalSink::NodeIn { node: dst_n, .. } if dst_n.index() < node_count => {
+                    reverse_adj[dst_n.index()].push(src_n);
+                }
+                _ => {}
+            }
+        }
+    }
+    for &p in protected {
+        if p.index() < node_count && !live[p.index()] {
+            live[p.index()] = true;
+            stack.push(p);
+        }
+    }
+    while let Some(node) = stack.pop() {
+        for &pred in &reverse_adj[node.index()] {
+            if !live[pred.index()] {
+                live[pred.index()] = true;
+                stack.push(pred);
+            }
+        }
+    }
+    live
+}
+
+fn collect_upstream_sources_bfs(circuit: &Circuit, root: NodeId) -> Vec<SignalSource> {
+    let mut sources = Vec::new();
+    let mut seen_sources = BTreeSet::new();
+    let mut visited_nodes: BTreeSet<NodeId> = [root].into_iter().collect();
+    let mut queue = VecDeque::new();
+    queue.push_back(root);
+    while let Some(node) = queue.pop_front() {
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == node
+            {
+                if seen_sources.insert(edge.src) {
+                    sources.push(edge.src);
+                }
+                if let SignalSource::NodeOut { node: src_n, .. } = edge.src
+                    && visited_nodes.insert(src_n)
+                {
+                    queue.push_back(src_n);
+                }
+            }
+        }
+    }
+    sources
+}
+
+fn signal_source_frame_value(
+    src: SignalSource,
+    input_frame: &[u64],
+    node_outs: &[u64],
+    width: crate::substrate::Width,
+) -> Option<u64> {
+    match src {
+        SignalSource::BoundaryIn(c) => input_frame.get(usize::from(c)).map(|&v| width.normalize(v)),
+        SignalSource::NodeOut { node, .. } => {
+            node_outs.get(node.index()).map(|&v| width.normalize(v))
+        }
+    }
+}
+
+fn min_hop_distance(circuit: &Circuit, from: SignalSource, to: NodeId) -> Option<usize> {
+    let node_count = circuit.node_count();
+    let mut dist = vec![usize::MAX; node_count];
+    let mut queue = VecDeque::new();
+    for edge in circuit.edges() {
+        if edge.src == from
+            && let SignalSink::NodeIn { node: dst, .. } = edge.dst
+            && dst.index() < node_count
+        {
+            let h = usize::from(edge.hops);
+            if h < dist[dst.index()] {
+                dist[dst.index()] = h;
+                queue.push_back(dst);
+            }
+        }
+    }
+    while let Some(cur) = queue.pop_front() {
+        let d = dist[cur.index()];
+        for edge in circuit.edges() {
+            if let SignalSource::NodeOut { node: src, .. } = edge.src
+                && src == cur
+                && let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst.index() < node_count
+            {
+                let nd = d.saturating_add(usize::from(edge.hops));
+                if nd < dist[dst.index()] {
+                    dist[dst.index()] = nd;
+                    queue.push_back(dst);
+                }
+            }
+        }
+    }
+    let res = dist.get(to.index()).copied().unwrap_or(usize::MAX);
+    (res != usize::MAX).then_some(res)
+}
+
+fn detect_fixed_point_const_loops(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+) -> BTreeMap<NodeId, u64> {
+    let mut result = BTreeMap::new();
+    let node_count = circuit.node_count();
+    let width = circuit.width();
+    let wires = state.wire_values();
+    let out_bases = node_out_bases(circuit);
+
+    // 1. Canonical 2-node closed ConstLoop(c): Delay{init: c} <-> Split holding `c`.
+    let mut inputs_of: Vec<Vec<SignalSource>> = vec![Vec::new(); node_count];
+    for edge in circuit.edges() {
+        if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+            && dst.index() < node_count
+        {
+            inputs_of[dst.index()].push(edge.src);
+        }
+    }
+    let mut delay_reg_of = vec![None; node_count];
+    let mut next_r = 0usize;
+    for (idx, prim) in circuit.nodes().iter().enumerate() {
+        if prim.is_stateful() {
+            delay_reg_of[idx] = Some(next_r);
+            next_r += 1;
+        }
+    }
+    for (d_idx, prim) in circuit.nodes().iter().enumerate() {
+        if let Primitive::Delay { init } = *prim
+            && let [SignalSource::NodeOut { node: sp, .. }] = inputs_of[d_idx].as_slice()
+            && circuit.nodes().get(sp.index()) == Some(&Primitive::Split)
+            && let [SignalSource::NodeOut { node: d_back, .. }] = inputs_of[sp.index()].as_slice()
+            && d_back.index() == d_idx
+            && let Some(reg_idx) = delay_reg_of[d_idx]
+            && state.registers().get(reg_idx).copied() == Some(width.normalize(init))
+        {
+            let c = width.normalize(init);
+            result.insert(NodeId(u32::try_from(d_idx).expect("fits")), c);
+            result.insert(*sp, c);
+        }
+    }
+
+    // 2. Closed autonomous subgraphs with 0 BoundaryIn inputs whose live registers are a
+    // step-1 fixed point (handles TicksPerHop `materialize_const_loop` and settled constants).
+    let mut zero_in_probe = state.clone();
+    let zeros_in = vec![0u64; usize::from(compiled.num_inputs())];
+    let mut dummy_out = vec![0u64; usize::from(compiled.num_outputs())];
+    if zero_in_probe
+        .step(compiled, &zeros_in, &mut dummy_out)
+        .is_ok()
+    {
+        // Identify nodes with zero BoundaryIn paths AND zero changing registers in their upstream cone.
+        let mut has_boundary_in = vec![false; node_count];
+        let mut stack = Vec::new();
+        for (idx, ins) in inputs_of.iter().enumerate() {
+            if ins.iter().any(|s| matches!(s, SignalSource::BoundaryIn(_))) {
+                has_boundary_in[idx] = true;
+                stack.push(NodeId(u32::try_from(idx).expect("fits")));
+            }
+        }
+        // Any explicit Delay or TicksPerHop edge whose register changed on `step` is not fixed.
+        let pre_regs = state.registers();
+        let post_regs = zero_in_probe.registers();
+        for (idx, reg_opt) in delay_reg_of.iter().enumerate() {
+            if let Some(r) = reg_opt
+                && pre_regs.get(*r) != post_regs.get(*r)
+                && !has_boundary_in[idx]
+            {
+                has_boundary_in[idx] = true;
+                stack.push(NodeId(u32::try_from(idx).expect("fits")));
+            }
+        }
+        if circuit.wire_delay() == WireDelayMode::TicksPerHop {
+            let bases = edge_register_bases(circuit, compiled.explicit_delay_count());
+            for (e_idx, edge) in circuit.edges().iter().enumerate() {
+                let base = bases[e_idx];
+                let changed = (0..usize::from(edge.hops))
+                    .any(|s| pre_regs.get(base + s) != post_regs.get(base + s));
+                if changed
+                    && let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                    && dst.index() < node_count
+                    && !has_boundary_in[dst.index()]
+                {
+                    has_boundary_in[dst.index()] = true;
+                    stack.push(dst);
+                }
+            }
+        }
+        while let Some(n) = stack.pop() {
+            for edge in circuit.edges() {
+                if let SignalSource::NodeOut { node: src, .. } = edge.src
+                    && src == n
+                    && let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                    && dst.index() < node_count
+                    && !has_boundary_in[dst.index()]
+                {
+                    has_boundary_in[dst.index()] = true;
+                    stack.push(dst);
+                }
+            }
+        }
+        // Any node with !has_boundary_in[idx] and valid current wire output is fixed-point constant.
+        if !wires.is_empty() {
+            let probe_wires = zero_in_probe.wire_values();
+            for (idx, &flag) in has_boundary_in.iter().enumerate() {
+                let nid = NodeId(u32::try_from(idx).expect("fits"));
+                if !flag
+                    && let Some(&w) = out_bases.get(idx)
+                    && w < probe_wires.len()
+                {
+                    result
+                        .entry(nid)
+                        .or_insert_with(|| width.normalize(probe_wires[w]));
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn certify_combinational_passthrough(
+    circuit: &Circuit,
+    v: NodeId,
+    x: SignalSource,
+    excised_set: &BTreeSet<NodeId>,
+    const_loops: &BTreeMap<NodeId, u64>,
+) -> Option<bool> {
+    let width = circuit.width();
+    let k = width.bits();
+    if k > EXACT_SENSITIVITY_MAX_BITS {
+        return None;
+    }
+    let node_count = circuit.node_count();
+    let mut node_inputs: Vec<Vec<SignalSource>> = vec![Vec::new(); node_count];
+    for (idx, prim) in circuit.nodes().iter().enumerate() {
+        node_inputs[idx].resize(usize::from(prim.input_arity()), SignalSource::BoundaryIn(0));
+    }
+    for edge in circuit.edges() {
+        if let SignalSink::NodeIn { node, port } = edge.dst
+            && node.index() < node_count
+            && usize::from(port) < node_inputs[node.index()].len()
+        {
+            node_inputs[node.index()][usize::from(port)] = edge.src;
+        }
+    }
+
+    let collect_comb_ancestors = |start: SignalSource| -> BTreeSet<SignalSource> {
+        let mut anc = BTreeSet::new();
+        let mut stack = vec![start];
+        while let Some(src) = stack.pop() {
+            if !anc.insert(src) {
+                continue;
+            }
+            if let SignalSource::NodeOut { node, .. } = src {
+                if const_loops.contains_key(&node) {
+                    continue;
+                }
+                if !circuit.nodes()[node.index()].is_stateful() {
+                    for &inp in &node_inputs[node.index()] {
+                        stack.push(inp);
+                    }
+                }
+            }
+        }
+        anc
+    };
+
+    let anc_x = collect_comb_ancestors(x);
+    let mut anc_s_other = BTreeSet::new();
+    for &s_node in excised_set {
+        if const_loops.contains_key(&s_node) {
+            continue;
+        }
+        for &inp in &node_inputs[s_node.index()] {
+            let in_s =
+                matches!(inp, SignalSource::NodeOut { node, .. } if excised_set.contains(&node));
+            if !in_s && inp != x {
+                anc_s_other.extend(collect_comb_ancestors(inp));
+            }
+        }
+    }
+    let shared_roots: BTreeSet<SignalSource> = anc_x.intersection(&anc_s_other).copied().collect();
+
+    // Canonicalize Split sources when building the symbolic DAG.
+    let mut free_var_index: BTreeMap<SignalSource, usize> = BTreeMap::new();
+    let mut memo_roots_check = vec![None; node_count];
+
+    fn has_shared_ancestor(
+        src: SignalSource,
+        node_inputs: &[Vec<SignalSource>],
+        const_loops: &BTreeMap<NodeId, u64>,
+        shared_roots: &BTreeSet<SignalSource>,
+        circuit: &Circuit,
+        memo: &mut [Option<bool>],
+    ) -> bool {
+        if shared_roots.contains(&src) {
+            return true;
+        }
+        let SignalSource::NodeOut { node, .. } = src else {
+            return false;
+        };
+        if const_loops.contains_key(&node) || circuit.nodes()[node.index()].is_stateful() {
+            return false;
+        }
+        if let Some(cached) = memo[node.index()] {
+            return cached;
+        }
+        memo[node.index()] = Some(false);
+        let res = node_inputs[node.index()].iter().any(|&inp| {
+            has_shared_ancestor(inp, node_inputs, const_loops, shared_roots, circuit, memo)
+        });
+        memo[node.index()] = Some(res);
+        res
+    }
+
+    #[derive(Clone, Debug)]
+    enum SymExpr {
+        Const(u64),
+        Var(usize),
+        Eqz(usize),
+        Add(usize, usize),
+        Sub(usize, usize),
+        Mul(usize, usize),
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_expr(
+        src: SignalSource,
+        circuit: &Circuit,
+        node_inputs: &[Vec<SignalSource>],
+        excised_set: &BTreeSet<NodeId>,
+        const_loops: &BTreeMap<NodeId, u64>,
+        shared_roots: &BTreeSet<SignalSource>,
+        memo_shared: &mut [Option<bool>],
+        free_var_index: &mut BTreeMap<SignalSource, usize>,
+        exprs: &mut Vec<SymExpr>,
+        src_cache: &mut BTreeMap<SignalSource, usize>,
+    ) -> usize {
+        if let Some(&id) = src_cache.get(&src) {
+            return id;
+        }
+        let res = match src {
+            SignalSource::BoundaryIn(_) => {
+                let next_idx = free_var_index.len();
+                let var_idx = *free_var_index.entry(src).or_insert(next_idx);
+                let id = exprs.len();
+                exprs.push(SymExpr::Var(var_idx));
+                id
+            }
+            SignalSource::NodeOut { node, .. } => {
+                if let Some(&c) = const_loops.get(&node) {
+                    let id = exprs.len();
+                    exprs.push(SymExpr::Const(c));
+                    id
+                } else if circuit.nodes()[node.index()] == Primitive::Split {
+                    let inp = node_inputs[node.index()][0];
+                    build_expr(
+                        inp,
+                        circuit,
+                        node_inputs,
+                        excised_set,
+                        const_loops,
+                        shared_roots,
+                        memo_shared,
+                        free_var_index,
+                        exprs,
+                        src_cache,
+                    )
+                } else if circuit.nodes()[node.index()].is_stateful() {
+                    let canon = SignalSource::NodeOut { node, port: 0 };
+                    let next_idx = free_var_index.len();
+                    let var_idx = *free_var_index.entry(canon).or_insert(next_idx);
+                    let id = exprs.len();
+                    exprs.push(SymExpr::Var(var_idx));
+                    id
+                } else {
+                    let in_s = excised_set.contains(&node);
+                    let expand_for_shared = !shared_roots.contains(&src)
+                        && has_shared_ancestor(
+                            src,
+                            node_inputs,
+                            const_loops,
+                            shared_roots,
+                            circuit,
+                            memo_shared,
+                        );
+                    if !in_s && !expand_for_shared {
+                        let canon = SignalSource::NodeOut { node, port: 0 };
+                        let next_idx = free_var_index.len();
+                        let var_idx = *free_var_index.entry(canon).or_insert(next_idx);
+                        let id = exprs.len();
+                        exprs.push(SymExpr::Var(var_idx));
+                        id
+                    } else {
+                        let ins = &node_inputs[node.index()];
+                        let prim = circuit.nodes()[node.index()];
+                        match prim {
+                            Primitive::Eqz => {
+                                let a = build_expr(
+                                    ins[0],
+                                    circuit,
+                                    node_inputs,
+                                    excised_set,
+                                    const_loops,
+                                    shared_roots,
+                                    memo_shared,
+                                    free_var_index,
+                                    exprs,
+                                    src_cache,
+                                );
+                                let id = exprs.len();
+                                exprs.push(SymExpr::Eqz(a));
+                                id
+                            }
+                            Primitive::Add | Primitive::Sub | Primitive::Mul => {
+                                let a = build_expr(
+                                    ins[0],
+                                    circuit,
+                                    node_inputs,
+                                    excised_set,
+                                    const_loops,
+                                    shared_roots,
+                                    memo_shared,
+                                    free_var_index,
+                                    exprs,
+                                    src_cache,
+                                );
+                                let b = build_expr(
+                                    ins[1],
+                                    circuit,
+                                    node_inputs,
+                                    excised_set,
+                                    const_loops,
+                                    shared_roots,
+                                    memo_shared,
+                                    free_var_index,
+                                    exprs,
+                                    src_cache,
+                                );
+                                let id = exprs.len();
+                                let node_expr = match prim {
+                                    Primitive::Add => SymExpr::Add(a, b),
+                                    Primitive::Sub => SymExpr::Sub(a, b),
+                                    Primitive::Mul => SymExpr::Mul(a, b),
+                                    _ => unreachable!(),
+                                };
+                                exprs.push(node_expr);
+                                id
+                            }
+                            Primitive::Split | Primitive::Delay { .. } => unreachable!(),
+                        }
+                    }
+                }
+            }
+        };
+        src_cache.insert(src, res);
+        res
+    }
+
+    let mut exprs = Vec::new();
+    let mut src_cache = BTreeMap::new();
+    let v_id = build_expr(
+        SignalSource::NodeOut { node: v, port: 0 },
+        circuit,
+        &node_inputs,
+        excised_set,
+        const_loops,
+        &shared_roots,
+        &mut memo_roots_check,
+        &mut free_var_index,
+        &mut exprs,
+        &mut src_cache,
+    );
+    let x_id = build_expr(
+        x,
+        circuit,
+        &node_inputs,
+        excised_set,
+        const_loops,
+        &shared_roots,
+        &mut memo_roots_check,
+        &mut free_var_index,
+        &mut exprs,
+        &mut src_cache,
+    );
+
+    let num_vars = free_var_index.len();
+    if num_vars > usize::from(EXACT_SENSITIVITY_MAX_BITS) {
+        return None;
+    }
+
+    let card = 1usize << k;
+    let total_assignments = card.checked_pow(num_vars as u32)?;
+    let mut var_vals = vec![0u64; num_vars];
+    let mut eval_vals = vec![0u64; exprs.len()];
+
+    for assign in 0..total_assignments {
+        let mut rem = assign;
+        for slot in &mut var_vals {
+            *slot = (rem % card) as u64;
+            rem /= card;
+        }
+        for (i, expr) in exprs.iter().enumerate() {
+            eval_vals[i] = match *expr {
+                SymExpr::Const(c) => c,
+                SymExpr::Var(vi) => var_vals[vi],
+                SymExpr::Eqz(a) => width.eqz(eval_vals[a]),
+                SymExpr::Add(a, b) => width.add(eval_vals[a], eval_vals[b]),
+                SymExpr::Sub(a, b) => width.sub(eval_vals[a], eval_vals[b]),
+                SymExpr::Mul(a, b) => width.mul(eval_vals[a], eval_vals[b]),
+            };
+        }
+        if eval_vals[v_id] != eval_vals[x_id] {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_replay_and_comparators(
+    orig_circuit: &Circuit,
+    orig_compiled: &CompiledCircuit,
+    orig_init_regs: &[u64],
+    staged: &Circuit,
+    staged_compiled: &CompiledCircuit,
+    staged_init_regs: &[u64],
+    old_to_new: &[Option<NodeId>],
+    comp_targets: &[ComparatorTarget],
+    past_inputs: &[Vec<u64>],
+    past_predictions: &[Vec<u64>],
+) -> bool {
+    let mut staged_state = ScalarState::new(staged_compiled);
+    if staged_state
+        .set_registers(staged_compiled, staged_init_regs)
+        .is_err()
+    {
+        return false;
+    }
+    let surviving_eqz_wires: Vec<(usize, usize)> = if comp_targets.is_empty() {
+        Vec::new()
+    } else {
+        let orig_bases = node_out_bases(orig_circuit);
+        let staged_bases = node_out_bases(staged);
+        comp_targets
+            .iter()
+            .filter_map(|target| {
+                let mapped_eqz = old_to_new.get(target.eqz_node.index()).copied().flatten()?;
+                Some((
+                    orig_bases[target.eqz_node.index()],
+                    staged_bases[mapped_eqz.index()],
+                ))
+            })
+            .collect()
+    };
+    let mut orig_probe = if surviving_eqz_wires.is_empty() {
+        None
+    } else {
+        let mut st = ScalarState::new(orig_compiled);
+        if st.set_registers(orig_compiled, orig_init_regs).is_err() {
+            return false;
+        }
+        Some(st)
+    };
+    let mut orig_pred = vec![0u64; usize::from(orig_circuit.num_outputs())];
+    let mut staged_pred = vec![0u64; usize::from(staged.num_outputs())];
+    for (frame_idx, input_frame) in past_inputs.iter().enumerate() {
+        if staged_state
+            .step(staged_compiled, input_frame, &mut staged_pred)
+            .is_err()
+        {
+            return false;
+        }
+        if frame_idx < past_predictions.len() && staged_pred != past_predictions[frame_idx] {
+            return false;
+        }
+        if let Some(ref mut orig_st) = orig_probe {
+            if orig_st
+                .step(orig_compiled, input_frame, &mut orig_pred)
+                .is_err()
+            {
+                return false;
+            }
+            for &(orig_wire, staged_wire) in &surviving_eqz_wires {
+                if staged_state.wire_values()[staged_wire] != orig_st.wire_values()[orig_wire] {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn certify_bounded_joint_state_equivalence(
+    orig_circuit: &Circuit,
+    orig_compiled: &CompiledCircuit,
+    orig_init_regs: &[u64],
+    staged: &Circuit,
+    staged_compiled: &CompiledCircuit,
+    staged_init_regs: &[u64],
+    old_to_new: &[Option<NodeId>],
+    comp_targets: &[ComparatorTarget],
+) -> bool {
+    let width = orig_circuit.width();
+    let k = width.bits();
+    let num_in = usize::from(orig_circuit.num_inputs());
+
+    let mut active_in_channels = Vec::new();
+    for ch in 0..num_in {
+        let src = SignalSource::BoundaryIn(u16::try_from(ch).expect("fits"));
+        let used_orig = circuit_uses_boundary_in(orig_circuit, src);
+        let used_staged = circuit_uses_boundary_in(staged, src);
+        if used_orig || used_staged {
+            active_in_channels.push(ch);
+        }
+    }
+
+    let m_in = active_in_channels.len();
+    if m_in > usize::from(EXACT_SENSITIVITY_MAX_BITS) || k > EXACT_SENSITIVITY_MAX_BITS {
+        return false;
+    }
+    let card = 1usize << k;
+    let Some(total_in_combos) = card.checked_pow(m_in as u32) else {
+        return false;
+    };
+    if total_in_combos > 64 {
+        return false;
+    }
+
+    let surviving_eqz_wires: Vec<(usize, usize)> = if comp_targets.is_empty() {
+        Vec::new()
+    } else {
+        let orig_bases = node_out_bases(orig_circuit);
+        let staged_bases = node_out_bases(staged);
+        comp_targets
+            .iter()
+            .filter_map(|target| {
+                let mapped_eqz = old_to_new.get(target.eqz_node.index()).copied().flatten()?;
+                Some((
+                    orig_bases[target.eqz_node.index()],
+                    staged_bases[mapped_eqz.index()],
+                ))
+            })
+            .collect()
+    };
+
+    let mut visited: BTreeSet<(Vec<u64>, Vec<u64>)> = BTreeSet::new();
+    let mut queue: VecDeque<(Vec<u64>, Vec<u64>)> = VecDeque::new();
+    let start_key = (orig_init_regs.to_vec(), staged_init_regs.to_vec());
+    visited.insert(start_key.clone());
+    queue.push_back(start_key);
+
+    let mut orig_state = ScalarState::new(orig_compiled);
+    let mut staged_state = ScalarState::new(staged_compiled);
+    let mut orig_out = vec![0u64; usize::from(orig_circuit.num_outputs())];
+    let mut staged_out = vec![0u64; usize::from(staged.num_outputs())];
+    let mut input_buf = vec![0u64; num_in];
+    let mut steps = 0usize;
+
+    while let Some((orig_regs, staged_regs)) = queue.pop_front() {
+        for assign in 0..total_in_combos {
+            steps += 1;
+            if steps > DEFAULT_MAX_CERTIFY_JOINT_STEPS {
+                return false;
+            }
+            input_buf.fill(0);
+            let mut rem = assign;
+            for &ch in &active_in_channels {
+                input_buf[ch] = (rem % card) as u64;
+                rem /= card;
+            }
+            if orig_state.set_registers(orig_compiled, &orig_regs).is_err()
+                || staged_state
+                    .set_registers(staged_compiled, &staged_regs)
+                    .is_err()
+            {
+                return false;
+            }
+            if orig_state
+                .step(orig_compiled, &input_buf, &mut orig_out)
+                .is_err()
+                || staged_state
+                    .step(staged_compiled, &input_buf, &mut staged_out)
+                    .is_err()
+            {
+                return false;
+            }
+            if orig_out != staged_out {
+                return false;
+            }
+            for &(orig_wire, staged_wire) in &surviving_eqz_wires {
+                if staged_state.wire_values()[staged_wire] != orig_state.wire_values()[orig_wire] {
+                    return false;
+                }
+            }
+            let next_key = (
+                orig_state.registers().to_vec(),
+                staged_state.registers().to_vec(),
+            );
+            if visited.insert(next_key.clone()) {
+                queue.push_back(next_key);
+            }
+        }
+    }
+
+    true
+}
+
+fn circuit_uses_boundary_in(circuit: &Circuit, target: SignalSource) -> bool {
+    let mut live_nodes = BTreeSet::new();
+    let mut stack = Vec::new();
+    for edge in circuit.edges() {
+        if matches!(edge.dst, SignalSink::BoundaryOut(_)) {
+            if edge.src == target {
+                return true;
+            }
+            if let SignalSource::NodeOut { node, .. } = edge.src
+                && live_nodes.insert(node)
+            {
+                stack.push(node);
+            }
+        }
+    }
+    while let Some(node) = stack.pop() {
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == node
+            {
+                if edge.src == target {
+                    return true;
+                }
+                if let SignalSource::NodeOut { node: src, .. } = edge.src
+                    && live_nodes.insert(src)
+                {
+                    stack.push(src);
+                }
+            }
+        }
+    }
+    false
+}
+
+fn align_tph_autonomous_after_prune(
+    orig_circuit: &Circuit,
+    orig_compiled: &CompiledCircuit,
+    orig_regs: &[u64],
+    staged: &Circuit,
+    staged_compiled: &CompiledCircuit,
+    remapped_regs: &[u64],
+) -> Option<Vec<u64>> {
+    if orig_circuit.wire_delay() != WireDelayMode::TicksPerHop {
+        return None;
+    }
+    let num_outputs = usize::from(orig_circuit.num_outputs());
+    let num_inputs = usize::from(orig_circuit.num_inputs());
+    let zeros_in = vec![0u64; num_inputs];
+
+    let mut orig_state = ScalarState::new(orig_compiled);
+    orig_state.set_registers(orig_compiled, orig_regs).ok()?;
+    let mut orig_seq = vec![Vec::with_capacity(64); num_outputs];
+    let mut out_buf = vec![0u64; num_outputs];
+    for _ in 0..64 {
+        orig_state
+            .step(orig_compiled, &zeros_in, &mut out_buf)
+            .ok()?;
+        for (p, &val) in out_buf.iter().enumerate() {
+            orig_seq[p].push(val);
+        }
+    }
+
+    let mut final_regs = remapped_regs.to_vec();
+    let mut changed_any = false;
+
+    // Collect delay and edge register indices for staged circuit.
+    let mut delay_reg_of = vec![None; staged.node_count()];
+    let mut next_d = 0usize;
+    for (idx, prim) in staged.nodes().iter().enumerate() {
+        if prim.is_stateful() {
+            delay_reg_of[idx] = Some(next_d);
+            next_d += 1;
+        }
+    }
+    let staged_edge_bases = edge_register_bases(staged, staged_compiled.explicit_delay_count());
+
+    for port in 0..orig_circuit.num_outputs() {
+        let p_idx = usize::from(port);
+        let Some(orig_driver) = orig_circuit
+            .edges()
+            .iter()
+            .find(|e| e.dst == SignalSink::BoundaryOut(port))
+            .map(|e| e.src)
+        else {
+            continue;
+        };
+        let Some(staged_driver) = staged
+            .edges()
+            .iter()
+            .find(|e| e.dst == SignalSink::BoundaryOut(port))
+            .map(|e| e.src)
+        else {
+            continue;
+        };
+        let is_auto = cone_channel_mask(orig_circuit, orig_driver) == 0
+            && source_has_cycle(orig_circuit, orig_driver)
+            && cone_channel_mask(staged, staged_driver) == 0
+            && source_has_cycle(staged, staged_driver);
+        if !is_auto {
+            continue;
+        }
+
+        // Check if already aligned at s = 0.
+        let mut check0 = ScalarState::new(staged_compiled);
+        check0.set_registers(staged_compiled, &final_regs).ok()?;
+        let mut already_ok = true;
+        for &exp in &orig_seq[p_idx] {
+            check0.step(staged_compiled, &zeros_in, &mut out_buf).ok()?;
+            if out_buf[p_idx] != exp {
+                already_ok = false;
+                break;
+            }
+        }
+        if already_ok {
+            continue;
+        }
+
+        // Collect all register indices inside port's autonomous cone in `staged`.
+        let (cone_nodes, cone_edges) = port_upstream_cone_and_edges(staged, port);
+        let mut cone_regs = Vec::new();
+        for &n in &cone_nodes {
+            if let Some(r) = delay_reg_of[n.index()] {
+                cone_regs.push(r);
+            }
+        }
+        for (e_idx, edge) in staged.edges().iter().enumerate() {
+            if cone_edges.contains(&(edge.src, edge.dst)) {
+                let base = staged_edge_bases[e_idx];
+                for s in 0..usize::from(edge.hops) {
+                    cone_regs.push(base + s);
+                }
+            }
+        }
+
+        // Search shifts s in 1..=128 (starting after flushing at least 1 step so new edges populate).
+        let mut probe = ScalarState::new(staged_compiled);
+        probe.set_registers(staged_compiled, &final_regs).ok()?;
+        let mut reg_history = Vec::with_capacity(192);
+        let mut out_history = Vec::with_capacity(192);
+        for _ in 0..192 {
+            reg_history.push(probe.registers().to_vec());
+            probe.step(staged_compiled, &zeros_in, &mut out_buf).ok()?;
+            out_history.push(out_buf[p_idx]);
+        }
+        let mut found_s = None;
+        for s in 1..=128usize {
+            if out_history[s..s + 64] == orig_seq[p_idx][..] {
+                found_s = Some(s);
+                break;
+            }
+        }
+        if let Some(s) = found_s {
+            for r in cone_regs {
+                if r < final_regs.len() && r < reg_history[s].len() {
+                    final_regs[r] = reg_history[s][r];
+                }
+            }
+            changed_any = true;
+        }
+    }
+
+    changed_any.then_some(final_regs)
 }
 
 /// Tracks marginal description debt allocated to newly sprouted nodes across structural edits (D1b.3).
