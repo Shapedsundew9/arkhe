@@ -122,7 +122,12 @@ Read `.shared/ai/core/common-instructions.md`.
      coding, file reading, and test runs to `Hydrogen`, sleeping at zero cost while workers execute.
      Wakes only on phase completion or `[escalation]` / `[watchdog-escalation]` to evaluate the big
      picture, formulate holistic Derived Scaling Laws when Milestone-Scoped Scaffolding constants
-     bind, and present them to the user for sign-off.
+     bind, and present them to the user for sign-off. Escalation goes first to the
+     `Chief Scientist` who shall present a way forward for the Scientific Orchestrator or require the
+     Principle Investigator (user) to make a decision.
+   - **Chief Scientist (`gemini-4-argon-high`):**
+     Always spawned fresh (**never** `fork: "coordinator"`, which inherits the coordinator's Argon
+     model binding). Read `/workspaces/arkhe/docs/chief_scientist_role.md`.
 8. **Exploratory vs. confirmatory.** Before a threshold is pre-registered, runs are exploratory:
    they measure and report and never gate. Confirmatory runs use only thresholds the user has
    signed off. Never tune toward an exploratory number.
