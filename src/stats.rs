@@ -7,7 +7,45 @@ use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 use serde::{Deserialize, Serialize};
 
+use crate::config::CliffCountersSummary;
 use crate::env::noise::uniform_u64_below;
+
+/// Per-case outcome classification under pre-registered guardrail semantics (§B3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaseOutcome {
+    /// Case passed its functional check with zero compute-guardrail bindings.
+    Passed,
+    /// Case failed its functional check.
+    Failed,
+    /// Case hit a compute guardrail (`max_nodes`) and is excluded from passing (§2.0.1).
+    Excluded,
+}
+
+/// Per-case cliff, bound, and guardrail telemetry summary for online verification runs (§B3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OnlineCaseSummary {
+    /// Unique case identifier.
+    pub label: String,
+    /// Final case classification (`Excluded` whenever a guardrail bound).
+    pub outcome: CaseOutcome,
+    /// Observed cliff, bound, and guardrail counters for this case.
+    pub cliff_counters: CliffCountersSummary,
+}
+
+/// Classifies a single verification case outcome, marking any compute-guardrail binding as `Excluded`.
+#[must_use]
+pub const fn classify_case_outcome(
+    functional_pass: bool,
+    cliff_counters: &CliffCountersSummary,
+) -> CaseOutcome {
+    if cliff_counters.guardrail_bound() {
+        CaseOutcome::Excluded
+    } else if functional_pass {
+        CaseOutcome::Passed
+    } else {
+        CaseOutcome::Failed
+    }
+}
 
 /// Minimum expected cell count per bank required for Pearson's asymptotic $\chi^2$
 /// approximation (Cochran's criterion); below this, exact conditional permutation is used.
@@ -583,5 +621,30 @@ mod tests {
             res_clustered_rare.distribution.p_value
         );
         assert!(!res_clustered_rare.passed);
+    }
+
+    #[test]
+    fn classify_case_outcome_marks_guardrail_binding_excluded() {
+        let guardrail_counters = CliffCountersSummary {
+            sprout_blocked_max_nodes: 1,
+            ..CliffCountersSummary::default()
+        };
+        assert_eq!(
+            classify_case_outcome(true, &guardrail_counters),
+            CaseOutcome::Excluded
+        );
+
+        let search_bound_counters = CliffCountersSummary {
+            lag_horizon_bound: 2,
+            ..CliffCountersSummary::default()
+        };
+        assert_eq!(
+            classify_case_outcome(true, &search_bound_counters),
+            CaseOutcome::Passed
+        );
+        assert_eq!(
+            classify_case_outcome(false, &search_bound_counters),
+            CaseOutcome::Failed
+        );
     }
 }

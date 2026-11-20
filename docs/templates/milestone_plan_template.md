@@ -24,8 +24,8 @@ Document exploratory measurements recorded prior to pre-registration (Rule 8: ex
 
 - **Development seeds:** `<explicit range>`
 - **Confirmation bank (fresh dev):** `<explicit range>`
-- **Holdout seeds (single-shot only, disjoint from M1 `10000..=10019`):** `<explicit range>`
-- **Multi-bank statistics:** One-sided 99% Clopper–Pearson lower confidence bound on pooled seed successes (`P_target`) plus 1% chi-squared across-bank homogeneity test (`src/verify_m1/stats.rs`).
+- **Holdout seeds (single-shot only, disjoint from M1 `10000..=10019`, M2a `30000..=30019`, and M2b `40000..=40019`):** `<explicit range>`
+- **Multi-bank statistics:** One-sided 99% Clopper–Pearson lower confidence bound on pooled seed successes (`P_target`) plus 1% chi-squared / Cochran conditional-permutation across-bank homogeneity test (`src/stats.rs`).
 - **Guardrail invariant:** Any run where a compute guardrail binds is marked `excluded` and never counted as `passed`.
 
 ## 5. Kill & Revisit Criteria

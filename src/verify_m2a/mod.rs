@@ -17,12 +17,12 @@ use crate::env::{
 };
 use crate::metrics::{BudgetAccountingMode, Scorecard};
 use crate::rng::SeedBank;
+use crate::stats::{
+    BankSample, CaseOutcome, MultiBankGateResult, OnlineCaseSummary, classify_case_outcome,
+    evaluate_multi_bank_gate,
+};
 use crate::structural::{ArkheLearner, EconomyConfig, GrowthConfig};
 use crate::substrate::{Circuit, SignalSink, SignalSource, Width, WireDelayMode};
-use crate::verify_m1::{
-    BankSample, CaseOutcome, MultiBankGateResult, OnlineCaseSummary, evaluate_multi_bank_gate,
-    m1b::classify_case_outcome,
-};
 
 /// Default Milestone 2a simulation horizon $T$ in ticks (§4 / §6).
 pub const DEFAULT_M2A_HORIZON: u64 = 2_000;

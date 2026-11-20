@@ -20,6 +20,9 @@ use crate::metrics::mdl::{
     EpistemicComparatorTrace, EpistemicTickPhase, epistemic_null_calibrated_mdl_delta_with_tax,
 };
 use crate::rng::SeedBank;
+use crate::stats::{
+    BankSample, CaseOutcome, MultiBankGateResult, classify_case_outcome, evaluate_multi_bank_gate,
+};
 use crate::structural::{
     ArkheLearner, EconomyConfig, EconomyState, EditableCircuit, ExecutionPhase, GrowthConfig,
     LiveCircuit, ReserveCap, build_autonomous_ring_source, derivation_cone_info,
@@ -28,16 +31,12 @@ use crate::structural::{
 use crate::substrate::{
     Circuit, NodeId, Primitive, SignalSink, SignalSource, Width, WireDelayMode,
 };
-use crate::verify_m1::{
-    BankSample, CaseOutcome, MultiBankGateResult, evaluate_multi_bank_gate,
-    m1b::classify_case_outcome,
-};
 
-/// Default prequential horizon $T$ for Milestone 2b verification (`docs/milestone_2b_plan.md` §6).
+/// Default prequential horizon $T$ for Milestone 2b verification (`docs/research_record.md` §11).
 pub const DEFAULT_M2B_HORIZON: u64 = 2_000;
 /// Default transient warmup window $W$ for Milestone 2b verification.
 pub const DEFAULT_M2B_WARMUP: u64 = 500;
-/// Default search TickBudget per verification run (`docs/milestone_2b_plan.md` §6).
+/// Default search TickBudget per verification run (`docs/research_record.md` §11).
 pub const DEFAULT_M2B_BUDGET: u64 = 200_000;
 /// Pre-registered offline loopback horizon $T_{\text{loop}}$ in ticks (`G2B.3`, §6).
 pub const DEFAULT_M2B_LOOPBACK_TICKS: u64 = 128;

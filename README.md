@@ -1,6 +1,6 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, and **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)** from the [Foundational Research Charter v3](docs/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [docs/parameter_inventory.md](docs/parameter_inventory.md), Milestone 0–2b sign-off records and derivations live in [docs/research_record.md](docs/research_record.md), Chief Scientist governance and escalation principles live in [docs/chief_scientist_role.md](docs/chief_scientist_role.md), and the ratified Stage M2b pre-registration plan lives in [docs/milestone_2b_plan.md](docs/milestone_2b_plan.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, and **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)** from the [Foundational Research Charter v3](docs/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [docs/parameter_inventory.md](docs/parameter_inventory.md), Milestone 0–2b sign-off records and derivations live in [docs/research_record.md](docs/research_record.md), and Chief Scientist governance and escalation principles live in [docs/chief_scientist_role.md](docs/chief_scientist_role.md).
 
 ## Overview
 
@@ -11,7 +11,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 - **`env`**: Finite-state benchmark generators (`T1`, `T2`, `T2_MultiViewCoupled`, `T3b`, `T3c`), declared channel substitution & scheduled channel-fault noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
 - **`metrics`**: Epistemic & boundary-null surprisal models ($\Delta E \equiv -\Delta L_{\text{null}}^{\text{epistemic}}$), Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests (with per-channel breakdowns) separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
 - **`baselines`**: Compute-matched prequential baseline harness (`RandomSearch`, `(1+λ) CGP`, `CTW`, `CrossChannelCtw`, BPTT `Rnn`, `ReedsSloane`, and certified small-circuit `Exhaustive` synthesis) over phase-exact sliding observation windows.
-- **`rng`, `config`, `verify`, `verify_m1`, `verify_m2a`, & `verify_m2b`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, M0/M1a/M1b/M2a/M2b verification batteries (`G2B.1`–`G2B.5`), pooled Clopper–Pearson + $\chi^2$/permutation homogeneity bank statistics, and `profile-compute` scaling/counter profiling.
+- **`rng`, `config`, `stats`, `verify_m2a`, & `verify_m2b`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, pooled Clopper–Pearson + $\chi^2$/permutation homogeneity bank statistics (`stats`), and M2a/M2b scientific regression verification batteries (`G2A.1`–`G2A.5`, `G2B.1`–`G2B.5`).
 
 ## Project Structure
 
@@ -20,42 +20,36 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 ├── .devcontainer/
 ├── .github/
 ├── docs/
+│   ├── instructions/
+│   │   └── repo-common.md
 │   ├── templates/
 │   │   ├── blocker_report.md
 │   │   └── milestone_plan_template.md
 │   ├── chief_scientist_role.md
 │   ├── foundational_research_charter_v3.md
-│   ├── milestone_2b_chief_scientist_review.md
-│   ├── milestone_2b_plan.md
-│   ├── milestone_2b_stage3_blocker_report.md
 │   ├── parameter_inventory.md
 │   └── research_record.md
 ├── scripts/
 │   ├── build.rs
-│   ├── check_doc_links.py
-│   └── measure_compute_profile.py
+│   └── check_doc_links.py
 ├── src/
 │   ├── baselines/
 │   ├── env/
 │   ├── metrics/
 │   ├── structural/
 │   ├── substrate/
-│   ├── verify_m1/
 │   ├── verify_m2a/
 │   ├── verify_m2b/
 │   ├── config.rs
 │   ├── lib.rs
 │   ├── main.rs
 │   ├── rng.rs
-│   └── verify.rs
+│   └── stats.rs
 ├── tests/
 │   ├── fixtures/golden/
 │   ├── cli.rs
 │   ├── determinism.rs
 │   ├── golden_traces.rs
-│   ├── m0_acceptance.rs
-│   ├── m1a_economy.rs
-│   ├── m1b_neurogenesis.rs
 │   ├── m2b_comparators.rs
 │   ├── multi_channel_development.rs
 │   ├── post-create.sh
@@ -76,29 +70,6 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 cargo build --locked --release
 ```
 
-1. Run the Milestone 0 pre-registered acceptance suite (Gates G1–G4 across $k = 1$ and $k = 2$ on development or holdout seed banks):
-
-```bash
-cargo run --locked --release -- verify-m0 --seed-offset 0 --seeds 20
-cargo run --locked --release -- verify-m0 --seed-offset 10000 --seeds 20
-```
-
-1. Run the M1a fixed-structure economy verification suite (single bank or 100-bank statistical sweep):
-
-```bash
-cargo run --locked --release -- verify-m1a --seed-offset 0 --seeds 20
-cargo run --locked --release -- verify-m1a --banks 100 --seed-offset 20 --seeds 20
-```
-
-1. Run the full Milestone 1 acceptance verification suite (Stage M1a hard gate audit followed by Stage M1b neurogenesis, single bank or 100-bank sweep):
-
-```bash
-cargo run --locked --release -- verify-m1 --seed-offset 0 --seeds 20
-cargo run --locked --release -- verify-m1b --banks 100 --seed-offset 20 --seeds 20
-cargo run --locked --release -- verify-m1 --banks 100 --seed-offset 20 --seeds 20
-cargo run --locked --release -- verify-m1 --seed-offset 10000 --seeds 20 --holdout
-```
-
 1. Run the Milestone 2a cross-channel predictive coupling verification suite (`G2A.1`–`G2A.5`):
 
 ```bash
@@ -112,13 +83,6 @@ cargo run --locked --release -- verify-m2a --banks 50 --seed-offset 20 --seeds 2
 cargo run --locked --release -- verify-m2b --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m2b --banks 50 --seed-offset 20 --seeds 20
 cargo run --locked --release -- verify-m2b --seed-offset 20040 --seeds 20
-```
-
-1. Run the Phase 0 / readiness compute and cliff-counter profiler:
-
-```bash
-cargo run --locked --release -- profile-compute --seed-offset 0 --seeds 5
-python3 scripts/measure_compute_profile.py --skip-build --seed-offset 0 --seeds 5
 ```
 
 1. Inspect analytical $\varepsilon$-machine and Reeds–Sloane ground-truth yardsticks for a generator:

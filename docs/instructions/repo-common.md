@@ -82,9 +82,9 @@ Read `.shared/ai/core/common-instructions.md`.
    Milestone-Scoped Scaffolding constant with a Derived Scaling Law. Prefer derived scaling laws
    that reduce identically to the earlier milestone's value at that milestone's scale
    ($K=1, \tau \le 3$), which keeps golden traces bit-identical automatically. When a more
-   fundamental derivation legitimately changes M1 trajectories while passing all M1 gates
-   (`verify-m1`), re-blessing `tests/golden_traces.rs` with the written mathematical derivation is
-   the expected scientific path.
+   fundamental derivation legitimately changes earlier-milestone trajectories while passing the
+   retained scientific regression suites (`verify-m2a`, `verify-m2b`), re-blessing
+   `tests/golden_traces.rs` with the written mathematical derivation is the expected scientific path.
 5. **Stop and escalate** (write a blocker report per `docs/templates/blocker_report.md`—prioritizing a
    first-principles Derived Scaling Law as Option (a) whenever a scaffolding constant or bound binds
    on an expanded scale axis—then wait for the user) when any of these occur:
@@ -134,4 +134,4 @@ Read `.shared/ai/core/common-instructions.md`.
 11. **Kill criteria are results.** Reaching a charter kill or revisit criterion is a finding to report,
     not an obstacle to engineer around. One phase per commit; golden traces verified at each
     behavior-preserving commit, or accompanied by the written Derived Scaling Law rationale and
-    `verify-m1` invariance proof.
+    `verify-m2a` / `verify-m2b` invariance proof.

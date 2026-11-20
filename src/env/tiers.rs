@@ -702,7 +702,7 @@ impl GeneratorConfig {
         }
     }
 
-    /// Standard Milestone 0 Tier-1 benchmark suite used by Gate G3 (`verify-m0`).
+    /// Standard Tier-1 benchmark suite (originally defined in M0 Gate G3).
     #[must_use]
     pub fn m0_t1_suite(width: Width) -> Vec<Self> {
         let high = if width.bits() == 1 { 1 } else { 3 };

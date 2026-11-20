@@ -1,24 +1,25 @@
-//! Arkhe: Deterministic variable-width modular circuit simulator and yardstick.
+//! Arkhe: Deterministic variable-width modular circuit simulator, yardstick, and neurogenesis platform.
 //!
-//! Implements Milestone 0 (`M0 — Simulator and yardstick`) of the Foundational Research Charter v2:
+//! Implements the coordinate-free substrate, metabolic economy, online neurogenesis, cross-channel
+//! coupling (`M2a`), and redundant comparator (`M2b`) architecture from the Foundational Research Charter v3:
 //! - [`rng`]: Domain-separated portable `ChaCha8Rng` streams and deterministic fingerprinting.
 //! - [`substrate`]: Exact $\mathbb{Z}_{2^k}$ arithmetic, Level-0 primitives, §2.5 invariants, and evaluators.
 //! - [`structural`]: Coordinate-free graph morphogenesis, metabolic economy, sensitivity credit, and online learner.
-//! - [`env`]: Finite-state benchmark tiers (`T1`, `T3b`, `T3c`), noise, exact $\varepsilon$-machines, and Reeds–Sloane synthesis.
+//! - [`env`]: Finite-state benchmark tiers (`T1`, `T2`, `T3b`, `T3c`), noise, exact $\varepsilon$-machines, and Reeds–Sloane synthesis.
 //! - [`metrics`]: Surprisal null models, Minimum Description Length ($L$), limit-cycle/basin inspection, and scorecards.
-//! - [`baselines`]: Compute-matched prequential baseline harness (`RandomSearch`, `CGP`, `CTW`, `ReedsSloane`, `Exhaustive`).
+//! - [`baselines`]: Compute-matched prequential baseline harness (`RandomSearch`, `CGP`, `CTW`, `CrossChannelCtw`, `Rnn`, `ReedsSloane`, `Exhaustive`).
 //! - [`config`]: Serializable TOML/JSON `ExperimentConfig` and `RunReport` execution.
-//! - [`verify`]: Pre-registered Milestone 0 acceptance verification battery (Gates G1–G4).
+//! - [`stats`]: Reusable multi-bank pooled Clopper–Pearson and Cochran $\chi^2$/permutation homogeneity statistics.
+//! - [`verify_m2a`], [`verify_m2b`]: Pre-registered Milestone 2a (`G2A.1`–`G2A.5`) and Milestone 2b (`G2B.1`–`G2B.5`) verification batteries.
 
 pub mod baselines;
 pub mod config;
 pub mod env;
 pub mod metrics;
 pub mod rng;
+pub mod stats;
 pub mod structural;
 pub mod substrate;
-pub mod verify;
-pub mod verify_m1;
 pub mod verify_m2a;
 pub mod verify_m2b;
 
@@ -30,9 +31,8 @@ use clap::{Parser, Subcommand};
 use crate::config::{ExperimentConfig, compute_ground_truth_yardstick, execute_experiment};
 use crate::env::{FiniteStateGenerator, GeneratorConfig, NoiseModel};
 use crate::substrate::{Width, WireDelayMode};
-use crate::verify::run_m0_verification_suite_with_offset;
 
-/// Command-line interface for the Arkhe Milestone 0 simulator and yardstick.
+/// Command-line interface for the Arkhe simulator, yardstick, and verification platform.
 #[derive(Debug, Parser)]
 #[command(
     name = "arkhe",
@@ -69,72 +69,6 @@ pub enum Commands {
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         epsilon: f64,
     },
-    /// Run the pre-registered Milestone 0 acceptance test suite (Gates G1–G4) across $k = 1$ and $k = 2$.
-    VerifyM0 {
-        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
-        #[arg(long, default_value_t = 0)]
-        seed_offset: u32,
-        /// Number of master seeds evaluated on stochastic conditions.
-        #[arg(long, default_value_t = 20)]
-        seeds: u32,
-    },
-    /// Run the fixed-structure Milestone 1a metabolic-economy gates.
-    VerifyM1a {
-        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
-        #[arg(long, default_value_t = 0)]
-        seed_offset: u32,
-        /// Number of master seeds evaluated on noisy conditions (per bank in bank mode).
-        #[arg(long, default_value_t = 20)]
-        seeds: u32,
-        /// Simulation horizon T in ticks.
-        #[arg(long, default_value_t = verify_m1::DEFAULT_HORIZON)]
-        horizon: u64,
-        /// Number of consecutive seed banks to score (when set, activates bank mode).
-        #[arg(long)]
-        banks: Option<u32>,
-        /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
-        #[arg(long, alias = "allow-holdout", default_value_t = false)]
-        holdout: bool,
-    },
-    /// Run the online neurogenesis Milestone 1b gates (G1B.1–G1B.4).
-    VerifyM1b {
-        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
-        #[arg(long, default_value_t = 0)]
-        seed_offset: u32,
-        /// Number of master seeds evaluated (per bank when `--banks` is set).
-        #[arg(long, default_value_t = 20)]
-        seeds: u32,
-        /// Simulation horizon T in ticks.
-        #[arg(long, default_value_t = verify_m1::DEFAULT_M1B_HORIZON)]
-        horizon: u64,
-        /// Number of consecutive seed banks to score (when set, activates bank mode).
-        #[arg(long)]
-        banks: Option<u32>,
-        /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
-        #[arg(long, alias = "allow-holdout", default_value_t = false)]
-        holdout: bool,
-    },
-    /// Run combined Milestone 1 verification (hard M1a pre-growth stage gate -> M1b neurogenesis).
-    VerifyM1 {
-        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
-        #[arg(long, default_value_t = 0)]
-        seed_offset: u32,
-        /// Number of master seeds evaluated (per bank when `--banks` is set).
-        #[arg(long, default_value_t = 20)]
-        seeds: u32,
-        /// Simulation horizon T for M1a in ticks.
-        #[arg(long, default_value_t = verify_m1::DEFAULT_HORIZON)]
-        m1a_horizon: u64,
-        /// Simulation horizon T for M1b in ticks.
-        #[arg(long, default_value_t = verify_m1::DEFAULT_M1B_HORIZON)]
-        m1b_horizon: u64,
-        /// Number of consecutive seed banks to score (when set, activates bank mode).
-        #[arg(long)]
-        banks: Option<u32>,
-        /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
-        #[arg(long, alias = "allow-holdout", default_value_t = false)]
-        holdout: bool,
-    },
     /// Run Milestone 2a cross-channel predictive coupling verification gates (`G2A.1`–`G2A.5`).
     VerifyM2a {
         /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
@@ -168,24 +102,6 @@ pub enum Commands {
         #[arg(long)]
         banks: Option<u32>,
         /// Explicit authorization to run against pre-registered M2b holdout seeds 40000..=40019.
-        #[arg(long, alias = "allow-holdout", default_value_t = false)]
-        holdout: bool,
-    },
-    /// Profiles compute time (`us/tick`), replay eval ticks, and cliff/bound counters across circuit scale $(N, K)$ (B5).
-    ProfileCompute {
-        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
-        #[arg(long, default_value_t = 0)]
-        seed_offset: u32,
-        /// Number of master seeds evaluated per `(regime, N, K)` cell and endogenous workload.
-        #[arg(long, default_value_t = 5)]
-        seeds: u32,
-        /// Controlled `(N, K)` sweep simulation horizon in ticks.
-        #[arg(long, default_value_t = verify_m1::profile::DEFAULT_PROFILE_HORIZON)]
-        horizon: u64,
-        /// Endogenous online neurogenesis simulation horizon in ticks.
-        #[arg(long, default_value_t = verify_m1::profile::DEFAULT_ENDOGENOUS_HORIZON)]
-        endogenous_horizon: u64,
-        /// Explicit authorization to run against pre-registered holdout seeds 10000..=10019.
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
     },
@@ -266,126 +182,6 @@ where
             println!("{}", serde_json::to_string_pretty(&gt)?);
             Ok(())
         }
-        Some(Commands::VerifyM0 { seed_offset, seeds }) => {
-            let summary = run_m0_verification_suite_with_offset(seed_offset, seeds);
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            if summary.all_passed() {
-                Ok(())
-            } else {
-                Err("Milestone 0 verification failed one or more acceptance gates".into())
-            }
-        }
-        Some(Commands::VerifyM1a {
-            seed_offset,
-            seeds,
-            horizon,
-            banks,
-            holdout,
-        }) => {
-            if let Some(num_banks) = banks {
-                let report = verify_m1::run_m1a_bank_evaluation(
-                    seed_offset,
-                    seeds,
-                    num_banks,
-                    horizon,
-                    holdout,
-                )?;
-                println!("{}", serde_json::to_string_pretty(&report)?);
-                if report.all_passed() {
-                    Ok(())
-                } else {
-                    Err("Milestone 1a bank evaluation failed one or more gates".into())
-                }
-            } else {
-                let summary = verify_m1::run_m1a_verification_suite_with_horizon_and_holdout(
-                    seed_offset,
-                    seeds,
-                    horizon,
-                    holdout,
-                )?;
-                println!("{}", serde_json::to_string_pretty(&summary)?);
-                if summary.all_passed {
-                    Ok(())
-                } else {
-                    Err("Milestone 1a verification failed one or more acceptance gates".into())
-                }
-            }
-        }
-        Some(Commands::VerifyM1b {
-            seed_offset,
-            seeds,
-            horizon,
-            banks,
-            holdout,
-        }) => {
-            if let Some(num_banks) = banks {
-                let report = verify_m1::run_m1b_bank_evaluation(
-                    seed_offset,
-                    seeds,
-                    num_banks,
-                    horizon,
-                    holdout,
-                )?;
-                println!("{}", serde_json::to_string_pretty(&report)?);
-                if report.all_passed() {
-                    Ok(())
-                } else {
-                    Err("Milestone 1b bank evaluation failed one or more gates".into())
-                }
-            } else {
-                verify_m1::check_seed_range_holdout(seed_offset, seeds, holdout)?;
-                let summary = verify_m1::run_m1b_verification_suite(seed_offset, seeds, horizon);
-                println!("{}", serde_json::to_string_pretty(&summary)?);
-                if summary.all_passed {
-                    Ok(())
-                } else {
-                    Err("Milestone 1b verification failed one or more acceptance gates".into())
-                }
-            }
-        }
-        Some(Commands::VerifyM1 {
-            seed_offset,
-            seeds,
-            m1a_horizon,
-            m1b_horizon,
-            banks,
-            holdout,
-        }) => {
-            if let Some(num_banks) = banks {
-                let report = verify_m1::run_m1_combined_bank_evaluation(
-                    seed_offset,
-                    seeds,
-                    num_banks,
-                    m1a_horizon,
-                    m1b_horizon,
-                    holdout,
-                )?;
-                println!("{}", serde_json::to_string_pretty(&report)?);
-                if report.stage_gate_aborted {
-                    Err("Milestone 1 stage gate aborted: M1a bank evaluation failed".into())
-                } else if report.all_passed {
-                    Ok(())
-                } else {
-                    Err("Milestone 1 combined bank evaluation failed one or more gates".into())
-                }
-            } else {
-                let combined = verify_m1::run_m1_combined_verification(
-                    seed_offset,
-                    seeds,
-                    m1a_horizon,
-                    m1b_horizon,
-                    holdout,
-                )?;
-                println!("{}", serde_json::to_string_pretty(&combined)?);
-                if combined.stage_gate_aborted {
-                    Err("Milestone 1 stage gate aborted: M1a failed one or more gates".into())
-                } else if combined.all_passed {
-                    Ok(())
-                } else {
-                    Err("Milestone 1 combined verification failed one or more gates".into())
-                }
-            }
-        }
         Some(Commands::VerifyM2a {
             seed_offset,
             seeds,
@@ -449,23 +245,6 @@ where
                     Err("Milestone 2b verification failed one or more acceptance gates".into())
                 }
             }
-        }
-        Some(Commands::ProfileCompute {
-            seed_offset,
-            seeds,
-            horizon,
-            endogenous_horizon,
-            holdout,
-        }) => {
-            let report = verify_m1::profile::run_compute_profile(
-                seed_offset,
-                seeds,
-                horizon,
-                endogenous_horizon,
-                holdout,
-            )?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            Ok(())
         }
     }
 }

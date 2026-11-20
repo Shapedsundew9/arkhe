@@ -62,7 +62,7 @@ Never accept prose summaries or mean-value feasibility arguments at face value:
 
 ### Principle 3: Audit the "Unambiguous Fixes" Queue Harder Than the Headline Trade-Off
 
-Implementation teams naturally scrutinize the trade-offs they escalate and under-scrutinize the "routine engineering fixes" they queue up behind them. Treat every queued fix as a first-class audit target: trace what happens on unpredicted exogenous inputs, `WireDelayMode::TicksPerHop` hop parity, width $k > 1$ zero-divisors, shared `Primitive::Split` cones, and prior milestone suites (`verify-m0`, `verify-m1`, `verify-m2a`, ...).
+Implementation teams naturally scrutinize the trade-offs they escalate and under-scrutinize the "routine engineering fixes" they queue up behind them. Treat every queued fix as a first-class audit target: trace what happens on unpredicted exogenous inputs, `WireDelayMode::TicksPerHop` hop parity, width $k > 1$ zero-divisors, shared `Primitive::Split` cones, and retained milestone suites (`verify-m2a`, `verify-m2b`, ...).
 
 ### Principle 4: Eliminate Split-Brain Dualities & Anchor to Global Conservation
 
