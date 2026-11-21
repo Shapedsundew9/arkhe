@@ -119,6 +119,24 @@ pub enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Run Milestone 3 free-rider resistance and verified local excision verification gates (`G3.1`–`G3.5`).
+    VerifyM3 {
+        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
+        #[arg(long, default_value_t = 0)]
+        seed_offset: u32,
+        /// Number of master seeds evaluated (per bank when `--banks` is set).
+        #[arg(long, default_value_t = 20)]
+        seeds: u32,
+        /// Number of consecutive seed banks to score (when set, activates multi-bank mode).
+        #[arg(long)]
+        banks: Option<u32>,
+        /// Explicit authorization to run against pre-registered M3 holdout seeds 50000..=50019.
+        #[arg(long, alias = "allow-holdout", default_value_t = false)]
+        holdout: bool,
+        /// Optional path to write the JSON verification report (prints to stdout when omitted).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Returns the crate banner string.
@@ -273,6 +291,42 @@ where
                 println!("{json}");
             }
             Ok(())
+        }
+        Some(Commands::VerifyM3 {
+            seed_offset,
+            seeds,
+            banks,
+            holdout,
+            output,
+        }) => {
+            if let Some(num_banks) = banks {
+                let report =
+                    verify_m3::run_m3_bank_evaluation(seed_offset, seeds, num_banks, holdout)?;
+                let json = serde_json::to_string_pretty(&report)?;
+                if let Some(out_path) = output {
+                    fs::write(out_path, json)?;
+                } else {
+                    println!("{json}");
+                }
+                if report.all_passed {
+                    Ok(())
+                } else {
+                    Err("Milestone 3 bank evaluation failed one or more gates".into())
+                }
+            } else {
+                let summary = verify_m3::run_m3_verification_suite(seed_offset, seeds, holdout)?;
+                let json = serde_json::to_string_pretty(&summary)?;
+                if let Some(out_path) = output {
+                    fs::write(out_path, json)?;
+                } else {
+                    println!("{json}");
+                }
+                if summary.all_passed {
+                    Ok(())
+                } else {
+                    Err("Milestone 3 verification failed one or more acceptance gates".into())
+                }
+            }
         }
     }
 }

@@ -207,6 +207,54 @@ pub fn counterfactual_sensitivity_with_comparators(
         latch_sources[chain.base_reg] = Some(chain.src_wire);
     }
 
+    let wire_count = wires.len();
+    let ops = compiled.comb_ops();
+    let mut op_count_per_wire = vec![0usize; wire_count];
+    for op in ops {
+        match *op {
+            CombOp::Add { lhs, rhs, .. }
+            | CombOp::Sub { lhs, rhs, .. }
+            | CombOp::Mul { lhs, rhs, .. } => {
+                op_count_per_wire[lhs] += 1;
+                if rhs != lhs {
+                    op_count_per_wire[rhs] += 1;
+                }
+            }
+            CombOp::Eqz { arg, .. } | CombOp::Split { arg, .. } => {
+                op_count_per_wire[arg] += 1;
+            }
+        }
+    }
+    let mut wire_op_offsets = Vec::with_capacity(wire_count + 1);
+    let mut running = 0usize;
+    for &cnt in &op_count_per_wire {
+        wire_op_offsets.push(running);
+        running += cnt;
+    }
+    wire_op_offsets.push(running);
+    let mut wire_op_cursor = wire_op_offsets[..wire_count].to_vec();
+    let mut wire_op_list = vec![0usize; running];
+    for (op_idx, op) in ops.iter().enumerate() {
+        let push_wire = |w: usize, cursor: &mut [usize], list: &mut [usize]| {
+            let pos = cursor[w];
+            list[pos] = op_idx;
+            cursor[w] = pos + 1;
+        };
+        match *op {
+            CombOp::Add { lhs, rhs, .. }
+            | CombOp::Sub { lhs, rhs, .. }
+            | CombOp::Mul { lhs, rhs, .. } => {
+                push_wire(lhs, &mut wire_op_cursor, &mut wire_op_list);
+                if rhs != lhs {
+                    push_wire(rhs, &mut wire_op_cursor, &mut wire_op_list);
+                }
+            }
+            CombOp::Eqz { arg, .. } | CombOp::Split { arg, .. } => {
+                push_wire(arg, &mut wire_op_cursor, &mut wire_op_list);
+            }
+        }
+    }
+
     let mut output_by_node = vec![vec![0.0; output_baseline.len()]; nodes.len()];
     let mut latch_by_node = vec![vec![0.0; latch_count]; nodes.len()];
     let mut comparator_sub_by_node = vec![vec![0.0; comparators.len()]; nodes.len()];
@@ -214,50 +262,165 @@ pub fn counterfactual_sensitivity_with_comparators(
     let mut rng = seed_bank.stream(StreamDomain::SensitivityProbe { tick_block });
     let width = compiled.width();
     let mut scratch = wires.to_vec();
+    let mut visited_wire = vec![0u32; wire_count];
+    let mut visited_op = vec![0u32; ops.len()];
+    let mut vis_epoch = 0u32;
+    let mut dirty_wires: Vec<usize> = Vec::with_capacity(wire_count);
+    let mut active_ops: Vec<usize> = Vec::with_capacity(ops.len());
+    let mut affected_ports: Vec<(usize, usize)> = Vec::with_capacity(output_baseline.len());
+    let mut affected_latches: Vec<(usize, usize)> = Vec::with_capacity(latch_count);
+    let mut affected_comp_subs: Vec<(usize, usize)> = Vec::with_capacity(comparators.len());
+    let mut affected_comp_eqzs: Vec<(usize, usize)> = Vec::with_capacity(comparators.len());
+    let mut stack_cands = [0u64; 16];
+    let mut heap_cands = Vec::new();
 
     for (node_index, primitive) in nodes.iter().copied().enumerate() {
         let out_base = node_out_base[node_index];
         let out_count = usize::from(primitive.output_arity());
         let actual = wires[out_base];
-        let candidates = candidate_values(width, actual, sample_count, &mut rng)?;
-        for candidate in &candidates {
-            scratch.copy_from_slice(wires);
-            for port in 0..out_count {
-                scratch[out_base + port] = *candidate;
+        let cand_len = if width.bits() <= EXACT_SENSITIVITY_MAX_BITS {
+            fill_exact_candidate_values(width, actual, &mut stack_cands)
+        } else {
+            heap_cands = candidate_values(width, actual, sample_count, &mut rng)?;
+            heap_cands.len()
+        };
+        let candidates: &[u64] = if width.bits() <= EXACT_SENSITIVITY_MAX_BITS {
+            &stack_cands[..cand_len]
+        } else {
+            &heap_cands
+        };
+
+        vis_epoch += 1;
+        dirty_wires.clear();
+        active_ops.clear();
+        for port in 0..out_count {
+            let w = out_base + port;
+            visited_wire[w] = vis_epoch;
+            dirty_wires.push(w);
+        }
+        let mut qi = 0usize;
+        while qi < dirty_wires.len() {
+            let w = dirty_wires[qi];
+            qi += 1;
+            let start = wire_op_offsets[w];
+            let end = wire_op_offsets[w + 1];
+            for &op_idx in &wire_op_list[start..end] {
+                if visited_op[op_idx] == vis_epoch {
+                    continue;
+                }
+                let op = ops[op_idx];
+                let op_out_base = comb_op_output_base(op);
+                if op_out_base == out_base {
+                    continue;
+                }
+                visited_op[op_idx] = vis_epoch;
+                active_ops.push(op_idx);
+                match op {
+                    CombOp::Add { out, .. }
+                    | CombOp::Sub { out, .. }
+                    | CombOp::Mul { out, .. }
+                    | CombOp::Eqz { out, .. } => {
+                        if visited_wire[out] != vis_epoch {
+                            visited_wire[out] = vis_epoch;
+                            dirty_wires.push(out);
+                        }
+                    }
+                    CombOp::Split { out0, out1, .. } => {
+                        if visited_wire[out0] != vis_epoch {
+                            visited_wire[out0] = vis_epoch;
+                            dirty_wires.push(out0);
+                        }
+                        if visited_wire[out1] != vis_epoch {
+                            visited_wire[out1] = vis_epoch;
+                            dirty_wires.push(out1);
+                        }
+                    }
+                }
             }
-            evaluate_counterfactual_cone(compiled.comb_ops(), &mut scratch, out_base, width);
-            for (port, driver) in compiled.output_drivers().iter().enumerate() {
-                if driver.is_some_and(|wire| scratch[wire] != output_baseline[port]) {
+        }
+        if active_ops.len() > 1 {
+            active_ops.sort_unstable();
+        }
+
+        affected_ports.clear();
+        for (port, driver) in compiled.output_drivers().iter().enumerate() {
+            if let Some(wire) = *driver
+                && visited_wire[wire] == vis_epoch
+            {
+                affected_ports.push((port, wire));
+            }
+        }
+        affected_latches.clear();
+        for (register, input_wire) in latch_sources.iter().enumerate() {
+            if let Some(wire) = *input_wire
+                && visited_wire[wire] == vis_epoch
+            {
+                affected_latches.push((register, wire));
+            }
+        }
+        affected_comp_subs.clear();
+        affected_comp_eqzs.clear();
+        for (m, &(sub_wire, eqz_wire)) in comp_wires.iter().enumerate() {
+            if visited_wire[sub_wire] == vis_epoch {
+                affected_comp_subs.push((m, sub_wire));
+            }
+            if visited_wire[eqz_wire] == vis_epoch {
+                affected_comp_eqzs.push((m, eqz_wire));
+            }
+        }
+
+        if affected_ports.is_empty()
+            && affected_latches.is_empty()
+            && affected_comp_subs.is_empty()
+            && affected_comp_eqzs.is_empty()
+        {
+            continue;
+        }
+
+        for &candidate in candidates {
+            for port in 0..out_count {
+                scratch[out_base + port] = candidate;
+            }
+            for &op_idx in &active_ops {
+                eval_comb_op(ops[op_idx], &mut scratch, width);
+            }
+            for &(port, wire) in &affected_ports {
+                if scratch[wire] != output_baseline[port] {
                     output_by_node[node_index][port] += 1.0;
                 }
             }
-            for (register, input_wire) in latch_sources.iter().enumerate() {
-                if input_wire.is_some_and(|wire| scratch[wire] != wires[wire]) {
+            for &(register, wire) in &affected_latches {
+                if scratch[wire] != wires[wire] {
                     latch_by_node[node_index][register] += 1.0;
                 }
             }
-            for (m, &(sub_wire, eqz_wire)) in comp_wires.iter().enumerate() {
+            for &(m, sub_wire) in &affected_comp_subs {
                 if scratch[sub_wire] != wires[sub_wire] {
                     comparator_sub_by_node[node_index][m] += 1.0;
                 }
+            }
+            for &(m, eqz_wire) in &affected_comp_eqzs {
                 if scratch[eqz_wire] != wires[eqz_wire] {
                     comparator_eqz_by_node[node_index][m] += 1.0;
                 }
             }
+            for &w in &dirty_wires {
+                scratch[w] = wires[w];
+            }
         }
         let denominator = candidates.len() as f64;
         if denominator > 0.0 {
-            for sensitivity in &mut output_by_node[node_index] {
-                *sensitivity /= denominator;
+            for &(port, _) in &affected_ports {
+                output_by_node[node_index][port] /= denominator;
             }
-            for sensitivity in &mut latch_by_node[node_index] {
-                *sensitivity /= denominator;
+            for &(register, _) in &affected_latches {
+                latch_by_node[node_index][register] /= denominator;
             }
-            for sensitivity in &mut comparator_sub_by_node[node_index] {
-                *sensitivity /= denominator;
+            for &(m, _) in &affected_comp_subs {
+                comparator_sub_by_node[node_index][m] /= denominator;
             }
-            for sensitivity in &mut comparator_eqz_by_node[node_index] {
-                *sensitivity /= denominator;
+            for &(m, _) in &affected_comp_eqzs {
+                comparator_eqz_by_node[node_index][m] /= denominator;
             }
         }
     }
@@ -457,32 +620,82 @@ fn assemble_causal_ancestry_core(
         }
     }
 
-    let mut wire_ancestry = vec![0.0; wire_count * node_count];
-    let mut node_ancestry = vec![0.0; node_count];
+    let mut base_wire_ancestry = vec![0.0; wire_count * node_count];
+    let mut base_nonzero = vec![false; wire_count];
+    for &(register, wire) in compiled.delay_reads() {
+        if let Some(trace) = register_eligibility.get(register) {
+            let dst_slice = &mut base_wire_ancestry[wire * node_count..(wire + 1) * node_count];
+            let mut any_nz = false;
+            for (dst, &value) in dst_slice.iter_mut().zip(trace) {
+                let v = trace_discount * value;
+                *dst = v;
+                if v != 0.0 {
+                    any_nz = true;
+                }
+            }
+            if any_nz {
+                base_nonzero[wire] = true;
+            }
+        }
+    }
+
+    let mut delay_nodes = Vec::new();
+    for (node, primitive) in circuit.nodes().iter().copied().enumerate() {
+        if matches!(primitive, Primitive::Delay { .. }) {
+            let Some(register) = delay_register_of_node[node] else {
+                return Err(SensitivityError::DimensionMismatch);
+            };
+            delay_nodes.push((node, register, node_out_base[node]));
+        }
+    }
+
     let wire_values = state.wire_values();
+    let comb_meta = build_comb_op_ancestry_meta(
+        circuit,
+        compiled,
+        wire_values,
+        activity,
+        &out_wire_to_node,
+        &wire_source_nodes,
+    )?;
+
+    let mut wire_ancestry = vec![0.0; wire_count * node_count];
+    let mut wire_epoch = vec![0u32; wire_count];
+    let mut wire_zero_epoch = vec![0u32; wire_count];
+    let mut cur_epoch = 0u32;
 
     for (port, shares) in port_shares.iter_mut().enumerate() {
-        ancestry_for_target(
-            circuit,
-            compiled,
-            wire_values,
+        let Some(driver) = compiled.output_drivers()[port] else {
+            continue;
+        };
+        cur_epoch += 1;
+        ancestry_for_target_fast(
+            node_count,
             sensitivity,
             comparators,
-            activity,
             register_eligibility,
             trace_discount,
-            &node_out_base,
-            &out_wire_to_node,
-            &wire_source_nodes,
-            &delay_register_of_node,
-            wire_count,
+            &delay_nodes,
+            &comb_meta,
+            &base_wire_ancestry,
+            &base_nonzero,
             Target::Output(port),
+            cur_epoch,
             &mut wire_ancestry,
-            &mut node_ancestry,
+            &mut wire_epoch,
+            &mut wire_zero_epoch,
         )?;
-        if let Some(driver) = compiled.output_drivers()[port] {
-            shares.copy_from_slice(&wire_ancestry[driver * node_count..(driver + 1) * node_count]);
-        }
+        copy_wire_ancestry_out(
+            driver,
+            node_count,
+            cur_epoch,
+            &wire_ancestry,
+            &wire_epoch,
+            &wire_zero_epoch,
+            &base_wire_ancestry,
+            &base_nonzero,
+            shares,
+        );
     }
 
     let mut register_input_wires = vec![None; register_count];
@@ -504,26 +717,33 @@ fn assemble_causal_ancestry_core(
         let Some(input_wire) = *input_wire_opt else {
             continue;
         };
-        ancestry_for_target(
-            circuit,
-            compiled,
-            wire_values,
+        cur_epoch += 1;
+        ancestry_for_target_fast(
+            node_count,
             sensitivity,
             comparators,
-            activity,
             register_eligibility,
             trace_discount,
-            &node_out_base,
-            &out_wire_to_node,
-            &wire_source_nodes,
-            &delay_register_of_node,
-            wire_count,
+            &delay_nodes,
+            &comb_meta,
+            &base_wire_ancestry,
+            &base_nonzero,
             Target::Register(register),
+            cur_epoch,
             &mut wire_ancestry,
-            &mut node_ancestry,
+            &mut wire_epoch,
+            &mut wire_zero_epoch,
         )?;
-        next_register_eligibility[register].copy_from_slice(
-            &wire_ancestry[input_wire * node_count..(input_wire + 1) * node_count],
+        copy_wire_ancestry_out(
+            input_wire,
+            node_count,
+            cur_epoch,
+            &wire_ancestry,
+            &wire_epoch,
+            &wire_zero_epoch,
+            &base_wire_ancestry,
+            &base_nonzero,
+            &mut next_register_eligibility[register],
         );
     }
 
@@ -533,27 +753,35 @@ fn assemble_causal_ancestry_core(
         } else {
             Target::ComparatorWake(m)
         };
-        ancestry_for_target(
-            circuit,
-            compiled,
-            wire_values,
+        cur_epoch += 1;
+        ancestry_for_target_fast(
+            node_count,
             sensitivity,
             comparators,
-            activity,
             register_eligibility,
             trace_discount,
-            &node_out_base,
-            &out_wire_to_node,
-            &wire_source_nodes,
-            &delay_register_of_node,
-            wire_count,
+            &delay_nodes,
+            &comb_meta,
+            &base_wire_ancestry,
+            &base_nonzero,
             target,
+            cur_epoch,
             &mut wire_ancestry,
-            &mut node_ancestry,
+            &mut wire_epoch,
+            &mut wire_zero_epoch,
         )?;
         let eqz_wire = node_out_base[comp.eqz_node.index()];
-        comparator_shares[m]
-            .copy_from_slice(&wire_ancestry[eqz_wire * node_count..(eqz_wire + 1) * node_count]);
+        copy_wire_ancestry_out(
+            eqz_wire,
+            node_count,
+            cur_epoch,
+            &wire_ancestry,
+            &wire_epoch,
+            &wire_zero_epoch,
+            &base_wire_ancestry,
+            &base_nonzero,
+            &mut comparator_shares[m],
+        );
     }
 
     Ok(ComparatorCausalAncestry {
@@ -573,68 +801,39 @@ enum Target {
     ComparatorSleep(usize),
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ancestry_for_target(
+struct CombOpAncestryMeta {
+    node: usize,
+    out0: usize,
+    out1: Option<usize>,
+    arity: usize,
+    in_wires: [usize; 2],
+    extra_in_wires: Vec<usize>,
+    default_weights: [f64; 2],
+}
+
+fn build_comb_op_ancestry_meta(
     circuit: &Circuit,
     compiled: &CompiledCircuit,
     wire_values: &[u64],
-    sensitivity: SensitivityView<'_>,
-    comparators: &[ComparatorTarget],
     activity: &[NodeActivity],
-    register_eligibility: &[Vec<f64>],
-    trace_discount: f64,
-    node_out_base: &[usize],
     out_wire_to_node: &[usize],
     wire_source_nodes: &[Option<NodeId>],
-    delay_register_of_node: &[Option<usize>],
-    wire_count: usize,
-    target: Target,
-    wire_ancestry: &mut [f64],
-    node_ancestry: &mut [f64],
-) -> Result<(), SensitivityError> {
-    let node_count = circuit.node_count();
-    wire_ancestry.fill(0.0);
-    for &(register, wire) in compiled.delay_reads() {
-        if let Some(trace) = register_eligibility.get(register) {
-            let dst_slice = &mut wire_ancestry[wire * node_count..(wire + 1) * node_count];
-            for (dst, &value) in dst_slice.iter_mut().zip(trace) {
-                *dst = trace_discount * value;
-            }
-        }
-    }
-
-    for (node, primitive) in circuit.nodes().iter().copied().enumerate() {
-        if !matches!(primitive, Primitive::Delay { .. }) {
-            continue;
-        }
-        let Some(register) = delay_register_of_node[node] else {
-            return Err(SensitivityError::DimensionMismatch);
-        };
-        let coefficient = target_sensitivity(sensitivity, comparators, node, target)?;
-        let wire = node_out_base[node];
-        let dst_slice = &mut wire_ancestry[wire * node_count..(wire + 1) * node_count];
-        let reg_elig = &register_eligibility[register];
-        for (ancestor, (dst, &elig)) in dst_slice.iter_mut().zip(reg_elig).enumerate() {
-            let inherited = trace_discount * elig;
-            let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
-            *dst = coefficient * raw.min(1.0);
-        }
-    }
-
-    debug_assert_eq!(wire_ancestry.len(), wire_count * node_count);
+) -> Result<Vec<CombOpAncestryMeta>, SensitivityError> {
+    let mut meta = Vec::with_capacity(compiled.comb_ops().len());
+    let mut in_vals_heap = Vec::new();
+    let mut in_act_heap = Vec::new();
     for operation in compiled.comb_ops() {
-        let (first_out, out_count, out_pair) = match *operation {
+        let (first_out, out1) = match *operation {
             CombOp::Add { out, .. }
             | CombOp::Sub { out, .. }
             | CombOp::Mul { out, .. }
-            | CombOp::Eqz { out, .. } => (out, 1usize, [out, 0]),
-            CombOp::Split { out0, out1, .. } => (out0, 2usize, [out0, out1]),
+            | CombOp::Eqz { out, .. } => (out, None),
+            CombOp::Split { out0, out1, .. } => (out0, Some(out1)),
         };
         let node = *out_wire_to_node
             .get(first_out)
             .filter(|&&idx| idx != usize::MAX)
             .ok_or(SensitivityError::DimensionMismatch)?;
-        let coefficient = target_sensitivity(sensitivity, comparators, node, target)?;
         let input_wires = &compiled.node_input_wires()[node];
         let arity = input_wires.len();
         let prim = circuit.nodes()[node];
@@ -642,8 +841,6 @@ fn ancestry_for_target(
 
         let mut in_vals_stack = [0u64; 2];
         let mut in_act_stack = [0.0f64; 2];
-        let mut in_vals_heap = Vec::new();
-        let mut in_act_heap = Vec::new();
         let (in_vals, in_act): (&mut [u64], &mut [f64]) = if arity <= 2 {
             (&mut in_vals_stack[..arity], &mut in_act_stack[..arity])
         } else {
@@ -662,32 +859,337 @@ fn ancestry_for_target(
                 }
             });
         }
-        let w_stack = match target {
-            Target::ComparatorWake(m) if node == comparators[m].sub_node.index() => [0.0, 1.0],
-            Target::ComparatorSleep(m) if node == comparators[m].sub_node.index() => [0.5, 0.5],
-            _ if arity == 1 => [1.0, 0.0],
-            _ => ring_identity_input_weights_pair(
+        let default_weights = if arity == 1 {
+            [1.0, 0.0]
+        } else {
+            ring_identity_input_weights_pair(
                 prim,
                 [in_vals[0], in_vals[1]],
                 [in_act[0], in_act[1]],
                 compiled.width(),
-            ),
+            )
         };
-        let weights = &w_stack[..arity];
-        for (ancestor, value) in node_ancestry.iter_mut().enumerate() {
-            let mut inherited = 0.0;
-            for (&wire, &weight) in input_wires.iter().zip(weights) {
-                inherited += weight * wire_ancestry[wire * node_count + ancestor];
-            }
-            let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
-            *value = coefficient * raw.min(1.0);
+        let in_wires = [
+            input_wires.first().copied().unwrap_or(0),
+            input_wires.get(1).copied().unwrap_or(0),
+        ];
+        let extra_in_wires = if arity > 2 {
+            input_wires[2..].to_vec()
+        } else {
+            Vec::new()
+        };
+        meta.push(CombOpAncestryMeta {
+            node,
+            out0: first_out,
+            out1,
+            arity,
+            in_wires,
+            extra_in_wires,
+            default_weights,
+        });
+    }
+    Ok(meta)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_wire_ancestry_out(
+    wire: usize,
+    node_count: usize,
+    cur_epoch: u32,
+    wire_ancestry: &[f64],
+    wire_epoch: &[u32],
+    wire_zero_epoch: &[u32],
+    base_wire_ancestry: &[f64],
+    base_nonzero: &[bool],
+    dst: &mut [f64],
+) {
+    if wire_zero_epoch[wire] == cur_epoch {
+        dst.fill(0.0);
+    } else if wire_epoch[wire] == cur_epoch {
+        dst.copy_from_slice(&wire_ancestry[wire * node_count..(wire + 1) * node_count]);
+    } else if base_nonzero[wire] {
+        dst.copy_from_slice(&base_wire_ancestry[wire * node_count..(wire + 1) * node_count]);
+    } else {
+        dst.fill(0.0);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WireSliceKind {
+    Zero,
+    Curr(usize),
+    Base(usize),
+}
+
+#[inline]
+fn classify_wire(
+    wire: usize,
+    cur_epoch: u32,
+    wire_epoch: &[u32],
+    wire_zero_epoch: &[u32],
+    base_nonzero: &[bool],
+) -> WireSliceKind {
+    if wire_zero_epoch[wire] == cur_epoch {
+        WireSliceKind::Zero
+    } else if wire_epoch[wire] == cur_epoch {
+        WireSliceKind::Curr(wire)
+    } else if base_nonzero[wire] {
+        WireSliceKind::Base(wire)
+    } else {
+        WireSliceKind::Zero
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ancestry_for_target_fast(
+    node_count: usize,
+    sensitivity: SensitivityView<'_>,
+    comparators: &[ComparatorTarget],
+    register_eligibility: &[Vec<f64>],
+    trace_discount: f64,
+    delay_nodes: &[(usize, usize, usize)],
+    comb_meta: &[CombOpAncestryMeta],
+    base_wire_ancestry: &[f64],
+    base_nonzero: &[bool],
+    target: Target,
+    cur_epoch: u32,
+    wire_ancestry: &mut [f64],
+    wire_epoch: &mut [u32],
+    wire_zero_epoch: &mut [u32],
+) -> Result<(), SensitivityError> {
+    for &(node, register, wire) in delay_nodes {
+        let coefficient = target_sensitivity(sensitivity, comparators, node, target)?;
+        if coefficient == 0.0 {
+            wire_zero_epoch[wire] = cur_epoch;
+            continue;
         }
-        for &wire in &out_pair[..out_count] {
-            wire_ancestry[wire * node_count..(wire + 1) * node_count]
-                .copy_from_slice(node_ancestry);
+        wire_epoch[wire] = cur_epoch;
+        let dst_slice = &mut wire_ancestry[wire * node_count..(wire + 1) * node_count];
+        let reg_elig = &register_eligibility[register];
+        for (ancestor, (dst, &elig)) in dst_slice.iter_mut().zip(reg_elig).enumerate() {
+            let inherited = trace_discount * elig;
+            let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+            *dst = coefficient * raw.min(1.0);
+        }
+    }
+
+    for op in comb_meta {
+        let node = op.node;
+        let coefficient = target_sensitivity(sensitivity, comparators, node, target)?;
+        if coefficient == 0.0 {
+            wire_zero_epoch[op.out0] = cur_epoch;
+            if let Some(out1) = op.out1 {
+                wire_zero_epoch[out1] = cur_epoch;
+            }
+            continue;
+        }
+
+        let weights = match target {
+            Target::ComparatorWake(m) if node == comparators[m].sub_node.index() => [0.0, 1.0],
+            Target::ComparatorSleep(m) if node == comparators[m].sub_node.index() => [0.5, 0.5],
+            _ => op.default_weights,
+        };
+
+        let out_start = op.out0 * node_count;
+        let out_end = out_start + node_count;
+        wire_epoch[op.out0] = cur_epoch;
+
+        if op.arity == 0 || !op.extra_in_wires.is_empty() {
+            let dst = &mut wire_ancestry[out_start..out_end];
+            dst.fill(0.0);
+            dst[node] = coefficient;
+        } else if op.arity == 1 {
+            let k0 = classify_wire(
+                op.in_wires[0],
+                cur_epoch,
+                wire_epoch,
+                wire_zero_epoch,
+                base_nonzero,
+            );
+            let w0 = weights[0];
+            match k0 {
+                WireSliceKind::Zero => {
+                    let dst = &mut wire_ancestry[out_start..out_end];
+                    dst.fill(0.0);
+                    dst[node] = coefficient;
+                }
+                WireSliceKind::Curr(src_w) => {
+                    let src_start = src_w * node_count;
+                    let (dst, src) =
+                        borrow_two_wire_slices_mut(wire_ancestry, out_start, src_start, node_count);
+                    for (ancestor, (d, &s)) in dst.iter_mut().zip(src).enumerate() {
+                        let inherited = w0 * s;
+                        let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+                        *d = coefficient * raw.min(1.0);
+                    }
+                }
+                WireSliceKind::Base(src_w) => {
+                    let src = &base_wire_ancestry[src_w * node_count..(src_w + 1) * node_count];
+                    let dst = &mut wire_ancestry[out_start..out_end];
+                    for (ancestor, (d, &s)) in dst.iter_mut().zip(src).enumerate() {
+                        let inherited = w0 * s;
+                        let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+                        *d = coefficient * raw.min(1.0);
+                    }
+                }
+            }
+        } else {
+            let k0 = classify_wire(
+                op.in_wires[0],
+                cur_epoch,
+                wire_epoch,
+                wire_zero_epoch,
+                base_nonzero,
+            );
+            let k1 = classify_wire(
+                op.in_wires[1],
+                cur_epoch,
+                wire_epoch,
+                wire_zero_epoch,
+                base_nonzero,
+            );
+            let w0 = weights[0];
+            let w1 = weights[1];
+            match (k0, k1) {
+                (WireSliceKind::Zero, WireSliceKind::Zero) => {
+                    let dst = &mut wire_ancestry[out_start..out_end];
+                    dst.fill(0.0);
+                    dst[node] = coefficient;
+                }
+                (WireSliceKind::Curr(s0), WireSliceKind::Zero) => {
+                    let (dst, src0) = borrow_two_wire_slices_mut(
+                        wire_ancestry,
+                        out_start,
+                        s0 * node_count,
+                        node_count,
+                    );
+                    for (ancestor, (d, &v0)) in dst.iter_mut().zip(src0).enumerate() {
+                        let inherited = w0 * v0;
+                        let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+                        *d = coefficient * raw.min(1.0);
+                    }
+                }
+                (WireSliceKind::Base(s0), WireSliceKind::Zero) => {
+                    let src0 = &base_wire_ancestry[s0 * node_count..(s0 + 1) * node_count];
+                    let dst = &mut wire_ancestry[out_start..out_end];
+                    for (ancestor, (d, &v0)) in dst.iter_mut().zip(src0).enumerate() {
+                        let inherited = w0 * v0;
+                        let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+                        *d = coefficient * raw.min(1.0);
+                    }
+                }
+                (WireSliceKind::Zero, WireSliceKind::Curr(s1)) => {
+                    let (dst, src1) = borrow_two_wire_slices_mut(
+                        wire_ancestry,
+                        out_start,
+                        s1 * node_count,
+                        node_count,
+                    );
+                    for (ancestor, (d, &v1)) in dst.iter_mut().zip(src1).enumerate() {
+                        let inherited = w1 * v1;
+                        let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+                        *d = coefficient * raw.min(1.0);
+                    }
+                }
+                (WireSliceKind::Zero, WireSliceKind::Base(s1)) => {
+                    let src1 = &base_wire_ancestry[s1 * node_count..(s1 + 1) * node_count];
+                    let dst = &mut wire_ancestry[out_start..out_end];
+                    for (ancestor, (d, &v1)) in dst.iter_mut().zip(src1).enumerate() {
+                        let inherited = w1 * v1;
+                        let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+                        *d = coefficient * raw.min(1.0);
+                    }
+                }
+                (k0, k1) => {
+                    for ancestor in 0..node_count {
+                        let mut inherited = 0.0;
+                        let v0 = match k0 {
+                            WireSliceKind::Zero => 0.0,
+                            WireSliceKind::Curr(s0) => wire_ancestry[s0 * node_count + ancestor],
+                            WireSliceKind::Base(s0) => {
+                                base_wire_ancestry[s0 * node_count + ancestor]
+                            }
+                        };
+                        let v1 = match k1 {
+                            WireSliceKind::Zero => 0.0,
+                            WireSliceKind::Curr(s1) => wire_ancestry[s1 * node_count + ancestor],
+                            WireSliceKind::Base(s1) => {
+                                base_wire_ancestry[s1 * node_count + ancestor]
+                            }
+                        };
+                        inherited += w0 * v0;
+                        inherited += w1 * v1;
+                        let raw = (if ancestor == node { 1.0 } else { 0.0 }) + inherited;
+                        wire_ancestry[out_start + ancestor] = coefficient * raw.min(1.0);
+                    }
+                }
+            }
+        }
+
+        if let Some(out1) = op.out1 {
+            wire_epoch[out1] = cur_epoch;
+            let o1_start = out1 * node_count;
+            let (dst1, src0) =
+                borrow_two_wire_slices_mut(wire_ancestry, o1_start, out_start, node_count);
+            dst1.copy_from_slice(src0);
         }
     }
     Ok(())
+}
+
+#[inline]
+fn borrow_two_wire_slices_mut(
+    buf: &mut [f64],
+    dst_start: usize,
+    src_start: usize,
+    len: usize,
+) -> (&mut [f64], &[f64]) {
+    if dst_start < src_start {
+        let (left, right) = buf.split_at_mut(src_start);
+        (&mut left[dst_start..dst_start + len], &right[..len])
+    } else {
+        let (left, right) = buf.split_at_mut(dst_start);
+        (&mut right[..len], &left[src_start..src_start + len])
+    }
+}
+
+#[inline]
+fn fill_exact_candidate_values(width: Width, actual: u64, out: &mut [u64; 16]) -> usize {
+    let actual = width.normalize(actual);
+    let cardinality = 1u64 << width.bits();
+    let mut len = 0usize;
+    for value in 0..cardinality {
+        if value != actual {
+            out[len] = value;
+            len += 1;
+        }
+    }
+    len
+}
+
+#[inline]
+const fn comb_op_output_base(op: CombOp) -> usize {
+    match op {
+        CombOp::Add { out, .. }
+        | CombOp::Sub { out, .. }
+        | CombOp::Mul { out, .. }
+        | CombOp::Eqz { out, .. } => out,
+        CombOp::Split { out0, .. } => out0,
+    }
+}
+
+#[inline]
+fn eval_comb_op(op: CombOp, wires: &mut [u64], width: Width) {
+    match op {
+        CombOp::Add { lhs, rhs, out } => wires[out] = width.add(wires[lhs], wires[rhs]),
+        CombOp::Sub { lhs, rhs, out } => wires[out] = width.sub(wires[lhs], wires[rhs]),
+        CombOp::Mul { lhs, rhs, out } => wires[out] = width.mul(wires[lhs], wires[rhs]),
+        CombOp::Eqz { arg, out } => wires[out] = width.eqz(wires[arg]),
+        CombOp::Split { arg, out0, out1 } => {
+            wires[out0] = wires[arg];
+            wires[out1] = wires[arg];
+        }
+    }
 }
 
 fn target_sensitivity(
@@ -759,36 +1261,6 @@ fn candidate_values(
         }
     }
     Ok(selected.into_iter().collect())
-}
-
-fn evaluate_counterfactual_cone(
-    operations: &[CombOp],
-    wires: &mut [u64],
-    source_base: usize,
-    width: Width,
-) {
-    for operation in operations {
-        let output_base = match *operation {
-            CombOp::Add { out, .. }
-            | CombOp::Sub { out, .. }
-            | CombOp::Mul { out, .. }
-            | CombOp::Eqz { out, .. } => out,
-            CombOp::Split { out0, .. } => out0,
-        };
-        if output_base == source_base {
-            continue;
-        }
-        match *operation {
-            CombOp::Add { lhs, rhs, out } => wires[out] = width.add(wires[lhs], wires[rhs]),
-            CombOp::Sub { lhs, rhs, out } => wires[out] = width.sub(wires[lhs], wires[rhs]),
-            CombOp::Mul { lhs, rhs, out } => wires[out] = width.mul(wires[lhs], wires[rhs]),
-            CombOp::Eqz { arg, out } => wires[out] = width.eqz(wires[arg]),
-            CombOp::Split { arg, out0, out1 } => {
-                wires[out0] = wires[arg];
-                wires[out1] = wires[arg];
-            }
-        }
-    }
 }
 
 fn ring_identity_input_weights_pair(

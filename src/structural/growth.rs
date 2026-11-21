@@ -1116,7 +1116,7 @@ impl DiagnosticBuffer {
             residual,
             node_outs,
             sensitive,
-            Some((pre_epoch, pre_registers.to_vec())),
+            Some((pre_epoch, pre_registers)),
         );
     }
 
@@ -1129,9 +1129,48 @@ impl DiagnosticBuffer {
         residual: &[u64],
         node_outs: &[u64],
         sensitive: &[bool],
-        snapshot: Option<(u64, Vec<u64>)>,
+        snapshot: Option<(u64, &[u64])>,
     ) {
-        if self.inputs.len() >= self.capacity {
+        #[inline]
+        fn rotate_and_overwrite<T: Copy>(col: &mut [Vec<T>], data: &[T]) {
+            col.rotate_left(1);
+            if let Some(last) = col.last_mut() {
+                last.clear();
+                last.extend_from_slice(data);
+            }
+        }
+
+        if self.capacity > 0 && self.inputs.len() >= self.capacity {
+            rotate_and_overwrite(&mut self.inputs, input);
+            rotate_and_overwrite(&mut self.truth, truth);
+            rotate_and_overwrite(&mut self.predictions, prediction);
+            rotate_and_overwrite(&mut self.residuals, residual);
+            rotate_and_overwrite(&mut self.node_outputs, node_outs);
+            rotate_and_overwrite(&mut self.counterfactual_sensitivity, sensitive);
+            if !self.pre_step_snapshots.is_empty() {
+                self.pre_step_snapshots.rotate_left(1);
+                if let Some(last_slot) = self.pre_step_snapshots.last_mut() {
+                    match (last_slot.as_mut(), snapshot) {
+                        (Some((ep, buf)), Some((new_ep, new_regs))) => {
+                            *ep = new_ep;
+                            buf.clear();
+                            buf.extend_from_slice(new_regs);
+                        }
+                        (_, Some((new_ep, new_regs))) => {
+                            *last_slot = Some((new_ep, new_regs.to_vec()));
+                        }
+                        (_, None) => {
+                            *last_slot = None;
+                        }
+                    }
+                }
+            } else {
+                self.pre_step_snapshots
+                    .push(snapshot.map(|(ep, regs)| (ep, regs.to_vec())));
+            }
+            return;
+        }
+        if self.capacity == 0 && !self.inputs.is_empty() {
             self.inputs.remove(0);
             self.truth.remove(0);
             self.predictions.remove(0);
@@ -1148,7 +1187,8 @@ impl DiagnosticBuffer {
         self.residuals.push(residual.to_vec());
         self.node_outputs.push(node_outs.to_vec());
         self.counterfactual_sensitivity.push(sensitive.to_vec());
-        self.pre_step_snapshots.push(snapshot);
+        self.pre_step_snapshots
+            .push(snapshot.map(|(ep, regs)| (ep, regs.to_vec())));
     }
 
     /// Returns the pre-step `(structure_epoch, registers)` captured at frame 0, if present.

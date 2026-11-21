@@ -204,6 +204,7 @@ impl ComparatorWakeWindow {
     }
 }
 
+#[derive(Clone)]
 enum PendingSnapshot {
     Base {
         ancestry: CausalAncestry,
@@ -227,9 +228,10 @@ pub enum InjectionMode {
     Juvenile,
 }
 
-type PendingPrediction = (Vec<u64>, PendingSnapshot, u64, Vec<u64>);
+type PendingPrediction = (Vec<u64>, PendingSnapshot, u64, Vec<u64>, Vec<u64>);
 
 /// Online gradient-free closed-loop learner driving coordinate-free structural neurogenesis and metabolic economy.
+#[derive(Clone)]
 pub struct ArkheLearner {
     editable: EditableCircuit,
     ledger: MarginalDebtLedger,
@@ -490,6 +492,26 @@ impl ArkheLearner {
         &self.growth_config
     }
 
+    /// Updates the wake structural excision mode without modifying any other configuration or state.
+    pub fn set_excision_mode(&mut self, mode: ExcisionMode) {
+        self.growth_config.excision_mode = mode;
+    }
+
+    /// Whether developmental growth on all ports has settled (`tick >= diagnostic_window`,
+    /// no active Stage 2 or Stage 3 needs on any port, and every node is mature).
+    #[must_use]
+    pub fn is_developmental_settled(&self) -> bool {
+        self.tick >= self.growth_config.diagnostic_window as u64
+            && (0..self.port_states.len())
+                .all(|q| !self.port_needs_stage2(q) && !self.port_needs_stage3(q))
+            && self
+                .editable
+                .economy()
+                .nodes()
+                .iter()
+                .all(|n| n.juvenile_ticks == 0)
+    }
+
     /// Configured economy parameters.
     #[must_use]
     pub const fn economy_config(&self) -> &EconomyConfig {
@@ -660,9 +682,6 @@ impl ArkheLearner {
                         }
                     }
                 }
-                for state in &mut self.port_states {
-                    state.stage2_mature_at_tick = self.tick.saturating_add(u64::from(eff_juv));
-                }
             }
         }
 
@@ -671,9 +690,13 @@ impl ArkheLearner {
             settle_injected_tph_constant_subgraphs(&mut self.editable, &is_surviving);
         }
 
-        for state in &mut self.port_states {
-            state.diagnostic_buffer.clear();
-            state.ticks_since_last_check = 0;
+        for q in 0..self.port_states.len() {
+            if self.is_port_driven(q as u16) {
+                self.port_states[q].stage2_exhausted = true;
+                self.port_states[q].stage3_exhausted = true;
+            }
+            self.port_states[q].diagnostic_buffer.clear();
+            self.port_states[q].ticks_since_last_check = 0;
         }
         self.apply_node_remap_to_windows(old_to_new);
         self.injected_detour_nodes.extend(injected.iter().copied());
@@ -784,11 +807,14 @@ impl ArkheLearner {
                     .port_scorer_mut(q)
                     .reset_predictor_counts();
             }
+            let preserve_settlement_flags = !reset_scorer_counts && self.is_port_driven(q as u16);
             self.port_states[q].diagnostic_buffer.clear();
             self.port_states[q].ticks_since_last_check = 0;
-            self.port_states[q].stage2_mature_at_tick = 0;
-            self.port_states[q].stage2_exhausted = false;
-            self.port_states[q].stage3_exhausted = false;
+            if !preserve_settlement_flags {
+                self.port_states[q].stage2_mature_at_tick = 0;
+                self.port_states[q].stage2_exhausted = false;
+                self.port_states[q].stage3_exhausted = false;
+            }
         }
     }
 
@@ -1376,7 +1402,10 @@ impl ArkheLearner {
         self.sync_comparator_windows();
         self.port_states[port_idx].diagnostic_buffer.clear();
         self.port_states[port_idx].ticks_since_last_check = 0;
-        self.port_states[port_idx].stage2_exhausted = false;
+        // Keep Pass 1 active when an autonomous ring comparator is committed so
+        // `evaluate_comparator_ring_promotion` can promote it; non-ring Stage-3
+        // comparators leave Stage 2 exhausted (`#15.1`).
+        self.port_states[port_idx].stage2_exhausted = autonomous_ring.is_none();
         self.port_states[port_idx].stage3_exhausted = false;
         self.redundancy_sprout_events += 1;
         true
@@ -1537,9 +1566,23 @@ impl ArkheLearner {
                 w.clear();
             }
         }
+        let width = self.editable.circuit().width();
+        let scorer = &self.editable.economy().scorers()[target_idx];
+        let p_null = self.port_states[target_idx]
+            .diagnostic_buffer
+            .predictions
+            .last()
+            .and_then(|frame| frame.get(target_idx).copied())
+            .map_or_else(
+                || 1.0 / (2.0f64.powi(i32::from(width.bits()))),
+                |pred| scorer.null_model().probability(width.normalize(pred)),
+            );
+        let beats_null = scorer.q_hat() > p_null;
         self.port_states[target_idx].diagnostic_buffer.clear();
         self.port_states[target_idx].ticks_since_last_check = 0;
-        self.port_states[target_idx].stage2_exhausted = false;
+        if !beats_null {
+            self.port_states[target_idx].stage2_exhausted = false;
+        }
         self.port_states[target_idx].stage3_exhausted = false;
         self.driver_handoff_events += 1;
         true
@@ -2290,7 +2333,13 @@ impl PredictorBaseline for ArkheLearner {
             PendingSnapshot::WithComparators { ancestry, snapshot }
         };
 
-        self.pending_prediction = Some((predictions.clone(), snap, pre_epoch, pre_registers));
+        self.pending_prediction = Some((
+            predictions.clone(),
+            snap,
+            pre_epoch,
+            pre_registers,
+            node_outputs,
+        ));
         predictions
     }
 
@@ -2298,7 +2347,7 @@ impl PredictorBaseline for ArkheLearner {
         if self.total_budget_seen.is_none() {
             self.total_budget_seen = Some(budget.remaining().saturating_add(budget.consumed()));
         }
-        let (predictions, pending_snap, pre_epoch, pre_registers) = self
+        let (predictions, pending_snap, pre_epoch, pre_registers, pre_step_node_outs) = self
             .pending_prediction
             .take()
             .expect("observe called with pending prediction");
@@ -2320,19 +2369,32 @@ impl PredictorBaseline for ArkheLearner {
                 ),
             };
 
-        let input_frame = self.prev_observed_frame.clone();
+        let mut input_frame_stack = [0u64; 16];
+        let input_frame_heap;
+        let input_frame_len = self.prev_observed_frame.len();
+        let input_frame: &[u64] = if input_frame_len <= input_frame_stack.len() {
+            input_frame_stack[..input_frame_len].copy_from_slice(&self.prev_observed_frame);
+            &input_frame_stack[..input_frame_len]
+        } else {
+            input_frame_heap = self.prev_observed_frame.clone();
+            &input_frame_heap
+        };
         self.obs_window
             .push_frame_with_state(truth, pre_epoch, &pre_registers);
         for (slot, &val) in self.prev_observed_frame.iter_mut().zip(truth) {
             *slot = self.editable.circuit().width().normalize(val);
         }
 
-        let wires = self.editable.state().wire_values().to_vec();
-        let pre_step_node_outs = node_output_values(self.editable.circuit(), self.editable.state());
-
         let num_ports = self.editable.economy().scorers().len();
-        let mut port_rewards = vec![0.0; num_ports];
-        for p in 0..num_ports {
+        let mut port_rewards_stack = [0.0f64; 8];
+        let mut port_rewards_heap = Vec::new();
+        let port_rewards: &mut [f64] = if num_ports <= port_rewards_stack.len() {
+            &mut port_rewards_stack[..num_ports]
+        } else {
+            port_rewards_heap.resize(num_ports, 0.0);
+            &mut port_rewards_heap
+        };
+        for (p, reward_slot) in port_rewards.iter_mut().enumerate() {
             let is_driven = self
                 .editable
                 .circuit()
@@ -2344,7 +2406,7 @@ impl PredictorBaseline for ArkheLearner {
                 .get(p)
                 .is_some_and(|shares| shares.iter().sum::<f64>() > 0.0);
             if is_driven && has_causal_ancestry {
-                port_rewards[p] = self
+                *reward_slot = self
                     .editable
                     .economy_mut()
                     .score_port_single(p, predictions[p], truth[p])
@@ -2354,7 +2416,7 @@ impl PredictorBaseline for ArkheLearner {
                     .editable
                     .economy_mut()
                     .observe_unconnected_port(p, truth[p]);
-                port_rewards[p] = 0.0;
+                *reward_slot = 0.0;
             }
         }
 
@@ -2366,7 +2428,16 @@ impl PredictorBaseline for ArkheLearner {
                 .economy_mut()
                 .assign_sprout_debts(&self.ledger.node_debts);
         }
-        let mut maintenance_costs = vec![0.0; n];
+        let mut maintenance_stack = [0.0f64; 128];
+        let mut maintenance_heap = Vec::new();
+        let maintenance_costs: &mut [f64] = if n <= maintenance_stack.len() {
+            let slice = &mut maintenance_stack[..n];
+            slice.fill(0.0);
+            slice
+        } else {
+            maintenance_heap.resize(n, 0.0);
+            &mut maintenance_heap
+        };
         for (i, cost) in maintenance_costs.iter_mut().enumerate().take(n) {
             let node = &self.editable.economy().nodes()[i];
             if node.juvenile_ticks == 0 && !self.ledger.debt_paid[i] {
@@ -2388,11 +2459,15 @@ impl PredictorBaseline for ArkheLearner {
             comp_pri_vals.reserve(comps_count);
             comp_alt_vals.reserve(comps_count);
             comp_eqz_vals.reserve(comps_count);
-            for comp in self.editable.economy().comparators() {
-                let sub_in = &self.editable.compiled().node_input_wires()[comp.sub_node.index()];
-                comp_pri_vals.push(wires[sub_in[0]]);
-                comp_alt_vals.push(wires[sub_in[1]]);
-                comp_eqz_vals.push(pre_step_node_outs[comp.eqz_node.index()]);
+            {
+                let wires = self.editable.state().wire_values();
+                let node_input_wires = self.editable.compiled().node_input_wires();
+                for comp in self.editable.economy().comparators() {
+                    let sub_in = &node_input_wires[comp.sub_node.index()];
+                    comp_pri_vals.push(wires[sub_in[0]]);
+                    comp_alt_vals.push(wires[sub_in[1]]);
+                    comp_eqz_vals.push(pre_step_node_outs[comp.eqz_node.index()]);
+                }
             }
             let fact_slice = truth.get(..num_ports).unwrap_or(truth);
             let comp_obs = self
@@ -2409,18 +2484,18 @@ impl PredictorBaseline for ArkheLearner {
             self.editable
                 .economy_mut()
                 .apply_causal_tick_with_comparators(
-                    &port_rewards,
+                    port_rewards,
                     &comp_rewards,
                     comp_obs.agreements,
                     comp_obs.disagreements,
                     comp_anc,
-                    &maintenance_costs,
+                    maintenance_costs,
                 )
                 .expect("valid comparator causal tick")
         } else {
             self.editable
                 .economy_mut()
-                .apply_causal_tick(&port_rewards, base_ancestry, &maintenance_costs)
+                .apply_causal_tick(port_rewards, base_ancestry, maintenance_costs)
                 .expect("valid causal tick")
         };
         self.cumulative_net_flux += econ_tick.net_flux;
@@ -2563,17 +2638,30 @@ impl PredictorBaseline for ArkheLearner {
         }
 
         // Post-juvenile diagnostic buffer
-        let mut res = vec![0u64; num_ports];
-        for p in 0..num_ports {
-            res[p] = self
-                .editable
-                .circuit()
-                .width()
-                .sub(truth[p], predictions[p]);
+        let mut res_stack = [0u64; 8];
+        let mut res_heap = Vec::new();
+        let res: &mut [u64] = if num_ports <= res_stack.len() {
+            &mut res_stack[..num_ports]
+        } else {
+            res_heap.resize(num_ports, 0);
+            &mut res_heap
+        };
+        let width = self.editable.circuit().width();
+        for (slot, (&tr, &pr)) in res.iter_mut().zip(truth.iter().zip(&predictions)) {
+            *slot = width.sub(tr, pr);
         }
         let node_outs = pre_step_node_outs;
         let node_count = self.editable.circuit().node_count();
-        let mut sensitive = vec![false; node_count];
+        let mut sensitive_stack = [false; 128];
+        let mut sensitive_heap = Vec::new();
+        let sensitive: &mut [bool] = if node_count <= sensitive_stack.len() {
+            let slice = &mut sensitive_stack[..node_count];
+            slice.fill(false);
+            slice
+        } else {
+            sensitive_heap.resize(node_count, false);
+            &mut sensitive_heap
+        };
         match self.growth_config.excision_mode {
             ExcisionMode::BaselineD1b1 => {
                 for (i, sens) in sensitive.iter_mut().enumerate().take(node_count) {
@@ -2647,12 +2735,12 @@ impl PredictorBaseline for ArkheLearner {
                 self.port_states[p]
                     .diagnostic_buffer
                     .push_frame_with_snapshot(
-                        &input_frame,
+                        input_frame,
                         truth,
                         &predictions,
-                        &res,
+                        res,
                         &node_outs,
-                        &sensitive,
+                        sensitive,
                         pre_epoch,
                         &pre_registers,
                     );
@@ -2706,19 +2794,22 @@ impl PredictorBaseline for ArkheLearner {
             };
             if !idle_nodes.is_empty() {
                 let pre_prune_circuit = self.editable.circuit().clone();
-                let past_inputs = self.port_states[p].diagnostic_buffer.inputs.clone();
-                let past_preds = self.port_states[p].diagnostic_buffer.predictions.clone();
-                let past_node_outs = self.port_states[p].diagnostic_buffer.node_outputs.clone();
-                if let Ok(old_to_new) = self.editable.prune_zero_sensitivity_mature_nodes_with_mode(
+                let diag_buf = std::mem::replace(
+                    &mut self.port_states[p].diagnostic_buffer,
+                    DiagnosticBuffer::new(0),
+                );
+                let prune_res = self.editable.prune_zero_sensitivity_mature_nodes_with_mode(
                     &idle_nodes,
-                    &past_inputs,
-                    &past_preds,
+                    &diag_buf.inputs,
+                    &diag_buf.predictions,
                     self.economy_config.split_code_tax,
                     self.growth_config.excision_mode,
                     self.growth_config.diagnostic_window,
-                    Some(&past_node_outs),
+                    Some(&diag_buf.node_outputs),
                     replay_initial_regs.as_deref(),
-                ) {
+                );
+                self.port_states[p].diagnostic_buffer = diag_buf;
+                if let Ok(old_to_new) = prune_res {
                     let any_pruned = old_to_new.iter().any(Option::is_none);
                     if any_pruned {
                         self.ledger.on_prune(
@@ -2746,17 +2837,20 @@ impl PredictorBaseline for ArkheLearner {
             }
             if self.growth_config.excision_mode == ExcisionMode::VerifiedLocalExcision {
                 let pre_prune_circuit = self.editable.circuit().clone();
-                let past_inputs = self.port_states[p].diagnostic_buffer.inputs.clone();
-                let past_preds = self.port_states[p].diagnostic_buffer.predictions.clone();
-                let past_node_outs = self.port_states[p].diagnostic_buffer.node_outputs.clone();
-                if let Ok(Some(old_to_new)) = self.editable.excise_verified_passthrough_subgraphs(
+                let diag_buf = std::mem::replace(
+                    &mut self.port_states[p].diagnostic_buffer,
+                    DiagnosticBuffer::new(0),
+                );
+                let excise_res = self.editable.excise_verified_passthrough_subgraphs(
                     port_u16,
-                    &past_inputs,
-                    &past_preds,
-                    &past_node_outs,
+                    &diag_buf.inputs,
+                    &diag_buf.predictions,
+                    &diag_buf.node_outputs,
                     replay_initial_regs.as_deref(),
                     self.economy_config.split_code_tax,
-                ) {
+                );
+                self.port_states[p].diagnostic_buffer = diag_buf;
+                if let Ok(Some(old_to_new)) = excise_res {
                     self.ledger.on_prune(
                         self.editable.circuit(),
                         self.economy_config.split_code_tax,

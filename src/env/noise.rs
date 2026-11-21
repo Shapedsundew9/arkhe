@@ -233,6 +233,7 @@ fn sample_distinct_symbol(rng: &mut ChaCha8Rng, width: Width, clean: u64) -> u64
 }
 
 /// Paired environment runner emitting both clean ground-truth and noisy observed frames per tick.
+#[derive(Clone, Debug)]
 pub struct NoisyEnvironment<G> {
     generator: G,
     noise: NoiseModel,

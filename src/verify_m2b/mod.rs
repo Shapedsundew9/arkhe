@@ -57,6 +57,10 @@ pub const M2B_HOLDOUT_SEED_END: u32 = 40_019;
 pub const M3_HOLDOUT_SEED_START: u32 = 50_000;
 /// Pre-registered M3 holdout range end seed (inclusive).
 pub const M3_HOLDOUT_SEED_END: u32 = 50_019;
+/// Pre-registered M4a holdout range start seed (unconditionally rejected in M2b).
+pub const M4A_HOLDOUT_SEED_START: u32 = 60_000;
+/// Pre-registered M4a holdout range end seed (inclusive).
+pub const M4A_HOLDOUT_SEED_END: u32 = 60_019;
 
 /// Pre-registered target pass rate for `G2B.1`.
 pub const G2B1_TARGET_RATE: f64 = 0.90;
@@ -88,8 +92,9 @@ pub const G2B5_POST_FAULT_KT_ADVANTAGE_MIN: f64 = 0.15;
 
 /// Guards M2b runs against pre-registered holdout seed ranges.
 ///
-/// Unconditionally rejects overlaps with M1 (`10000..=10019`), M2a (`30000..=30019`), and M3
-/// (`50000..=50019`) holdout ranges, and rejects M2b (`40000..=40019`) unless `allow_holdout` is true.
+/// Unconditionally rejects overlaps with M1 (`10000..=10019`), M2a (`30000..=30019`), M3
+/// (`50000..=50019`), and M4a (`60000..=60019`) holdout ranges, and rejects M2b (`40000..=40019`)
+/// unless `allow_holdout` is true.
 ///
 /// # Errors
 ///
@@ -105,6 +110,7 @@ pub fn check_m2b_seed_range_holdout(
         ("M1", M1_HOLDOUT_SEED_START, M1_HOLDOUT_SEED_END),
         ("M2a", M2A_HOLDOUT_SEED_START, M2A_HOLDOUT_SEED_END),
         ("M3", M3_HOLDOUT_SEED_START, M3_HOLDOUT_SEED_END),
+        ("M4a", M4A_HOLDOUT_SEED_START, M4A_HOLDOUT_SEED_END),
     ];
     for (label, h_start, h_end) in unconditional {
         if start <= h_end && end > h_start {
@@ -2898,7 +2904,7 @@ mod tests {
 
     #[test]
     fn holdout_guards_reject_m1_m2a_m2b_and_m3_ranges() {
-        for blocked in [10_000u32, 30_000, 50_000] {
+        for blocked in [10_000u32, 30_000, 50_000, 60_000] {
             assert!(check_m2b_seed_range_holdout(blocked, 20, false).is_err());
             assert!(check_m2b_seed_range_holdout(blocked, 20, true).is_err());
             assert!(check_m2b_seed_range_holdout(blocked - 5, 10, true).is_err());
@@ -2908,7 +2914,8 @@ mod tests {
         assert!(check_m2b_seed_range_holdout(40_000, 20, true).is_ok());
 
         for safe in [
-            0u32, 9_980, 10_020, 20_040, 29_980, 30_020, 39_980, 40_020, 49_980, 50_020,
+            0u32, 9_980, 10_020, 20_040, 29_980, 30_020, 39_980, 40_020, 49_980, 50_020, 59_980,
+            60_020,
         ] {
             assert!(
                 check_m2b_seed_range_holdout(safe, 20, false).is_ok(),

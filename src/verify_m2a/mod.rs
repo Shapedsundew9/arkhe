@@ -43,11 +43,19 @@ pub const M2A_HOLDOUT_SEED_END: u32 = 30_019;
 pub const M2B_HOLDOUT_SEED_START: u32 = 40_000;
 /// Reserved M2b holdout seed range end (inclusive).
 pub const M2B_HOLDOUT_SEED_END: u32 = 40_019;
+/// Reserved M3 holdout seed range start (never touched by M2a).
+pub const M3_HOLDOUT_SEED_START: u32 = 50_000;
+/// Reserved M3 holdout seed range end (inclusive).
+pub const M3_HOLDOUT_SEED_END: u32 = 50_019;
+/// Reserved M4a holdout seed range start (never touched by M2a).
+pub const M4A_HOLDOUT_SEED_START: u32 = 60_000;
+/// Reserved M4a holdout seed range end (inclusive).
+pub const M4A_HOLDOUT_SEED_END: u32 = 60_019;
 
 /// Checks whether `[seed_offset, seed_offset + seeds)` overlaps any reserved holdout seed range.
 ///
-/// - `10000..=10019` (M1 holdout) and `40000..=40019` (M2b holdout) are unconditionally refused
-///   by `verify-m2a`.
+/// - `10000..=10019` (M1 holdout), `40000..=40019` (M2b holdout), `50000..=50019` (M3 holdout),
+///   and `60000..=60019` (M4a holdout) are unconditionally refused by `verify-m2a`.
 /// - `30000..=30019` (M2a single-shot holdout) is refused unless `allow_holdout == true`.
 ///
 /// # Errors
@@ -74,6 +82,18 @@ pub fn check_m2a_seed_range_holdout(
         return Err(format!(
             "refusing seed range {start}..{end} which overlaps pre-registered holdout range \
              {M2B_HOLDOUT_SEED_START}..={M2B_HOLDOUT_SEED_END} (reserved for M2b)"
+        ));
+    }
+    if overlaps(M3_HOLDOUT_SEED_START, M3_HOLDOUT_SEED_END) {
+        return Err(format!(
+            "refusing seed range {start}..{end} which overlaps pre-registered holdout range \
+             {M3_HOLDOUT_SEED_START}..={M3_HOLDOUT_SEED_END} (reserved for M3)"
+        ));
+    }
+    if overlaps(M4A_HOLDOUT_SEED_START, M4A_HOLDOUT_SEED_END) {
+        return Err(format!(
+            "refusing seed range {start}..{end} which overlaps pre-registered holdout range \
+             {M4A_HOLDOUT_SEED_START}..={M4A_HOLDOUT_SEED_END} (reserved for M4a)"
         ));
     }
     if overlaps(M2A_HOLDOUT_SEED_START, M2A_HOLDOUT_SEED_END) && !allow_holdout {
@@ -2509,7 +2529,8 @@ fn summarize_single_bank(
 /// # Errors
 ///
 /// Returns an error if `horizon <= DEFAULT_M2A_WARMUP` or if the seed range overlaps a guarded
-/// holdout bank (`10000..=10019`, `30000..=30019` without `--holdout`, or `40000..=40019`).
+/// holdout bank (`10000..=10019`, `30000..=30019` without `--holdout`, `40000..=40019`,
+/// `50000..=50019`, or `60000..=60019`).
 pub fn run_m2a_verification_suite(
     seed_offset: u32,
     seeds: u32,
@@ -2681,10 +2702,13 @@ mod tests {
         assert!(check_m2a_seed_range_holdout(10_000, 20, true).is_err());
         assert!(check_m2a_seed_range_holdout(9_990, 20, true).is_err());
 
-        // M2b holdout 40000..=40019 always refused even with allow_holdout=true
-        assert!(check_m2a_seed_range_holdout(40_000, 20, false).is_err());
-        assert!(check_m2a_seed_range_holdout(40_000, 20, true).is_err());
-        assert!(check_m2a_seed_range_holdout(39_990, 20, true).is_err());
+        // M2b (40000..=40019), M3 (50000..=50019), and M4a (60000..=60019) holdouts
+        // are always refused even with allow_holdout=true
+        for blocked in [40_000u32, 50_000, 60_000] {
+            assert!(check_m2a_seed_range_holdout(blocked, 20, false).is_err());
+            assert!(check_m2a_seed_range_holdout(blocked, 20, true).is_err());
+            assert!(check_m2a_seed_range_holdout(blocked - 10, 20, true).is_err());
+        }
 
         // M2a holdout 30000..=30019 requires allow_holdout=true
         let err = check_m2a_seed_range_holdout(30_000, 20, false).unwrap_err();
@@ -2693,9 +2717,10 @@ mod tests {
         assert!(check_m2a_seed_range_holdout(30_000, 20, true).is_ok());
 
         // Disjoint dev and confirmation ranges succeed cleanly
-        assert!(check_m2a_seed_range_holdout(0, 20, false).is_ok());
+        for safe in [0u32, 20, 20_020, 49_980, 50_020, 59_980, 60_020] {
+            assert!(check_m2a_seed_range_holdout(safe, 20, false).is_ok());
+        }
         assert!(check_m2a_seed_range_holdout(20, 1_000, false).is_ok());
-        assert!(check_m2a_seed_range_holdout(20_020, 20, false).is_ok());
     }
 
     #[test]

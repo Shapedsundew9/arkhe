@@ -105,6 +105,8 @@ pub struct ObservationWindow {
     frames: Vec<Vec<u64>>,
     state_snapshots: Vec<Option<(u64, Vec<u64>)>>,
     capacity: usize,
+    recycled_frames: Vec<Vec<u64>>,
+    recycled_regs: Vec<Vec<u64>>,
 }
 
 impl ObservationWindow {
@@ -118,6 +120,8 @@ impl ObservationWindow {
             frames: Vec::with_capacity(cap + WINDOW_EVICT_CHUNK),
             state_snapshots: Vec::with_capacity(cap + WINDOW_EVICT_CHUNK),
             capacity: cap,
+            recycled_frames: Vec::with_capacity(WINDOW_EVICT_CHUNK),
+            recycled_regs: Vec::with_capacity(WINDOW_EVICT_CHUNK),
         }
     }
 
@@ -130,6 +134,8 @@ impl ObservationWindow {
             frames: prefix_frames.to_vec(),
             state_snapshots: vec![None; prefix_frames.len()],
             capacity: prefix_frames.len().max(16),
+            recycled_frames: Vec::new(),
+            recycled_regs: Vec::new(),
         }
     }
 
@@ -147,17 +153,40 @@ impl ObservationWindow {
         structure_epoch: u64,
         pre_step_registers: &[u64],
     ) {
-        self.push_frame_inner(frame, Some((structure_epoch, pre_step_registers.to_vec())));
+        self.push_frame_inner(frame, Some((structure_epoch, pre_step_registers)));
     }
 
-    fn push_frame_inner(&mut self, frame: &[u64], snapshot: Option<(u64, Vec<u64>)>) {
-        self.frames.push(frame.to_vec());
-        self.state_snapshots.push(snapshot);
+    fn push_frame_inner(&mut self, frame: &[u64], snapshot: Option<(u64, &[u64])>) {
+        let frame_buf = if let Some(mut buf) = self.recycled_frames.pop() {
+            buf.clear();
+            buf.extend_from_slice(frame);
+            buf
+        } else {
+            frame.to_vec()
+        };
+        let snap_val = snapshot.map(|(epoch, regs)| {
+            let regs_buf = if let Some(mut buf) = self.recycled_regs.pop() {
+                buf.clear();
+                buf.extend_from_slice(regs);
+                buf
+            } else {
+                regs.to_vec()
+            };
+            (epoch, regs_buf)
+        });
+        self.frames.push(frame_buf);
+        self.state_snapshots.push(snap_val);
         if self.frames.len() >= self.capacity + WINDOW_EVICT_CHUNK {
             let evict = WINDOW_EVICT_CHUNK;
             self.prior_frame.copy_from_slice(&self.frames[evict - 1]);
-            self.frames.drain(0..evict);
-            self.state_snapshots.drain(0..evict);
+            for mut old_frame in self.frames.drain(0..evict) {
+                old_frame.clear();
+                self.recycled_frames.push(old_frame);
+            }
+            for (_, mut old_regs) in self.state_snapshots.drain(0..evict).flatten() {
+                old_regs.clear();
+                self.recycled_regs.push(old_regs);
+            }
             self.start_tick += evict as u64;
         }
     }

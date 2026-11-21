@@ -623,11 +623,10 @@ impl EditableCircuit {
             .iter()
             .flat_map(|c| [c.sub_node, c.eqz_node])
             .collect();
-        let const_loops =
-            detect_fixed_point_const_loops(&self.circuit, &self.compiled, &self.state);
+        let mut const_loops_cache = None;
         let width = self.circuit.width();
-        let l_old = circuit_code_bits_with_tax(&self.circuit, 0, split_code_tax);
-        let comp_targets = self.comparator_targets();
+        let mut l_old_cache: Option<f64> = None;
+        let mut comp_targets_cache: Option<Vec<ComparatorTarget>> = None;
 
         // Order candidate `v` by topological output proximity (outermost primary/comp nodes first).
         let mut candidates_v: Vec<NodeId> = candidate_cone
@@ -646,12 +645,12 @@ impl EditableCircuit {
         candidates_v.sort_by_key(|v| std::cmp::Reverse(v.index()));
 
         for v in candidates_v {
-            // Collect upstream sources `x` in BFS order, prioritizing maximal excised region size
-            // so shared/comparator-cone roots are tested ahead of shallower cloned branches (`D7b`).
-            let upstream_sources = collect_upstream_sources_bfs(&self.circuit, v);
-            for x in
-                self.prioritize_passthrough_sources(v, upstream_sources, &protected, split_code_tax)
-            {
+            // Collect upstream sources `x` in reversed BFS order, run eligibility + cheap Step-1
+            // empirical `W_diag` matching first, and only score/sort if `matched.len() > 1`.
+            let mut upstream_sources = collect_upstream_sources_bfs(&self.circuit, v);
+            upstream_sources.reverse();
+            let mut matched: Vec<(usize, SignalSource, usize)> = Vec::new();
+            for (rev_idx, x) in upstream_sources.into_iter().enumerate() {
                 if let SignalSource::NodeOut { node: u, .. } = x
                     && (u == v
                         || protected.contains(&u)
@@ -669,7 +668,7 @@ impl EditableCircuit {
                 // Step 1: Empirical W_diag screen.
                 let delta_h = match self.circuit.wire_delay() {
                     WireDelayMode::Combinational => {
-                        let matched = (0..w_diag).all(|t| {
+                        let matched_w = (0..w_diag).all(|t| {
                             let v_val = past_node_outputs[t]
                                 .get(v.index())
                                 .map(|&val| width.normalize(val));
@@ -681,7 +680,7 @@ impl EditableCircuit {
                             );
                             v_val.is_some() && v_val == x_val
                         });
-                        if !matched {
+                        if !matched_w {
                             continue;
                         }
                         0usize
@@ -731,14 +730,37 @@ impl EditableCircuit {
                         }
                     }
                 };
+                matched.push((rev_idx, x, delta_h));
+            }
 
-                // Steps 2 & 3: build candidate C', verify equivalence over S, verify strict MDL reduction, commit.
+            if matched.is_empty() {
+                continue;
+            }
+            let ordered_matches = if matched.len() == 1 {
+                matched
+                    .into_iter()
+                    .map(|(_, x, delta_h)| (x, delta_h))
+                    .collect()
+            } else {
+                self.prioritize_matched_passthrough_sources(v, matched, &protected, split_code_tax)
+            };
+
+            let const_loops = const_loops_cache.get_or_insert_with(|| {
+                detect_fixed_point_const_loops(&self.circuit, &self.compiled, &self.state)
+            });
+            let l_old = *l_old_cache.get_or_insert_with(|| {
+                circuit_code_bits_with_tax(&self.circuit, 0, split_code_tax)
+            });
+            let comp_targets = comp_targets_cache.get_or_insert_with(|| self.comparator_targets());
+
+            // Steps 2 & 3: build candidate C', verify equivalence over S, verify strict MDL reduction, commit.
+            for (x, delta_h) in ordered_matches {
                 if let Some(old_to_new) = self.try_certify_and_commit_passthrough_bypass(
                     v,
                     x,
                     &protected,
-                    &const_loops,
-                    &comp_targets,
+                    const_loops,
+                    comp_targets,
                     past_inputs,
                     past_predictions,
                     replay_initial_regs,
@@ -755,18 +777,16 @@ impl EditableCircuit {
         Ok(None)
     }
 
-    fn prioritize_passthrough_sources(
+    fn prioritize_matched_passthrough_sources<T: Copy>(
         &self,
         v: NodeId,
-        mut upstream_sources: Vec<SignalSource>,
+        matched: Vec<(usize, SignalSource, T)>,
         protected: &BTreeSet<NodeId>,
         split_code_tax: bool,
-    ) -> Vec<SignalSource> {
-        upstream_sources.reverse();
-        let mut scored: Vec<(f64, usize, usize, SignalSource)> = upstream_sources
+    ) -> Vec<(SignalSource, T)> {
+        let mut scored: Vec<(f64, usize, usize, SignalSource, T)> = matched
             .into_iter()
-            .enumerate()
-            .map(|(rev_idx, x)| {
+            .map(|(rev_idx, x, meta)| {
                 let (l_new, exc_len) = self
                     .build_passthrough_bypass_candidate(v, x, protected)
                     .map_or((f64::INFINITY, 0), |(staged, _, exc)| {
@@ -775,7 +795,7 @@ impl EditableCircuit {
                             exc.len(),
                         )
                     });
-                (l_new, exc_len, rev_idx, x)
+                (l_new, exc_len, rev_idx, x, meta)
             })
             .collect();
         scored.sort_by(|a, b| {
@@ -783,7 +803,29 @@ impl EditableCircuit {
                 .then_with(|| b.1.cmp(&a.1))
                 .then_with(|| a.2.cmp(&b.2))
         });
-        scored.into_iter().map(|(_, _, _, x)| x).collect()
+        scored
+            .into_iter()
+            .map(|(_, _, _, x, meta)| (x, meta))
+            .collect()
+    }
+
+    fn prioritize_passthrough_sources(
+        &self,
+        v: NodeId,
+        mut upstream_sources: Vec<SignalSource>,
+        protected: &BTreeSet<NodeId>,
+        split_code_tax: bool,
+    ) -> Vec<SignalSource> {
+        upstream_sources.reverse();
+        let indexed: Vec<(usize, SignalSource, ())> = upstream_sources
+            .into_iter()
+            .enumerate()
+            .map(|(rev_idx, x)| (rev_idx, x, ()))
+            .collect();
+        self.prioritize_matched_passthrough_sources(v, indexed, protected, split_code_tax)
+            .into_iter()
+            .map(|(x, ())| x)
+            .collect()
     }
 
     /// Attempts M3-E2 local pass-through excision when `starved_set` threatens a node inside
