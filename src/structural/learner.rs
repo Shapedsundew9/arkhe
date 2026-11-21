@@ -1485,13 +1485,54 @@ impl ArkheLearner {
                 }
             }
         }
-        for state in &mut self.port_states {
-            state.diagnostic_buffer.clear();
-        }
-        self.port_states[target_idx].ticks_since_last_check = 0;
-        self.port_states[target_idx].stage2_exhausted = false;
-        self.port_states[target_idx].stage3_exhausted = false;
+        self.refresh_stage_gates_after_comparator_transition(target_port, true);
         true
+    }
+
+    /// Return whether `target_port` remains driven and its primary scorer still
+    /// beats the trailing diagnostic null model before diagnostic buffers reset.
+    fn surviving_driver_beats_null(&self, target_port: u16) -> bool {
+        let target_idx = usize::from(target_port);
+        if !self.is_port_driven(target_port) {
+            return false;
+        }
+        let width = self.editable.circuit().width();
+        let scorer = &self.editable.economy().scorers()[target_idx];
+        let p_null = self.port_states[target_idx]
+            .diagnostic_buffer
+            .predictions
+            .last()
+            .and_then(|frame| frame.get(target_idx).copied())
+            .map_or_else(
+                || 1.0 / (2.0f64.powi(i32::from(width.bits()))),
+                |pred| scorer.null_model().probability(width.normalize(pred)),
+            );
+        scorer.q_hat() > p_null
+    }
+
+    /// Reset post-comparator stage gates for `target_port`, reopening Stage 2
+    /// only when the surviving primary driver is absent or no longer beats null.
+    fn refresh_stage_gates_after_comparator_transition(
+        &mut self,
+        target_port: u16,
+        clear_all_diag_buffers: bool,
+    ) {
+        let beats_null = self.surviving_driver_beats_null(target_port);
+        if clear_all_diag_buffers {
+            for state in &mut self.port_states {
+                state.diagnostic_buffer.clear();
+            }
+        } else {
+            self.port_states[usize::from(target_port)]
+                .diagnostic_buffer
+                .clear();
+        }
+        let state = &mut self.port_states[usize::from(target_port)];
+        state.ticks_since_last_check = 0;
+        if !beats_null {
+            state.stage2_exhausted = false;
+        }
+        state.stage3_exhausted = false;
     }
 
     fn perform_comparator_handoff(&mut self, comp_idx: usize) -> bool {
@@ -1566,24 +1607,7 @@ impl ArkheLearner {
                 w.clear();
             }
         }
-        let width = self.editable.circuit().width();
-        let scorer = &self.editable.economy().scorers()[target_idx];
-        let p_null = self.port_states[target_idx]
-            .diagnostic_buffer
-            .predictions
-            .last()
-            .and_then(|frame| frame.get(target_idx).copied())
-            .map_or_else(
-                || 1.0 / (2.0f64.powi(i32::from(width.bits()))),
-                |pred| scorer.null_model().probability(width.normalize(pred)),
-            );
-        let beats_null = scorer.q_hat() > p_null;
-        self.port_states[target_idx].diagnostic_buffer.clear();
-        self.port_states[target_idx].ticks_since_last_check = 0;
-        if !beats_null {
-            self.port_states[target_idx].stage2_exhausted = false;
-        }
-        self.port_states[target_idx].stage3_exhausted = false;
+        self.refresh_stage_gates_after_comparator_transition(target_port, false);
         self.driver_handoff_events += 1;
         true
     }
