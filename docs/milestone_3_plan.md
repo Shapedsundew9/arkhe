@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-20  
 **Status:** `Draft awaiting user sign-off`  
-**Charter Links:** [Foundational Research Charter v3](foundational_research_charter_v3.md), [Parameter Inventory](parameter_inventory.md), [Research Record](research_record.md), [Chief Scientist Skill](../.github/skills/arkhe-chief-scientist/SKILL.md)
+**Charter Links:** [Foundational Research Charter v3](foundational_research_charter_v3.md), [Parameter Inventory](parameter_inventory.md), [Research Record](research_record.md), [Chief Scientist Skill](../.agents/skills/arkhe-chief-scientist/SKILL.md)
 
 ## 1. Charter Hypotheses & Decision Rights
 
@@ -25,16 +25,16 @@
 
 - **Decision rights & escalation levels:** Per [Charter §7.1](foundational_research_charter_v3.md#71-milestone-lifecycle-and-decision-rights) and [`.github/copilot-instructions.md`](../.github/copilot-instructions.md) Rules 2, 4, 5, and 7–11, execution follows the two-level escalation hierarchy:
   - **Implementation Workers (`gemini-4-hydrogen-high` / `gemini-4-hydrogen-xhigh`):** Always spawned fresh (**never** `fork: "coordinator"`), strictly bound to file scope and a 2-strike escalation rule.
-  - **Operational Watchdog (`@monitor`, `gemini-4-hydrogen-high` with [`arkhe-watchdog`](../.github/skills/arkhe-watchdog/SKILL.md)):** Parallel sidecar monitor that wakes on a 10-minute timer (`schedule`) to inspect stateless worker transcript deltas, `git diff --stat`, and benchmark runtimes (`W1`–`W6`).
-  - **Level 1 Escalation — Senior Scientist Orchestrator (`Argon` `@coordinator` with [`arkhe-orchestrator`](../.github/skills/arkhe-orchestrator/SKILL.md)):** Owns intra-phase and intra-milestone execution (tweaking phase/milestone mechanistic details toward optimal solutions, resolving bugs, aligning harnesses, and correcting substantively suboptimal behavior that trips a guardrail while preserving the limit).
-  - **Level 2 Escalation — Chief Scientist (`gemini-4-argon-high` with [`arkhe-chief-scientist`](../.github/skills/arkhe-chief-scientist/SKILL.md)):** Acts as the Foundational Stand-In for the User with full autonomous authority over Charter §§2–3 amendments (if required to achieve Charter §§0–1 goals), [`docs/parameter_inventory.md`](parameter_inventory.md) reasoned Derived Scaling Laws (no magic numbers), pre-registered gate threshold recalibration (Rule 9), Rule-4 golden re-blessing, milestone splitting (`Ma/Mb/Mc`) or re-ordering, single-shot holdout authorization (**S3** for `50000..=50019`), holdout-failure recovery, and milestone closeout/progression (**S4**).
+  - **Operational Watchdog (`@monitor`, `gemini-4-hydrogen-high` with [`arkhe-watchdog`](../.agents/skills/arkhe-watchdog/SKILL.md)):** Parallel sidecar monitor that wakes on a 10-minute timer (`schedule`) to inspect stateless worker transcript deltas, `git diff --stat`, and benchmark runtimes (`W1`–`W6`).
+  - **Level 1 Escalation — Senior Scientist Orchestrator (`Argon` `@coordinator` with [`arkhe-orchestrator`](../.agents/skills/arkhe-orchestrator/SKILL.md)):** Owns intra-phase and intra-milestone execution (tweaking phase/milestone mechanistic details toward optimal solutions, resolving bugs, aligning harnesses, and correcting substantively suboptimal behavior that trips a guardrail while preserving the limit).
+  - **Level 2 Escalation — Chief Scientist (`gemini-4-argon-high` with [`arkhe-chief-scientist`](../.agents/skills/arkhe-chief-scientist/SKILL.md)):** Acts as the Foundational Stand-In for the User with full autonomous authority over Charter §§2–3 amendments (if required to achieve Charter §§0–1 goals), [`docs/parameter_inventory.md`](parameter_inventory.md) reasoned Derived Scaling Laws (no magic numbers), pre-registered gate threshold recalibration (Rule 9), Rule-4 golden re-blessing, milestone splitting (`Ma/Mb/Mc`) or re-ordering, single-shot holdout authorization (**S3** for `50000..=50019`), holdout-failure recovery, and milestone closeout/progression (**S4**).
   - **Principal Investigator (User):** Needed **only** if Charter-Core Invariants ([Charter §§0–1](foundational_research_charter_v3.md#0-purpose-in-one-paragraph), holdout isolation) or the overarching Charter goal are at risk and the Chief Scientist cannot identify a path with a realistic chance of success.
 
 ---
 
 ## 2. Exploratory Characterisation & Upfront Blocker Resolution Strategy
 
-Per Rule 8 and [Chief Scientist Skill §3 Principles 1–6](../.github/skills/arkhe-chief-scientist/SKILL.md#3-seven-operating-principles), verbatim inspection of [`src/structural/surgery.rs`](../src/structural/surgery.rs), [`src/structural/sensitivity.rs`](../src/structural/sensitivity.rs), [`src/structural/economy.rs`](../src/structural/economy.rs), [`src/structural/growth.rs`](../src/structural/growth.rs), [`src/structural/graph_edit.rs`](../src/structural/graph_edit.rs), and [`src/structural/learner.rs`](../src/structural/learner.rs) together with existing `M1b`–`M2b` baseline measurements in [`docs/research_record.md`](research_record.md) identifies three structural gaps in the unamended `M2b` wake pruning rules that would otherwise cause Milestone 3 to hit an immediate wall.
+Per Rule 8 and [Chief Scientist Skill §3 Principles 1–6](../.agents/skills/arkhe-chief-scientist/SKILL.md#3-seven-operating-principles), verbatim inspection of [`src/structural/surgery.rs`](../src/structural/surgery.rs), [`src/structural/sensitivity.rs`](../src/structural/sensitivity.rs), [`src/structural/economy.rs`](../src/structural/economy.rs), [`src/structural/growth.rs`](../src/structural/growth.rs), [`src/structural/graph_edit.rs`](../src/structural/graph_edit.rs), and [`src/structural/learner.rs`](../src/structural/learner.rs) together with existing `M1b`–`M2b` baseline measurements in [`docs/research_record.md`](research_record.md) identifies three structural gaps in the unamended `M2b` wake pruning rules that would otherwise cause Milestone 3 to hit an immediate wall.
 
 ### 2.1 Code-Level Diagnosis of the Three Non-Contributing Node Failure Modes
 
@@ -178,15 +178,15 @@ Executed against the dev `0..20` bank (output archived in `/tmp/explore_m3_dev20
 | `Juvenile` | `D7aFakeComparator` | `437/440` | `[128, 131.2, 186]` | `220/220` | `[245, 245.0, 245]` | `169.77 / 66.22` | `starvation_bypass` / `idle_d1b1` |
 | `Juvenile` | `D7bAgreementGate` | `437/440` | `[128, 131.2, 186]` | `120/120` | `[384, 470.0, 513]` | `220.21 / 95.81` | `local_excision` / `idle_d1b1` |
 
-3. **Paired Excision Ablation (`VerifiedLocalExcision` vs. `BaselineD1b1`, clean `Combinational`, `3,960` pairs):**
+1. **Paired Excision Ablation (`VerifiedLocalExcision` vs. `BaselineD1b1`, clean `Combinational`, `3,960` pairs):**
    - `Established` (`1,980` pairs): `VLE` excised `1,980 / 1,980` (`100.0%`, `0` collapsed) vs. `BaselineD1b1` `280 / 1,980` (`14.1%`, `1,700` bloated; `VLE` strictly lower final MDL on `1,780` runs, mean `dMDL = +88.27` bits saved).
    - `Juvenile` (`1,980` pairs): `VLE` excised `1,980 / 1,980` (`100.0%`, `0` collapsed) vs. `BaselineD1b1` `600 / 1,980` excised (`1,300` destructive primary-cone collapses across `D2`–`D7b`, `80` bloated).
 
-4. **Paired `split_code_tax` Ablation (`true` vs. `false`):**
+2. **Paired `split_code_tax` Ablation (`true` vs. `false`):**
    - **Injection (`1,600` pairs):** `split_code_tax = true` excised `1,600 / 1,600` (`100.0%`, mean residual `dL_inj = 0.00` bits) vs. `false` `1,400 / 1,600` (`87.5%`, `200` bloated, mean `dL_inj = +2.30` bits; mean `L_pre` `51.59` vs. `42.15` bits).
    - **Spontaneous (`37 x 20 = 740` pairs at `T = 8000`):** `100%` (`740/740`) clean-locked under both modes; `split_code_tax = true` priced `Split` fan-outs at `+2.58` to `+192.99` bits on clean `Split`-bearing circuits and reduced noisy `eps=0.05` splitting (`T2_CrossSum(k=1)`: `0.90` vs. `2.05` `Split`s; `T2_MultiViewCoupled(k=1)`: `4.00` vs. `5.25` `Split`s).
 
-5. **Spontaneous Long-Horizon `T in {2000, 8000}` Size Discipline (`split_code_tax = true`, `37 x 20 = 740` runs):**
+3. **Spontaneous Long-Horizon `T in {2000, 8000}` Size Discipline (`split_code_tax = true`, `37 x 20 = 740` runs):**
    - `740 / 740` (`100.0%`) locked and remained clean-locked at `T = 8000` with **`SproutBlockedMaxNodes == 0` across all `740` runs**.
    - Representative cells: `T1_Constant(0, k=1,2)` & `T1_NoisyConstant(0/max, k=1,2)` locked at `N = 0 -> 0 -> 0` (`slope = 0.0`); `T1_Alternating(k=1,2)` clean `2 -> 2 -> 2` (`ratio = 2.00`), noisy `3.90/3.80 -> 4.00 -> 4.00` (`ratio = 4.00`), TPH `1 -> 1 -> 1`; `T1_PeriodicMotif([0,1,1], k=1)` `5 -> 5 -> 5` (`ratio = 2.50`, TPH `1`, `ratio = 0.50`); `T1_PeriodicMotif([0,1,3], k=2)` & `T3b_CounterModN(3, k=2)` `6 -> 6 -> 6` (`ratio = 3.00`, TPH `1`, `ratio = 0.50`); `T1_AffineLag1(1,1,0, k=2)` `7 -> 7 -> 7` (`ratio = 2.33`, TPH `1`, `ratio = 1.00`); `T2_CrossSum(k=1,2)` clean `4->6->6` / `3->3->3`; `T2_CrossMulEqz(k=2)` `4->4->4`; `T2_MultiViewCoupled(k=1,2)` clean `1->2->2` / `3->7->7` (`comp8k = 3.00`), TPH `1->1->1` (`comp8k = 1.00`).
 

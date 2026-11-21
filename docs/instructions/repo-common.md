@@ -123,14 +123,14 @@ Read `.shared/ai/core/common-instructions.md`.
      guardrail/limit bound is due to substantively suboptimal learner/harness behavior vs. genuine
      problem-class scale expansion.
    - **Operational Watchdog (`@monitor`, `gemini-4-hydrogen-high` with
-     [`.github/skills/arkhe-watchdog/SKILL.md`](../../.github/skills/arkhe-watchdog/SKILL.md)):**
+     [`.agents/skills/arkhe-watchdog/SKILL.md`](../../.agents/skills/arkhe-watchdog/SKILL.md)):**
      Parallel operational sidecar (not an escalation decision level). Wakes on a 10-minute timer
      (`schedule`), uses a compact stateless delta check without dumping code or transcripts into its
      context, verifies workers run on `gemini-4-hydrogen-*`, and halts any worker that exceeds 2
      retries on a failure, weakens a test, masks a guardrail counter, edits out-of-scope files, or
      runs an un-extrapolated multi-hour sweep (`W1`–`W6`), alerting Level 1 (`@coordinator`).
    - **Level 1 Escalation — Senior Scientist Orchestrator (`Argon` `@coordinator` with
-     [`.github/skills/arkhe-orchestrator/SKILL.md`](../../.github/skills/arkhe-orchestrator/SKILL.md)):**
+     [`.agents/skills/arkhe-orchestrator/SKILL.md`](../../.agents/skills/arkhe-orchestrator/SKILL.md)):**
      The Orchestrator is the **Senior Scientist** for **intra-phase and intra-milestone execution**.
      It resolves **~80% of worker escalations directly in 1 turn** without waking the Chief
      Scientist:
@@ -155,7 +155,7 @@ Read `.shared/ai/core/common-instructions.md`.
        dev and confirmation sweeps are complete and ready for single-shot holdout authorization
        (`S3`) or milestone closeout (`S4`).
    - **Level 2 Escalation — Chief Scientist (`gemini-4-argon-high` with
-     [`.github/skills/arkhe-chief-scientist/SKILL.md`](../../.github/skills/arkhe-chief-scientist/SKILL.md)):**
+     [`.agents/skills/arkhe-chief-scientist/SKILL.md`](../../.agents/skills/arkhe-chief-scientist/SKILL.md)):**
      Always spawned fresh (**never** `fork: "coordinator"`), and **always** sleeps with
      `swarm_wait{mentions_only: true}`. Acts as the **Foundational Stand-In for the User** across
      the milestone roadmap (`M3`–`M6`):
