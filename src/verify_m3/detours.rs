@@ -424,39 +424,49 @@ pub fn build_detour_edit(
         .map(|i| Some(NodeId(u32::try_from(i).expect("fits in u32"))))
         .collect();
 
-    // Check if `orig_driver` is a comparator tap `Split` in TicksPerHop autonomous mode: if so,
-    // splice upstream of that `Split` so `BoundaryOut` and `ComparatorSite::sub_node.in(0)` stay aligned.
-    let (splice_src, splice_dst) = if is_tph
-        && hop_delta > 0
-        && let SignalSource::NodeOut { node: sp_node, .. } = orig_driver
-        && orig_circuit.nodes().get(sp_node.index()) == Some(&Primitive::Split)
-        && orig_circuit.edges().iter().any(|e| {
-            matches!(e.src, SignalSource::NodeOut { node, .. } if node == sp_node)
-                && matches!(e.dst, SignalSink::NodeIn { node: c, port: 0 }
-                    if editable.economy().comparators().iter().any(|comp| comp.sub_node == c))
-        }) {
-        let in_src = orig_circuit
-            .edges()
-            .iter()
-            .find(|e| {
-                e.dst
-                    == SignalSink::NodeIn {
-                        node: sp_node,
-                        port: 0,
-                    }
+    // Check if `orig_driver` is a comparator tap `Split`: if so, splice/tap upstream of that
+    // `Split` in both `Combinational` and `TicksPerHop` modes so `BoundaryOut` and
+    // `ComparatorSite::sub_node.in(0)` stay aligned on the comparator's `exclusive_fanout_root`.
+    let comp_tap_in_src: Option<(SignalSource, SignalSink)> =
+        if let SignalSource::NodeOut { node: sp_node, .. } = orig_driver
+            && orig_circuit.nodes().get(sp_node.index()) == Some(&Primitive::Split)
+            && orig_circuit.edges().iter().any(|e| {
+                matches!(e.src, SignalSource::NodeOut { node, .. } if node == sp_node)
+                    && matches!(e.dst, SignalSink::NodeIn { node: c, port: 0 }
+                        if editable.economy().comparators().iter().any(|comp| comp.sub_node == c))
             })
-            .map(|e| e.src)
-            .ok_or_else(|| "missing Split input".to_owned())?;
-        (
-            in_src,
-            SignalSink::NodeIn {
-                node: sp_node,
-                port: 0,
-            },
-        )
+        {
+            let in_src = orig_circuit
+                .edges()
+                .iter()
+                .find(|e| {
+                    e.dst
+                        == SignalSink::NodeIn {
+                            node: sp_node,
+                            port: 0,
+                        }
+                })
+                .map(|e| e.src)
+                .ok_or_else(|| "missing Split input".to_owned())?;
+            Some((
+                in_src,
+                SignalSink::NodeIn {
+                    node: sp_node,
+                    port: 0,
+                },
+            ))
+        } else {
+            None
+        };
+
+    let (splice_src, splice_dst) = if hop_delta > 0
+        && let Some(pair) = comp_tap_in_src
+    {
+        pair
     } else {
         (orig_driver, out_sink)
     };
+    let tap_driver = comp_tap_in_src.map_or(orig_driver, |(in_src, _)| in_src);
 
     // Pre-step pre-injection output sequence on `target_port` when `is_tph && is_autonomous`.
     let mut pre_y = Vec::new();
@@ -497,8 +507,8 @@ pub fn build_detour_edit(
                 );
                 let _ = osc_sp;
             } else {
-                // Tap splice_src (or orig_driver) into a stateful dead feedback loop.
-                let tapped = tap_source(&mut edited, orig_driver);
+                // Tap splice_src (or tap_driver) into a stateful dead feedback loop.
+                let tapped = tap_source(&mut edited, tap_driver);
                 let dead_d = edited.add_node(Primitive::Delay { init: 0 });
                 let dead_sp = edited.add_node(Primitive::Split);
                 let dead_add = edited.add_node(Primitive::Add);
@@ -947,12 +957,12 @@ pub fn build_detour_edit(
                 let (cloned_src, clone_nodes, _) = clone_upstream_cone(
                     orig_circuit,
                     orig_regs,
-                    orig_driver,
+                    tap_driver,
                     &mut edited,
                     is_tph_autonomous_flag(is_tph, is_autonomous),
                 )?;
                 extra_injected.extend(clone_nodes);
-                let tapped = tap_source(&mut edited, orig_driver);
+                let tapped = tap_source(&mut edited, tap_driver);
                 let fake_sub = edited.add_node(Primitive::Sub);
                 let fake_eqz = edited.add_node(Primitive::Eqz);
                 edited.connect(
@@ -1014,8 +1024,11 @@ pub fn build_detour_edit(
             let eqz = edited.add_node(Primitive::Eqz);
             let mul = edited.add_node(Primitive::Mul);
 
+            // If `splice_src` was `BoundaryIn(c)`, `clone_upstream_cone` may have left a live edge
+            // on it; `tap_source` inserts a `Split` only when `splice_src` already has a fan-out.
+            let gate_in = tap_source(&mut edited, splice_src);
             edited.connect(
-                splice_src,
+                gate_in,
                 SignalSink::NodeIn {
                     node: split_gate,
                     port: 0,
@@ -1035,7 +1048,8 @@ pub fn build_detour_edit(
                 },
                 SignalSink::NodeIn { node: sub, port: 0 },
             );
-            edited.connect(cloned_src, SignalSink::NodeIn { node: sub, port: 1 });
+            let cloned_tap = tap_source(&mut edited, cloned_src);
+            edited.connect(cloned_tap, SignalSink::NodeIn { node: sub, port: 1 });
             edited.connect(
                 SignalSource::NodeOut { node: sub, port: 0 },
                 SignalSink::NodeIn { node: eqz, port: 0 },
@@ -1048,7 +1062,7 @@ pub fn build_detour_edit(
             if is_tph {
                 d7b_clone_regs = Some((clone_base_regs, cloned_edge_inits, clone_set));
                 detour_edges.push((
-                    splice_src,
+                    gate_in,
                     SignalSink::NodeIn {
                         node: split_gate,
                         port: 0,
@@ -1072,7 +1086,7 @@ pub fn build_detour_edit(
                     pre_y[1],
                 ));
                 detour_edges.push((
-                    cloned_src,
+                    cloned_tap,
                     SignalSink::NodeIn { node: sub, port: 1 },
                     pre_y[1],
                 ));

@@ -5696,6 +5696,9 @@ fn evaluate_stage3_candidate_pre(
     } else {
         2
     };
+    if e_alt_diag > 0 && tier != 1 {
+        return None;
+    }
 
     Some(Ok(EvaluatedStage3Pre {
         staged,

@@ -267,6 +267,7 @@ pub struct ArkheLearner {
     lag_deepening_steps: u64,
     sprout_budget_exhausted: u64,
     total_budget_seen: Option<u64>,
+    injected_detour_nodes: BTreeSet<NodeId>,
 }
 
 impl ArkheLearner {
@@ -357,6 +358,7 @@ impl ArkheLearner {
             lag_deepening_steps: 0,
             sprout_budget_exhausted: 0,
             total_budget_seen: None,
+            injected_detour_nodes: BTreeSet::new(),
         })
     }
 
@@ -447,6 +449,7 @@ impl ArkheLearner {
             lag_deepening_steps: 0,
             sprout_budget_exhausted: 0,
             total_budget_seen: None,
+            injected_detour_nodes: BTreeSet::new(),
         })
     }
 
@@ -657,10 +660,8 @@ impl ArkheLearner {
                         }
                     }
                 }
-                for (q, state) in self.port_states.iter_mut().enumerate() {
-                    if port_cone_changed(&pre_circuit, &post_circuit, old_to_new, q as u16) {
-                        state.stage2_mature_at_tick = self.tick.saturating_add(u64::from(eff_juv));
-                    }
+                for state in &mut self.port_states {
+                    state.stage2_mature_at_tick = self.tick.saturating_add(u64::from(eff_juv));
                 }
             }
         }
@@ -675,7 +676,17 @@ impl ArkheLearner {
             state.ticks_since_last_check = 0;
         }
         self.apply_node_remap_to_windows(old_to_new);
+        self.injected_detour_nodes.extend(injected.iter().copied());
+        for win in &mut self.comparator_windows {
+            win.clear();
+        }
         Ok(())
+    }
+
+    /// Number of externally injected detour nodes still present in the live circuit.
+    #[must_use]
+    pub fn surviving_injected_detour_nodes(&self) -> usize {
+        self.injected_detour_nodes.len()
     }
 
     /// Total autonomous ring-closure events committed.
@@ -1095,6 +1106,11 @@ impl ArkheLearner {
     }
 
     fn apply_node_remap_to_windows(&mut self, old_to_new: &[Option<NodeId>]) {
+        self.injected_detour_nodes = self
+            .injected_detour_nodes
+            .iter()
+            .filter_map(|id| old_to_new.get(id.index()).copied().flatten())
+            .collect();
         let new_node_count = self.editable.circuit().node_count();
         for state in &mut self.port_states {
             state
@@ -1477,16 +1493,20 @@ impl ArkheLearner {
         {
             return false;
         }
-        if self.editable.circuit().node_count() > pre_n {
-            self.ledger
-                .on_sprout(self.editable.circuit(), split_tax, &old_to_new);
-            self.editable
-                .economy_mut()
-                .assign_sprout_debts(&self.ledger.node_debts);
-        } else {
-            self.ledger.last_committed_code_bits =
-                circuit_code_bits_with_tax(self.editable.circuit(), 0, split_tax);
+        let post_n = self.editable.circuit().node_count();
+        if post_n > pre_n {
+            self.ledger.node_debts.resize(post_n, 0.0);
+            self.ledger.debt_paid.resize(post_n, true);
+            for idx in pre_n..post_n {
+                if let Some(ne) = self.editable.economy_mut().node_mut(idx) {
+                    ne.juvenile_ticks = 0;
+                    ne.debt_paid = true;
+                    ne.description_debt = 0.0;
+                }
+            }
         }
+        self.ledger.last_committed_code_bits =
+            circuit_code_bits_with_tax(self.editable.circuit(), 0, split_tax);
         self.swap_port_and_comparator_scorer(target_idx, comp_idx);
         let new_primary_mask = comp.alt_channel_mask;
         {
@@ -2763,7 +2783,9 @@ impl PredictorBaseline for ArkheLearner {
 
             let mut sprouted = false;
             let port_zero_error = self.is_port_zero_error(p);
-            if !self.port_states[p].stage2_exhausted {
+            if !self.port_states[p].stage2_exhausted
+                && self.tick >= self.port_states[p].stage2_mature_at_tick
+            {
                 let mut port_budget = if num_ports == 1 {
                     *budget
                 } else {
@@ -3043,7 +3065,11 @@ impl PredictorBaseline for ArkheLearner {
                     || self.port_states[p].ticks_since_last_check
                         >= self.growth_config.sprout_interval;
 
-                if !((ran_pass1 || ready_for_stage3_only) && is_primed && buf_ready && timer_ready)
+                if !((ran_pass1 || ready_for_stage3_only)
+                    && is_primed
+                    && buf_ready
+                    && timer_ready
+                    && self.tick >= self.port_states[p].stage2_mature_at_tick)
                 {
                     continue;
                 }

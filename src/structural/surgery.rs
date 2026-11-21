@@ -502,6 +502,18 @@ impl EditableCircuit {
                 })
                 .collect()
         };
+        if !comp_targets.is_empty()
+            && (surviving_eqz_wires.len() != comp_targets.len()
+                || comp_targets.iter().any(|t| {
+                    old_to_new
+                        .get(t.sub_node.index())
+                        .copied()
+                        .flatten()
+                        .is_none()
+                }))
+        {
+            return Ok(identity_map());
+        }
 
         let mut orig_probe_state = if surviving_eqz_wires.is_empty() {
             None
@@ -598,7 +610,10 @@ impl EditableCircuit {
             return Ok(None);
         }
         let primary_nodes = primary_cone_nodes(&self.circuit, &self.economy, port);
-        if primary_nodes.is_empty() {
+        let comp_exclusive = comparator_exclusive_nodes(&self.circuit, &self.economy);
+        let candidate_cone: BTreeSet<NodeId> =
+            primary_nodes.union(&comp_exclusive).copied().collect();
+        if candidate_cone.is_empty() {
             return Ok(None);
         }
 
@@ -608,15 +623,14 @@ impl EditableCircuit {
             .iter()
             .flat_map(|c| [c.sub_node, c.eqz_node])
             .collect();
-        let comp_exclusive = comparator_exclusive_nodes(&self.circuit, &self.economy);
         let const_loops =
             detect_fixed_point_const_loops(&self.circuit, &self.compiled, &self.state);
         let width = self.circuit.width();
         let l_old = circuit_code_bits_with_tax(&self.circuit, 0, split_code_tax);
         let comp_targets = self.comparator_targets();
 
-        // Order candidate `v` by topological output proximity (outermost primary nodes first).
-        let mut candidates_v: Vec<NodeId> = primary_nodes
+        // Order candidate `v` by topological output proximity (outermost primary/comp nodes first).
+        let mut candidates_v: Vec<NodeId> = candidate_cone
             .iter()
             .copied()
             .filter(|&v| {
@@ -641,7 +655,8 @@ impl EditableCircuit {
                 if let SignalSource::NodeOut { node: u, .. } = x
                     && (u == v
                         || protected.contains(&u)
-                        || comp_exclusive.contains(&u)
+                        || (primary_nodes.contains(&v) != primary_nodes.contains(&u))
+                        || (comp_exclusive.contains(&v) != comp_exclusive.contains(&u))
                         || self
                             .economy
                             .nodes()
@@ -845,8 +860,15 @@ impl EditableCircuit {
                             continue;
                         }
                         let x_anc = collect_upstream_sources_bfs(&self.circuit, u);
+                        let candidate_excised = self
+                            .build_passthrough_bypass_candidate(v, x, &protected)
+                            .map(|(_, _, exc)| exc);
                         if x_anc.iter().any(|src| {
-                            matches!(src, SignalSource::NodeOut { node, .. } if starved_set.contains(node))
+                            matches!(src, SignalSource::NodeOut { node, .. }
+                                if starved_set.contains(node)
+                                    && candidate_excised
+                                        .as_ref()
+                                        .is_none_or(|exc| !exc.contains(node)))
                         }) {
                             continue;
                         }
@@ -863,7 +885,7 @@ impl EditableCircuit {
                         0,
                         l_old,
                         split_code_tax,
-                        false,
+                        true,
                     )? {
                         return Ok(Some(old_to_new));
                     }
@@ -1165,7 +1187,6 @@ impl EditableCircuit {
             .flat_map(|comp| [comp.sub_node, comp.eqz_node])
             .collect();
 
-        let mut removed = initially_removed.clone();
         let mut logical_edges: Vec<(SignalSource, SignalSink)> = self
             .circuit
             .edges()
@@ -1229,6 +1250,76 @@ impl EditableCircuit {
                 multiplicative_one_sources.insert(node);
             } else if is_zero {
                 additive_zero_sources.insert(node);
+            }
+        }
+
+        // Propagate constant identity sources through Split/zero-Mul ahead of initializing `removed`,
+        // so non-constant Split taps and identity-bypassable Add/Sub/Mul consumers can be deferred.
+        loop {
+            let mut propagated = false;
+            for (index, &primitive) in self.circuit.nodes().iter().enumerate() {
+                let node = NodeId(u32::try_from(index).expect("node count fits in u32"));
+                if protected_comp_nodes.contains(&node) {
+                    continue;
+                }
+                match primitive {
+                    Primitive::Split => {
+                        if let Some(src_node) =
+                            input_source(&logical_edges, node, 0).and_then(source_node)
+                        {
+                            if additive_zero_sources.contains(&src_node) {
+                                propagated |= additive_zero_sources.insert(node);
+                            } else if multiplicative_one_sources.contains(&src_node) {
+                                propagated |= multiplicative_one_sources.insert(node);
+                            }
+                        }
+                    }
+                    Primitive::Mul => {
+                        let zero_in = (0..2).any(|p| {
+                            input_source(&logical_edges, node, p)
+                                .and_then(source_node)
+                                .is_some_and(|s| additive_zero_sources.contains(&s))
+                        });
+                        if zero_in {
+                            propagated |= additive_zero_sources.insert(node);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !propagated {
+                break;
+            }
+        }
+
+        let mut removed = BTreeSet::new();
+        for &node in initially_removed {
+            let prim = self.circuit.nodes().get(node.index()).copied();
+            let defer_split = prim == Some(Primitive::Split)
+                && !additive_zero_sources.contains(&node)
+                && !multiplicative_one_sources.contains(&node)
+                && input_source(&logical_edges, node, 0)
+                    .and_then(source_node)
+                    .is_none_or(|src| src != node);
+            let defer_consumer = !protected_sub_nodes.contains(&node)
+                && match prim {
+                    Some(Primitive::Add) => (0..2).any(|p| {
+                        input_source(&logical_edges, node, p)
+                            .and_then(source_node)
+                            .is_some_and(|s| additive_zero_sources.contains(&s))
+                    }),
+                    Some(Primitive::Sub) => input_source(&logical_edges, node, 1)
+                        .and_then(source_node)
+                        .is_some_and(|s| additive_zero_sources.contains(&s)),
+                    Some(Primitive::Mul) => (0..2).any(|p| {
+                        input_source(&logical_edges, node, p)
+                            .and_then(source_node)
+                            .is_some_and(|s| multiplicative_one_sources.contains(&s))
+                    }),
+                    _ => false,
+                };
+            if !defer_split && !defer_consumer {
+                removed.insert(node);
             }
         }
 
@@ -1394,7 +1485,7 @@ impl EditableCircuit {
                     .nodes()
                     .get(index)
                     .is_none_or(|n| n.juvenile_ticks == 0);
-                if is_mature && !*live {
+                if (is_mature || initially_removed.contains(&node)) && !*live {
                     removed.insert(node);
                     outer_changed = true;
                 }
@@ -1460,6 +1551,17 @@ impl EditableCircuit {
             }
 
             if !outer_changed {
+                let mut forced_any = false;
+                for &node in initially_removed {
+                    if !protected_comp_nodes.contains(&node) && removed.insert(node) {
+                        forced_any = true;
+                    }
+                }
+                if forced_any {
+                    logical_edges
+                        .retain(|(source, sink)| !edge_touches_nodes(*source, *sink, &removed));
+                    continue;
+                }
                 break;
             }
         }
@@ -1815,7 +1917,6 @@ impl EditableCircuit {
             return None;
         }
 
-        let excised_set = removed.clone();
         let mut bypasses: Vec<(SignalSource, SignalSink)> =
             v_sinks.iter().map(|&sink| (x_chosen, sink)).collect();
         let mut direct_bypass_ports = BTreeSet::new();
@@ -1894,6 +1995,7 @@ impl EditableCircuit {
             }
         }
 
+        let excised_set = removed.clone();
         let mut staged = self.circuit.clone();
         let old_to_new = staged.remove_nodes(&removed);
         if need_extra_split {

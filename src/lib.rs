@@ -107,6 +107,18 @@ pub enum Commands {
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
     },
+    /// Run Milestone 3 exploratory and paired-ablation sweep on non-holdout development seeds.
+    ExploreM3 {
+        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
+        #[arg(long, default_value_t = 0)]
+        seed_offset: u64,
+        /// Number of master seeds evaluated.
+        #[arg(long, default_value_t = 20)]
+        seeds: usize,
+        /// Optional path to write the JSON `ExploreM3Report` (prints to stdout when omitted).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Returns the crate banner string.
@@ -247,6 +259,20 @@ where
                     Err("Milestone 2b verification failed one or more acceptance gates".into())
                 }
             }
+        }
+        Some(Commands::ExploreM3 {
+            seed_offset,
+            seeds,
+            output,
+        }) => {
+            let report = verify_m3::run_explore_m3(seed_offset, seeds)?;
+            let json = serde_json::to_string_pretty(&report)?;
+            if let Some(out_path) = output {
+                fs::write(out_path, json)?;
+            } else {
+                println!("{json}");
+            }
+            Ok(())
         }
     }
 }

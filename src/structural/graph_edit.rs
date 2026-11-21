@@ -1367,6 +1367,7 @@ pub fn prune_starved_preserving_healthy_split_branches(
     let mut work = circuit.clone();
     let mut bypassed_splits: BTreeSet<NodeId> = BTreeSet::new();
     let mut dead_seed_nodes: BTreeSet<NodeId> = BTreeSet::new();
+    let mut kept_sinks: Vec<SignalSink> = Vec::new();
 
     let forward_branch_info =
         |circ: &Circuit, split: NodeId, port: u8| -> (Vec<SignalSink>, BTreeSet<NodeId>, bool) {
@@ -1489,6 +1490,7 @@ pub fn prune_starved_preserving_healthy_split_branches(
             for sink in keep_sinks {
                 work.disconnect(keep_src, sink);
                 work.connect(in_src, sink);
+                kept_sinks.push(sink);
             }
             let dead_src = SignalSource::NodeOut {
                 node: split,
@@ -1612,6 +1614,31 @@ pub fn prune_starved_preserving_healthy_split_branches(
         }
     }
 
+    for sink in &kept_sinks {
+        match sink {
+            SignalSink::NodeIn { node, .. } if removed.contains(node) => return None,
+            SignalSink::BoundaryOut(port)
+                if !work
+                    .edges()
+                    .iter()
+                    .any(|e| e.dst == SignalSink::BoundaryOut(*port)) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    let had_any_output = circuit
+        .edges()
+        .iter()
+        .any(|e| matches!(e.dst, SignalSink::BoundaryOut(_)));
+    let has_any_output = work
+        .edges()
+        .iter()
+        .any(|e| matches!(e.dst, SignalSink::BoundaryOut(_)));
+    if had_any_output && !has_any_output {
+        return None;
+    }
     let old_to_new = work.remove_nodes(&removed);
     work.compile().ok()?;
     Some((work, old_to_new))

@@ -152,6 +152,47 @@ Prior to running confirmatory multi-bank verification (`Phase 4`), the `explore-
   5. `split_code_tax ∈ {true, false}` (Charter §8 `SPLIT`-tax ablation across both injection and spontaneous $T \in \{2000, 8000\}$ runs).
 - **Recorded per-run metrics:** Primary-cone and comparator-cone node counts over time; injection tick $T_{\text{inj}}$; exact removal tick $\Delta t_{\text{excise}}$ per injected node; prune mechanism (`idle_d1b1`, `local_excision`, `starvation_bypass`, `collapse_regrow`); transient post-injection clean mismatches and KT excess bits over $[T_{\text{inj}}, T_{\text{inj}} + 4 W_{\text{obs}})$; pre-injection vs. final $L(C)$; energy siphoned by detour nodes prior to excision; $\Delta E$ conservation residual including `exogenous_injection_bits`; spontaneous $T \in \{2000, 8000\}$ post-lock slope and $N_{\text{primary}} / N_{\min}$ ratio; and all cliff/guardrail counters.
 
+#### Dev `0..20` Exploratory Sweep Summary (`cargo run --release -- explore-m3 --seed-offset 0 --seeds 20`)
+
+Executed against the dev `0..20` bank (output archived in `/tmp/explore_m3_dev20.json`, untracked):
+
+1. **Aggregate Sweep, Conservation & Comparator Preservation (`0..20`):**
+   - **Conservation (`G3.1` probe, `4,320 / 4,320` passed across `T1`/`T2`/`T2_MultiViewCoupled`, `k in {1, 2}`, `eps in {0.0, 0.05}`, `Established`/`Juvenile`, all 9 detour classes):** `max_epistemic_mdl_residual = 0.0` b/sym, `max_pre_excision_delta_e_residual = 2.08e-15` b/sym, `max_exogenous_bits_err = 0.0` bits.
+   - **VerifiedLocalExcision (`Combinational`):** Clean (`eps=0.0`): `3,960 / 3,960` (`100.0%`) excised within `W_obs = 256` ticks (`0` collapses, `0` bloated, `720 / 720` `T2_MultiViewCoupled` comparators preserved). Noisy (`eps=0.05`): `3,905 / 3,960` (`98.6%`) excised (`3,895` within `W_obs`, `0` collapses, `720 / 720` `T2_MultiViewCoupled` comparators preserved; remaining `55` are `0`-collapse endogenous Stage-2/3 changes on `1/20` `T1_PeriodicMotif([0,1,1], k=1)`, `2/20` `T2_MultiViewCoupled(k=1)`, and `1/20` `T2_MultiViewCoupled(k=2)` `D7b` `Established`).
+   - **VerifiedLocalExcision (`TicksPerHop`, clean):** `2,560 / 2,560` (`100.0%` applicable, `0` skipped) excised within `3 W_obs = 768` (`2,320` within `W_obs`), `0` collapses, `0` bloated, `160 / 160` `T2_MultiViewCoupled` comparators preserved, max clean mismatches = `1` (`D2OneFire` only).
+
+2. **Excision Latency & Peak Siphoned Energy by Detour Class (`VerifiedLocalExcision`):**
+
+| Mode | Class | Comb Excised | Comb `dt` `[min, mean, max]` | TPH Excised | TPH `dt` `[min, mean, max]` | Comb Peak / Net Energy (bits) | Primary Mechanism |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| `Established` | `D0Dead` | `437/440` | `[64, 64.9, 339]` | `220/220` | `[64, 64.0, 64]` | `40.60 / 17.03` | `idle_d1b1` |
+| `Established` | `D1AddZero` | `437/440` | `[64, 64.7, 403]` | `120/120` | `[65, 65.0, 65]` | `40.60 / 17.03` | `idle_d1b1` |
+| `Established` | `D2OneFire` | `437/440` | `[15, 93.3, 403]` | `120/120` | `[65, 65.0, 65]` | `56.55 / 20.33` | `idle_d1b1` / `local_excision` |
+| `Established` | `D3MulZero` | `437/440` | `[64, 64.7, 403]` | `120/120` | `[65, 65.0, 65]` | `40.60 / 17.03` | `idle_d1b1` |
+| `Established` | `D4MulOne` | `437/440` | `[64, 64.7, 403]` | `120/120` | `[65, 65.0, 65]` | `40.60 / 17.03` | `idle_d1b1` |
+| `Established` | `D5CancelSub` | `437/440` | `[3, 64.8, 748]` | `120/120` | `[65, 65.0, 65]` | `100.70 / 38.03` | `local_excision` |
+| `Established` | `D6Involution` | `437/440` | `[64, 65.4, 748]` | `120/120` | `[65, 65.0, 65]` | `108.26 / 44.72` | `local_excision` |
+| `Established` | `D7aFakeComparator` | `437/440` | `[15, 64.7, 339]` | `220/220` | `[64, 64.0, 64]` | `103.56 / 28.92` | `idle_d1b1` |
+| `Established` | `D7bAgreementGate` | `436/440` | `[1, 63.4, 403]` | `120/120` | `[65, 65.0, 65]` | `175.89 / 40.97` | `idle_d1b1` |
+| `Juvenile` | `D0Dead` | `437/440` | `[128, 128.6, 129]` | `220/220` | `[186, 186.0, 186]` | `81.61 / 38.54` | `starvation_bypass` / `idle_d1b1` |
+| `Juvenile` | `D1AddZero`–`D4MulOne` | `437/440` ea. | `[128, 128.6, 129]` | `120/120` ea. | `[129..245]` | `81.61–90.86 / 38.75–43.68` | `local_excision` / `idle_d1b1` |
+| `Juvenile` | `D5CancelSub` | `437/440` | `[129, 129.0, 129]` | `120/120` | `[373, 373.0, 373]` | `187.21 / 87.49` | `local_excision` |
+| `Juvenile` | `D6Involution` | `437/440` | `[129, 152.3, 748]` | `120/120` | `[129, 149.7, 191]` | `218.56 / 97.95` | `local_excision` |
+| `Juvenile` | `D7aFakeComparator` | `437/440` | `[128, 131.2, 186]` | `220/220` | `[245, 245.0, 245]` | `169.77 / 66.22` | `starvation_bypass` / `idle_d1b1` |
+| `Juvenile` | `D7bAgreementGate` | `437/440` | `[128, 131.2, 186]` | `120/120` | `[384, 470.0, 513]` | `220.21 / 95.81` | `local_excision` / `idle_d1b1` |
+
+3. **Paired Excision Ablation (`VerifiedLocalExcision` vs. `BaselineD1b1`, clean `Combinational`, `3,960` pairs):**
+   - `Established` (`1,980` pairs): `VLE` excised `1,980 / 1,980` (`100.0%`, `0` collapsed) vs. `BaselineD1b1` `280 / 1,980` (`14.1%`, `1,700` bloated; `VLE` strictly lower final MDL on `1,780` runs, mean `dMDL = +88.27` bits saved).
+   - `Juvenile` (`1,980` pairs): `VLE` excised `1,980 / 1,980` (`100.0%`, `0` collapsed) vs. `BaselineD1b1` `600 / 1,980` excised (`1,300` destructive primary-cone collapses across `D2`–`D7b`, `80` bloated).
+
+4. **Paired `split_code_tax` Ablation (`true` vs. `false`):**
+   - **Injection (`1,600` pairs):** `split_code_tax = true` excised `1,600 / 1,600` (`100.0%`, mean residual `dL_inj = 0.00` bits) vs. `false` `1,400 / 1,600` (`87.5%`, `200` bloated, mean `dL_inj = +2.30` bits; mean `L_pre` `51.59` vs. `42.15` bits).
+   - **Spontaneous (`37 x 20 = 740` pairs at `T = 8000`):** `100%` (`740/740`) clean-locked under both modes; `split_code_tax = true` priced `Split` fan-outs at `+2.58` to `+192.99` bits on clean `Split`-bearing circuits and reduced noisy `eps=0.05` splitting (`T2_CrossSum(k=1)`: `0.90` vs. `2.05` `Split`s; `T2_MultiViewCoupled(k=1)`: `4.00` vs. `5.25` `Split`s).
+
+5. **Spontaneous Long-Horizon `T in {2000, 8000}` Size Discipline (`split_code_tax = true`, `37 x 20 = 740` runs):**
+   - `740 / 740` (`100.0%`) locked and remained clean-locked at `T = 8000` with **`SproutBlockedMaxNodes == 0` across all `740` runs**.
+   - Representative cells: `T1_Constant(0, k=1,2)` & `T1_NoisyConstant(0/max, k=1,2)` locked at `N = 0 -> 0 -> 0` (`slope = 0.0`); `T1_Alternating(k=1,2)` clean `2 -> 2 -> 2` (`ratio = 2.00`), noisy `3.90/3.80 -> 4.00 -> 4.00` (`ratio = 4.00`), TPH `1 -> 1 -> 1`; `T1_PeriodicMotif([0,1,1], k=1)` `5 -> 5 -> 5` (`ratio = 2.50`, TPH `1`, `ratio = 0.50`); `T1_PeriodicMotif([0,1,3], k=2)` & `T3b_CounterModN(3, k=2)` `6 -> 6 -> 6` (`ratio = 3.00`, TPH `1`, `ratio = 0.50`); `T1_AffineLag1(1,1,0, k=2)` `7 -> 7 -> 7` (`ratio = 2.33`, TPH `1`, `ratio = 1.00`); `T2_CrossSum(k=1,2)` clean `4->6->6` / `3->3->3`; `T2_CrossMulEqz(k=2)` `4->4->4`; `T2_MultiViewCoupled(k=1,2)` clean `1->2->2` / `3->7->7` (`comp8k = 3.00`), TPH `1->1->1` (`comp8k = 1.00`).
+
 ---
 
 ## 3. Pre-Registered Hypotheses & Falsifiable Success Criteria
