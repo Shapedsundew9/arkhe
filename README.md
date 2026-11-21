@@ -1,6 +1,6 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, and **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)** from the [Foundational Research Charter v3](docs/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [docs/parameter_inventory.md](docs/parameter_inventory.md), Milestone 0–2b sign-off records and derivations live in [docs/research_record.md](docs/research_record.md), and Chief Scientist governance and escalation principles live in [docs/chief_scientist_role.md](docs/chief_scientist_role.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, and **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)** from the [Foundational Research Charter v3](docs/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [docs/parameter_inventory.md](docs/parameter_inventory.md), Milestone 0–2b sign-off records and derivations live in [docs/research_record.md](docs/research_record.md), and two-level swarm escalation skills live in [.github/skills/arkhe-orchestrator/SKILL.md](.github/skills/arkhe-orchestrator/SKILL.md), [.github/skills/arkhe-chief-scientist/SKILL.md](.github/skills/arkhe-chief-scientist/SKILL.md), and [.github/skills/arkhe-watchdog/SKILL.md](.github/skills/arkhe-watchdog/SKILL.md).
 
 ## Overview
 
@@ -25,7 +25,6 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   ├── templates/
 │   │   ├── blocker_report.md
 │   │   └── milestone_plan_template.md
-│   ├── chief_scientist_role.md
 │   ├── foundational_research_charter_v3.md
 │   ├── parameter_inventory.md
 │   └── research_record.md

@@ -69,11 +69,12 @@ Read `.shared/ai/core/common-instructions.md`.
    `juvenile_ticks = 128`, `diagnostic_window = 64` calibrated at $K=1, \tau \le 3$) to keep initial
    experiments tractable. Scaffolding constants are **not** immutable across new scale axes
    ($\tau, K, k, N$). When a later milestone expands a scale axis and a scaffolding constant binds
-   for a provable mathematical reason (e.g., $\gamma^{\tau-1}$ credit attenuation, $\tau$-tick
-   pipeline fill latency, alphabet size $2^k$, or description debt $\Delta L_v$), the **primary
-   remedy** to propose in a blocker report is replacing the fixed scalar with a
-   **zero-free-parameter Derived Scaling Law**—never weakening the benchmark task, narrowing a
-   gate, or tuning a new magic number.
+   for a reasoned structural or mathematical cause (e.g., $\gamma^{\tau-1}$ credit attenuation,
+   $\tau$-tick pipeline fill latency, alphabet size $2^k$, or description debt $\Delta L_v$), the
+   **primary remedy** is replacing the fixed scalar with a **reasoned Derived Scaling Law** (no
+   magic numbers—every constant or scaling relationship must have a documented, reasoned explanation
+   for why it is what it is)—never weakening the benchmark task, narrowing a gate, or tuning an
+   arbitrary magic number.
 3. **Every limit is observable.** Any cap, guardrail, clip, or window truncation must emit a named
    telemetry counter when it binds. Guardrails must never bind in an accepted run.
 4. **Golden traces serve the science and never block derived scaling laws.** Behavior-preserving
@@ -89,8 +90,8 @@ Read `.shared/ai/core/common-instructions.md`.
    occur:
    - a structural limit, guardrail (`SproutBlockedMaxNodes`, `SproutBudgetExhausted`), starvation
      cliff, search bound, or milestone-scoped scaffolding constant binds;
-   - a pre-registered gate fails on development seeds and the cause is not an implementation bug
-     with a demonstrable fix within 2 attempts;
+   - a pre-registered gate fails on development, confirmation, or holdout seeds and the cause is not
+     an implementation bug with a demonstrable fix within 2 attempts;
    - a fix would add, remove, or re-derive a constant, a threshold, a gate, a test assertion, or a
      golden fixture;
    - two consecutive fix attempts for the same failure brought no new diagnostic understanding;
@@ -98,66 +99,102 @@ Read `.shared/ai/core/common-instructions.md`.
    - a theoretical argument suggests the target is unreachable under the current rules.
 6. **Multi-bank acceptance uses pooled confidence bounds plus a homogeneity test**, never compound
    per-bank hurdles.
-7. **Decision rights & two-level escalation hierarchy.** Only the user (Principal Investigator)
-   decides scientific parameters, derived scaling laws, gate thresholds, seed banks, evidence
-   retirement, golden re-blessing, charter text, kill-criterion interpretation, and milestone
-   sign-off (see Charter §7.1). Swarm execution follows a strict hierarchy with **two distinct
-   escalation levels** above the implementation workers:
-   - **Tier 1 — Implementation Workers (`gemini-4-hydrogen-high` / `gemini-4-hydrogen-xhigh`):**
-     Always spawned fresh (**never** `fork: "coordinator"`, which inherits the coordinator's Argon
-     model binding). Strictly bound to the parameters, formulas, file scope, and test
-     specifications in their brief. Maximum **2 fix attempts** on any failing test; **never**
-     weaken test assertions, alter generator parameters (e.g., `add_b`, `lag`, `Width`), mask or
-     suppress guardrail counters (`SproutBlockedMaxNodes`, `SproutBudgetExhausted`), or edit
-     out-of-scope files to make a test pass. When escalating (`@coordinator [escalation]` +
-     `swarm_wait{mentions_only: true}`), the worker **must** present: (i) the root cause or exact
-     failing observation (file, line, metric), (ii) **2–3 concrete options with trade-offs**, and
-     (iii) whether any guardrail/limit bound is due to silly learner/harness behavior vs. genuine
+7. **Decision rights, Charter-Core Invariants & two-level escalation hierarchy (see Charter §7.1).**
+   - **Charter-Core Invariants (Immutable without User / Principal Investigator Sign-Off):**
+     1. **Overarching Charter purpose & epistemological premise ([Charter §§0–1](../foundational_research_charter_v3.md#0-purpose-in-one-paragraph)):**
+        Starting from minimal exact arithmetic primitives with no gradients, no pre-trained
+        representations, and no outside grader beyond environment facts; fallibilist truth
+        (disagreement conclusive, agreement provisional and null-surprisal-weighted); wake empirical
+        prediction + redundant derivations/comparators; sleep isolated deduction + formal theorem
+        compilation into higher-order axioms so the learner's vocabulary grows open-endedly and
+        every level of the hierarchy is auditable.
+     2. **Holdout Seed Bank Isolation:** Pre-registered single-shot holdout banks (`10000..=10019`,
+        `30000..=30019`, `40000..=40019`, `50000..=50019`, `60000..=60019`, and future milestone
+        holdouts) are never inspected during development or used to tune thresholds.
+   - **Implementation Workers (`gemini-4-hydrogen-high` / `gemini-4-hydrogen-xhigh`, phase authors & `@verifier`):**
+     Always spawned fresh (**never** `fork: "coordinator"`). Strictly bound to the parameters,
+     formulas, file scope, and test specifications in their brief. Maximum **2 fix attempts** on any
+     failing test; **never** weaken test assertions, alter generator parameters (`add_b`, `lag`,
+     `Width`), mask or suppress guardrail counters (`SproutBlockedMaxNodes`,
+     `SproutBudgetExhausted`), or edit out-of-scope files to make a test pass. When escalating
+     (`@coordinator [escalation]` + `swarm_wait{mentions_only: true}`), the worker **must** present:
+     (i) the root cause or exact failing observation (file, line, metric), (ii) **2–3 concrete
+     options with trade-offs** aimed at an optimal or near-optimal solution, and (iii) whether any
+     guardrail/limit bound is due to substantively suboptimal learner/harness behavior vs. genuine
      problem-class scale expansion.
-   - **Tier 2 — Anti-Grind & Quota Watchdog (`gemini-4-hydrogen-high` with
+   - **Operational Watchdog (`@monitor`, `gemini-4-hydrogen-high` with
      [`.github/skills/arkhe-watchdog/SKILL.md`](../../.github/skills/arkhe-watchdog/SKILL.md)):**
-     Wakes on a 10-minute timer (`schedule`), uses a compact stateless delta check without dumping
-     code or transcripts into its context, verifies workers run on `gemini-4-hydrogen-*`, and halts
-     any worker that exceeds 2 retries on a failure, weakens a test, masks a guardrail counter,
-     edits out-of-scope files, or runs an un-extrapolated multi-hour sweep (`W1`–`W6`), escalating
-     to `@coordinator`.
+     Parallel operational sidecar (not an escalation decision level). Wakes on a 10-minute timer
+     (`schedule`), uses a compact stateless delta check without dumping code or transcripts into its
+     context, verifies workers run on `gemini-4-hydrogen-*`, and halts any worker that exceeds 2
+     retries on a failure, weakens a test, masks a guardrail counter, edits out-of-scope files, or
+     runs an un-extrapolated multi-hour sweep (`W1`–`W6`), alerting Level 1 (`@coordinator`).
    - **Level 1 Escalation — Senior Scientist Orchestrator (`Argon` `@coordinator` with
      [`.github/skills/arkhe-orchestrator/SKILL.md`](../../.github/skills/arkhe-orchestrator/SKILL.md)):**
-     The Orchestrator is the **Senior Scientist** and first-line decision filter. It resolves
-     **~80% of worker escalations directly in 1 turn** without waking the Chief Scientist:
+     The Orchestrator is the **Senior Scientist** for **intra-phase and intra-milestone execution**.
+     It resolves **~80% of worker escalations directly in 1 turn** without waking the Chief
+     Scientist:
+     - **Scope of authority:** Tweaking mechanistic and architectural implementation details
+       *within* the active phase or milestone to make the problem tractable and achieve an optimal
+       or near-optimal implementation, resolving implementation/harness bugs, granting cross-file
+       edit permissions, and resetting the 2-strike counter.
      - **Anti-duplication rule:** When a worker has already identified the root cause and presented
-       valid options within the pre-registered plan, `@coordinator` inspects at most the 1–2 cited
-       code ranges to verify the options, **makes the decision directly**, grants file-scope
-       authorization if needed, resets the 2-strike counter, and sends the worker back. Never
-       re-run the worker's analysis or outsource routine bug/harness decisions to the Chief
-       Scientist.
+       valid options within the active milestone's gates and parameters, `@coordinator` inspects at
+       most the 1–2 cited code ranges, **makes the decision directly**, and sends the worker back.
+       Never re-run the worker's analysis or outsource phase-level decisions to `@chief-scientist`.
      - **Limit & guardrail triage:** Bounds like `max_nodes` exist to flag pathology, not to be
-       ground against or silenced. When a limit binds due to **silly worker or learner behavior**
-       (e.g., sprouting on unpredictable exogenous driver channels, or running deep candidate
-       searches on an already-locked port), `@coordinator` directs a correction to the behavior
-       while **maintaining the limit**.
+       ground against or silenced. When a limit binds due to **substantively suboptimal worker or
+       learner behavior** (e.g., sprouting on unpredictable exogenous driver channels, or running
+       deep candidate searches on an already-locked port), `@coordinator` directs a correction to
+       eliminate the suboptimal behavior while **maintaining the limit**.
      - **When to escalate to Level 2 (`@chief-scientist`):** Escalate to `@chief-scientist` **only**
        when: (a) every option has material disadvantages or cross-milestone fallout (`M3`–`M6`),
        (b) a limit/scaffolding constant is binding because the **class of problem genuinely expands
-       the scale boundary**, requiring a broader directional tweak to make the problem tractable or
-       a zero-free-parameter Derived Scaling Law, or (c) a pre-registered gate, oracle, or Charter
-       hypothesis is in question.
+       the scale boundary**, (c) achieving Charter §§0–1 goals requires amending Charter §§2–3,
+       recalibrating a pre-registered gate threshold, or splitting/re-ordering a milestone, or (d)
+       dev and confirmation sweeps are complete and ready for single-shot holdout authorization
+       (`S3`) or milestone closeout (`S4`).
    - **Level 2 Escalation — Chief Scientist (`gemini-4-argon-high` with
-     [`.github/skills/arkhe-chief-scientist/SKILL.md`](../../.github/skills/arkhe-chief-scientist/SKILL.md)
-     and [`docs/chief_scientist_role.md`](../chief_scientist_role.md)):**
+     [`.github/skills/arkhe-chief-scientist/SKILL.md`](../../.github/skills/arkhe-chief-scientist/SKILL.md)):**
      Always spawned fresh (**never** `fork: "coordinator"`), and **always** sleeps with
-     `swarm_wait{mentions_only: true}` so it never auto-wakes on worker-to-coordinator traffic.
-     Acts as a foundational arbiter and stand-in for the user on hard directional trade-offs: it
-     cannot overturn Charter goals or user-owned thresholds unilaterally, but has broad authority
-     to tweak research/mechanistic direction so the problem becomes tractable without contortion or
-     guardrail masking. The Chief Scientist **never** performs interactive binary debugging
-     (`lldb`, `gdb`, `objdump`) or writes copy-paste implementation patches for workers. When a
-     foundational change, gate threshold change, or Derived Scaling Law requires Principal
-     Investigator sign-off, it prepares a structured blocker report ([`docs/templates/blocker_report.md`](../templates/blocker_report.md))
-     for the user (`Stop Point S2`).
+     `swarm_wait{mentions_only: true}`. Acts as the **Foundational Stand-In for the User** across
+     the milestone roadmap (`M3`–`M6`):
+     - **Full authority over Charter §§2–3 amendments, parameters, derived laws, gates, holdouts,
+       and milestone structure:** So long as the **Charter-Core Invariants (Charter §§0–1 & holdout
+       isolation)** are preserved and no arbitrary magic-number tuning occurs, the Chief Scientist
+       has full authority to:
+       1. **Amend Charter §2 (Substrate) or Charter §3 (Two-Layer Architecture)** if required to
+          meet the foundational goals in Charter §§0–1 (recording the amendment and rationale in
+          Charter Appendix A Decision Record `DR #`);
+       2. Alter or re-derive any parameter in [`docs/parameter_inventory.md`](../parameter_inventory.md)
+          (evolving Milestone-Scoped Scaffolding constants, search bounds, or compute guardrails
+          into **reasoned Derived Scaling Laws** where every number or relationship has a
+          documented, non-arbitrary basis) and authorize **Rule-4 golden trace re-blessing**;
+       3. Recalibrate **pre-registered gate thresholds, $P_{\text{target}}$, margins, or yardsticks**
+          that prove scientifically or practically mis-calibrated during execution (provided the
+          revised gate cites a theoretical bound or measured baseline per Rule 9 and still tests
+          the Charter hypothesis);
+       4. **Split a milestone into sub-milestones (`Ma / Mb / Mc`)**, re-order phases, or
+          **re-order/re-prioritize milestones** in Charter §7 to take a more effective, tractable
+          route to the Charter §§0–1 goal (ratifying updates in `docs/milestone_*_plan.md`,
+          `docs/parameter_inventory.md`, and Charter Appendix A Decision Record);
+       5. **Approve and authorize single-shot holdout runs (`S3`)** once dev and confirmation banks
+          pass cleanly, **approve milestone completion and progression to the next milestone (`S4`)**
+          when holdout passes, and **adjudicate holdout failures** as a Level-2 escalation (e.g.,
+          restructuring the milestone and allocating a fresh disjoint holdout bank without tuning to
+          the consumed holdout seeds).
+     - **When to escalate to the User (Principal Investigator):** The User is needed **only** when
+       the overarching goal of the Charter (Charter §§0–1) is genuinely at risk—i.e., a core
+       Charter hypothesis is falsified or blocked and **the Chief Scientist cannot identify a
+       scientifically sound path forward with a realistic chance of success**.
+     - **Hard execution boundary:** The Chief Scientist **never** performs interactive binary
+       debugging (`lldb`, `gdb`, `objdump`), never masks a guardrail counter, and never writes
+       copy-paste implementation patches for workers.
 8. **Exploratory vs. confirmatory.** Before a threshold is pre-registered, runs are exploratory:
-   they measure and report and never gate. Confirmatory runs use only thresholds the user has
-   signed off. Never tune toward an exploratory number.
+   they measure and report and never gate. Confirmatory runs use thresholds signed off in the
+   milestone plan (or recalibrated by the Chief Scientist with a documented Rule-9 feasibility bound
+   prior to opening the single-shot holdout bank). Never tune toward an exploratory or holdout
+   number.
 9. **Feasibility before targets.** Every gate threshold must cite a theoretical bound or a measured
    baseline that shows it is reachable. A threshold without one is a characterisation metric, not
    a gate.

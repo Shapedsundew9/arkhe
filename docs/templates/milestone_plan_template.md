@@ -8,7 +8,7 @@
 
 - **Hypotheses tested:** `<H_x, ...>`
 - **Explicit non-goals / deferred hypotheses:** `<What this milestone does NOT claim>`
-- **Decision rights & execution tiers:** Per Charter §7.1 and [`.github/copilot-instructions.md`](../../.github/copilot-instructions.md) Rules 2, 4, 5, and 7, parameter values, Milestone-Scoped Scaffolding $\to$ Derived Scaling Law evolutions, gate thresholds, seed banks, golden re-blessing approvals, and kill-criterion interpretation require explicit user sign-off before confirmatory execution. Implementation follows the 3-tier hierarchy (Tier 1 Hydrogen workers with a 2-strike escalation rule; Tier 2 `arkhe-watchdog`; Tier 3 Argon orchestrator).
+- **Decision rights & escalation levels:** Per Charter §7.1 and [`.github/copilot-instructions.md`](../../.github/copilot-instructions.md) Rules 2, 4, 5, and 7, execution follows the two-level escalation hierarchy: Implementation Workers (`Hydrogen`, 2-strike bounded) and the Operational Watchdog (`arkhe-watchdog` sidecar) escalate to Level 1 (`@coordinator`, Senior Scientist Orchestrator) for intra-phase/intra-milestone mechanistic tweaks, bug fixes, and correcting substantively suboptimal behavior that trips a limit; Level 2 (`@chief-scientist`, Foundational Stand-In for the User) holds autonomous authority over Charter §§2–3 amendments (when required to achieve Charter §§0–1 goals), [`docs/parameter_inventory.md`](../parameter_inventory.md) reasoned Derived Scaling Laws (no magic numbers), pre-registered gate threshold recalibration (Rule 9), Rule-4 golden re-blessing, milestone splitting (`Ma/Mb/Mc`) or re-ordering, single-shot holdout authorization (`S3`), and milestone closeout/progression (`S4`). The User (Principal Investigator) is required only if Charter-Core Invariants (Charter §§0–1, holdout isolation) or the overarching Charter goal are at risk with no realistic path forward.
 
 ## 2. Exploratory Characterisation Summary
 
@@ -37,7 +37,7 @@ Document exploratory measurements recorded prior to pre-registration (Rule 8: ex
 
 ## 6. Parameter Inventory Changes
 
-List every constant added, reclassified (e.g., **Milestone-Scoped Scaffolding** evolved into a zero-free-parameter **Derived Scaling Law** as scale axes $\tau, K, k, N$ expand), derived, or bounded in [`docs/parameter_inventory.md`](../parameter_inventory.md), with its classification, config path, telemetry counter, backward-reduction behavior on golden traces, and sensitivity sweep plan.
+List every constant added, reclassified (e.g., **Milestone-Scoped Scaffolding** evolved into a reasoned **Derived Scaling Law**—with no magic numbers—as scale axes $\tau, K, k, N$ expand), derived, or bounded in [`docs/parameter_inventory.md`](../parameter_inventory.md), with its classification, config path, telemetry counter, backward-reduction behavior on golden traces, and sensitivity sweep plan.
 
 ## 7. Phased Implementation Plan
 

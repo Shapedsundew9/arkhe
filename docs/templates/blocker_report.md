@@ -27,13 +27,15 @@ State whether the cause is an implementation bug, an architectural interaction, 
 
 | Option | Behavior changed | Constants / gates touched | Engineering & scientific cost |
 | :--- | :--- | :--- | :--- |
-| **(a) Derived Scaling Law (Primary remedy when a scaffolding constant binds)** | Replace binding Milestone-Scoped Scaffolding scalar with a zero-free-parameter derived scaling law; state whether it reduces identically at earlier milestone scales or requires golden fixture re-blessing + backward gate verification | ... | ... |
+| **(a) Reasoned Derived Scaling Law (Primary remedy when a scaffolding constant binds)** | Replace binding Milestone-Scoped Scaffolding scalar with a reasoned derived scaling law (no magic numbers—documented basis for every constant/relationship); state whether it reduces identically at earlier milestone scales or requires golden fixture re-blessing + backward gate verification | ... | ... |
 | **(b)** | ... | ... | ... |
 
 ## 6. Recommendation
 
 State the recommended option with rationale.
 
-## 7. What the agent will not do without a decision
+## 7. Escalation Target & Authority Boundary
 
-Explicitly list prohibited unilateral actions (e.g., changing a constant/threshold, altering a test or gate, re-blessing golden fixtures, editing Charter rules, opening holdout seeds).
+State whether this report is:
+- **Level-2 Chief Scientist Adjudication (`@chief-scientist`):** For amending Charter §§2–3 to achieve Charter §§0–1 goals, evolving a Milestone-Scoped Scaffolding constant or bound into a reasoned Derived Scaling Law (no magic numbers), recalibrating an impractical pre-registered gate threshold (with a Rule-9 feasibility bound), re-blessing golden fixtures under Rule 4, splitting a milestone (`Ma/Mb/Mc`), or re-ordering milestones/phases; or
+- **Principal Investigator (User) Charter-Risk Escalation:** Required **only** when the overarching goal of the Charter (Charter §§0–1) or Holdout Seed Isolation is genuinely at risk and the Chief Scientist cannot identify a scientifically sound path forward with a realistic chance of success.
