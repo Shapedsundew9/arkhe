@@ -12,6 +12,7 @@ RUN apt-get update \
     build-essential \
     libssl-dev \
     lldb \
+    linux-perf \
     pkg-config \
     ripgrep \
     vim \
