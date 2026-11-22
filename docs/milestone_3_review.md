@@ -4,7 +4,7 @@
 **Reviewed HEAD:** `7cb1ee0`  
 **Scope:** Implementation evidence, recorded M3 outcomes, retained M2 regressions, documentation consistency, and information useful to M4 planning.
 
-> **Latest re-review:** [2026-11-22 at `b33c550`](#re-review-at-b33c550-2026-11-22). The original comparator regression is addressed, but M3 v2 remains pre-S3 and the re-review identifies additional replay and verification defects. The original review below is preserved as evidence about `7cb1ee0`.
+> **Latest re-review:** [Pre-S3, 2026-11-22 at `a7ec23c`](#pre-s3-re-review-at-a7ec23c-2026-11-22). R2-R5 are resolved and the clean-commit evidence matches the current source. R1 remains partially open for a surviving cyclic source without an earlier matching snapshot. Earlier reviews below are preserved as historical evidence.
 
 ## Executive Summary
 
@@ -139,3 +139,51 @@ The existing [pre-S3 evidence packet](research_record.md#125-milestone-3-v2-reme
 4. Obtain S4 closeout after acceptance, permanently close the consumed v2 range, and retain the raw JSON evidence durably.
 
 This re-review ran only the original comparator regression test (passed), the checker self-tests (`26/26` passed), two isolated regression probes (both failed as detailed in R1/R3), synthetic validator counterexamples, and documentation-link validation. The probes ran in a temporary worktree of `b33c550` with no production-mechanism edits; that worktree was removed. No broad scientific suite or holdout was rerun. Only this review document was changed in the main worktree.
+
+## Pre-S3 Re-review at a7ec23c (2026-11-22)
+
+### Disposition of R1-R5
+
+The remediation and its evidence are substantially improved. **R2-R5 can be closed for this review. R1's original acyclic counterexample is fixed, but a reproducible cyclic-source fallback defect remains.** This is a pre-S3 assessment, not a holdout authorization or milestone-completion decision.
+
+| Finding | Disposition | Evidence |
+| :--- | :--- | :--- |
+| R1: surviving-state priming | **Partially resolved; residual below** | The original two-Delay reproducer now yields `[2, 3]`, with and without an earlier matching snapshot. Snapshot-backed cyclic priming passes. The combination of a cyclic source and missing earlier snapshot still fails. |
+| R2: provenance binding | **Resolved** | The checker captures live worktree state and source/lock digests, rejects stale commit/digest evidence, requires expected provenance for clean validation, and supports explicit rebuild. Its stale-report and dirty-worktree self-tests pass. |
+| R3: clean-stratum macro checks | **Resolved** | The Rust rule now requires pooled acceptance, clean conjunction, and per-task checks together. The exact previous pooled-homogeneity counterexample is retained as a passing regression test. |
+| R4: missing or contradictory evidence | **Resolved** | The checker recomputes binomial/Clopper-Pearson quantities, cross-checks counts and flags, requires clean conjunctions, and enforces nonempty finite tails plus manifest-required keys. Previously failing synthetic cases are rejected. Archived M3 dev/confirmation reports now contain nonempty finite tails for all 469 tasks. |
+| R5: unmetered priming | **Resolved** | Stage 2 and Stage 3 charge `w_replay + prime_steps`, accounting for any already-charged fast-path replay. Exact-budget and insufficient-budget regression cases pass and exhaustion remains observable. |
+
+### R1 Residual - High: Missing-Snapshot Fallback Cannot Reconstruct Cyclic Phase
+
+**Sources at the reviewed commit:** [growth.rs](../src/structural/growth.rs), `plan_non_surviving_register_priming` at line 2554, `acyclic_register_depth` at line 2435, and the snapshot-loading callback in `evaluate_sprout_motif` at line 3320.
+
+If the snapshot at `prime_start_new` is absent or belongs to a different structure epoch, the planner falls back to a "full" acyclic register depth. That depth still stops at cyclic nodes. The shadow replay consequently starts the surviving ring from its declared initial registers when no matching snapshot exists at the fallback start. Replaying the new pipeline's depth does not restore the ring's historical phase, and the helper returns normally rather than reporting unavailable state.
+
+**Reproduced by extending the existing cyclic-ring regression in an isolated worktree:**
+
+1. Use its surviving period-3 ring `[1, 2, 3]` feeding a newly added Delay.
+2. Preserve all observed frames and the valid snapshot at `start_idx = 3`, but omit earlier snapshots. The live surviving registers at index 3 are `[3, 2, 1]`; the ring output at index 2 was `3`.
+3. Prime with `start_idx = eval_start_idx = 3`.
+4. The surviving registers remain correct, but the new Delay receives **`1` instead of `3`**. The unchanged snapshot-backed variant passes.
+
+This is the cyclic counterpart of the missing-snapshot case already covered for acyclic pipelines, not a failure of the previously reported two-Delay fix. The production Stage-2 path uses the same optional snapshot loading and proceeds to score the resulting candidate.
+
+**Required correction:** Seed replay from valid historical state or a rigorously reconstructed cyclic phase. If that history cannot be established, explicitly reject/defer the candidate with an observable reason instead of evaluating it from an arbitrary initial phase. Cover both missing and mismatched-epoch snapshots for cyclic sources, while retaining the repaired budget accounting.
+
+### Evidence Rechecked
+
+- **Source equivalence:** `a7ec23c` differs from clean code commit `f55bb096782b36806d15e7ca9119992b98004ea4` only in four documentation files. The independently computed current source digest is `398a25d5e5f4cbe765d98403cc85a3a6`, matching the archived evidence; the lock digest is `8d29cd24b1fbdbb743cf5c0b3933b22d`.
+- **Retained baselines:** Revalidated `/tmp/m3_v2_r5_retained/m2a_dev100.json` and `m2b_dev100.json` using the updated validator and manifest against their recorded clean `f55bb09` provenance. Both pass. The archived verdict includes an unskipped, passing golden-trace run with the same clean provenance.
+- **M3 evidence:** Checked `/tmp/m3_v2_r5_dev20.json`, `m3_v2_r5_dev100.json`, and `m3_v2_r5_conf100.json`. Each reports `all_passed = true`, zero exclusions, zero max-node guardrail hits, matching provenance, and no missing/empty/non-finite task tails. These were inspected, not rerun.
+- **Focused Rust tests:** `cargo test --locked --lib -- r1_ r3_ r5_` passed all five selected tests.
+- **Validator tests:** `python3 scripts/check_retained_baselines.py --self-test` passed all 42 tests.
+- **Additional probe:** The isolated missing-snapshot cyclic-source extension failed with `left: 1`, `right: 3`. Its scratch worktree was removed after recording the result.
+
+### Pre-S3 Boundary
+
+The checked dev/confirmation results remain valid evidence for the recorded source, but do not establish correctness of the residual R1 fallback. Resolve or explicitly adjudicate that defect before opening the fresh holdout. After any code correction, refresh the affected clean-commit evidence.
+
+The latest plan and charter status now label the unexecuted 50-bank development sweep optional; it is not represented here as completed or as a newly discovered failure. S3 authorization, the fresh `50100..=50199` holdout, S4 closeout, permanent closure of that consumed range, and durable retention of raw artifacts remain subsequent steps.
+
+No holdout or broad scientific suite was run during this re-review. Only this review document was changed in the main worktree.
