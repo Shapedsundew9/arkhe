@@ -2507,11 +2507,78 @@ fn acyclic_register_depth(
     max_depth
 }
 
+fn non_surviving_depends_on_surviving_cyclic(
+    staged: &Circuit,
+    is_surviving_node: &[bool],
+    is_cyclic_node: &[bool],
+) -> bool {
+    let n = staged.node_count();
+    let mut incoming = vec![Vec::new(); n];
+    for edge in staged.edges() {
+        if let (SignalSource::NodeOut { node: src, .. }, SignalSink::NodeIn { node: dst, .. }) =
+            (edge.src, edge.dst)
+            && src.index() < n
+            && dst.index() < n
+        {
+            incoming[dst.index()].push(src.index());
+        }
+    }
+
+    let mut visited = vec![false; n];
+    let mut stack = Vec::new();
+    for (idx, seen) in visited.iter_mut().enumerate() {
+        if !is_surviving_node.get(idx).copied().unwrap_or(false)
+            && !is_cyclic_node.get(idx).copied().unwrap_or(false)
+        {
+            *seen = true;
+            stack.push(idx);
+        }
+    }
+    if staged.wire_delay() == WireDelayMode::TicksPerHop {
+        for edge in staged.edges() {
+            if edge.hops > 0
+                && matches!(edge.dst, SignalSink::BoundaryOut(_))
+                && let SignalSource::NodeOut { node: src, .. } = edge.src
+            {
+                let src_idx = src.index();
+                if src_idx < n
+                    && !is_surviving_node.get(src_idx).copied().unwrap_or(false)
+                    && !visited[src_idx]
+                {
+                    visited[src_idx] = true;
+                    stack.push(src_idx);
+                }
+            }
+        }
+    }
+
+    while let Some(curr) = stack.pop() {
+        for &src in &incoming[curr] {
+            let src_surviving = is_surviving_node.get(src).copied().unwrap_or(false);
+            let src_cyclic = is_cyclic_node.get(src).copied().unwrap_or(false);
+            if src_surviving && src_cyclic {
+                return true;
+            }
+            if !src_cyclic && !visited[src] {
+                visited[src] = true;
+                stack.push(src);
+            }
+        }
+    }
+    false
+}
+
 struct PrimingPlan {
     is_surviving_node: Vec<bool>,
     is_cyclic_node: Vec<bool>,
     prime_start: usize,
     prime_steps: usize,
+}
+
+enum PrimingPlanOutcome {
+    NotNeeded,
+    Ready(PrimingPlan),
+    Unavailable,
 }
 
 fn plan_non_surviving_register_priming(
@@ -2522,9 +2589,9 @@ fn plan_non_surviving_register_priming(
     structure_epoch: u64,
     start_idx: usize,
     eval_start_idx: usize,
-) -> Option<PrimingPlan> {
+) -> PrimingPlanOutcome {
     if start_idx == 0 {
-        return None;
+        return PrimingPlanOutcome::NotNeeded;
     }
     let n = staged.node_count();
     let mut is_surviving_node = vec![false; n];
@@ -2541,7 +2608,7 @@ fn plan_non_surviving_register_priming(
     let is_cyclic_node = compute_cyclic_nodes(staged);
     let d_new = acyclic_register_depth(staged, &is_surviving_node, &is_cyclic_node, true);
     if eval_start_idx.saturating_sub(start_idx) >= d_new {
-        return None;
+        return PrimingPlanOutcome::NotNeeded;
     }
 
     let prime_start_new = start_idx.saturating_sub(d_new);
@@ -2551,15 +2618,18 @@ fn plan_non_surviving_register_priming(
     let prime_start = if has_new_snapshot {
         prime_start_new
     } else {
+        if non_surviving_depends_on_surviving_cyclic(staged, &is_surviving_node, &is_cyclic_node) {
+            return PrimingPlanOutcome::Unavailable;
+        }
         let d_full = acyclic_register_depth(staged, &is_surviving_node, &is_cyclic_node, false);
         start_idx.saturating_sub(d_full)
     };
     let prime_steps = start_idx.saturating_sub(prime_start);
     if prime_steps == 0 {
-        return None;
+        return PrimingPlanOutcome::NotNeeded;
     }
 
-    Some(PrimingPlan {
+    PrimingPlanOutcome::Ready(PrimingPlan {
         is_surviving_node,
         is_cyclic_node,
         prime_start,
@@ -2660,6 +2730,14 @@ fn prime_non_surviving_registers_with_plan(
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimingOutcome {
+    NotNeeded,
+    Primed,
+    Unavailable,
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn prime_non_surviving_registers(
     staged: &Circuit,
@@ -2672,8 +2750,8 @@ fn prime_non_surviving_registers(
     start_idx: usize,
     eval_start_idx: usize,
     regs: &mut [u64],
-) {
-    let Some(plan) = plan_non_surviving_register_priming(
+) -> PrimingOutcome {
+    let plan = match plan_non_surviving_register_priming(
         staged,
         old_to_new,
         protected_new_node,
@@ -2681,8 +2759,10 @@ fn prime_non_surviving_registers(
         structure_epoch,
         start_idx,
         eval_start_idx,
-    ) else {
-        return;
+    ) {
+        PrimingPlanOutcome::NotNeeded => return PrimingOutcome::NotNeeded,
+        PrimingPlanOutcome::Unavailable => return PrimingOutcome::Unavailable,
+        PrimingPlanOutcome::Ready(plan) => plan,
     };
     prime_non_surviving_registers_with_plan(
         &plan,
@@ -2704,6 +2784,7 @@ fn prime_non_surviving_registers(
             true
         },
     );
+    PrimingOutcome::Primed
 }
 
 enum SproutMotifOutcome {
@@ -3263,7 +3344,7 @@ fn evaluate_sprout_motif(
         .state_snapshot_at(baseline.start_idx)
         .filter(|&(snap_epoch, _)| snap_epoch == editable.structure_epoch());
     let priming_plan = if start_snap.is_some() {
-        plan_non_surviving_register_priming(
+        match plan_non_surviving_register_priming(
             &staged,
             &baseline.survivor_map,
             None,
@@ -3271,7 +3352,16 @@ fn evaluate_sprout_motif(
             editable.structure_epoch(),
             baseline.start_idx,
             baseline.eval_start_idx,
-        )
+        ) {
+            PrimingPlanOutcome::NotNeeded => None,
+            PrimingPlanOutcome::Ready(plan) => Some(plan),
+            PrimingPlanOutcome::Unavailable => {
+                if let Some(tel) = telemetry {
+                    tel.candidate_undecidable += 1;
+                }
+                return SproutMotifOutcome::Rejected;
+            }
+        }
     } else {
         None
     };
@@ -6013,7 +6103,7 @@ fn evaluate_stage3_candidate_pre(
         .state_snapshot_at(baseline.start_idx)
         .filter(|&(snap_epoch, _)| snap_epoch == editable.structure_epoch());
     let priming_plan = if start_snap.is_some() {
-        plan_non_surviving_register_priming(
+        match plan_non_surviving_register_priming(
             &staged,
             &old_to_new,
             protected_new_node,
@@ -6021,7 +6111,14 @@ fn evaluate_stage3_candidate_pre(
             editable.structure_epoch(),
             baseline.start_idx,
             baseline.eval_start_idx,
-        )
+        ) {
+            PrimingPlanOutcome::NotNeeded => None,
+            PrimingPlanOutcome::Ready(plan) => Some(plan),
+            PrimingPlanOutcome::Unavailable => {
+                telemetry.candidate_undecidable += 1;
+                return None;
+            }
+        }
     } else {
         None
     };
@@ -8100,17 +8197,20 @@ mod tests {
         obs_a.push_frame_with_state(&[2], 1, &[0]);
         obs_a.push_frame_with_state(&[1], 1, &[3]);
         let mut regs_a = [2u64, 0u64];
-        prime_non_surviving_registers(
-            &staged,
-            &staged_compiled,
-            &old_to_new,
-            &reg_map,
-            None,
-            &obs_a,
-            1,
-            3,
-            3,
-            &mut regs_a,
+        assert_eq!(
+            prime_non_surviving_registers(
+                &staged,
+                &staged_compiled,
+                &old_to_new,
+                &reg_map,
+                None,
+                &obs_a,
+                1,
+                3,
+                3,
+                &mut regs_a,
+            ),
+            PrimingOutcome::Primed
         );
         assert_eq!(regs_a, [2, 3]);
 
@@ -8121,17 +8221,20 @@ mod tests {
         obs_b.push_frame_with_state(&[1], 0, &[3]);
         obs_b.push_frame_with_state(&[1], 1, &[2]);
         let mut regs_b = [2u64, 0u64];
-        prime_non_surviving_registers(
-            &staged,
-            &staged_compiled,
-            &old_to_new,
-            &reg_map,
-            None,
-            &obs_b,
-            1,
-            3,
-            3,
-            &mut regs_b,
+        assert_eq!(
+            prime_non_surviving_registers(
+                &staged,
+                &staged_compiled,
+                &old_to_new,
+                &reg_map,
+                None,
+                &obs_b,
+                1,
+                3,
+                3,
+                &mut regs_b,
+            ),
+            PrimingOutcome::Primed
         );
         assert_eq!(regs_b, [2, 3]);
 
@@ -8235,17 +8338,20 @@ mod tests {
         map_snapshot_regs_into(&reg_map, obs.state_snapshot_at(3).unwrap().1, &mut regs);
         assert_eq!(regs[d_new_reg], 0);
 
-        prime_non_surviving_registers(
-            &staged,
-            &staged_compiled,
-            &old_to_new,
-            &reg_map,
-            None,
-            &obs,
-            0,
-            3,
-            3,
-            &mut regs,
+        assert_eq!(
+            prime_non_surviving_registers(
+                &staged,
+                &staged_compiled,
+                &old_to_new,
+                &reg_map,
+                None,
+                &obs,
+                0,
+                3,
+                3,
+                &mut regs,
+            ),
+            PrimingOutcome::Primed
         );
         // Surviving ring registers at idx = 3 stay [3, 2, 1]; new Delay primed from idx = 2 ring output (3).
         assert_eq!(regs[..3], [3, 2, 1]);
@@ -8364,7 +8470,7 @@ mod tests {
             .map(|i| Some(NodeId(i as u32)))
             .collect();
         let excl = derivation_cone_info(tph_editable.circuit(), &[SignalSink::BoundaryOut(0)]);
-        let plan = plan_non_surviving_register_priming(
+        let PrimingPlanOutcome::Ready(plan) = plan_non_surviving_register_priming(
             &tph_staged,
             &old_to_new,
             spliced.inserted_split,
@@ -8372,8 +8478,9 @@ mod tests {
             0,
             tph_baseline.start_idx,
             tph_baseline.eval_start_idx,
-        )
-        .expect("priming plan needed for TPH alt Delay");
+        ) else {
+            panic!("priming plan needed for TPH alt Delay");
+        };
         assert_eq!(plan.prime_steps, 4); // BoundaryIn(1) -[1]-> alt_delay(1) -[1]-> sub_node -[1]-> eqz_node
         let mut tph_budget = TickBudget::new((tph_baseline.w_replay + plan.prime_steps) as u64);
         let mut tph_tel = SproutTelemetry::default();
@@ -8612,5 +8719,256 @@ mod tests {
             (baseline3.w_replay + expected_prime_steps3) as u64
         );
         assert_eq!(b3_exact.remaining(), 0);
+    }
+
+    #[test]
+    fn r1_residual_surviving_cyclic_ring_missing_or_mismatched_snapshot_unavailable() {
+        // Exact R1 Residual reproducer: surviving period-3 cyclic ring [1, 2, 3] feeding a new
+        // Delay { init: 0 }. At `start_idx = eval_start_idx = 3`, live registers are `[3, 2, 1]`.
+        let mut old = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let (ring_delays, ring_split) = build_autonomous_ring(&mut old, 3, &[1, 2, 3], 0);
+        assert_eq!(ring_delays.len(), 3);
+        let old_compiled = old.compile().unwrap();
+
+        let mut sim = ScalarState::new(&old_compiled);
+        let mut obs_missing = ObservationWindow::new(1, 16);
+        let mut obs_mismatch = ObservationWindow::new(1, 16);
+        let mut pred = [0u64];
+        let structure_epoch = 1u64;
+        for t in 0..4usize {
+            let pre_regs = sim.registers().to_vec();
+            sim.step(&old_compiled, &[0], &mut pred).unwrap();
+            if t < 3 {
+                obs_missing.push_frame(&pred);
+                obs_mismatch.push_frame_with_state(&pred, structure_epoch - 1, &pre_regs);
+            } else {
+                obs_missing.push_frame_with_state(&pred, structure_epoch, &pre_regs);
+                obs_mismatch.push_frame_with_state(&pred, structure_epoch, &pre_regs);
+            }
+        }
+        assert!(obs_missing.state_snapshot_at(2).is_none());
+        assert_eq!(
+            obs_missing.state_snapshot_at(3).unwrap(),
+            (1, [3, 2, 1].as_slice())
+        );
+        assert_eq!(
+            obs_mismatch.state_snapshot_at(2).unwrap(),
+            (0, [2, 1, 3].as_slice())
+        );
+        assert_eq!(
+            obs_mismatch.state_snapshot_at(3).unwrap(),
+            (1, [3, 2, 1].as_slice())
+        );
+
+        let mut staged = old.clone();
+        let d_new = staged.add_node(Primitive::Delay { init: 0 });
+        let tapped = tap_source(
+            &mut staged,
+            SignalSource::NodeOut {
+                node: ring_split,
+                port: 1,
+            },
+        );
+        staged.connect(
+            tapped,
+            SignalSink::NodeIn {
+                node: d_new,
+                port: 0,
+            },
+        );
+        let staged_compiled = staged.compile().unwrap();
+
+        let old_to_new: Vec<Option<NodeId>> = (0..old.node_count())
+            .map(|i| Some(NodeId(i as u32)))
+            .collect();
+        let reg_map = register_mapping(&old, &staged, &old_compiled, &staged_compiled, &old_to_new);
+        let d_new_reg = explicit_delay_register_index(&staged, d_new).unwrap();
+
+        // (a) Missing earlier snapshots (`None` at idx < 3): must return Unavailable and keep regs unchanged.
+        let mut regs_missing = vec![0u64; staged_compiled.total_registers()];
+        map_snapshot_regs_into(
+            &reg_map,
+            obs_missing.state_snapshot_at(3).unwrap().1,
+            &mut regs_missing,
+        );
+        let expected_unchanged = regs_missing.clone();
+        assert_eq!(expected_unchanged[..3], [3, 2, 1]);
+        assert_eq!(expected_unchanged[d_new_reg], 0);
+        assert_eq!(
+            prime_non_surviving_registers(
+                &staged,
+                &staged_compiled,
+                &old_to_new,
+                &reg_map,
+                None,
+                &obs_missing,
+                structure_epoch,
+                3,
+                3,
+                &mut regs_missing,
+            ),
+            PrimingOutcome::Unavailable
+        );
+        assert_eq!(regs_missing, expected_unchanged);
+        assert_ne!(regs_missing[d_new_reg], 1);
+
+        // (b) Mismatched-epoch earlier snapshot (`structure_epoch - 1` at idx = 2): must return Unavailable and keep regs unchanged.
+        let mut regs_mismatch = expected_unchanged.clone();
+        assert_eq!(
+            prime_non_surviving_registers(
+                &staged,
+                &staged_compiled,
+                &old_to_new,
+                &reg_map,
+                None,
+                &obs_mismatch,
+                structure_epoch,
+                3,
+                3,
+                &mut regs_mismatch,
+            ),
+            PrimingOutcome::Unavailable
+        );
+        assert_eq!(regs_mismatch, expected_unchanged);
+        assert_ne!(regs_mismatch[d_new_reg], 1);
+    }
+
+    #[test]
+    fn r1_residual_stage2_and_stage3_reject_cyclic_source_without_matching_snapshot() {
+        let econ = EconomyConfig {
+            juvenile_ticks: 0,
+            ..EconomyConfig::default()
+        };
+        let growth = GrowthConfig {
+            diagnostic_window: 2,
+            min_match_gain: 1,
+            ..GrowthConfig::default()
+        };
+
+        // Surviving period-3 cyclic ring [1, 2, 3] on port 0 in a 2-input, 1-output circuit.
+        let mut old = Circuit::new(Width::BITS_2, 2, 1, WireDelayMode::Combinational);
+        build_autonomous_ring(&mut old, 3, &[1, 2, 3], 0);
+        let mut editable = EditableCircuit::new(old.clone(), econ).unwrap();
+        let old_to_new: Vec<Option<NodeId>> = (0..old.node_count())
+            .map(|i| Some(NodeId(i as u32)))
+            .collect();
+        editable
+            .recompile_preserving_state(old, &old_to_new)
+            .unwrap();
+        assert_eq!(editable.structure_epoch(), 1);
+
+        let mut sim = ScalarState::new(editable.compiled());
+        let mut obs_missing = ObservationWindow::new(2, 16);
+        let mut obs_mismatch = ObservationWindow::new(2, 16);
+        let mut pred = [0u64];
+        for t in 0..5usize {
+            let pre_regs = sim.registers().to_vec();
+            let ch1 = ((t % 3) + 1) as u64;
+            sim.step(editable.compiled(), &[0, ch1], &mut pred).unwrap();
+            let frame = [pred[0], ch1];
+            if t < 3 {
+                obs_missing.push_frame(&frame);
+                obs_mismatch.push_frame_with_state(&frame, 0, &pre_regs);
+            } else {
+                obs_missing.push_frame_with_state(&frame, 1, &pre_regs);
+                obs_mismatch.push_frame_with_state(&frame, 1, &pre_regs);
+            }
+        }
+
+        for (label, obs) in [("missing", &obs_missing), ("mismatched", &obs_mismatch)] {
+            let baseline = replay_current_baseline(&editable, obs, &growth, &econ, 0, false);
+            assert_eq!(baseline.start_idx, 3, "{label}: start_idx");
+            assert_eq!(baseline.eval_start_idx, 3, "{label}: eval_start_idx");
+            assert_eq!(baseline.w_replay, 2, "{label}: w_replay");
+
+            // 1. Stage 2 (`evaluate_sprout_motif`): `LagYhat(0, 1)` creates a Delay fed by the cyclic ring.
+            let mut s2_budget = TickBudget::new(100);
+            let mut s2_tel = SproutTelemetry::default();
+            let s2_out = evaluate_sprout_motif(
+                &editable,
+                obs,
+                &growth,
+                &econ,
+                0,
+                &CandidateMotif::Identity(SourceFeature::LagYhat { port: 0, tau: 1 }),
+                false,
+                false,
+                &baseline,
+                Some(&mut s2_budget),
+                Some(&mut s2_tel),
+            );
+            assert!(
+                matches!(s2_out, SproutMotifOutcome::Rejected),
+                "{label}: expected Stage 2 rejection"
+            );
+            assert_eq!(
+                s2_tel.candidate_undecidable, 1,
+                "{label}: Stage 2 undecidable"
+            );
+            assert_eq!(
+                s2_tel.sprout_budget_exhausted, 0,
+                "{label}: Stage 2 budget exhausted"
+            );
+            assert_eq!(
+                s2_budget.consumed(),
+                0,
+                "{label}: Stage 2 zero unmetered budget consumed"
+            );
+            assert_eq!(s2_budget.remaining(), 100);
+
+            // 2. Stage 3 (`evaluate_stage3_candidate_pre`): comparator spliced onto the surviving cyclic ring.
+            let mut staged3 = editable.circuit().clone();
+            let alt_delay = staged3.add_node(Primitive::Delay { init: 0 });
+            staged3.connect(
+                SignalSource::BoundaryIn(1),
+                SignalSink::NodeIn {
+                    node: alt_delay,
+                    port: 0,
+                },
+            );
+            let alt_src = SignalSource::NodeOut {
+                node: alt_delay,
+                port: 0,
+            };
+            let spliced3 = splice_comparator_onto_port(&mut staged3, 0, alt_src).unwrap();
+            let excl3 = derivation_cone_info(editable.circuit(), &[SignalSink::BoundaryOut(0)]);
+            let mut s3_budget = TickBudget::new(100);
+            let mut s3_tel = SproutTelemetry::default();
+            let mut blocked3 = 0usize;
+            let s3_res = evaluate_stage3_candidate_pre(
+                &editable,
+                obs,
+                &growth,
+                &econ,
+                &mut s3_budget,
+                0,
+                0,
+                &excl3,
+                &baseline,
+                2,
+                staged3,
+                spliced3,
+                alt_src,
+                None,
+                &mut blocked3,
+                &mut s3_tel,
+            );
+            assert!(s3_res.is_none(), "{label}: expected Stage 3 rejection");
+            assert_eq!(blocked3, 0, "{label}: Stage 3 max_nodes");
+            assert_eq!(
+                s3_tel.candidate_undecidable, 1,
+                "{label}: Stage 3 undecidable"
+            );
+            assert_eq!(
+                s3_tel.sprout_budget_exhausted, 0,
+                "{label}: Stage 3 budget exhausted"
+            );
+            assert_eq!(
+                s3_budget.consumed(),
+                0,
+                "{label}: Stage 3 zero unmetered budget consumed"
+            );
+            assert_eq!(s3_budget.remaining(), 100);
+        }
     }
 }
