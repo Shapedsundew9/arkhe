@@ -1,7 +1,7 @@
 //! Milestone 2b verification suite: epistemic MDL conservation, comparator formation,
 //! offline loopback falsification, stationary noise robustness, and fault survival (`G2B.1`–`G2B.5`).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use rand_chacha::ChaCha8Rng;
 use rand_core::{Rng, SeedableRng};
@@ -21,7 +21,10 @@ use crate::metrics::mdl::{
 };
 use crate::rng::SeedBank;
 use crate::stats::{
-    BankSample, CaseOutcome, MultiBankGateResult, classify_case_outcome, evaluate_multi_bank_gate,
+    BankSample, BankTailMetricMap, BankTaskCountMap, CaseOutcome, GateRegime, HoldoutRangeSpec,
+    MultiBankGateResult, StratifiedGateAudit, check_seed_range_holdouts, classify_case_outcome,
+    evaluate_multi_bank_gate, evaluate_stratified_from_bank_maps, merge_tail_metric_map,
+    strip_seed_suffix, update_max_finite, update_min_finite,
 };
 use crate::structural::{
     ArkheLearner, EconomyConfig, EconomyState, EditableCircuit, ExecutionPhase, GrowthConfig,
@@ -49,18 +52,22 @@ pub const M1_HOLDOUT_SEED_END: u32 = 10_019;
 pub const M2A_HOLDOUT_SEED_START: u32 = 30_000;
 /// Pre-registered M2a holdout range end seed (inclusive).
 pub const M2A_HOLDOUT_SEED_END: u32 = 30_019;
-/// Pre-registered M2b holdout range start seed.
+/// Pre-registered M2b holdout range start seed (consumed at `b211afa`; permanently closed).
 pub const M2B_HOLDOUT_SEED_START: u32 = 40_000;
 /// Pre-registered M2b holdout range end seed (inclusive).
 pub const M2B_HOLDOUT_SEED_END: u32 = 40_019;
-/// Pre-registered M3 holdout range start seed (unconditionally rejected in M2b).
+/// Pre-registered M3 v1 holdout range start seed (consumed at `dd13839`; permanently closed).
 pub const M3_HOLDOUT_SEED_START: u32 = 50_000;
 /// Pre-registered M3 holdout range end seed (inclusive).
 pub const M3_HOLDOUT_SEED_END: u32 = 50_019;
-/// Pre-registered M4a holdout range start seed (unconditionally rejected in M2b).
+/// Pre-registered M3 v2 holdout range start seed (unconditionally rejected in M2b).
+pub const M3_V2_HOLDOUT_SEED_START: u32 = 50_100;
+/// Pre-registered M3 v2 holdout range end seed (inclusive).
+pub const M3_V2_HOLDOUT_SEED_END: u32 = 50_199;
+/// Pre-registered M4a holdout range start seed (100 seeds; unconditionally rejected in M2b).
 pub const M4A_HOLDOUT_SEED_START: u32 = 60_000;
 /// Pre-registered M4a holdout range end seed (inclusive).
-pub const M4A_HOLDOUT_SEED_END: u32 = 60_019;
+pub const M4A_HOLDOUT_SEED_END: u32 = 60_099;
 
 /// Pre-registered target pass rate for `G2B.1`.
 pub const G2B1_TARGET_RATE: f64 = 0.90;
@@ -92,9 +99,9 @@ pub const G2B5_POST_FAULT_KT_ADVANTAGE_MIN: f64 = 0.15;
 
 /// Guards M2b runs against pre-registered holdout seed ranges.
 ///
-/// Unconditionally rejects overlaps with M1 (`10000..=10019`), M2a (`30000..=30019`), M3
-/// (`50000..=50019`), and M4a (`60000..=60019`) holdout ranges, and rejects M2b (`40000..=40019`)
-/// unless `allow_holdout` is true.
+/// Unconditionally rejects overlaps with M1 (`10000..=10019`), closed M2a (`30000..=30019`),
+/// closed M2b (`40000..=40019`), closed M3 v1 (`50000..=50019`), reserved M3 v2 (`50100..=50199`),
+/// and reserved M4a (`60000..=60099`) holdout ranges, even when `allow_holdout == true`.
 ///
 /// # Errors
 ///
@@ -104,27 +111,57 @@ pub fn check_m2b_seed_range_holdout(
     seeds: u32,
     allow_holdout: bool,
 ) -> Result<(), String> {
-    let start = seed_offset;
-    let end = seed_offset.saturating_add(seeds.max(1));
-    let unconditional = [
-        ("M1", M1_HOLDOUT_SEED_START, M1_HOLDOUT_SEED_END),
-        ("M2a", M2A_HOLDOUT_SEED_START, M2A_HOLDOUT_SEED_END),
-        ("M3", M3_HOLDOUT_SEED_START, M3_HOLDOUT_SEED_END),
-        ("M4a", M4A_HOLDOUT_SEED_START, M4A_HOLDOUT_SEED_END),
+    let ranges = [
+        HoldoutRangeSpec {
+            label: "M1",
+            start: u64::from(M1_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M1_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "reserved M1 holdout",
+        },
+        HoldoutRangeSpec {
+            label: "M2a",
+            start: u64::from(M2A_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M2A_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "consumed at aa6fb6d; permanently closed",
+        },
+        HoldoutRangeSpec {
+            label: "M2b",
+            start: u64::from(M2B_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M2B_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "consumed at b211afa; permanently closed",
+        },
+        HoldoutRangeSpec {
+            label: "M3",
+            start: u64::from(M3_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M3_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "consumed at dd13839; permanently closed",
+        },
+        HoldoutRangeSpec {
+            label: "M3_v2",
+            start: u64::from(M3_V2_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M3_V2_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "reserved M3 v2 holdout",
+        },
+        HoldoutRangeSpec {
+            label: "M4a",
+            start: u64::from(M4A_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M4A_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "reserved M4a holdout",
+        },
     ];
-    for (label, h_start, h_end) in unconditional {
-        if start <= h_end && end > h_start {
-            return Err(format!(
-                "refusing seed range {start}..{end} which overlaps pre-registered {label} holdout range {h_start}..={h_end} (unconditionally forbidden under verify-m2b)"
-            ));
-        }
-    }
-    if start <= M2B_HOLDOUT_SEED_END && end > M2B_HOLDOUT_SEED_START && !allow_holdout {
-        return Err(format!(
-            "refusing seed range {start}..{end} which overlaps pre-registered holdout range {M2B_HOLDOUT_SEED_START}..={M2B_HOLDOUT_SEED_END} without --holdout flag"
-        ));
-    }
-    Ok(())
+    check_seed_range_holdouts(
+        "verify-m2b",
+        u64::from(seed_offset),
+        u64::from(seeds.max(1)),
+        allow_holdout,
+        &ranges,
+    )
 }
 
 /// Summary report for one M2b gate in single-bank verification mode.
@@ -152,6 +189,8 @@ pub struct M2bGateReport {
     pub aux_metric_summary: Option<String>,
     /// Failure diagnostics recorded during evaluation.
     pub failures: Vec<String>,
+    /// Statistical Policy Option A + D regime-stratified & per-task tail audit.
+    pub stratified: StratifiedGateAudit,
 }
 
 /// Complete verification summary emitted by `arkhe verify-m2b` in single-bank mode.
@@ -200,6 +239,8 @@ pub struct M2bBankGateReport {
     pub pooled_metric_passed: bool,
     /// Sample failure strings recorded across banks.
     pub failures: Vec<String>,
+    /// Statistical Policy Option A + D regime-stratified & per-task tail audit.
+    pub stratified: StratifiedGateAudit,
 }
 
 /// Multi-bank Milestone 2b report emitted by `arkhe verify-m2b --banks N`.
@@ -238,6 +279,10 @@ struct GateTally {
     excluded_cases: usize,
     cliff_counters: CliffCountersSummary,
     failures: Vec<String>,
+    task_counts: BTreeMap<(String, GateRegime), (usize, usize)>,
+    task_tails: BTreeMap<String, BTreeMap<String, f64>>,
+    clean_seed_conj_succ: usize,
+    clean_seed_conj_trials: usize,
 }
 
 impl GateTally {
@@ -252,9 +297,37 @@ impl GateTally {
         cliff: &CliffCountersSummary,
         detail: Option<String>,
     ) {
+        self.record_with_regime(label, GateRegime::Clean, functional_pass, cliff, detail);
+    }
+
+    fn record_noisy(
+        &mut self,
+        label: String,
+        functional_pass: bool,
+        cliff: &CliffCountersSummary,
+        detail: Option<String>,
+    ) {
+        self.record_with_regime(label, GateRegime::Noisy, functional_pass, cliff, detail);
+    }
+
+    fn record_with_regime(
+        &mut self,
+        label: String,
+        regime: GateRegime,
+        functional_pass: bool,
+        cliff: &CliffCountersSummary,
+        detail: Option<String>,
+    ) {
         self.cliff_counters.accumulate(cliff);
-        match classify_case_outcome(functional_pass, cliff) {
-            CaseOutcome::Passed => self.passed_cases += 1,
+        let outcome = classify_case_outcome(functional_pass, cliff);
+        let task_key = (strip_seed_suffix(&label).to_owned(), regime);
+        let entry = self.task_counts.entry(task_key).or_insert((0, 0));
+        entry.1 += 1;
+        match outcome {
+            CaseOutcome::Passed => {
+                self.passed_cases += 1;
+                entry.0 += 1;
+            }
             CaseOutcome::Failed => {
                 self.failed_cases += 1;
                 if let Some(msg) = detail {
@@ -273,12 +346,63 @@ impl GateTally {
         }
     }
 
-    fn merge(&mut self, other: Self) {
+    fn record_tail_max(&mut self, task_label: &str, key: &str, value: f64) {
+        let map = self.task_tails.entry(task_label.to_owned()).or_default();
+        update_max_finite(map, key, value);
+    }
+
+    fn record_tail_min(&mut self, task_label: &str, key: &str, value: f64) {
+        let map = self.task_tails.entry(task_label.to_owned()).or_default();
+        update_min_finite(map, key, value);
+    }
+
+    fn clean_seed_passed(&self) -> Option<bool> {
+        let mut has_clean = false;
+        let mut all_ok = self.excluded_cases == 0;
+        for ((_, regime), &(succ, trials)) in &self.task_counts {
+            if *regime == GateRegime::Clean && trials > 0 {
+                has_clean = true;
+                if succ != trials {
+                    all_ok = false;
+                }
+            }
+        }
+        has_clean.then_some(all_ok)
+    }
+
+    fn clean_seed_bank(&self) -> Option<Vec<BankSample>> {
+        if self.clean_seed_conj_trials > 0 {
+            Some(vec![BankSample::new(
+                self.clean_seed_conj_succ,
+                self.clean_seed_conj_trials,
+            )])
+        } else {
+            self.clean_seed_passed()
+                .map(|ok| vec![BankSample::new(usize::from(ok), 1)])
+        }
+    }
+
+    fn merge_seed(&mut self, other: Self) {
+        if let Some(ok) = other.clean_seed_passed() {
+            self.clean_seed_conj_trials += 1;
+            if ok {
+                self.clean_seed_conj_succ += 1;
+            }
+        }
         self.passed_cases += other.passed_cases;
         self.failed_cases += other.failed_cases;
         self.excluded_cases += other.excluded_cases;
         self.cliff_counters.accumulate(&other.cliff_counters);
         self.failures.extend(other.failures);
+        for (k, (s, n)) in other.task_counts {
+            let entry = self.task_counts.entry(k).or_insert((0, 0));
+            entry.0 += s;
+            entry.1 += n;
+        }
+        for (task, tails) in other.task_tails {
+            let entry = self.task_tails.entry(task).or_default();
+            merge_tail_metric_map(entry, &tails);
+        }
     }
 
     fn bank_sample(&self) -> BankSample {
@@ -301,14 +425,27 @@ impl GateTally {
                 total - 64
             ));
         }
+        let clean_conj = self.clean_seed_bank();
+        let stratified = evaluate_stratified_from_bank_maps(
+            &[&self.task_counts],
+            &[&self.task_tails],
+            None,
+            clean_conj.as_deref(),
+            target_rate,
+            target_rate,
+            false,
+        );
         let total = self.total_cases();
         let empirical_rate = if total == 0 {
             0.0
         } else {
             (self.passed_cases as f64) / (total as f64)
         };
-        let passed =
-            total > 0 && self.excluded_cases == 0 && empirical_rate >= target_rate && extra_ok;
+        let passed = total > 0
+            && self.excluded_cases == 0
+            && empirical_rate >= target_rate
+            && extra_ok
+            && stratified.passed;
         M2bGateReport {
             gate: gate.to_owned(),
             passed,
@@ -321,6 +458,7 @@ impl GateTally {
             cliff_counters: self.cliff_counters,
             aux_metric_summary,
             failures: self.failures,
+            stratified,
         }
     }
 }
@@ -1160,6 +1298,7 @@ fn evaluate_g2b1_seed(seed: u32, horizon: u64, warmup: u64) -> (GateTally, f64) 
     let (mdl_ok, mdl_msg) = match check_epistemic_mdl_for_seed(seed64) {
         Ok(err) => {
             max_mdl_err = err;
+            tally.record_tail_max("G2B.1a:epistemic_mdl", "max_epistemic_mdl_err", err);
             (true, None)
         }
         Err(msg) => (false, Some(msg)),
@@ -2291,7 +2430,16 @@ fn evaluate_g2b4_seed(seed: u32, horizon: u64, warmup: u64) -> G2b4SeedResult {
                 trace.telemetry.active_comparator_count
             )
         });
-        tally.record(format!("G2B.4:{label}:seed={seed}"), ok, &trace.cliff, msg);
+        let g2b4_task = format!("G2B.4:{label}");
+        tally.record_noisy(format!("{g2b4_task}:seed={seed}"), ok, &trace.cliff, msg);
+        tally.record_tail_max(&g2b4_task, "max_abs_kt_diff", paired_diff);
+        if let Some(r) = target_comp_dis_rate {
+            tally.record_tail_max(
+                &g2b4_task,
+                "max_disagreement_dev",
+                (r - theory_dis_rate).abs(),
+            );
+        }
     }
 
     // NoisyConstant(0) and NoisyConstant(2^k - 1) halting at 0 nodes and 0 redundancy sprouts
@@ -2327,7 +2475,7 @@ fn evaluate_g2b4_seed(seed: u32, horizon: u64, warmup: u64) -> G2b4SeedResult {
                     trace.telemetry.active_comparator_count
                 )
             });
-            tally.record(
+            tally.record_noisy(
                 format!("G2B.4:Noisy{tag}(k={}):seed={seed}", width.bits()),
                 ok,
                 &trace.cliff,
@@ -2447,12 +2595,9 @@ fn evaluate_g2b5_seed(seed: u32, horizon: u64, warmup: u64) -> G2b5SeedResult {
                 pair.kt_false_post_fault
             )
         });
-        tally.record(
-            format!("G2B.5:{label}:seed={seed}"),
-            ok,
-            &combined_cliff,
-            msg,
-        );
+        let task_name = format!("G2B.5:{label}");
+        tally.record(format!("{task_name}:seed={seed}"), ok, &combined_cliff, msg);
+        tally.record_tail_min(&task_name, "min_post_fault_kt_advantage", kt_adv);
     }
 
     G2b5SeedResult {
@@ -2621,15 +2766,15 @@ fn run_single_bank_internal(seed_offset: u32, seeds: u32, horizon: u64) -> RawBa
             .into_inner()
             .expect("slot lock")
             .expect("seed result computed");
-        g1.merge(res.g1);
+        g1.merge_seed(res.g1);
         g1_max_mdl_err = g1_max_mdl_err.max(res.g1_max_mdl_err);
-        g2.merge(res.g2);
-        g3.merge(res.g3);
-        g4.merge(res.g4.tally);
+        g2.merge_seed(res.g2);
+        g3.merge_seed(res.g3);
+        g4.merge_seed(res.g4.tally);
         g4_kt_sum += res.g4.kt_sum;
         g4_h_bayes_class_sum += res.g4.h_bayes_class_sum;
         g4_samples += res.g4.sample_count;
-        g5.merge(res.g5.tally);
+        g5.merge_seed(res.g5.tally);
         g5_adv_sum += res.g5.advantage_sum;
         g5_pairs += res.g5.pair_count;
     }
@@ -2770,6 +2915,9 @@ pub fn run_m2b_bank_evaluation(
 
     let mut g_excl = [0usize; 5];
     let mut g_failures: [Vec<String>; 5] = Default::default();
+    let mut g_bank_counts: [Vec<BankTaskCountMap>; 5] = Default::default();
+    let mut g_bank_tails: [Vec<BankTailMetricMap>; 5] = Default::default();
+    let mut g_clean_conj_banks: [Vec<BankSample>; 5] = Default::default();
     let mut total_cliff = CliffCountersSummary::default();
 
     let mut max_mdl_err = 0.0f64;
@@ -2793,13 +2941,19 @@ pub fn run_m2b_bank_evaluation(
         g4_samples.push(agg.g4.bank_sample());
         g5_samples.push(agg.g5.bank_sample());
 
+        let seed_offset = agg.seed_offset;
         let tallies = [agg.g1, agg.g2, agg.g3, agg.g4, agg.g5];
         for (gi, tally) in tallies.into_iter().enumerate() {
             g_excl[gi] += tally.excluded_cases;
             total_cliff.accumulate(&tally.cliff_counters);
+            if let Some(cb) = tally.clean_seed_bank() {
+                g_clean_conj_banks[gi].extend(cb);
+            }
+            g_bank_counts[gi].push(tally.task_counts);
+            g_bank_tails[gi].push(tally.task_tails);
             for f in tally.failures {
                 if g_failures[gi].len() < 32 {
-                    g_failures[gi].push(format!("bank {b_idx} (offset {}): {f}", agg.seed_offset));
+                    g_failures[gi].push(format!("bank {b_idx} (offset {seed_offset}): {f}"));
                 }
             }
         }
@@ -2822,6 +2976,35 @@ pub fn run_m2b_bank_evaluation(
     let mb4 = evaluate_multi_bank_gate(&g4_samples, G2B4_TARGET_RATE);
     let mb5 = evaluate_multi_bank_gate(&g5_samples, G2B5_TARGET_RATE);
 
+    let targets = [
+        G2B1_TARGET_RATE,
+        G2B2_TARGET_RATE,
+        G2B3_TARGET_RATE,
+        G2B4_TARGET_RATE,
+        G2B5_TARGET_RATE,
+    ];
+    let mut strat: [Option<StratifiedGateAudit>; 5] = Default::default();
+    for gi in 0..5 {
+        let count_refs: Vec<&_> = g_bank_counts[gi].iter().collect();
+        let tail_refs: Vec<&_> = g_bank_tails[gi].iter().collect();
+        let conj_opt =
+            (!g_clean_conj_banks[gi].is_empty()).then_some(g_clean_conj_banks[gi].as_slice());
+        strat[gi] = Some(evaluate_stratified_from_bank_maps(
+            &count_refs,
+            &tail_refs,
+            None,
+            conj_opt,
+            targets[gi],
+            targets[gi],
+            true,
+        ));
+    }
+    let s1 = strat[0].take().expect("strat 1");
+    let s2 = strat[1].take().expect("strat 2");
+    let s3 = strat[2].take().expect("strat 3");
+    let s4 = strat[3].take().expect("strat 4");
+    let s5 = strat[4].take().expect("strat 5");
+
     let g1_extra_ok = max_mdl_err <= G2B1_EPISTEMIC_MDL_TOL_BITS_PER_SYMBOL;
     let g4_extra_ok = g4_pooled_abs_diff <= G2B4_KT_DIFF_MAX;
     let g5_extra_ok = g5_pooled_adv >= G2B5_POST_FAULT_KT_ADVANTAGE_MIN;
@@ -2829,53 +3012,58 @@ pub fn run_m2b_bank_evaluation(
     let gates = vec![
         M2bBankGateReport {
             gate: "G2B.1".to_owned(),
-            passed: mb1.passed && g_excl[0] == 0 && g1_extra_ok,
+            passed: mb1.passed && s1.passed && g_excl[0] == 0 && g1_extra_ok,
             excluded_cases: g_excl[0],
             multi_bank: mb1,
             pooled_metric_name: Some("max_epistemic_mdl_err_b_per_sym".to_owned()),
             pooled_metric_value: Some(max_mdl_err),
             pooled_metric_passed: g1_extra_ok,
             failures: std::mem::take(&mut g_failures[0]),
+            stratified: s1,
         },
         M2bBankGateReport {
             gate: "G2B.2".to_owned(),
-            passed: mb2.passed && g_excl[1] == 0,
+            passed: mb2.passed && s2.passed && g_excl[1] == 0,
             excluded_cases: g_excl[1],
             multi_bank: mb2,
             pooled_metric_name: None,
             pooled_metric_value: None,
             pooled_metric_passed: true,
             failures: std::mem::take(&mut g_failures[1]),
+            stratified: s2,
         },
         M2bBankGateReport {
             gate: "G2B.3".to_owned(),
-            passed: mb3.passed && g_excl[2] == 0,
+            passed: mb3.passed && s3.passed && g_excl[2] == 0,
             excluded_cases: g_excl[2],
             multi_bank: mb3,
             pooled_metric_name: None,
             pooled_metric_value: None,
             pooled_metric_passed: true,
             failures: std::mem::take(&mut g_failures[2]),
+            stratified: s3,
         },
         M2bBankGateReport {
             gate: "G2B.4".to_owned(),
-            passed: mb4.passed && g_excl[3] == 0 && g4_extra_ok,
+            passed: mb4.passed && s4.passed && g_excl[3] == 0 && g4_extra_ok,
             excluded_cases: g_excl[3],
             multi_bank: mb4,
             pooled_metric_name: Some("pooled_abs_kt_minus_h_bayes_class_b_per_sym".to_owned()),
             pooled_metric_value: Some(g4_pooled_abs_diff),
             pooled_metric_passed: g4_extra_ok,
             failures: std::mem::take(&mut g_failures[3]),
+            stratified: s4,
         },
         M2bBankGateReport {
             gate: "G2B.5".to_owned(),
-            passed: mb5.passed && g_excl[4] == 0 && g5_extra_ok,
+            passed: mb5.passed && s5.passed && g_excl[4] == 0 && g5_extra_ok,
             excluded_cases: g_excl[4],
             multi_bank: mb5,
             pooled_metric_name: Some("pooled_post_fault_kt_advantage_b_per_sym".to_owned()),
             pooled_metric_value: Some(g5_pooled_adv),
             pooled_metric_passed: g5_extra_ok,
             failures: std::mem::take(&mut g_failures[4]),
+            stratified: s5,
         },
     ];
 
@@ -2904,24 +3092,48 @@ mod tests {
 
     #[test]
     fn holdout_guards_reject_m1_m2a_m2b_and_m3_ranges() {
-        for blocked in [10_000u32, 30_000, 50_000, 60_000] {
+        for blocked in [10_000u32, 30_000, 40_000, 50_000, 50_100, 60_000, 60_050] {
             assert!(check_m2b_seed_range_holdout(blocked, 20, false).is_err());
             assert!(check_m2b_seed_range_holdout(blocked, 20, true).is_err());
             assert!(check_m2b_seed_range_holdout(blocked - 5, 10, true).is_err());
         }
-        assert!(check_m2b_seed_range_holdout(40_000, 20, false).is_err());
         assert!(check_m2b_seed_range_holdout(39_990, 20, false).is_err());
-        assert!(check_m2b_seed_range_holdout(40_000, 20, true).is_ok());
+        assert!(check_m2b_seed_range_holdout(40_000, 20, true).is_err());
 
         for safe in [
-            0u32, 9_980, 10_020, 20_040, 29_980, 30_020, 39_980, 40_020, 49_980, 50_020, 59_980,
-            60_020,
+            0u32, 9_980, 10_020, 20_040, 29_980, 30_020, 39_980, 40_020, 49_980, 50_020, 50_200,
+            59_980, 60_100,
         ] {
             assert!(
                 check_m2b_seed_range_holdout(safe, 20, false).is_ok(),
                 "expected safe seed range at {safe}"
             );
         }
+    }
+
+    #[test]
+    fn g2b2_stratified_audit_rejects_concentrated_zero_task() {
+        let mut agg = GateTally::default();
+        let cliff = CliffCountersSummary::default();
+        for seed in 0..20 {
+            let mut per_seed = GateTally::default();
+            for ti in 0..9 {
+                per_seed.record(format!("G2B.2:Task{ti}:seed={seed}"), true, &cliff, None);
+            }
+            per_seed.record(
+                format!("G2B.2:MV_AddEqz_k2_Comb:seed={seed}"),
+                false,
+                &cliff,
+                Some("0 comps".to_owned()),
+            );
+            agg.merge_seed(per_seed);
+        }
+        let report = agg.into_report("G2B.2", G2B2_TARGET_RATE, true, None);
+        assert!(
+            !report.passed,
+            "G2B.2 must fail when one task fails 0/20 despite 180/200 pooled"
+        );
+        assert!(!report.stratified.passed);
     }
 
     #[test]

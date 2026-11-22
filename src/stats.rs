@@ -320,44 +320,116 @@ pub struct MultiBankGateResult {
     pub passed: bool,
 }
 
-/// Evaluates multi-bank results against a target success rate (§2.8).
+/// Computes the exact lower-tail binomial probability $\Pr[\mathrm{Bin}(n, p) \le k]$.
 ///
-/// 1. Computes the one-sided 99% Clopper–Pearson lower bound on pooled success rate.
-/// 2. Performs a $\chi^2$ homogeneity test across banks at $\alpha = 0.01$.
-/// 3. Computes the bank mean, standard deviation, and 5th percentile.
-/// 4. Rejects if either the pooled lower bound falls below `target_rate` or failures cluster
-///    significantly across banks (rejecting homogeneity).
+/// Uses $I_{1-p}(n - k, k + 1)$ directly (not $1 - I_p(\cdot)$) so tiny tail $p$-values
+/// retain relative precision under FWER thresholds ($\alpha / M$).
 #[must_use]
-pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> MultiBankGateResult {
-    let bank_count = banks.len();
-    let total_trials: usize = banks.iter().map(|b| b.trials).sum();
-    let total_successes: usize = banks.iter().map(|b| b.successes).sum();
+pub fn binomial_lower_tail_p_value(k: usize, n: usize, p: f64) -> f64 {
+    if n == 0 || k >= n || p <= 0.0 {
+        return 1.0;
+    }
+    if p >= 1.0 {
+        return 0.0;
+    }
+    inc_beta((n - k) as f64, (k + 1) as f64, 1.0 - p).clamp(0.0, 1.0)
+}
 
-    let pooled_rate = if total_trials == 0 {
-        0.0
+/// Computes linear-rank-interpolated quantile $q \in [0, 1]$ over an already sorted slice.
+#[must_use]
+pub fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let q_clamped = q.clamp(0.0, 1.0);
+    let rank = q_clamped * ((sorted.len() - 1) as f64);
+    let idx = rank.floor() as usize;
+    let frac = rank - (idx as f64);
+    if idx + 1 < sorted.len() {
+        (1.0 - frac) * sorted[idx] + frac * sorted[idx + 1]
     } else {
-        (total_successes as f64) / (total_trials as f64)
-    };
+        sorted[idx]
+    }
+}
 
-    let lower_bound_99 = clopper_pearson_lower_bound(total_successes, total_trials, 0.99);
-    let passes_pooled = lower_bound_99 >= target_rate;
+/// Statistical regime stratum (`Clean` exact $\varepsilon = 0$ vs `Noisy` $\varepsilon > 0$).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateRegime {
+    Clean,
+    Noisy,
+}
 
-    let pooled = PooledSuccessResult {
-        total_trials,
-        total_successes,
-        pooled_rate,
-        lower_bound_99,
-        target_rate,
-        passes_pooled,
-    };
+/// Per-task bank-level inputs for [`evaluate_stratified_gate_audit`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskBankInput {
+    pub task_label: String,
+    pub regime: GateRegime,
+    pub banks: Vec<BankSample>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tail_metrics: std::collections::BTreeMap<String, f64>,
+}
 
+/// FWER-adjusted per-task statistical evaluation within a regime stratum.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PerTaskGateResult {
+    pub task_label: String,
+    pub regime: GateRegime,
+    pub total_successes: usize,
+    pub total_trials: usize,
+    pub empirical_rate: f64,
+    pub lower_bound_99: f64,
+    pub binomial_lower_tail_p: f64,
+    pub fwer_alpha: f64,
+    pub passes_fwer_binomial: bool,
+    pub distribution: BankDistributionSummary,
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tail_metrics: std::collections::BTreeMap<String, f64>,
+}
+
+/// Regime-stratified multi-bank and FWER per-task gate evaluation (`Clean` or `Noisy`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RegimeStratumResult {
+    pub regime: GateRegime,
+    pub task_count: usize,
+    pub target_rate: f64,
+    pub fwer_alpha: f64,
+    pub pooled_multi_bank: MultiBankGateResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_conjunction_multi_bank: Option<MultiBankGateResult>,
+    pub tasks: Vec<PerTaskGateResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worst_task_label: Option<String>,
+    pub worst_task_rate: f64,
+    pub passed: bool,
+}
+
+/// Full Statistical Policy Option A + D audit separating `Clean` ($\varepsilon = 0$) and
+/// `Noisy` ($\varepsilon > 0$) strata without cross-regime pooling.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StratifiedGateAudit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clean: Option<RegimeStratumResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noisy: Option<RegimeStratumResult>,
+    pub passed: bool,
+}
+
+/// Evaluates across-bank homogeneity at significance level `alpha` (§2.8, Option A).
+#[must_use]
+pub fn evaluate_bank_homogeneity_with_alpha(
+    banks: &[BankSample],
+    alpha: f64,
+) -> BankDistributionSummary {
+    let bank_count = banks.len();
     if bank_count <= 1 {
         let rate = if bank_count == 1 {
             banks[0].rate()
         } else {
             0.0
         };
-        let distribution = BankDistributionSummary {
+        return BankDistributionSummary {
             bank_count,
             mean: rate,
             std_dev: 0.0,
@@ -367,12 +439,15 @@ pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> Multi
             p_value: 1.0,
             passes_homogeneity: true,
         };
-        return MultiBankGateResult {
-            pooled,
-            distribution,
-            passed: passes_pooled,
-        };
     }
+
+    let total_trials: usize = banks.iter().map(|b| b.trials).sum();
+    let total_successes: usize = banks.iter().map(|b| b.successes).sum();
+    let pooled_rate = if total_trials == 0 {
+        0.0
+    } else {
+        (total_successes as f64) / (total_trials as f64)
+    };
 
     let mut rates: Vec<f64> = banks.iter().map(|b| b.rate()).collect();
     rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -381,16 +456,7 @@ pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> Multi
     let variance: f64 =
         rates.iter().map(|&r| (r - mean) * (r - mean)).sum::<f64>() / ((bank_count - 1) as f64);
     let std_dev = variance.sqrt();
-
-    // 5th percentile via linear rank interpolation
-    let p05_rank = 0.05 * ((bank_count - 1) as f64);
-    let p05_idx = p05_rank.floor() as usize;
-    let p05_frac = p05_rank - (p05_idx as f64);
-    let percentile_5th = if p05_idx + 1 < bank_count {
-        (1.0 - p05_frac) * rates[p05_idx] + p05_frac * rates[p05_idx + 1]
-    } else {
-        rates[p05_idx]
-    };
+    let percentile_5th = percentile_sorted(&rates, 0.05);
 
     // Chi-squared homogeneity test (with exact conditional permutation fallback when Cochran's
     // cell-expectation criterion `E >= 5` fails, e.g. rare failures across 20-seed banks).
@@ -431,11 +497,11 @@ pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> Multi
                 chi2,
             )
         };
-        let passes = p >= 0.01;
+        let passes = p >= alpha;
         (chi2, p, passes)
     };
 
-    let distribution = BankDistributionSummary {
+    BankDistributionSummary {
         bank_count,
         mean,
         std_dev,
@@ -444,14 +510,383 @@ pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> Multi
         df,
         p_value,
         passes_homogeneity,
+    }
+}
+
+/// Evaluates multi-bank results against a target success rate (§2.8).
+///
+/// 1. Computes the one-sided 99% Clopper–Pearson lower bound on pooled success rate.
+/// 2. Performs a $\chi^2$ homogeneity test across banks at $\alpha = 0.01$.
+/// 3. Computes the bank mean, standard deviation, and 5th percentile.
+/// 4. Rejects if either the pooled lower bound falls below `target_rate` or failures cluster
+///    significantly across banks (rejecting homogeneity).
+#[must_use]
+pub fn evaluate_multi_bank_gate(banks: &[BankSample], target_rate: f64) -> MultiBankGateResult {
+    let total_trials: usize = banks.iter().map(|b| b.trials).sum();
+    let total_successes: usize = banks.iter().map(|b| b.successes).sum();
+
+    let pooled_rate = if total_trials == 0 {
+        0.0
+    } else {
+        (total_successes as f64) / (total_trials as f64)
     };
 
-    let passed = passes_pooled && passes_homogeneity;
+    let lower_bound_99 = clopper_pearson_lower_bound(total_successes, total_trials, 0.99);
+    let passes_pooled = lower_bound_99 >= target_rate;
+
+    let pooled = PooledSuccessResult {
+        total_trials,
+        total_successes,
+        pooled_rate,
+        lower_bound_99,
+        target_rate,
+        passes_pooled,
+    };
+
+    let distribution = evaluate_bank_homogeneity_with_alpha(banks, 0.01);
+    let passed = passes_pooled && distribution.passes_homogeneity;
     MultiBankGateResult {
         pooled,
         distribution,
         passed,
     }
+}
+
+fn evaluate_regime_stratum(
+    regime: GateRegime,
+    inputs: &[&TaskBankInput],
+    seed_conjunction_banks: Option<&[BankSample]>,
+    target_rate: f64,
+    enforce_pooled_cp: bool,
+) -> Option<RegimeStratumResult> {
+    if inputs.is_empty() {
+        return None;
+    }
+    let task_count = inputs.len();
+    let fwer_alpha = 0.01 / (task_count as f64);
+    let exact_mode = target_rate >= 1.0;
+
+    let num_banks = inputs.iter().map(|t| t.banks.len()).max().unwrap_or(0);
+    let mut pooled_banks = vec![BankSample::new(0, 0); num_banks];
+    for t in inputs {
+        for (bi, b) in t.banks.iter().enumerate() {
+            pooled_banks[bi].successes += b.successes;
+            pooled_banks[bi].trials += b.trials;
+        }
+    }
+    let pooled_multi_bank = evaluate_multi_bank_gate(&pooled_banks, target_rate);
+    let seed_conjunction_multi_bank =
+        seed_conjunction_banks.map(|cb| evaluate_multi_bank_gate(cb, target_rate));
+
+    let mut tasks = Vec::with_capacity(task_count);
+    let mut worst_task_label: Option<String> = None;
+    let mut worst_task_rate = f64::INFINITY;
+    for t in inputs {
+        let total_trials: usize = t.banks.iter().map(|b| b.trials).sum();
+        let total_successes: usize = t.banks.iter().map(|b| b.successes).sum();
+        let empirical_rate = if total_trials == 0 {
+            0.0
+        } else {
+            (total_successes as f64) / (total_trials as f64)
+        };
+        let lower_bound_99 = clopper_pearson_lower_bound(total_successes, total_trials, 0.99);
+        let binomial_lower_tail_p =
+            binomial_lower_tail_p_value(total_successes, total_trials, target_rate);
+        let passes_fwer_binomial = if exact_mode {
+            total_trials > 0 && total_successes == total_trials
+        } else {
+            total_trials > 0 && binomial_lower_tail_p >= fwer_alpha
+        };
+        let distribution = evaluate_bank_homogeneity_with_alpha(&t.banks, fwer_alpha);
+        let passed = passes_fwer_binomial && distribution.passes_homogeneity;
+
+        let better_worst = match &worst_task_label {
+            None => true,
+            Some(prev_label) => {
+                empirical_rate < worst_task_rate
+                    || ((empirical_rate - worst_task_rate).abs() <= f64::EPSILON
+                        && t.task_label < *prev_label)
+            }
+        };
+        if better_worst {
+            worst_task_rate = empirical_rate;
+            worst_task_label = Some(t.task_label.clone());
+        }
+
+        tasks.push(PerTaskGateResult {
+            task_label: t.task_label.clone(),
+            regime,
+            total_successes,
+            total_trials,
+            empirical_rate,
+            lower_bound_99,
+            binomial_lower_tail_p,
+            fwer_alpha,
+            passes_fwer_binomial,
+            distribution,
+            passed,
+            tail_metrics: t.tail_metrics.clone(),
+        });
+    }
+    if worst_task_label.is_none() {
+        worst_task_rate = 0.0;
+    }
+
+    let all_tasks_passed = tasks.iter().all(|t| t.passed);
+    let passed = if exact_mode {
+        let pooled_exact = pooled_multi_bank.pooled.total_trials > 0
+            && pooled_multi_bank.pooled.total_successes == pooled_multi_bank.pooled.total_trials;
+        let conj_exact = seed_conjunction_multi_bank.as_ref().is_none_or(|c| {
+            c.pooled.total_trials > 0 && c.pooled.total_successes == c.pooled.total_trials
+        });
+        pooled_exact && conj_exact && all_tasks_passed
+    } else if regime == GateRegime::Clean
+        && let Some(conj) = &seed_conjunction_multi_bank
+    {
+        let macro_ok = if enforce_pooled_cp {
+            conj.passed
+        } else {
+            conj.pooled.total_trials > 0 && conj.pooled.pooled_rate >= target_rate
+        };
+        macro_ok && all_tasks_passed
+    } else {
+        let macro_ok = if enforce_pooled_cp {
+            pooled_multi_bank.passed
+        } else {
+            pooled_multi_bank.pooled.total_trials > 0
+                && pooled_multi_bank.pooled.pooled_rate >= target_rate
+        };
+        macro_ok && all_tasks_passed
+    };
+
+    Some(RegimeStratumResult {
+        regime,
+        task_count,
+        target_rate,
+        fwer_alpha,
+        pooled_multi_bank,
+        seed_conjunction_multi_bank,
+        tasks,
+        worst_task_label,
+        worst_task_rate,
+        passed,
+    })
+}
+
+/// Evaluates Statistical Policy Option A + D over regime-stratified per-task bank samples.
+#[must_use]
+pub fn evaluate_stratified_gate_audit(
+    tasks: &[TaskBankInput],
+    clean_seed_conjunction_banks: Option<&[BankSample]>,
+    clean_target_rate: f64,
+    noisy_target_rate: f64,
+    enforce_pooled_cp: bool,
+) -> StratifiedGateAudit {
+    let mut clean_inputs: Vec<&TaskBankInput> = tasks
+        .iter()
+        .filter(|t| t.regime == GateRegime::Clean)
+        .collect();
+    let mut noisy_inputs: Vec<&TaskBankInput> = tasks
+        .iter()
+        .filter(|t| t.regime == GateRegime::Noisy)
+        .collect();
+    clean_inputs.sort_by(|a, b| a.task_label.cmp(&b.task_label));
+    noisy_inputs.sort_by(|a, b| a.task_label.cmp(&b.task_label));
+
+    let clean = evaluate_regime_stratum(
+        GateRegime::Clean,
+        &clean_inputs,
+        clean_seed_conjunction_banks,
+        clean_target_rate,
+        enforce_pooled_cp,
+    );
+    let noisy = evaluate_regime_stratum(
+        GateRegime::Noisy,
+        &noisy_inputs,
+        None,
+        noisy_target_rate,
+        enforce_pooled_cp,
+    );
+    let passed = (clean.is_some() || noisy.is_some())
+        && clean.as_ref().is_none_or(|s| s.passed)
+        && noisy.as_ref().is_none_or(|s| s.passed);
+
+    StratifiedGateAudit {
+        clean,
+        noisy,
+        passed,
+    }
+}
+
+/// Pre-registered milestone holdout seed range specification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoldoutRangeSpec {
+    pub label: &'static str,
+    pub start: u64,
+    pub end_inclusive: u64,
+    pub allow_with_flag: bool,
+    pub status_note: &'static str,
+}
+
+/// Validates `[seed_offset, seed_offset + seeds)` against guarded holdout ranges.
+///
+/// # Errors
+///
+/// Returns a descriptive refusal string when an overlap violates closed/unconditional or
+/// `--holdout`-gated isolation rules.
+pub fn check_seed_range_holdouts(
+    command_name: &str,
+    seed_offset: u64,
+    seeds: u64,
+    allow_holdout: bool,
+    ranges: &[HoldoutRangeSpec],
+) -> Result<(), String> {
+    let start = u128::from(seed_offset);
+    let end = start.saturating_add(u128::from(seeds.max(1)));
+    for r in ranges {
+        let hs = u128::from(r.start);
+        let he = u128::from(r.end_inclusive);
+        if start <= he && end > hs {
+            if !r.allow_with_flag {
+                return Err(format!(
+                    "refusing seed range {start}..{end} which overlaps pre-registered holdout range ({} {}..={}; {}; unconditionally forbidden under {command_name})",
+                    r.label, r.start, r.end_inclusive, r.status_note
+                ));
+            }
+            if !allow_holdout {
+                return Err(format!(
+                    "refusing seed range {start}..{end} which overlaps pre-registered holdout range ({} {}..={}) without --holdout flag",
+                    r.label, r.start, r.end_inclusive
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Strips trailing `:seed=<N>` from a per-case verification label to yield its task identifier.
+#[must_use]
+pub fn strip_seed_suffix(case_label: &str) -> &str {
+    case_label
+        .rsplit_once(":seed=")
+        .map_or(case_label, |(prefix, _)| prefix)
+}
+
+/// Updates `metrics[key]` with the maximum of existing and `value` when `value.is_finite()`.
+pub fn update_max_finite(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    key: &str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        return;
+    }
+    if let Some(prev) = metrics.get_mut(key) {
+        if value > *prev {
+            *prev = value;
+        }
+    } else {
+        metrics.insert(key.to_owned(), value);
+    }
+}
+
+/// Updates `metrics[key]` with the minimum of existing and `value` when `value.is_finite()`.
+pub fn update_min_finite(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    key: &str,
+    value: f64,
+) {
+    if !value.is_finite() {
+        return;
+    }
+    if let Some(prev) = metrics.get_mut(key) {
+        if value < *prev {
+            *prev = value;
+        }
+    } else {
+        metrics.insert(key.to_owned(), value);
+    }
+}
+
+/// Merges `src` finite metrics into `dst` using min for `min_*` keys and max otherwise.
+pub fn merge_tail_metric_map(
+    dst: &mut std::collections::BTreeMap<String, f64>,
+    src: &std::collections::BTreeMap<String, f64>,
+) {
+    for (k, &v) in src {
+        if k.starts_with("min_") {
+            update_min_finite(dst, k, v);
+        } else {
+            update_max_finite(dst, k, v);
+        }
+    }
+}
+
+/// Per-bank task outcome count map: `(task_label, regime) -> (successes, trials)`.
+pub type BankTaskCountMap = std::collections::BTreeMap<(String, GateRegime), (usize, usize)>;
+
+/// Per-bank tail metric map: `task_label -> (metric_name -> finite_value)`.
+pub type BankTailMetricMap =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>;
+
+/// Pivots per-bank `(task_label, regime) -> (successes, trials)` and tail metrics into [`StratifiedGateAudit`].
+#[must_use]
+pub fn evaluate_stratified_from_bank_maps(
+    bank_counts: &[&BankTaskCountMap],
+    bank_tails: &[&BankTailMetricMap],
+    pooled_tail_overrides: Option<&BankTailMetricMap>,
+    clean_seed_conjunction_banks: Option<&[BankSample]>,
+    clean_target_rate: f64,
+    noisy_target_rate: f64,
+    enforce_pooled_cp: bool,
+) -> StratifiedGateAudit {
+    let mut keys = std::collections::BTreeSet::new();
+    for map in bank_counts {
+        for k in map.keys() {
+            keys.insert(k.clone());
+        }
+    }
+
+    let mut inputs = Vec::with_capacity(keys.len());
+    for (task_label, regime) in keys {
+        let mut banks = Vec::with_capacity(bank_counts.len());
+        for map in bank_counts {
+            let (succ, trials) = map
+                .get(&(task_label.clone(), regime))
+                .copied()
+                .unwrap_or((0, 0));
+            banks.push(BankSample::new(succ, trials));
+        }
+        let mut tail_metrics = std::collections::BTreeMap::new();
+        for tmap in bank_tails {
+            if let Some(m) = tmap.get(&task_label) {
+                merge_tail_metric_map(&mut tail_metrics, m);
+            }
+        }
+        if let Some(ov) = pooled_tail_overrides
+            && let Some(m) = ov.get(&task_label)
+        {
+            for (k, &v) in m {
+                if v.is_finite() {
+                    tail_metrics.insert(k.clone(), v);
+                }
+            }
+        }
+        inputs.push(TaskBankInput {
+            task_label,
+            regime,
+            banks,
+            tail_metrics,
+        });
+    }
+
+    evaluate_stratified_gate_audit(
+        &inputs,
+        clean_seed_conjunction_banks,
+        clean_target_rate,
+        noisy_target_rate,
+        enforce_pooled_cp,
+    )
 }
 
 /// Evaluates the exact conditional permutation upper-tail $p$-value for Pearson's $\chi^2$
@@ -588,6 +1023,172 @@ mod tests {
         assert!(
             !res_clustered.passed,
             "overall gate must fail when homogeneity is rejected"
+        );
+    }
+
+    #[test]
+    fn binomial_lower_tail_p_value_matches_direct_combinatoric_sums() {
+        let direct_cdf = |k: usize, n: usize, p: f64| -> f64 {
+            let mut sum = 0.0f64;
+            let mut log_binom = 0.0f64;
+            let log_p = p.ln();
+            let log_q = (1.0 - p).ln();
+            for i in 0..=k {
+                if i > 0 {
+                    log_binom += ((n - i + 1) as f64).ln() - (i as f64).ln();
+                }
+                sum += (log_binom + (i as f64) * log_p + ((n - i) as f64) * log_q).exp();
+            }
+            sum.clamp(0.0, 1.0)
+        };
+
+        let p0_20 = binomial_lower_tail_p_value(0, 20, 0.90);
+        assert!(
+            (p0_20 - 1e-20).abs() <= 1e-29,
+            "expected ~1e-20, got {p0_20:e}"
+        );
+        for k in [5usize, 13, 17, 19, 20] {
+            let got = binomial_lower_tail_p_value(k, 20, 0.90);
+            let exp = direct_cdf(k, 20, 0.90);
+            let rel = if exp == 0.0 {
+                got.abs()
+            } else {
+                (got - exp).abs() / exp
+            };
+            assert!(rel < 1e-9, "n=20 k={k}: got={got}, exp={exp}");
+        }
+
+        let p0_100 = binomial_lower_tail_p_value(0, 100, 0.90);
+        assert!(
+            (p0_100 - 1e-100).abs() <= 1e-109,
+            "expected ~1e-100, got {p0_100:e}"
+        );
+        for k in [50usize, 78, 85, 90, 99, 100] {
+            let got = binomial_lower_tail_p_value(k, 100, 0.90);
+            let exp = direct_cdf(k, 100, 0.90);
+            let rel = if exp == 0.0 {
+                got.abs()
+            } else {
+                (got - exp).abs() / exp
+            };
+            assert!(rel < 1e-9, "n=100 k={k}: got={got}, exp={exp}");
+        }
+    }
+
+    #[test]
+    fn stratified_gate_audit_rejects_concentrated_failure_and_separates_regimes() {
+        // 1. Single-bank 20-seed concentrated failure: 9 tasks 20/20, 1 task 0/20 (90% pooled).
+        let mut clean_20: Vec<TaskBankInput> = (0..9)
+            .map(|i| TaskBankInput {
+                task_label: format!("CleanTask{i}"),
+                regime: GateRegime::Clean,
+                banks: vec![BankSample::new(20, 20)],
+                tail_metrics: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        clean_20.push(TaskBankInput {
+            task_label: "BrokenCleanTask".to_owned(),
+            regime: GateRegime::Clean,
+            banks: vec![BankSample::new(0, 20)],
+            tail_metrics: std::collections::BTreeMap::new(),
+        });
+        let audit_20 = evaluate_stratified_gate_audit(
+            &clean_20,
+            Some(&[BankSample::new(0, 20)]),
+            0.90,
+            0.90,
+            false,
+        );
+        assert!(!audit_20.passed);
+        let clean_s20 = audit_20.clean.as_ref().unwrap();
+        assert!(!clean_s20.passed);
+        assert_eq!(
+            clean_s20.worst_task_label.as_deref(),
+            Some("BrokenCleanTask")
+        );
+        assert!(
+            !clean_s20
+                .tasks
+                .iter()
+                .find(|t| t.task_label == "BrokenCleanTask")
+                .unwrap()
+                .passes_fwer_binomial
+        );
+
+        // 2. 5-bank 100-seed concentrated failure in Clean AND Noisy: 9 tasks 100/100, 1 task 0/100.
+        for regime in [GateRegime::Clean, GateRegime::Noisy] {
+            let mut inputs: Vec<TaskBankInput> = (0..9)
+                .map(|i| TaskBankInput {
+                    task_label: format!("Ok{i}"),
+                    regime,
+                    banks: vec![BankSample::new(20, 20); 5],
+                    tail_metrics: std::collections::BTreeMap::new(),
+                })
+                .collect();
+            inputs.push(TaskBankInput {
+                task_label: "Broken100".to_owned(),
+                regime,
+                banks: vec![BankSample::new(0, 20); 5],
+                tail_metrics: std::collections::BTreeMap::new(),
+            });
+            let audit_100 = evaluate_stratified_gate_audit(
+                &inputs,
+                (regime == GateRegime::Clean)
+                    .then(|| vec![BankSample::new(0, 20); 5])
+                    .as_deref(),
+                0.90,
+                0.90,
+                true,
+            );
+            assert!(!audit_100.passed);
+        }
+
+        // 3. Healthy heterogeneous Noisy tasks: 9 tasks 100/100, 1 hard task 92/100 (across 5 uniform banks) passes.
+        let mut noisy_ok: Vec<TaskBankInput> = (0..9)
+            .map(|i| TaskBankInput {
+                task_label: format!("NoisyEasy{i}"),
+                regime: GateRegime::Noisy,
+                banks: vec![BankSample::new(20, 20); 5],
+                tail_metrics: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        noisy_ok.push(TaskBankInput {
+            task_label: "NoisyHard".to_owned(),
+            regime: GateRegime::Noisy,
+            banks: vec![
+                BankSample::new(19, 20),
+                BankSample::new(18, 20),
+                BankSample::new(19, 20),
+                BankSample::new(18, 20),
+                BankSample::new(18, 20),
+            ],
+            tail_metrics: std::collections::BTreeMap::new(),
+        });
+        let audit_ok = evaluate_stratified_gate_audit(&noisy_ok, None, 0.90, 0.85, true);
+        assert!(
+            audit_ok.passed,
+            "heterogeneous healthy noisy tasks must pass"
+        );
+
+        // 4. Per-task bank-clustered failure ([20,20,20,20,10]/20) fails per-task homogeneity despite 90/100 >= 0.85.
+        let clustered = vec![TaskBankInput {
+            task_label: "BankClustered".to_owned(),
+            regime: GateRegime::Noisy,
+            banks: vec![
+                BankSample::new(20, 20),
+                BankSample::new(20, 20),
+                BankSample::new(20, 20),
+                BankSample::new(20, 20),
+                BankSample::new(10, 20),
+            ],
+            tail_metrics: std::collections::BTreeMap::new(),
+        }];
+        let audit_clustered = evaluate_stratified_gate_audit(&clustered, None, 0.90, 0.85, true);
+        assert!(!audit_clustered.passed);
+        assert!(
+            !audit_clustered.noisy.as_ref().unwrap().tasks[0]
+                .distribution
+                .passes_homogeneity
         );
     }
 

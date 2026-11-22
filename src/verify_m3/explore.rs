@@ -28,7 +28,7 @@ use crate::rng::SeedBank;
 use crate::structural::graph_edit::source_has_cycle;
 use crate::structural::growth::ExcisionMode;
 use crate::structural::learner::InjectionMode;
-use crate::structural::surgery::primary_cone_nodes;
+use crate::structural::surgery::{primary_cone_nodes, primary_cone_nodes_without_comparator_taps};
 use crate::structural::{
     ArkheLearner, EconomyConfig, EconomyState, EditableCircuit, GrowthConfig, ReserveCap,
     build_autonomous_ring, cone_channel_mask, materialize_const_loop, observation_horizon,
@@ -51,14 +51,18 @@ pub const M2A_HOLDOUT_SEED_END: u64 = 30_019;
 pub const M2B_HOLDOUT_SEED_START: u64 = 40_000;
 /// Pre-registered M2b holdout range end seed (inclusive).
 pub const M2B_HOLDOUT_SEED_END: u64 = 40_019;
-/// Pre-registered M3 holdout range start seed (unconditionally rejected in `explore-m3`).
+/// Pre-registered M3 v1 holdout range start seed (consumed at `dd13839`; permanently closed).
 pub const M3_HOLDOUT_SEED_START: u64 = 50_000;
-/// Pre-registered M3 holdout range end seed (inclusive).
+/// Pre-registered M3 v1 holdout range end seed (inclusive).
 pub const M3_HOLDOUT_SEED_END: u64 = 50_019;
-/// Pre-registered M4a reserved holdout range start seed (unconditionally rejected).
+/// Pre-registered M3 v2 holdout range start seed (100 seeds; unconditionally rejected in `explore-m3`).
+pub const M3_V2_HOLDOUT_SEED_START: u64 = 50_100;
+/// Pre-registered M3 v2 holdout range end seed (inclusive).
+pub const M3_V2_HOLDOUT_SEED_END: u64 = 50_199;
+/// Pre-registered M4a reserved holdout range start seed (100 seeds; unconditionally rejected).
 pub const M4A_HOLDOUT_SEED_START: u64 = 60_000;
 /// Pre-registered M4a reserved holdout range end seed (inclusive).
-pub const M4A_HOLDOUT_SEED_END: u64 = 60_019;
+pub const M4A_HOLDOUT_SEED_END: u64 = 60_099;
 
 const MAX_SETTLE_TICKS: u64 = 2_000;
 const INJECTION_TICK_BUDGET: u64 = 200_000;
@@ -69,32 +73,58 @@ const SPONTANEOUS_WARMUP: u64 = 500;
 const CONSERVATION_TOL: f64 = 1e-11;
 
 /// Unconditionally rejects any seed range `[seed_offset, seed_offset + seeds)` overlapping
-/// pre-registered milestone holdout banks (`M1`, `M2a`, `M2b`, `M3`, `M4a`).
+/// pre-registered milestone holdout banks (`M1`, `M2a`, `M2b`, `M3`, `M3_v2`, `M4a`).
 ///
 /// # Errors
 ///
 /// Returns a descriptive error if the requested range overlaps any holdout bank.
 pub fn check_explore_m3_seed_range_holdout(seed_offset: u64, seeds: usize) -> Result<(), String> {
-    let start = u128::from(seed_offset);
-    let span = u128::try_from(seeds.max(1)).unwrap_or(u128::MAX);
-    let end = start.saturating_add(span);
-    let banks = [
-        ("M1", M1_HOLDOUT_SEED_START, M1_HOLDOUT_SEED_END),
-        ("M2a", M2A_HOLDOUT_SEED_START, M2A_HOLDOUT_SEED_END),
-        ("M2b", M2B_HOLDOUT_SEED_START, M2B_HOLDOUT_SEED_END),
-        ("M3", M3_HOLDOUT_SEED_START, M3_HOLDOUT_SEED_END),
-        ("M4a", M4A_HOLDOUT_SEED_START, M4A_HOLDOUT_SEED_END),
+    let ranges = [
+        crate::stats::HoldoutRangeSpec {
+            label: "M1",
+            start: M1_HOLDOUT_SEED_START,
+            end_inclusive: M1_HOLDOUT_SEED_END,
+            allow_with_flag: false,
+            status_note: "reserved M1 holdout",
+        },
+        crate::stats::HoldoutRangeSpec {
+            label: "M2a",
+            start: M2A_HOLDOUT_SEED_START,
+            end_inclusive: M2A_HOLDOUT_SEED_END,
+            allow_with_flag: false,
+            status_note: "consumed at aa6fb6d; permanently closed",
+        },
+        crate::stats::HoldoutRangeSpec {
+            label: "M2b",
+            start: M2B_HOLDOUT_SEED_START,
+            end_inclusive: M2B_HOLDOUT_SEED_END,
+            allow_with_flag: false,
+            status_note: "consumed at b211afa; permanently closed",
+        },
+        crate::stats::HoldoutRangeSpec {
+            label: "M3",
+            start: M3_HOLDOUT_SEED_START,
+            end_inclusive: M3_HOLDOUT_SEED_END,
+            allow_with_flag: false,
+            status_note: "consumed at dd13839; permanently closed",
+        },
+        crate::stats::HoldoutRangeSpec {
+            label: "M3_v2",
+            start: M3_V2_HOLDOUT_SEED_START,
+            end_inclusive: M3_V2_HOLDOUT_SEED_END,
+            allow_with_flag: false,
+            status_note: "reserved for M3 v2 verification",
+        },
+        crate::stats::HoldoutRangeSpec {
+            label: "M4a",
+            start: M4A_HOLDOUT_SEED_START,
+            end_inclusive: M4A_HOLDOUT_SEED_END,
+            allow_with_flag: false,
+            status_note: "reserved for M4a",
+        },
     ];
-    for (label, h_start, h_end) in banks {
-        let hs = u128::from(h_start);
-        let he = u128::from(h_end);
-        if start <= he && end > hs {
-            return Err(format!(
-                "refusing explore-m3 seed range {start}..{end} which overlaps pre-registered {label} holdout range {h_start}..={h_end} (unconditionally forbidden)"
-            ));
-        }
-    }
-    Ok(())
+    let span = u64::try_from(seeds.max(1)).unwrap_or(u64::MAX);
+    crate::stats::check_seed_range_holdouts("explore-m3", seed_offset, span, false, &ranges)
 }
 
 /// Prune mechanism observed after detour injection.
@@ -815,7 +845,28 @@ fn target_cone_signature(
     economy: &EconomyState,
     target_port: u16,
 ) -> (Vec<(NodeId, Primitive)>, usize) {
-    let pri = primary_cone_nodes(circuit, economy, target_port);
+    target_cone_signature_inner(circuit, economy, target_port, false)
+}
+
+fn target_cone_signature_without_comparator_taps(
+    circuit: &Circuit,
+    economy: &EconomyState,
+    target_port: u16,
+) -> (Vec<(NodeId, Primitive)>, usize) {
+    target_cone_signature_inner(circuit, economy, target_port, true)
+}
+
+fn target_cone_signature_inner(
+    circuit: &Circuit,
+    economy: &EconomyState,
+    target_port: u16,
+    exclude_comparator_taps: bool,
+) -> (Vec<(NodeId, Primitive)>, usize) {
+    let pri = if exclude_comparator_taps {
+        primary_cone_nodes_without_comparator_taps(circuit, economy, target_port)
+    } else {
+        primary_cone_nodes(circuit, economy, target_port)
+    };
     let comp = comparator_cone_set(circuit, economy, Some(target_port));
     let mut nodes: Vec<(NodeId, Primitive)> = pri
         .union(&comp)
@@ -1695,7 +1746,7 @@ fn run_spontaneous_case(
     let is_noisy_constant =
         matches!(spec.gen_cfg, GeneratorConfig::T1_Constant { .. }) && spec.epsilon > 0.0;
     let mut clean_window: VecDeque<bool> = VecDeque::with_capacity(w_obs as usize);
-    let mut last_sig = target_cone_signature(
+    let mut last_sig = target_cone_signature_without_comparator_taps(
         learner.editable().circuit(),
         learner.editable().economy(),
         spec.target_port,
@@ -1727,7 +1778,7 @@ fn run_spontaneous_case(
 
         learner.observe(&obs, &mut budget);
 
-        let curr_sig = target_cone_signature(
+        let curr_sig = target_cone_signature_without_comparator_taps(
             learner.editable().circuit(),
             learner.editable().economy(),
             spec.target_port,
@@ -1756,7 +1807,7 @@ fn run_spontaneous_case(
             if is_locked {
                 t_lock = Some(t + 1);
                 n_primary_at_lock = Some(
-                    primary_cone_nodes(
+                    primary_cone_nodes_without_comparator_taps(
                         learner.editable().circuit(),
                         learner.editable().economy(),
                         spec.target_port,
@@ -1767,7 +1818,7 @@ fn run_spontaneous_case(
         }
 
         if t + 1 == SPONTANEOUS_T2000 {
-            n_primary_2000 = primary_cone_nodes(
+            n_primary_2000 = primary_cone_nodes_without_comparator_taps(
                 learner.editable().circuit(),
                 learner.editable().economy(),
                 spec.target_port,
@@ -1777,7 +1828,7 @@ fn run_spontaneous_case(
         }
     }
 
-    let n_primary_8000 = primary_cone_nodes(
+    let n_primary_8000 = primary_cone_nodes_without_comparator_taps(
         learner.editable().circuit(),
         learner.editable().economy(),
         spec.target_port,
@@ -3033,8 +3084,9 @@ mod tests {
     #[test]
     fn holdout_guards_reject_all_five_milestone_banks() {
         // M1 (10_000..=10_019), M2a (30_000..=30_019), M2b (40_000..=40_019),
-        // M3 (50_000..=50_019), M4a (60_000..=60_019) must all be unconditionally rejected.
-        for holdout_start in [10_000u64, 30_000, 40_000, 50_000, 60_000] {
+        // M3 v1 (50_000..=50_019), M3 v2 (50_100..=50_199), M4a (60_000..=60_099)
+        // must all be unconditionally rejected by explore-m3.
+        for holdout_start in [10_000u64, 30_000, 40_000, 50_000, 50_100, 60_000] {
             // Exact bank start.
             assert!(
                 check_explore_m3_seed_range_holdout(holdout_start, 20).is_err(),
@@ -3056,11 +3108,18 @@ mod tests {
                 "expected rejection on seeds=0 at {holdout_start}"
             );
         }
+        // Tail interior overlaps for 100-seed holdout banks (M3 v2 and M4a).
+        for interior in [50_150u64, 50_199, 60_020, 60_099] {
+            assert!(
+                check_explore_m3_seed_range_holdout(interior, 1).is_err(),
+                "expected rejection inside 100-seed holdout at {interior}"
+            );
+        }
 
         // Safe disjoint ranges must be accepted.
         for safe in [
-            0u64, 9_980, 10_020, 20_060, 29_980, 30_020, 39_980, 40_020, 49_980, 50_020, 59_980,
-            60_020,
+            0u64, 9_980, 10_020, 20_060, 29_980, 30_020, 39_980, 40_020, 49_980, 50_020, 50_200,
+            59_980, 60_100,
         ] {
             assert!(
                 check_explore_m3_seed_range_holdout(safe, 20).is_ok(),

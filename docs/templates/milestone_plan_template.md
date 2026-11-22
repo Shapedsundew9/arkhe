@@ -14,19 +14,43 @@
 
 Document exploratory measurements recorded prior to pre-registration (Rule 8: exploratory runs measure and report without gating).
 
-## 3. Pre-Registered Hypotheses & Falsifiable Success Criteria
+## 3. Pre-Registered Hypotheses & Falsifiable Success Criteria (Regime-Stratified)
 
-| Gate ID | Definition (metric, generator, width `k`, noise, equal-compute baseline) | Target Threshold (`P_target`, margin) | Feasibility Argument (Rule 9: theoretical bound or measured baseline) |
+Separate `Clean` ($\varepsilon = 0.0$) and `Noisy` ($\varepsilon > 0.0$) tasks strictly (`GateRegime::Clean` vs. `GateRegime::Noisy` in `StratifiedGateAudit`, [Charter §2.8](../foundational_research_charter_v3.md#28-statistical-policy-holdout-governance-and-retained-baseline-regression-gate)); never pool across regimes or hide single-task failures behind pooled empirical averages.
+
+### 3.1 Gate Thresholds & Feasibility
+
+| Gate ID | Regime Stratum (`Clean` / `Noisy`) | Definition (metric, generator, width `k`, noise, equal-compute baseline) | Target Threshold (`P_target`, margin, FWER $\alpha = 0.01 / M_{\text{stratum}}$) | Feasibility Argument (Rule 9: theoretical bound or measured baseline) |
+| :--- | :---: | :--- | :--- | :--- |
+| `G...` | `Clean` / `Noisy` | ... | ... | ... |
+
+### 3.2 Option D Per-Task Tail Metrics (`tail_metrics`)
+
+Record finite per-task extrema and 95th-percentile bounds emitted via `update_max_finite` / `update_min_finite` (`src/stats.rs`, preventing non-finite `INFINITY` from serializing as JSON `null`):
+
+| Gate / Task Label | Tail Metric Key (e.g., `max_epistemic_mdl_err`, `max_excise_dt`, `p95_excise_dt`, `max_n_primary_8000`, `p95_n_primary_8000`, `max_t_lock`, `max_abs_kt_diff`, `min_kt_advantage`) | Pre-Registered Bound / Diagnostic Expectation |
+| :--- | :--- | :--- |
+| `G...:<task>` | ... | ... |
+
+## 4. Verification Protocol & 100-Seed Confirmation / Holdout Ledger
+
+- **Fast development smoke only (non-confirmatory):** `0..20` (`20` seeds).
+- **Development multi-bank sweep:** `<explicit range, e.g. 20..1020 (50 × 20)>`
+- **Confirmation bank (`100` seeds = `5` banks $\times$ `20` seeds, fresh dev):** `<explicit range, e.g. 20200..=20299 for M4a+>`
+- **Holdout seeds (`100` seeds = `5` banks $\times$ `20` seeds, single-shot only, disjoint from permanently closed ranges `10000..=10019`, `30000..=30019`, `40000..=40019`, `50000..=50019`, and `50100..=50199`):** `<explicit range, e.g. 60000..=60099>`
+- **Unconditional closure of consumed holdout ranges:** Every consumed holdout range must be permanently closed with `allow_with_flag: false` in `HoldoutRangeSpec` across all CLI verification commands in the milestone closeout commit.
+- **Statistical Policy Option A (`src/stats.rs` `StratifiedGateAudit`):**
+  1. Never pool `Clean` ($\varepsilon = 0.0$) and `Noisy` ($\varepsilon > 0.0$) tasks into one gate criterion.
+  2. Within each stratum of $M_{\text{stratum}}$ tasks, enforce per-task FWER exact binomial lower-tail check at $\alpha = 0.01 / M_{\text{stratum}}$ (exact `total_successes == total_trials` when `target_rate >= 1.0`) and per-task across-bank homogeneity at $\alpha = 0.01 / M_{\text{stratum}}$ (`evaluate_bank_homogeneity_with_alpha`).
+  3. Enforce per-seed `Clean` conjunction across all clean tasks in a gate (`seed_conjunction_multi_bank`), plus stratum-level 99% Clopper–Pearson lower confidence bound and homogeneity checks.
+- **Guardrail invariant:** Any run where a compute guardrail (`SproutBlockedMaxNodes`) binds is marked `excluded` and never counted as `passed`.
+- **Mandatory Retained-Baseline Regression Gate (`S3` & `S4` precondition):** Before any `S3` or `S4` request, run `python3 scripts/check_retained_baselines.py --require-clean` against `docs/retained_baselines.json` on a clean git tree (forbidding `--fast`, `--skip-golden`, `git_dirty: true`, and prose-only or pooled-only sign-off claims).
+
+| Check | Command | Required Outcome | Clean-Tree JSON Evidence |
 | :--- | :--- | :--- | :--- |
-| `G...` | ... | ... | ... |
-
-## 4. Verification Protocol & Seed Governance
-
-- **Development seeds:** `<explicit range>`
-- **Confirmation bank (fresh dev):** `<explicit range>`
-- **Holdout seeds (single-shot only, disjoint from M1 `10000..=10019`, M2a `30000..=30019`, and M2b `40000..=40019`):** `<explicit range>`
-- **Multi-bank statistics:** One-sided 99% Clopper–Pearson lower confidence bound on pooled seed successes (`P_target`) plus 1% chi-squared / Cochran conditional-permutation across-bank homogeneity test (`src/stats.rs`).
-- **Guardrail invariant:** Any run where a compute guardrail binds is marked `excluded` and never counted as `passed`.
+| Golden traces + retained M2a/M2b gates | `python3 scripts/check_retained_baselines.py --require-clean` | `all_passed: true`, `git_dirty: false`, `golden_traces` `1/1` bit-identical | `<JSON artifact / summary>` |
+| 100-seed confirmation (`S3` precondition) | `cargo run --locked --release -- verify-<m> --banks 5 --seed-offset <conf> --seeds 20` | `StratifiedGateAudit` clean & noisy strata pass, `excluded_cases == 0` | `<JSON artifact / summary>` |
+| 100-seed single-shot holdout (`S4` precondition) | `cargo run --locked --release -- verify-<m> --banks 5 --seed-offset <holdout> --seeds 20 --holdout` | `StratifiedGateAudit` clean & noisy strata pass, `excluded_cases == 0`, Option D tails inspected | `<JSON artifact / summary>` |
 
 ## 5. Kill & Revisit Criteria
 
@@ -47,8 +71,10 @@ List every constant added, reclassified (e.g., **Milestone-Scoped Scaffolding** 
 
 ## 8. User Sign-Off & Attainment Record
 
-- **Pre-registration sign-off:** `<Pending user approval / commit hash>`
-- **Dev bank summary:** `<To be filled post-implementation>`
-- **Single-shot holdout outcome:** `<To be filled once after dev banks pass>`
+- **Pre-registration sign-off:** `<Pending user / Chief Scientist approval / commit hash>`
+- **Retained-baseline gate (`python3 scripts/check_retained_baselines.py --require-clean`):** `<To be filled from clean-tree JSON output>`
+- **Dev bank & 100-seed confirmation (`5 × 20`) summary:** `<To be filled post-implementation with StratifiedGateAudit + Option D tail_metrics>`
+- **100-seed single-shot holdout (`5 × 20`) outcome:** `<To be filled once after confirmation + retained-baseline gate pass>`
+- **Consumed holdout closure commit (`allow_with_flag: false`):** `<To be filled at S4 closeout>`
 - **Source digest (`source_tree_fnv1a128`):** `<To be filled>`
 - **Independent review status:** `<Open / Reviewed>`

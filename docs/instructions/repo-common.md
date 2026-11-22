@@ -97,8 +97,11 @@ Read `.shared/ai/core/common-instructions.md`.
    - two consecutive fix attempts for the same failure brought no new diagnostic understanding;
    - the charter, a milestone plan, the inventory, and the code disagree;
    - a theoretical argument suggests the target is unreachable under the current rules.
-6. **Multi-bank acceptance uses pooled confidence bounds plus a homogeneity test**, never compound
-   per-bank hurdles.
+6. **Multi-bank acceptance uses regime-stratified, per-task FWER statistics plus tail telemetry (Charter §2.8, `src/stats.rs`),** never compound per-bank hurdles and never cross-regime or cross-task pooling that masks a zero-pass task:
+   - `Clean` ($\varepsilon = 0.0$) and `Noisy` ($\varepsilon > 0.0$) tasks are stratified separately (`StratifiedGateAudit`);
+   - Each stratum enforces pooled 99% Clopper–Pearson + 1% homogeneity, per-task FWER binomial lower-tail & homogeneity at $\alpha = 0.01 / M_{\text{stratum}}$, per-seed `Clean` task conjunction, and finite per-task Option D `tail_metrics`;
+   - **Prose-only or pooled-only sign-off claims are forbidden:** before any `S3` holdout authorization or `S4` closeout request, workers/coordinators must run `python3 scripts/check_retained_baselines.py --require-clean` (which forbids `--fast`, `--skip-golden`, and `git_dirty: true`) and attach its verified JSON evidence alongside regime-stratified per-task FWER and `tail_metrics` outputs;
+   - **Permanent unconditional holdout closure:** in every milestone closeout commit, consumed holdout ranges (`10000..=10019`, `30000..=30019`, `40000..=40019`, `50000..=50019`, and future consumed holdouts) must be set to `allow_with_flag: false` in CLI code (`HoldoutRangeSpec`) so they are rejected even when `--holdout` is passed.
 7. **Decision rights, Charter-Core Invariants & two-level escalation hierarchy (see Charter §7.1).**
    - **Charter-Core Invariants (Immutable without User / Principal Investigator Sign-Off):**
      1. **Overarching Charter purpose & epistemological premise ([Charter §§0–1](../foundational_research_charter_v3.md#0-purpose-in-one-paragraph)):**
@@ -109,8 +112,11 @@ Read `.shared/ai/core/common-instructions.md`.
         compilation into higher-order axioms so the learner's vocabulary grows open-endedly and
         every level of the hierarchy is auditable.
      2. **Holdout Seed Bank Isolation:** Pre-registered single-shot holdout banks (`10000..=10019`,
-        `30000..=30019`, `40000..=40019`, `50000..=50019`, `60000..=60019`, and future milestone
-        holdouts) are never inspected during development or used to tune thresholds.
+        `30000..=30019`, `40000..=40019`, `50000..=50019`, `50100..=50199`, `60000..=60099`,
+        and future 100-seed milestone holdouts) are never inspected during development or used to
+        tune thresholds. Consumed ranges (`10000..=10019`, `30000..=30019`, `40000..=40019`,
+        `50000..=50019`) remain permanently and unconditionally closed (`allow_with_flag: false`)
+        in CLI code (`HoldoutRangeSpec`).
    - **Implementation Workers (`gemini-4-hydrogen-high` / `gemini-4-hydrogen-xhigh`, phase authors & `@verifier`):**
      Always spawned fresh (**never** `fork: "coordinator"`). Strictly bound to the parameters,
      formulas, file scope, and test specifications in their brief. Maximum **2 fix attempts** on any
@@ -178,11 +184,16 @@ Read `.shared/ai/core/common-instructions.md`.
           **re-order/re-prioritize milestones** in Charter §7 to take a more effective, tractable
           route to the Charter §§0–1 goal (ratifying updates in `docs/milestone_*_plan.md`,
           `docs/parameter_inventory.md`, and Charter Appendix A Decision Record);
-       5. **Approve and authorize single-shot holdout runs (`S3`)** once dev and confirmation banks
-          pass cleanly, **approve milestone completion and progression to the next milestone (`S4`)**
-          when holdout passes, and **adjudicate holdout failures** as a Level-2 escalation (e.g.,
-          restructuring the milestone and allocating a fresh disjoint holdout bank without tuning to
-          the consumed holdout seeds).
+       5. **Approve and authorize single-shot holdout runs (`S3`)** once 100-seed confirmation
+          (`5 × 20`) and dev banks pass cleanly under `StratifiedGateAudit` (`excluded_cases == 0`)
+          AND `python3 scripts/check_retained_baselines.py --require-clean` passes on a clean
+          commit (never `--fast`, `--skip-golden`, `git_dirty: true`, or prose-only/pooled-only
+          claims); **approve milestone completion and progression (`S4`)** when the 100-seed
+          holdout passes `StratifiedGateAudit` + Option D `tail_metrics` inspection and the
+          closeout commit permanently closes the consumed holdout range (`allow_with_flag: false`);
+          and **adjudicate holdout failures** as a Level-2 escalation (e.g., restructuring the
+          milestone and allocating a fresh disjoint 100-seed holdout bank without tuning to the
+          consumed holdout seeds).
      - **When to escalate to the User (Principal Investigator):** The User is needed **only** when
        the overarching goal of the Charter (Charter §§0–1) is genuinely at risk—i.e., a core
        Charter hypothesis is falsified or blocked and **the Chief Scientist cannot identify a

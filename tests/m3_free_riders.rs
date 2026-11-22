@@ -17,11 +17,16 @@ use arkhe::rng::SeedBank;
 use arkhe::stats::{CaseOutcome, classify_case_outcome};
 use arkhe::structural::growth::ExcisionMode;
 use arkhe::structural::learner::InjectionMode;
-use arkhe::structural::surgery::primary_cone_nodes;
+use arkhe::structural::surgery::{
+    comparator_tap_split_nodes, primary_cone_nodes, primary_cone_nodes_without_comparator_taps,
+};
 use arkhe::structural::{
     ArkheLearner, EconomyConfig, EditableCircuit, GrowthConfig, ReserveCap, build_autonomous_ring,
+    splice_comparator_onto_port, tap_source,
 };
-use arkhe::substrate::{Circuit, ScalarState, Width, WireDelayMode};
+use arkhe::substrate::{
+    Circuit, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
+};
 use arkhe::verify_m3::{
     DetourClass, G35B_MIN_SPLIT_TAX_BITS, build_detour_edit,
     verify_analytical_split_pricing_theorem,
@@ -436,4 +441,205 @@ fn g35b_split_code_tax_pricing_and_guardrail_exclusion_semantics() {
     };
     assert_eq!(classify_case_outcome(true, &cliff), CaseOutcome::Excluded);
     let _ = ScalarState::new(&circ.compile().unwrap());
+}
+
+#[test]
+fn comparator_tap_split_nodes_excludes_registered_taps_only() {
+    let econ = EconomyConfig::default();
+    let growth = GrowthConfig::default();
+
+    // 1. Registered comparator on port 0 tapping shared BoundaryIn(0) used by port 2 primary.
+    let mut reg_circ = Circuit::new(Width::BITS_2, 3, 3, WireDelayMode::Combinational);
+    reg_circ.connect(SignalSource::BoundaryIn(0), SignalSink::BoundaryOut(2));
+    reg_circ.connect(SignalSource::BoundaryIn(1), SignalSink::BoundaryOut(0));
+    let tap = tap_source(&mut reg_circ, SignalSource::BoundaryIn(0));
+    let spliced = splice_comparator_onto_port(&mut reg_circ, 0, tap).unwrap();
+    let tap_node = match tap {
+        SignalSource::NodeOut { node, .. } => node,
+        SignalSource::BoundaryIn(_) => panic!("second consumer on BoundaryIn(0) creates Split"),
+    };
+    let mut reg_ed = EditableCircuit::new_with_growth(reg_circ, econ, &growth).unwrap();
+    reg_ed
+        .register_comparator(spliced.sub_node, spliced.eqz_node, 0, 0x2, 0x1)
+        .unwrap();
+    let taps = comparator_tap_split_nodes(reg_ed.circuit(), reg_ed.economy());
+    assert!(taps.contains(&tap_node));
+    assert!(primary_cone_nodes(reg_ed.circuit(), reg_ed.economy(), 2).contains(&tap_node));
+    assert!(
+        !primary_cone_nodes_without_comparator_taps(reg_ed.circuit(), reg_ed.economy(), 2)
+            .contains(&tap_node)
+    );
+
+    // 2. Unregistered fake-comparator & D0Dead Splits on shared BoundaryIn(0) stay counted as bloat.
+    let mut unreg_comp_circ = Circuit::new(Width::BITS_2, 3, 3, WireDelayMode::Combinational);
+    unreg_comp_circ.connect(SignalSource::BoundaryIn(0), SignalSink::BoundaryOut(2));
+    unreg_comp_circ.connect(SignalSource::BoundaryIn(1), SignalSink::BoundaryOut(0));
+    let unreg_tap = tap_source(&mut unreg_comp_circ, SignalSource::BoundaryIn(0));
+    let u_spliced = splice_comparator_onto_port(&mut unreg_comp_circ, 0, unreg_tap).unwrap();
+    let _ = (u_spliced.sub_node, u_spliced.eqz_node);
+    let unreg_tap_node = match unreg_tap {
+        SignalSource::NodeOut { node, .. } => node,
+        SignalSource::BoundaryIn(_) => panic!("expected Split on BoundaryIn(0)"),
+    };
+    let unreg_comp_ed = EditableCircuit::new_with_growth(unreg_comp_circ, econ, &growth).unwrap();
+    assert!(
+        comparator_tap_split_nodes(unreg_comp_ed.circuit(), unreg_comp_ed.economy()).is_empty(),
+        "unregistered comparator Split must never be excluded as comparator tap"
+    );
+    assert!(
+        primary_cone_nodes_without_comparator_taps(
+            unreg_comp_ed.circuit(),
+            unreg_comp_ed.economy(),
+            2,
+        )
+        .contains(&unreg_tap_node),
+        "unregistered fake comparator Split must remain in port 2 primary cone count"
+    );
+
+    let mut d0_circ = Circuit::new(Width::BITS_2, 3, 3, WireDelayMode::Combinational);
+    let delay = d0_circ.add_node(Primitive::Delay { init: 0 });
+    d0_circ.connect(
+        SignalSource::BoundaryIn(0),
+        SignalSink::NodeIn {
+            node: delay,
+            port: 0,
+        },
+    );
+    d0_circ.connect(
+        SignalSource::NodeOut {
+            node: delay,
+            port: 0,
+        },
+        SignalSink::BoundaryOut(2),
+    );
+    let d0_ed = EditableCircuit::new_with_growth(d0_circ, econ, &growth).unwrap();
+    for class in [DetourClass::D0Dead, DetourClass::D7aFakeComparator] {
+        let mut learner =
+            ArkheLearner::from_editable(d0_ed.clone(), growth, SeedBank::new(0)).unwrap();
+        let pre_len = primary_cone_nodes_without_comparator_taps(
+            learner.editable().circuit(),
+            learner.editable().economy(),
+            2,
+        )
+        .len();
+        let edit = build_detour_edit(learner.editable(), 2, class).unwrap();
+        edit.apply_to_learner(&mut learner, InjectionMode::Established)
+            .unwrap();
+        assert!(
+            comparator_tap_split_nodes(learner.editable().circuit(), learner.editable().economy())
+                .is_empty(),
+            "unregistered {class} Split must never be treated as comparator tap"
+        );
+        let post_len = primary_cone_nodes_without_comparator_taps(
+            learner.editable().circuit(),
+            learner.editable().economy(),
+            2,
+        )
+        .len();
+        assert!(
+            post_len > pre_len,
+            "unregistered {class} bloat must increase primary cone count: pre={pre_len}, post={post_len}"
+        );
+    }
+}
+
+#[test]
+fn t2_multiview_coupled_k2_comb_noisy_seeds_4_13_stabilize_without_secondary_comparator_bloat() {
+    let mut taps = vec![0u64; 11];
+    taps[8] = 1;
+    taps[10] = 1;
+    let d11 = LfsrStage {
+        taps,
+        init: vec![1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+    };
+    let gen_cfg = GeneratorConfig::T2_MultiViewCoupled {
+        driver: MultiViewDriver::Lfsr { stage: d11 },
+        view_0: MultiViewTransform {
+            delay: 1,
+            mul_a: 1,
+            add_b: 0,
+        },
+        view_1: MultiViewTransform {
+            delay: 0,
+            mul_a: 3,
+            add_b: 2,
+        },
+        target: MultiViewTarget::Affine {
+            lag: 2,
+            mul_a: 3,
+            add_b: 1,
+        },
+    };
+    let econ = EconomyConfig::default();
+    let growth = GrowthConfig::default();
+    let noise = NoiseModel::IndependentSubstitution {
+        epsilon: 0.05,
+        channels: vec![0, 1, 2],
+    };
+
+    for seed in [4u64, 13u64] {
+        let sb = SeedBank::new(seed);
+        let mut env =
+            NoisyEnvironment::new(gen_cfg.build(Width::BITS_2).unwrap(), noise.clone(), sb)
+                .unwrap();
+        let mut learner = ArkheLearner::new_with_config(
+            Width::BITS_2,
+            3,
+            WireDelayMode::Combinational,
+            econ,
+            growth,
+            sb,
+        )
+        .unwrap();
+        let mut budget = TickBudget::new(800_000);
+        let mut clean = [0u64; 3];
+        let mut obs = [0u64; 3];
+        let mut settled_n: Option<usize> = None;
+        let mut n_2000 = 0usize;
+        for t in 0..8_000u64 {
+            env.step_frame(&mut clean, &mut obs);
+            let _ = learner.predict(&mut budget);
+            learner.observe(&obs, &mut budget);
+            if settled_n.is_none() && learner.is_developmental_settled() && t < 2_000 {
+                settled_n = Some(
+                    primary_cone_nodes_without_comparator_taps(
+                        learner.editable().circuit(),
+                        learner.editable().economy(),
+                        2,
+                    )
+                    .len(),
+                );
+            }
+            if t + 1 == 2_000 {
+                n_2000 = primary_cone_nodes_without_comparator_taps(
+                    learner.editable().circuit(),
+                    learner.editable().economy(),
+                    2,
+                )
+                .len();
+                if settled_n.is_none() {
+                    settled_n = Some(n_2000);
+                }
+            }
+        }
+        let n_8000 = primary_cone_nodes_without_comparator_taps(
+            learner.editable().circuit(),
+            learner.editable().economy(),
+            2,
+        )
+        .len();
+        let mut comps_by_port = [0usize; 3];
+        for c in learner.editable().economy().comparators() {
+            comps_by_port[usize::from(c.target_port)] += 1;
+        }
+        let max_comp = comps_by_port.into_iter().max().unwrap_or(0);
+        assert!(
+            max_comp <= 1,
+            "seed={seed} retained multiple comparators on one port: {comps_by_port:?}"
+        );
+        assert!(
+            n_8000 <= n_2000 && n_2000 <= settled_n.unwrap_or(n_2000),
+            "seed={seed} primary cone drifted: settle={settled_n:?}, 2k={n_2000}, 8k={n_8000}"
+        );
+    }
 }

@@ -456,3 +456,52 @@ fn charter_1_3_offline_loopback_falsification_and_majority_pruning() {
         assert_eq!(clean_report.max_circular_discrepancy, 0);
     }
 }
+
+#[test]
+fn mv_addeqz_k2_comb_forms_causal_disjoint_comparator_on_seed_0() {
+    let mut taps = vec![0u64; 11];
+    taps[8] = 1;
+    taps[10] = 1;
+    let d11 = LfsrStage {
+        taps,
+        init: vec![1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+    };
+    let cfg = arkhe_experiment_config(
+        Width::BITS_2,
+        WireDelayMode::Combinational,
+        GeneratorConfig::T2_MultiViewCoupled {
+            driver: MultiViewDriver::Lfsr { stage: d11 },
+            view_0: MultiViewTransform {
+                delay: 0,
+                mul_a: 1,
+                add_b: 0,
+            },
+            view_1: MultiViewTransform {
+                delay: 3,
+                mul_a: 1,
+                add_b: 0,
+            },
+            target: MultiViewTarget::AddEqz { lag_a: 5, lag_b: 6 },
+        },
+        NoiseModel::None,
+        2_000,
+        500,
+        0,
+    );
+    let report = execute_experiment(&cfg).expect("MV_AddEqz_k2_Comb succeeds");
+    let ch2 = report
+        .scorecard
+        .per_channel
+        .get(2)
+        .expect("target channel 2 scorecard present");
+    assert_eq!(ch2.post_transient_clean_mismatches, 0);
+    let tel = report.m1_telemetry.as_ref().expect("telemetry present");
+    assert!(
+        tel.active_comparator_count >= 1,
+        "MV_AddEqz_k2_Comb must form target comparator, got active_comparator_count={}",
+        tel.active_comparator_count
+    );
+    assert_eq!(tel.comparator_disagreement_ticks, 0);
+    assert_eq!(tel.disagreement_prune_events, 0);
+    assert_eq!(tel.sprout_blocked_max_nodes, 0);
+}

@@ -1803,6 +1803,17 @@ impl ArkheLearner {
                         Some(false)
                     } else if f_pri <= 0.0 && f_alt > 0.0 {
                         Some(true)
+                    } else if disagreements.saturating_mul(2) >= win_after.disagree.len() {
+                        let full_len = win_after.disagree.len();
+                        let e_pri_obs = win_after.e_primary_count_tail(full_len);
+                        let e_alt_obs = win_after.e_alt_count_tail(full_len);
+                        if e_alt_obs > e_pri_obs && (f_pri - f_alt) > delta_l_comp {
+                            Some(false)
+                        } else if e_pri_obs > e_alt_obs && (f_alt - f_pri) > delta_l_comp {
+                            Some(true)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };

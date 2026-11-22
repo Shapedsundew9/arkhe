@@ -2131,6 +2131,98 @@ pub fn primary_cone_nodes(
     cone
 }
 
+/// Returns shared `Primitive::Split` fan-out tap nodes whose extra fan-out branch only exists to
+/// feed registered [`ComparatorSite`] subgraphs (i.e., collapsing registered comparators reduces the
+/// `Split` to `<= 1` non-comparator consumer while leaving unregistered free-rider `Split`s intact).
+#[must_use]
+pub fn comparator_tap_split_nodes(circuit: &Circuit, economy: &EconomyState) -> BTreeSet<NodeId> {
+    let comps = economy.comparators();
+    if comps.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut comp_nodes = comparator_exclusive_nodes(circuit, economy);
+    for comp in comps {
+        comp_nodes.insert(comp.sub_node);
+        comp_nodes.insert(comp.eqz_node);
+    }
+
+    let n = circuit.node_count();
+    let mut out_edges: Vec<Vec<(usize, Option<NodeId>)>> = vec![Vec::new(); n];
+    for (ei, edge) in circuit.edges().iter().enumerate() {
+        if let SignalSource::NodeOut { node: src, .. } = edge.src {
+            let dst_node = match edge.dst {
+                SignalSink::NodeIn { node, .. } => Some(node),
+                SignalSink::BoundaryOut(_) => None,
+            };
+            out_edges[src.index()].push((ei, dst_node));
+        }
+    }
+
+    let mut eliminated_edge = vec![false; circuit.edges().len()];
+    for (ei, edge) in circuit.edges().iter().enumerate() {
+        if let SignalSink::NodeIn { node, .. } = edge.dst
+            && comp_nodes.contains(&node)
+        {
+            eliminated_edge[ei] = true;
+        }
+    }
+
+    let mut tap_splits = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (idx, edges) in out_edges.iter().enumerate().take(n) {
+            if circuit.nodes()[idx] != Primitive::Split {
+                continue;
+            }
+            let node = NodeId(u32::try_from(idx).expect("node index fits in u32"));
+            if comp_nodes.contains(&node) || tap_splits.contains(&node) {
+                continue;
+            }
+            let mut surv = 0usize;
+            let mut elim = 0usize;
+            for &(ei, _) in edges {
+                if eliminated_edge[ei] {
+                    elim += 1;
+                } else {
+                    surv += 1;
+                }
+            }
+            if elim > 0 && surv <= 1 {
+                tap_splits.insert(node);
+                changed = true;
+                if surv == 0 {
+                    for (ei, edge) in circuit.edges().iter().enumerate() {
+                        if matches!(edge.dst, SignalSink::NodeIn { node: d, .. } if d == node)
+                            && !eliminated_edge[ei]
+                        {
+                            eliminated_edge[ei] = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    tap_splits
+}
+
+/// Returns [`primary_cone_nodes`] excluding pure registered-comparator tap `Split` nodes from
+/// [`comparator_tap_split_nodes`].
+#[must_use]
+pub fn primary_cone_nodes_without_comparator_taps(
+    circuit: &Circuit,
+    economy: &EconomyState,
+    port: u16,
+) -> BTreeSet<NodeId> {
+    let mut cone = primary_cone_nodes(circuit, economy, port);
+    for tap in comparator_tap_split_nodes(circuit, economy) {
+        cone.remove(&tap);
+    }
+    cone
+}
+
 fn comparator_exclusive_nodes(circuit: &Circuit, economy: &EconomyState) -> BTreeSet<NodeId> {
     let comps = economy.comparators();
     if comps.is_empty() {

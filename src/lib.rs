@@ -85,7 +85,7 @@ pub enum Commands {
         /// Number of consecutive seed banks to score (when set, activates multi-bank mode).
         #[arg(long)]
         banks: Option<u32>,
-        /// Explicit authorization to run against pre-registered M2a holdout seeds 30000..=30019.
+        /// Pre-registered M2a holdout range (30000..=30019 consumed at aa6fb6d and permanently closed).
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
     },
@@ -103,7 +103,7 @@ pub enum Commands {
         /// Number of consecutive seed banks to score (when set, activates multi-bank mode).
         #[arg(long)]
         banks: Option<u32>,
-        /// Explicit authorization to run against pre-registered M2b holdout seeds 40000..=40019.
+        /// Pre-registered M2b holdout range (40000..=40019 consumed at b211afa and permanently closed).
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
     },
@@ -130,7 +130,7 @@ pub enum Commands {
         /// Number of consecutive seed banks to score (when set, activates multi-bank mode).
         #[arg(long)]
         banks: Option<u32>,
-        /// Explicit authorization to run against pre-registered M3 holdout seeds 50000..=50019.
+        /// Explicit authorization to run against fresh M3 v2 100-seed holdout seeds 50100..=50199 (50000..=50019 permanently closed).
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
         /// Optional path to write the JSON verification report (prints to stdout when omitted).

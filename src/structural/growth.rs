@@ -24,7 +24,8 @@ use crate::structural::surgery::{
     port_upstream_cone_and_edges, port_uses_boundary_in, register_mapping,
 };
 use crate::substrate::{
-    Circuit, Edge, NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
+    Circuit, CompiledCircuit, Edge, NodeId, Primitive, ScalarState, SignalSink, SignalSource,
+    Width, WireDelayMode,
 };
 
 /// Numerical tolerance for deterministic candidate $\Delta J$ tie-breaking.
@@ -2382,6 +2383,207 @@ fn replay_current_baseline(
     }
 }
 
+fn new_acyclic_register_depth(
+    staged: &Circuit,
+    is_surviving_node: &[bool],
+    is_cyclic_node: &[bool],
+) -> usize {
+    fn rec(
+        circuit: &Circuit,
+        node: NodeId,
+        is_surviving_node: &[bool],
+        is_cyclic_node: &[bool],
+        memo: &mut [Option<usize>],
+        on_path: &mut [bool],
+    ) -> usize {
+        let idx = node.index();
+        if is_surviving_node.get(idx).copied().unwrap_or(false)
+            || is_cyclic_node.get(idx).copied().unwrap_or(false)
+            || on_path[idx]
+        {
+            return 0;
+        }
+        if let Some(cached) = memo[idx] {
+            return cached;
+        }
+        on_path[idx] = true;
+        let self_reg = usize::from(circuit.nodes()[idx].is_stateful());
+        let is_tph = circuit.wire_delay() == WireDelayMode::TicksPerHop;
+        let mut max_up = 0usize;
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == node
+            {
+                let hop_regs = if is_tph { usize::from(edge.hops) } else { 0 };
+                let up = match edge.src {
+                    SignalSource::BoundaryIn(_) => hop_regs,
+                    SignalSource::NodeOut { node: src, .. } => {
+                        hop_regs
+                            + rec(
+                                circuit,
+                                src,
+                                is_surviving_node,
+                                is_cyclic_node,
+                                memo,
+                                on_path,
+                            )
+                    }
+                };
+                max_up = max_up.max(up);
+            }
+        }
+        on_path[idx] = false;
+        let depth = self_reg + max_up;
+        memo[idx] = Some(depth);
+        depth
+    }
+
+    let n = staged.node_count();
+    let mut memo = vec![None; n];
+    let mut on_path = vec![false; n];
+    let mut max_depth = 0usize;
+    for idx in 0..n {
+        if !is_surviving_node[idx] && !is_cyclic_node[idx] {
+            max_depth = max_depth.max(rec(
+                staged,
+                NodeId(u32::try_from(idx).expect("node index fits in u32")),
+                is_surviving_node,
+                is_cyclic_node,
+                &mut memo,
+                &mut on_path,
+            ));
+        }
+    }
+    if staged.wire_delay() == WireDelayMode::TicksPerHop {
+        for edge in staged.edges() {
+            if edge.hops > 0
+                && matches!(edge.dst, SignalSink::BoundaryOut(_))
+                && let SignalSource::NodeOut { node: src, .. } = edge.src
+                && !is_surviving_node.get(src.index()).copied().unwrap_or(false)
+                && !is_cyclic_node.get(src.index()).copied().unwrap_or(false)
+            {
+                let d = memo[src.index()].unwrap_or(0) + usize::from(edge.hops);
+                max_depth = max_depth.max(d);
+            }
+        }
+    }
+    max_depth
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prime_non_surviving_registers(
+    staged: &Circuit,
+    staged_compiled: &CompiledCircuit,
+    old_to_new: &[Option<NodeId>],
+    reg_map: &[Option<usize>],
+    protected_new_node: Option<NodeId>,
+    obs_window: &ObservationWindow,
+    start_idx: usize,
+    eval_start_idx: usize,
+    regs: &mut [u64],
+) {
+    if start_idx == 0 {
+        return;
+    }
+    let n = staged.node_count();
+    let mut is_surviving_node = vec![false; n];
+    for mapped in old_to_new.iter().flatten() {
+        if mapped.index() < n {
+            is_surviving_node[mapped.index()] = true;
+        }
+    }
+    if let Some(p_node) = protected_new_node
+        && p_node.index() < n
+    {
+        is_surviving_node[p_node.index()] = true;
+    }
+    let is_cyclic_node: Vec<bool> = (0..n)
+        .map(|idx| {
+            !is_surviving_node[idx]
+                && source_has_cycle(
+                    staged,
+                    SignalSource::NodeOut {
+                        node: NodeId(u32::try_from(idx).expect("node index fits in u32")),
+                        port: 0,
+                    },
+                )
+        })
+        .collect();
+    let d_new = new_acyclic_register_depth(staged, &is_surviving_node, &is_cyclic_node);
+    if eval_start_idx.saturating_sub(start_idx) >= d_new {
+        return;
+    }
+
+    let mut is_untouched_reg = vec![false; regs.len()];
+    for nr in reg_map.iter().flatten().copied() {
+        if nr < is_untouched_reg.len() {
+            is_untouched_reg[nr] = true;
+        }
+    }
+    let mut exp_reg = 0usize;
+    for (idx, prim) in staged.nodes().iter().enumerate() {
+        if prim.is_stateful() {
+            if exp_reg < is_untouched_reg.len() && (is_surviving_node[idx] || is_cyclic_node[idx]) {
+                is_untouched_reg[exp_reg] = true;
+            }
+            exp_reg += 1;
+        }
+    }
+    if staged.wire_delay() == WireDelayMode::TicksPerHop {
+        let mut base = staged_compiled.explicit_delay_count();
+        for edge in staged.edges() {
+            let hops = usize::from(edge.hops);
+            let untouched = match edge.src {
+                SignalSource::NodeOut { node, .. } => {
+                    is_surviving_node
+                        .get(node.index())
+                        .copied()
+                        .unwrap_or(false)
+                        || is_cyclic_node.get(node.index()).copied().unwrap_or(false)
+                }
+                SignalSource::BoundaryIn(_) => match edge.dst {
+                    SignalSink::NodeIn { node, .. } => is_surviving_node
+                        .get(node.index())
+                        .copied()
+                        .unwrap_or(false),
+                    SignalSink::BoundaryOut(_) => true,
+                },
+            };
+            if untouched {
+                for s in 0..hops {
+                    if base + s < is_untouched_reg.len() {
+                        is_untouched_reg[base + s] = true;
+                    }
+                }
+            }
+            base += hops;
+        }
+    }
+
+    let prime_start = start_idx.saturating_sub(d_new);
+    let mut shadow = ScalarState::new(staged_compiled);
+    let mut dummy_pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
+    for idx in prime_start..start_idx {
+        let input = if idx == 0 {
+            obs_window.prior_frame()
+        } else {
+            &obs_window.frames()[idx - 1]
+        };
+        if shadow
+            .step(staged_compiled, input, &mut dummy_pred)
+            .is_err()
+        {
+            return;
+        }
+    }
+    let shadow_regs = shadow.registers();
+    for (r, untouched) in is_untouched_reg.iter().enumerate() {
+        if !*untouched && r < regs.len() && r < shadow_regs.len() {
+            regs[r] = shadow_regs[r];
+        }
+    }
+}
+
 enum SproutMotifOutcome {
     Accepted {
         circuit: Circuit,
@@ -2930,6 +3132,17 @@ fn evaluate_sprout_motif(
                 staged_regs[*nr] = snap_regs[old_r];
             }
         }
+        prime_non_surviving_registers(
+            &staged,
+            &staged_compiled,
+            &baseline.survivor_map,
+            &reg_map,
+            None,
+            obs_window,
+            baseline.start_idx,
+            baseline.eval_start_idx,
+            &mut staged_regs,
+        );
         let _ = state.set_registers(&staged_compiled, &staged_regs);
     }
     let num_outputs = usize::from(staged_compiled.num_outputs());
@@ -5618,6 +5831,13 @@ fn evaluate_stage3_candidate_pre(
     if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(baseline.start_idx)
         && snap_epoch == editable.structure_epoch()
     {
+        let reg_map = register_mapping(
+            editable.circuit(),
+            &staged,
+            editable.compiled(),
+            &staged_compiled,
+            &old_to_new,
+        );
         let mut regs = state.registers().to_vec();
         if let Some(split_node) = spliced
             .inserted_split
@@ -5637,13 +5857,6 @@ fn evaluate_stage3_candidate_pre(
                 regs = adj_regs;
             }
         } else {
-            let reg_map = register_mapping(
-                editable.circuit(),
-                &staged,
-                editable.compiled(),
-                &staged_compiled,
-                &old_to_new,
-            );
             for (old_r, new_r) in reg_map.iter().enumerate() {
                 if let Some(nr) = new_r
                     && old_r < snap_regs.len()
@@ -5652,6 +5865,19 @@ fn evaluate_stage3_candidate_pre(
                 }
             }
         }
+        prime_non_surviving_registers(
+            &staged,
+            &staged_compiled,
+            &old_to_new,
+            &reg_map,
+            spliced
+                .inserted_split
+                .filter(|_| spliced.primary_autonomous_shifted),
+            obs_window,
+            baseline.start_idx,
+            baseline.eval_start_idx,
+            &mut regs,
+        );
         if let Some((period, ref mu, ref delay_nodes)) = autonomous_ring {
             let align_tick = (obs_window.start_tick() as usize) + baseline.start_idx;
             for (j, &delay_node) in delay_nodes.iter().enumerate() {
@@ -5675,6 +5901,7 @@ fn evaluate_stage3_candidate_pre(
     let mut pred = vec![0u64; num_outputs];
     let mut e_cand_by_port = vec![0usize; num_outputs];
     let mut e_alt_diag = 0usize;
+    let mut disagree_diag = 0usize;
     let mut flux_alt = 0.0f64;
     let sub_alt_wire = staged_compiled.node_input_wires()[spliced.sub_node.index()][1];
     let mut alt_scorer = PointForecastScorer::new(
@@ -5707,6 +5934,9 @@ fn evaluate_stage3_candidate_pre(
             if alt_val != truth[out_idx] {
                 e_alt_diag += 1;
             }
+            if staged.width().normalize(alt_val) != staged.width().normalize(pred[out_idx]) {
+                disagree_diag += 1;
+            }
             flux_alt += score_with_reward_mode(
                 &mut alt_scorer,
                 economy_config.reward_mode,
@@ -5729,10 +5959,15 @@ fn evaluate_stage3_candidate_pre(
     }
 
     let l_cand = circuit_code_bits_with_tax(&staged, 0, economy_config.split_code_tax);
-    let eval_len = baseline
+    let eval_len_usize = baseline
         .w_replay
-        .saturating_sub(baseline.eval_start_idx.saturating_sub(baseline.start_idx))
-        as u64;
+        .saturating_sub(baseline.eval_start_idx.saturating_sub(baseline.start_idx));
+    if e_alt_diag > baseline.e_curr_by_port[out_idx]
+        && disagree_diag.saturating_mul(2) >= eval_len_usize
+    {
+        return None;
+    }
+    let eval_len = eval_len_usize as u64;
     let j_cand = l_cand + facts_code_bits(staged.width(), eval_len, e_alt_diag as u64);
     let alt_channel_mask = if autonomous_ring.is_some() {
         0

@@ -18,8 +18,10 @@ use crate::env::{
 use crate::metrics::{BudgetAccountingMode, Scorecard};
 use crate::rng::SeedBank;
 use crate::stats::{
-    BankSample, CaseOutcome, MultiBankGateResult, OnlineCaseSummary, classify_case_outcome,
-    evaluate_multi_bank_gate,
+    BankSample, BankTailMetricMap, BankTaskCountMap, CaseOutcome, GateRegime, HoldoutRangeSpec,
+    MultiBankGateResult, OnlineCaseSummary, StratifiedGateAudit, check_seed_range_holdouts,
+    classify_case_outcome, evaluate_multi_bank_gate, evaluate_stratified_from_bank_maps,
+    update_max_finite, update_min_finite,
 };
 use crate::structural::{ArkheLearner, EconomyConfig, GrowthConfig};
 use crate::substrate::{Circuit, SignalSink, SignalSource, Width, WireDelayMode};
@@ -35,74 +37,92 @@ pub const DEFAULT_M2A_BUDGET: u64 = 200_000;
 pub const M1_HOLDOUT_SEED_START: u32 = 10_000;
 /// Reserved M1 holdout seed range end (inclusive).
 pub const M1_HOLDOUT_SEED_END: u32 = 10_019;
-/// Pre-registered M2a single-shot holdout seed range start (§4).
+/// Pre-registered M2a single-shot holdout seed range start (consumed at `aa6fb6d`; permanently closed).
 pub const M2A_HOLDOUT_SEED_START: u32 = 30_000;
 /// Pre-registered M2a single-shot holdout seed range end (inclusive).
 pub const M2A_HOLDOUT_SEED_END: u32 = 30_019;
-/// Reserved M2b holdout seed range start (never touched by M2a).
+/// Reserved M2b holdout seed range start (consumed at `b211afa`; permanently closed).
 pub const M2B_HOLDOUT_SEED_START: u32 = 40_000;
 /// Reserved M2b holdout seed range end (inclusive).
 pub const M2B_HOLDOUT_SEED_END: u32 = 40_019;
-/// Reserved M3 holdout seed range start (never touched by M2a).
+/// Reserved M3 v1 holdout seed range start (consumed at `dd13839`; permanently closed).
 pub const M3_HOLDOUT_SEED_START: u32 = 50_000;
-/// Reserved M3 holdout seed range end (inclusive).
+/// Reserved M3 v1 holdout seed range end (inclusive).
 pub const M3_HOLDOUT_SEED_END: u32 = 50_019;
-/// Reserved M4a holdout seed range start (never touched by M2a).
+/// Reserved M3 v2 100-seed holdout seed range start (never touched by M2a).
+pub const M3_V2_HOLDOUT_SEED_START: u32 = 50_100;
+/// Reserved M3 v2 100-seed holdout seed range end (inclusive).
+pub const M3_V2_HOLDOUT_SEED_END: u32 = 50_199;
+/// Reserved M4a 100-seed holdout seed range start (never touched by M2a).
 pub const M4A_HOLDOUT_SEED_START: u32 = 60_000;
-/// Reserved M4a holdout seed range end (inclusive).
-pub const M4A_HOLDOUT_SEED_END: u32 = 60_019;
+/// Reserved M4a 100-seed holdout seed range end (inclusive).
+pub const M4A_HOLDOUT_SEED_END: u32 = 60_099;
 
-/// Checks whether `[seed_offset, seed_offset + seeds)` overlaps any reserved holdout seed range.
+/// Checks whether `[seed_offset, seed_offset + seeds)` overlaps any reserved or closed holdout range.
 ///
-/// - `10000..=10019` (M1 holdout), `40000..=40019` (M2b holdout), `50000..=50019` (M3 holdout),
-///   and `60000..=60019` (M4a holdout) are unconditionally refused by `verify-m2a`.
-/// - `30000..=30019` (M2a single-shot holdout) is refused unless `allow_holdout == true`.
+/// Unconditionally refuses `10000..=10019` (M1), `30000..=30019` (closed M2a), `40000..=40019`
+/// (closed M2b), `50000..=50019` (closed M3 v1), `50100..=50199` (M3 v2), and `60000..=60099`
+/// (M4a), even when `allow_holdout == true`.
 ///
 /// # Errors
 ///
-/// Returns an explanatory error string whenever a guarded holdout range overlaps without valid
-/// authorization.
+/// Returns an explanatory error string whenever a guarded holdout range overlaps.
 pub fn check_m2a_seed_range_holdout(
     seed_offset: u32,
     seeds: u32,
     allow_holdout: bool,
 ) -> Result<(), String> {
-    let start = seed_offset;
-    let end = seed_offset.saturating_add(seeds.max(1));
-
-    let overlaps = |lo: u32, hi: u32| start <= hi && end > lo;
-
-    if overlaps(M1_HOLDOUT_SEED_START, M1_HOLDOUT_SEED_END) {
-        return Err(format!(
-            "refusing seed range {start}..{end} which overlaps pre-registered holdout range \
-             {M1_HOLDOUT_SEED_START}..={M1_HOLDOUT_SEED_END} (reserved for M1)"
-        ));
-    }
-    if overlaps(M2B_HOLDOUT_SEED_START, M2B_HOLDOUT_SEED_END) {
-        return Err(format!(
-            "refusing seed range {start}..{end} which overlaps pre-registered holdout range \
-             {M2B_HOLDOUT_SEED_START}..={M2B_HOLDOUT_SEED_END} (reserved for M2b)"
-        ));
-    }
-    if overlaps(M3_HOLDOUT_SEED_START, M3_HOLDOUT_SEED_END) {
-        return Err(format!(
-            "refusing seed range {start}..{end} which overlaps pre-registered holdout range \
-             {M3_HOLDOUT_SEED_START}..={M3_HOLDOUT_SEED_END} (reserved for M3)"
-        ));
-    }
-    if overlaps(M4A_HOLDOUT_SEED_START, M4A_HOLDOUT_SEED_END) {
-        return Err(format!(
-            "refusing seed range {start}..{end} which overlaps pre-registered holdout range \
-             {M4A_HOLDOUT_SEED_START}..={M4A_HOLDOUT_SEED_END} (reserved for M4a)"
-        ));
-    }
-    if overlaps(M2A_HOLDOUT_SEED_START, M2A_HOLDOUT_SEED_END) && !allow_holdout {
-        return Err(format!(
-            "refusing seed range {start}..{end} which overlaps pre-registered holdout range \
-             {M2A_HOLDOUT_SEED_START}..={M2A_HOLDOUT_SEED_END} without --holdout flag"
-        ));
-    }
-    Ok(())
+    let ranges = [
+        HoldoutRangeSpec {
+            label: "M1",
+            start: u64::from(M1_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M1_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "reserved M1 holdout",
+        },
+        HoldoutRangeSpec {
+            label: "M2a",
+            start: u64::from(M2A_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M2A_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "consumed at aa6fb6d; permanently closed",
+        },
+        HoldoutRangeSpec {
+            label: "M2b",
+            start: u64::from(M2B_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M2B_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "consumed at b211afa; permanently closed",
+        },
+        HoldoutRangeSpec {
+            label: "M3",
+            start: u64::from(M3_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M3_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "consumed at dd13839; permanently closed",
+        },
+        HoldoutRangeSpec {
+            label: "M3_v2",
+            start: u64::from(M3_V2_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M3_V2_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "reserved M3 v2 holdout",
+        },
+        HoldoutRangeSpec {
+            label: "M4a",
+            start: u64::from(M4A_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M4A_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "reserved M4a holdout",
+        },
+    ];
+    check_seed_range_holdouts(
+        "verify-m2a",
+        u64::from(seed_offset),
+        u64::from(seeds.max(1)),
+        allow_holdout,
+        &ranges,
+    )
 }
 
 /// Summary of one baseline evaluated on a `G2A.5` benchmark task.
@@ -170,6 +190,8 @@ pub struct M2aGateReport {
     /// Failure explanations, if any.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub failures: Vec<String>,
+    /// Statistical Policy Option A + D regime-stratified & per-task tail audit.
+    pub stratified: StratifiedGateAudit,
 }
 
 /// Complete Milestone 2a verification report for one seed slice (`verify-m2a`).
@@ -216,8 +238,10 @@ pub struct M2aBankGateReport {
     /// For `G2A.4`, maximum pooled task-level `|mean(kt_learner) - H_reactive(eps, m, k)|` (`<= 0.040` b/sym).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_g2a4b_mean_h_reactive_dev_bits: Option<f64>,
-    /// Whether `stats.passed`, `excluded_cases == 0`, `G2A.4b` mean deviation, and `G2A.5` margin passed.
+    /// Whether `stats.passed`, `stratified.passed`, `excluded_cases == 0`, `G2A.4b` mean deviation, and `G2A.5` margin passed.
     pub passed: bool,
+    /// Statistical Policy Option A + D regime-stratified & per-task tail audit.
+    pub stratified: StratifiedGateAudit,
 }
 
 /// Multi-bank Milestone 2a verification report (`verify-m2a --banks N`).
@@ -1161,19 +1185,24 @@ fn reduce_g2a3_seed(
     solos: &[G2a3SoloOutcome],
     multis: &[G2a3MultiOutcome],
     multi_specs: &[G2a3MultiSpec],
-) -> SeedOutcome {
+) -> (SeedOutcome, Vec<M2aTaskRecord>) {
     let w_diag = GrowthConfig::default().diagnostic_window as f64;
     let mut seed_cliff = CliffCountersSummary::default();
     let mut excluded_cases = 0usize;
     let mut failures = Vec::new();
     let mut all_ok = true;
+    let mut task_records = Vec::with_capacity(multi_specs.len());
 
     let mut solo_seen = vec![false; solos.len()];
     for (m_out, m_spec) in multis.iter().zip(multi_specs) {
+        let mut solo_excl = false;
         for &solo_idx in &m_spec.solo_indices {
+            let s = &solos[solo_idx];
+            if s.excluded {
+                solo_excl = true;
+            }
             if !solo_seen[solo_idx] {
                 solo_seen[solo_idx] = true;
-                let s = &solos[solo_idx];
                 seed_cliff.accumulate(&s.cliff);
                 if s.excluded {
                     excluded_cases += 1;
@@ -1186,6 +1215,7 @@ fn reduce_g2a3_seed(
             excluded_cases += 1;
             all_ok = false;
         }
+        let mut task_ok = !m_out.excluded && !solo_excl;
         for (ch, &solo_idx) in m_spec.solo_indices.iter().enumerate() {
             let solo_t = solos[solo_idx].t_lock;
             let (tm_opt, clean_mis) = m_out.channels[ch];
@@ -1197,6 +1227,7 @@ fn reduce_g2a3_seed(
             };
             if !ch_ok {
                 all_ok = false;
+                task_ok = false;
                 failures.push(format!(
                     "G2A.3 {} {:?} ch={ch} seed={master_seed}: \
                      solo={solo_t:?} multi={tm_opt:?} clean_mis={clean_mis}",
@@ -1204,14 +1235,24 @@ fn reduce_g2a3_seed(
                 ));
             }
         }
+        task_records.push(M2aTaskRecord {
+            gate_idx: 2,
+            task_label: format!("G2A.3:{}({:?})", m_spec.panel_label, m_spec.wire_delay),
+            regime: GateRegime::Clean,
+            passed: task_ok,
+            tail_metrics: Vec::new(),
+        });
     }
 
-    SeedOutcome {
-        passed: all_ok && excluded_cases == 0,
-        cliff: seed_cliff,
-        excluded_cases,
-        failures,
-    }
+    (
+        SeedOutcome {
+            passed: all_ok && excluded_cases == 0,
+            cliff: seed_cliff,
+            excluded_cases,
+            failures,
+        },
+        task_records,
+    )
 }
 
 enum ReactiveTargetRule {
@@ -1482,7 +1523,11 @@ fn build_g2a4a_machine(width: Width, gen_cfg: &GeneratorConfig) -> Option<Epsilo
     .epsilon_machine
 }
 
-fn run_g2a4a_task(spec: &G2a4aTaskSpec, master_seed: u64, horizon: u64) -> TaskOutcomePiece {
+fn run_g2a4a_task(
+    spec: &G2a4aTaskSpec,
+    master_seed: u64,
+    horizon: u64,
+) -> (TaskOutcomePiece, Option<f64>) {
     let seeds_bank = SeedBank::new(master_seed);
     let generator = spec.gen_cfg.build(spec.width).unwrap();
     let channels = generator.channels();
@@ -1510,19 +1555,22 @@ fn run_g2a4a_task(spec: &G2a4aTaskSpec, master_seed: u64, horizon: u64) -> TaskO
             spec.label, target_sc.prequential_kt_residual_bits_per_symbol, res.excluded
         )
     });
-    TaskOutcomePiece {
-        ok,
-        excluded: res.excluded,
-        cliff: res.cliff,
-        failure,
-    }
+    (
+        TaskOutcomePiece {
+            ok,
+            excluded: res.excluded,
+            cliff: res.cliff,
+            failure,
+        },
+        regret,
+    )
 }
 
 fn run_g2a4b_task(
     spec: &G2a4bTaskSpec,
     master_seed: u64,
     horizon: u64,
-) -> (TaskOutcomePiece, (f64, f64)) {
+) -> (TaskOutcomePiece, (f64, f64), f64) {
     let seeds_bank = SeedBank::new(master_seed);
     let generator = spec.gen_cfg.build(spec.width).unwrap();
     let channels = generator.channels();
@@ -1578,6 +1626,7 @@ fn run_g2a4b_task(
             failure,
         },
         (kt, h_react),
+        paired_diff,
     )
 }
 
@@ -1884,10 +1933,20 @@ fn aggregate_g2a5_benchmarks(
     (reports, min_required_margin)
 }
 
+struct M2aTaskRecord {
+    gate_idx: usize,
+    task_label: String,
+    regime: GateRegime,
+    passed: bool,
+    tail_metrics: Vec<(&'static str, f64)>,
+}
+
 struct EvaluatedSingleBank {
     summary: M2aVerificationSummary,
     raw_g2a4b_metrics: Vec<[(f64, f64); 4]>,
     raw_g2a5_metrics: Vec<Vec<[G2a5RunMetrics; 7]>>,
+    gate_task_counts: [BankTaskCountMap; 5],
+    gate_task_tails: [BankTailMetricMap; 5],
 }
 
 const M2A_GATE_SPECS: [(&str, f64); 5] = [
@@ -1902,6 +1961,7 @@ struct AllGatesSeedOutcome {
     gates: [SeedOutcome; 5],
     g4b_samples: [(f64, f64); 4],
     g5_metrics: Vec<[G2a5RunMetrics; 7]>,
+    task_records: Vec<M2aTaskRecord>,
 }
 
 /// Shared task specs plus deterministic yardstick/baseline caches built in parallel once per run.
@@ -2106,11 +2166,13 @@ enum M2aTaskPayload {
     G4a {
         idx: usize,
         piece: TaskOutcomePiece,
+        regret: Option<f64>,
     },
     G4b {
         idx: usize,
         piece: TaskOutcomePiece,
         sample: (f64, f64),
+        paired_diff: f64,
     },
     G5 {
         idx: usize,
@@ -2179,13 +2241,19 @@ fn execute_m2a_task(
             idx,
             out: run_g2a3_multi_task(&specs.g3_multis[idx], master_seed, horizon),
         },
-        M2aTaskKind::G4a(idx) => M2aTaskPayload::G4a {
-            idx,
-            piece: run_g2a4a_task(&specs.g4a[idx], master_seed, horizon),
-        },
+        M2aTaskKind::G4a(idx) => {
+            let (piece, regret) = run_g2a4a_task(&specs.g4a[idx], master_seed, horizon);
+            M2aTaskPayload::G4a { idx, piece, regret }
+        }
         M2aTaskKind::G4b(idx) => {
-            let (piece, sample) = run_g2a4b_task(&specs.g4b[idx], master_seed, horizon);
-            M2aTaskPayload::G4b { idx, piece, sample }
+            let (piece, sample, paired_diff) =
+                run_g2a4b_task(&specs.g4b[idx], master_seed, horizon);
+            M2aTaskPayload::G4b {
+                idx,
+                piece,
+                sample,
+                paired_diff,
+            }
         }
         M2aTaskKind::G5(idx) => {
             let (piece, metrics) = run_g2a5_task(
@@ -2228,6 +2296,8 @@ fn reduce_task_pieces(pieces: impl IntoIterator<Item = (TaskOutcomePiece, usize)
     }
 }
 
+type G4bTaskSample = (TaskOutcomePiece, (f64, f64), f64);
+
 struct SeedTaskAccumulator {
     g1: Vec<Option<(TaskOutcomePiece, usize)>>,
     g2_deep: Vec<Option<TaskOutcomePiece>>,
@@ -2235,8 +2305,8 @@ struct SeedTaskAccumulator {
     g2_tph: Vec<Option<TaskOutcomePiece>>,
     g3_solos: Vec<Option<G2a3SoloOutcome>>,
     g3_multis: Vec<Option<G2a3MultiOutcome>>,
-    g4a: Vec<Option<TaskOutcomePiece>>,
-    g4b: Vec<Option<(TaskOutcomePiece, (f64, f64))>>,
+    g4a: Vec<Option<(TaskOutcomePiece, Option<f64>)>>,
+    g4b: Vec<Option<G4bTaskSample>>,
     g5: Vec<Option<(TaskOutcomePiece, [G2a5RunMetrics; 7])>>,
 }
 
@@ -2267,8 +2337,13 @@ impl SeedTaskAccumulator {
             M2aTaskPayload::G2Tph { idx, piece } => self.g2_tph[idx] = Some(piece),
             M2aTaskPayload::G3Solo { idx, out } => self.g3_solos[idx] = Some(out),
             M2aTaskPayload::G3Multi { idx, out } => self.g3_multis[idx] = Some(out),
-            M2aTaskPayload::G4a { idx, piece } => self.g4a[idx] = Some(piece),
-            M2aTaskPayload::G4b { idx, piece, sample } => self.g4b[idx] = Some((piece, sample)),
+            M2aTaskPayload::G4a { idx, piece, regret } => self.g4a[idx] = Some((piece, regret)),
+            M2aTaskPayload::G4b {
+                idx,
+                piece,
+                sample,
+                paired_diff,
+            } => self.g4b[idx] = Some((piece, sample, paired_diff)),
             M2aTaskPayload::G5 {
                 idx,
                 piece,
@@ -2277,30 +2352,69 @@ impl SeedTaskAccumulator {
         }
     }
 
-    fn into_outcome(self, master_seed: u64, multi_specs: &[G2a3MultiSpec]) -> AllGatesSeedOutcome {
+    fn into_outcome(self, master_seed: u64, specs: &M2aSharedSpecs) -> AllGatesSeedOutcome {
         let unit_excl = |p: TaskOutcomePiece| {
             let ex = usize::from(p.excluded);
             (p, ex)
         };
-        let g1 = reduce_task_pieces(
-            self.g1
-                .into_iter()
-                .map(|x| x.expect("G2A.1 task completed")),
-        );
-        let g2 = reduce_task_pieces(
-            self.g2_deep
-                .into_iter()
-                .map(|x| x.expect("G2A.2 deep task completed"))
-                .chain(std::iter::once(
-                    self.g2_ring.expect("G2A.2 M1 ring task completed"),
-                ))
-                .chain(
-                    self.g2_tph
-                        .into_iter()
-                        .map(|x| x.expect("G2A.2 Tph task completed")),
-                )
-                .map(unit_excl),
-        );
+        let mut task_records = Vec::new();
+
+        let g1_items: Vec<(TaskOutcomePiece, usize)> = self
+            .g1
+            .into_iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let (p, ex) = x.expect("G2A.1 task completed");
+                task_records.push(M2aTaskRecord {
+                    gate_idx: 0,
+                    task_label: format!("G2A.1:{}", specs.g1[i].label),
+                    regime: GateRegime::Clean,
+                    passed: p.ok && !p.excluded,
+                    tail_metrics: Vec::new(),
+                });
+                (p, ex)
+            })
+            .collect();
+        let g1 = reduce_task_pieces(g1_items);
+
+        let mut g2_items = Vec::new();
+        for (i, x) in self.g2_deep.into_iter().enumerate() {
+            let p = x.expect("G2A.2 deep task completed");
+            task_records.push(M2aTaskRecord {
+                gate_idx: 1,
+                task_label: format!(
+                    "G2A.2:DeepLag(d={},k={})",
+                    specs.g2_deep[i].lag,
+                    specs.g2_deep[i].width.bits()
+                ),
+                regime: GateRegime::Clean,
+                passed: p.ok && !p.excluded,
+                tail_metrics: Vec::new(),
+            });
+            g2_items.push(unit_excl(p));
+        }
+        let ring_p = self.g2_ring.expect("G2A.2 M1 ring task completed");
+        task_records.push(M2aTaskRecord {
+            gate_idx: 1,
+            task_label: "G2A.2:M1_PeriodicRing(k=1)".to_owned(),
+            regime: GateRegime::Clean,
+            passed: ring_p.ok && !ring_p.excluded,
+            tail_metrics: Vec::new(),
+        });
+        g2_items.push(unit_excl(ring_p));
+        for (i, x) in self.g2_tph.into_iter().enumerate() {
+            let p = x.expect("G2A.2 Tph task completed");
+            task_records.push(M2aTaskRecord {
+                gate_idx: 1,
+                task_label: format!("G2A.2:{}", specs.g2_tph[i].label),
+                regime: GateRegime::Clean,
+                passed: p.ok && !p.excluded,
+                tail_metrics: Vec::new(),
+            });
+            g2_items.push(unit_excl(p));
+        }
+        let g2 = reduce_task_pieces(g2_items);
+
         let solos: Vec<G2a3SoloOutcome> = self
             .g3_solos
             .into_iter()
@@ -2311,17 +2425,38 @@ impl SeedTaskAccumulator {
             .into_iter()
             .map(|x| x.expect("G2A.3 multi task completed"))
             .collect();
-        let g3 = reduce_g2a3_seed(master_seed, &solos, &multis, multi_specs);
+        let (g3, g3_records) = reduce_g2a3_seed(master_seed, &solos, &multis, &specs.g3_multis);
+        task_records.extend(g3_records);
 
         let mut g4_pieces = Vec::with_capacity(self.g4a.len() + self.g4b.len());
-        g4_pieces.extend(
-            self.g4a
+        for (i, x) in self.g4a.into_iter().enumerate() {
+            let (piece, regret) = x.expect("G2A.4a task completed");
+            let tail_metrics = regret
                 .into_iter()
-                .map(|x| unit_excl(x.expect("G2A.4a task completed"))),
-        );
+                .map(|r| ("max_paired_regret", r.abs()))
+                .collect();
+            task_records.push(M2aTaskRecord {
+                gate_idx: 3,
+                task_label: format!("G2A.4a:{}", specs.g4a[i].label),
+                regime: GateRegime::Noisy,
+                passed: piece.ok && !piece.excluded,
+                tail_metrics,
+            });
+            g4_pieces.push(unit_excl(piece));
+        }
         let mut g4b_samples = Vec::with_capacity(self.g4b.len());
-        for item in self.g4b {
-            let (piece, sample) = item.expect("G2A.4b task completed");
+        for (i, item) in self.g4b.into_iter().enumerate() {
+            let (piece, sample, paired_diff) = item.expect("G2A.4b task completed");
+            task_records.push(M2aTaskRecord {
+                gate_idx: 3,
+                task_label: format!("G2A.4b:{}", specs.g4b[i].label),
+                regime: GateRegime::Noisy,
+                passed: piece.ok && !piece.excluded,
+                tail_metrics: vec![
+                    ("max_abs_kt_diff", paired_diff),
+                    ("max_h_reactive_dev", (sample.0 - sample.1).abs()),
+                ],
+            });
             g4_pieces.push(unit_excl(piece));
             g4b_samples.push(sample);
         }
@@ -2329,8 +2464,23 @@ impl SeedTaskAccumulator {
 
         let mut g5_pieces = Vec::with_capacity(self.g5.len());
         let mut g5_metrics = Vec::with_capacity(self.g5.len());
-        for item in self.g5 {
+        for (i, item) in self.g5.into_iter().enumerate() {
             let (piece, metrics) = item.expect("G2A.5 task completed");
+            let arkhe_kt = metrics[0].target_kt;
+            let mut min_adv =
+                (metrics[1].target_kt - arkhe_kt).min(metrics[2].target_kt - arkhe_kt);
+            if specs.g5_panel[i].nonlinear {
+                min_adv = min_adv
+                    .min(metrics[3].target_kt - arkhe_kt)
+                    .min(metrics[4].target_kt - arkhe_kt);
+            }
+            task_records.push(M2aTaskRecord {
+                gate_idx: 4,
+                task_label: format!("G2A.5:{}", specs.g5_panel[i].label),
+                regime: GateRegime::Clean,
+                passed: piece.ok && !piece.excluded,
+                tail_metrics: vec![("min_kt_advantage", min_adv)],
+            });
             g5_pieces.push(unit_excl(piece));
             g5_metrics.push(metrics);
         }
@@ -2340,6 +2490,7 @@ impl SeedTaskAccumulator {
             gates: [g1, g2, g3, g4, g5],
             g4b_samples: g4b_samples.try_into().expect("4 G2A.4b samples per seed"),
             g5_metrics,
+            task_records,
         }
     }
 }
@@ -2420,7 +2571,7 @@ fn evaluate_m2a_seed_range(
         .enumerate()
         .map(|(seed_idx, acc)| {
             let master_seed = u64::from(seed_offset) + (seed_idx as u64);
-            acc.into_outcome(master_seed, &specs.g3_multis)
+            acc.into_outcome(master_seed, specs)
         })
         .collect()
 }
@@ -2436,6 +2587,12 @@ fn summarize_single_bank(
     let mut excl_counts = [0usize; 5];
     let mut gate_cliffs = [CliffCountersSummary::default(); 5];
     let mut gate_failures: [Vec<String>; 5] = Default::default();
+    let mut gate_task_counts: [std::collections::BTreeMap<(String, GateRegime), (usize, usize)>;
+        5] = Default::default();
+    let mut gate_task_tails: [std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, f64>,
+    >; 5] = Default::default();
     let mut raw_g2a4b_metrics = Vec::with_capacity(outcomes.len());
     let mut raw_g2a5_metrics = Vec::with_capacity(outcomes.len());
 
@@ -2447,6 +2604,27 @@ fn summarize_single_bank(
             excl_counts[idx] += g.excluded_cases;
             gate_cliffs[idx].accumulate(&g.cliff);
             gate_failures[idx].extend(g.failures);
+        }
+        for rec in item.task_records {
+            let entry = gate_task_counts[rec.gate_idx]
+                .entry((rec.task_label.clone(), rec.regime))
+                .or_insert((0, 0));
+            entry.1 += 1;
+            if rec.passed {
+                entry.0 += 1;
+            }
+            if !rec.tail_metrics.is_empty() {
+                let tm = gate_task_tails[rec.gate_idx]
+                    .entry(rec.task_label)
+                    .or_default();
+                for (k, v) in rec.tail_metrics {
+                    if k.starts_with("min_") {
+                        update_min_finite(tm, k, v);
+                    } else {
+                        update_max_finite(tm, k, v);
+                    }
+                }
+            }
         }
         raw_g2a4b_metrics.push(item.g4b_samples);
         raw_g2a5_metrics.push(item.g5_metrics);
@@ -2467,6 +2645,16 @@ fn summarize_single_bank(
         let empirical_rate = (passed_seeds as f64) / (total as f64);
         let bank_gate_stats =
             evaluate_multi_bank_gate(&[BankSample::new(passed_seeds, total)], target_rate);
+        let clean_conj = [BankSample::new(passed_seeds, total)];
+        let stratified = evaluate_stratified_from_bank_maps(
+            &[&gate_task_counts[idx]],
+            &[&gate_task_tails[idx]],
+            None,
+            (idx != 3).then_some(&clean_conj[..]),
+            target_rate,
+            target_rate,
+            false,
+        );
         let g4_mean_ok = idx != 3 || max_g4_mean_dev <= 0.040;
         if idx == 3 && !g4_mean_ok {
             gate_failures[idx].push(format!(
@@ -2480,7 +2668,8 @@ fn summarize_single_bank(
             ));
         }
         let min_pass = ((total as f64) * target_rate).ceil() as usize;
-        let passed = excl == 0 && passed_seeds >= min_pass && g4_mean_ok && margin_ok;
+        let passed =
+            excl == 0 && passed_seeds >= min_pass && g4_mean_ok && margin_ok && stratified.passed;
         if !passed {
             all_passed = false;
         }
@@ -2499,6 +2688,7 @@ fn summarize_single_bank(
             min_required_mean_margin_bits: (idx == 4).then_some(min_margin),
             max_g2a4b_mean_h_reactive_dev_bits: (idx == 3).then_some(max_g4_mean_dev),
             failures: gate_failures[idx].clone(),
+            stratified,
         });
     }
 
@@ -2521,6 +2711,8 @@ fn summarize_single_bank(
         summary,
         raw_g2a4b_metrics,
         raw_g2a5_metrics,
+        gate_task_counts,
+        gate_task_tails,
     }
 }
 
@@ -2605,6 +2797,8 @@ pub fn run_m2a_bank_evaluation(
     let mut banks_above_target = [0u32; 5];
     let mut gate_excl = [0usize; 5];
     let mut gate_cliffs = [CliffCountersSummary::default(); 5];
+    let mut per_bank_task_counts: [Vec<BankTaskCountMap>; 5] = Default::default();
+    let mut per_bank_task_tails: [Vec<BankTailMetricMap>; 5] = Default::default();
     let mut all_g2a4b_raw = Vec::with_capacity(total_seeds as usize);
     let mut all_g2a5_raw = Vec::with_capacity(total_seeds as usize);
     let mut failures = Vec::new();
@@ -2616,6 +2810,12 @@ pub fn run_m2a_bank_evaluation(
         total_excluded += out.summary.excluded_cases;
         all_g2a4b_raw.extend(out.raw_g2a4b_metrics);
         all_g2a5_raw.extend(out.raw_g2a5_metrics);
+        for (gi, tc) in out.gate_task_counts.into_iter().enumerate() {
+            per_bank_task_counts[gi].push(tc);
+        }
+        for (gi, tt) in out.gate_task_tails.into_iter().enumerate() {
+            per_bank_task_tails[gi].push(tt);
+        }
 
         for (g_idx, g) in out.summary.gates.iter().enumerate() {
             samples_per_gate[g_idx].push(BankSample::new(g.passed_seeds, g.total_seeds));
@@ -2645,6 +2845,17 @@ pub fn run_m2a_bank_evaluation(
     let mut all_passed = total_excluded == 0;
     for (idx, &(gate_name, target_rate)) in M2A_GATE_SPECS.iter().enumerate() {
         let stats = evaluate_multi_bank_gate(&samples_per_gate[idx], target_rate);
+        let count_refs: Vec<&_> = per_bank_task_counts[idx].iter().collect();
+        let tail_refs: Vec<&_> = per_bank_task_tails[idx].iter().collect();
+        let stratified = evaluate_stratified_from_bank_maps(
+            &count_refs,
+            &tail_refs,
+            None,
+            (idx != 3).then_some(samples_per_gate[idx].as_slice()),
+            target_rate,
+            target_rate,
+            true,
+        );
         let excl = gate_excl[idx];
         let g4_mean_ok = idx != 3 || pooled_max_g4_mean_dev <= 0.040;
         if idx == 3 && !g4_mean_ok && failures.len() < 100 {
@@ -2658,7 +2869,7 @@ pub fn run_m2a_bank_evaluation(
                 "G2A.5 pooled min required mean KT margin = {pooled_min_margin:.4} < 0.2500"
             ));
         }
-        let passed = stats.passed && excl == 0 && g4_mean_ok && margin_ok;
+        let passed = stats.passed && stratified.passed && excl == 0 && g4_mean_ok && margin_ok;
         if !passed {
             all_passed = false;
         }
@@ -2672,6 +2883,7 @@ pub fn run_m2a_bank_evaluation(
             min_required_mean_margin_bits: (idx == 4).then_some(pooled_min_margin),
             max_g2a4b_mean_h_reactive_dev_bits: (idx == 3).then_some(pooled_max_g4_mean_dev),
             passed,
+            stratified,
         });
     }
 
@@ -2697,27 +2909,18 @@ mod tests {
 
     #[test]
     fn holdout_guards_reject_m1_m2a_and_m2b_ranges() {
-        // M1 holdout 10000..=10019 always refused even with allow_holdout=true
-        assert!(check_m2a_seed_range_holdout(10_000, 20, false).is_err());
-        assert!(check_m2a_seed_range_holdout(10_000, 20, true).is_err());
-        assert!(check_m2a_seed_range_holdout(9_990, 20, true).is_err());
-
-        // M2b (40000..=40019), M3 (50000..=50019), and M4a (60000..=60019) holdouts
-        // are always refused even with allow_holdout=true
-        for blocked in [40_000u32, 50_000, 60_000] {
+        // M1 (10000..=10019), closed M2a (30000..=30019), closed M2b (40000..=40019),
+        // closed M3 v1 (50000..=50019), M3 v2 (50100..=50199), and M4a (60000..=60099)
+        // are always refused even with allow_holdout=true.
+        for blocked in [10_000u32, 30_000, 40_000, 50_000, 50_100, 60_000, 60_050] {
             assert!(check_m2a_seed_range_holdout(blocked, 20, false).is_err());
             assert!(check_m2a_seed_range_holdout(blocked, 20, true).is_err());
             assert!(check_m2a_seed_range_holdout(blocked - 10, 20, true).is_err());
         }
-
-        // M2a holdout 30000..=30019 requires allow_holdout=true
-        let err = check_m2a_seed_range_holdout(30_000, 20, false).unwrap_err();
-        assert!(err.contains("30000..=30019"));
         assert!(check_m2a_seed_range_holdout(29_900, 101, false).is_err());
-        assert!(check_m2a_seed_range_holdout(30_000, 20, true).is_ok());
 
         // Disjoint dev and confirmation ranges succeed cleanly
-        for safe in [0u32, 20, 20_020, 49_980, 50_020, 59_980, 60_020] {
+        for safe in [0u32, 20, 20_020, 49_980, 50_020, 50_200, 59_980, 60_100] {
             assert!(check_m2a_seed_range_holdout(safe, 20, false).is_ok());
         }
         assert!(check_m2a_seed_range_holdout(20, 1_000, false).is_ok());

@@ -34,12 +34,15 @@ use crate::metrics::mdl::{
 use crate::metrics::{circuit_code_bits_with_tax, facts_code_bits};
 use crate::rng::SeedBank;
 use crate::stats::{
-    BankSample, CaseOutcome, MultiBankGateResult, classify_case_outcome, evaluate_multi_bank_gate,
+    BankSample, BankTailMetricMap, BankTaskCountMap, CaseOutcome, GateRegime, HoldoutRangeSpec,
+    MultiBankGateResult, StratifiedGateAudit, check_seed_range_holdouts, classify_case_outcome,
+    evaluate_multi_bank_gate, evaluate_stratified_from_bank_maps, merge_tail_metric_map,
+    percentile_sorted, strip_seed_suffix, update_max_finite,
 };
 use crate::structural::graph_edit::source_has_cycle;
 use crate::structural::growth::ExcisionMode;
 use crate::structural::learner::InjectionMode;
-use crate::structural::surgery::primary_cone_nodes;
+use crate::structural::surgery::{primary_cone_nodes, primary_cone_nodes_without_comparator_taps};
 use crate::structural::{
     ArkheLearner, EconomyConfig, EconomyState, EditableCircuit, GrowthConfig, ReserveCap,
     build_autonomous_ring, cone_channel_mask, materialize_const_loop, observation_horizon,
@@ -61,14 +64,18 @@ pub const M2A_HOLDOUT_SEED_END: u32 = 30_019;
 pub const M2B_HOLDOUT_SEED_START: u32 = 40_000;
 /// Pre-registered M2b holdout range end seed (inclusive).
 pub const M2B_HOLDOUT_SEED_END: u32 = 40_019;
-/// Pre-registered M3 single-shot holdout range start seed (`--holdout` required).
+/// Pre-registered M3 v1 holdout range start seed (consumed at `dd13839`; permanently closed).
 pub const M3_HOLDOUT_SEED_START: u32 = 50_000;
-/// Pre-registered M3 single-shot holdout range end seed (inclusive).
+/// Pre-registered M3 v1 holdout range end seed (inclusive).
 pub const M3_HOLDOUT_SEED_END: u32 = 50_019;
-/// Pre-registered M4a reserved holdout range start seed (unconditionally rejected in `verify-m3`).
+/// Pre-registered M3 v2 single-shot 100-seed holdout range start seed (`--holdout` required).
+pub const M3_V2_HOLDOUT_SEED_START: u32 = 50_100;
+/// Pre-registered M3 v2 single-shot 100-seed holdout range end seed (inclusive).
+pub const M3_V2_HOLDOUT_SEED_END: u32 = 50_199;
+/// Pre-registered M4a reserved holdout range start seed (100 seeds; unconditionally rejected in `verify-m3`).
 pub const M4A_HOLDOUT_SEED_START: u32 = 60_000;
 /// Pre-registered M4a reserved holdout range end seed (inclusive).
-pub const M4A_HOLDOUT_SEED_END: u32 = 60_019;
+pub const M4A_HOLDOUT_SEED_END: u32 = 60_099;
 
 /// Default maximum ticks to settle a primary circuit before detour injection.
 pub const M3_MAX_SETTLE_TICKS: u64 = 2_000;
@@ -114,9 +121,10 @@ pub const G35B_TARGET_RATE: f64 = 1.0;
 
 /// Guards `verify-m3` runs against pre-registered milestone holdout seed banks.
 ///
-/// Unconditionally rejects overlaps with M1 (`10000..=10019`), M2a (`30000..=30019`), M2b
-/// (`40000..=40019`), and M4a (`60000..=60019`) even when `allow_holdout == true`, and rejects
-/// M3 (`50000..=50019`) unless `allow_holdout == true`.
+/// Unconditionally rejects overlaps with M1 (`10000..=10019`), closed M2a (`30000..=30019`),
+/// closed M2b (`40000..=40019`), closed M3 v1 (`50000..=50019`), and reserved M4a
+/// (`60000..=60099`) even when `allow_holdout == true`, and rejects fresh M3 v2 holdout
+/// (`50100..=50199`) unless `allow_holdout == true`.
 ///
 /// # Errors
 ///
@@ -126,30 +134,57 @@ pub fn check_m3_seed_range_holdout(
     seeds: u32,
     allow_holdout: bool,
 ) -> Result<(), String> {
-    let start = u64::from(seed_offset);
-    let end = start + u64::from(seeds.max(1));
-    let unconditional = [
-        ("M1", M1_HOLDOUT_SEED_START, M1_HOLDOUT_SEED_END),
-        ("M2a", M2A_HOLDOUT_SEED_START, M2A_HOLDOUT_SEED_END),
-        ("M2b", M2B_HOLDOUT_SEED_START, M2B_HOLDOUT_SEED_END),
-        ("M4a", M4A_HOLDOUT_SEED_START, M4A_HOLDOUT_SEED_END),
+    let ranges = [
+        HoldoutRangeSpec {
+            label: "M1",
+            start: u64::from(M1_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M1_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "reserved M1 holdout",
+        },
+        HoldoutRangeSpec {
+            label: "M2a",
+            start: u64::from(M2A_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M2A_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "consumed at aa6fb6d; permanently closed",
+        },
+        HoldoutRangeSpec {
+            label: "M2b",
+            start: u64::from(M2B_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M2B_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "consumed at b211afa; permanently closed",
+        },
+        HoldoutRangeSpec {
+            label: "M3",
+            start: u64::from(M3_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M3_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "consumed at dd13839; permanently closed",
+        },
+        HoldoutRangeSpec {
+            label: "M3_v2",
+            start: u64::from(M3_V2_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M3_V2_HOLDOUT_SEED_END),
+            allow_with_flag: true,
+            status_note: "fresh 100-seed M3 v2 holdout",
+        },
+        HoldoutRangeSpec {
+            label: "M4a",
+            start: u64::from(M4A_HOLDOUT_SEED_START),
+            end_inclusive: u64::from(M4A_HOLDOUT_SEED_END),
+            allow_with_flag: false,
+            status_note: "reserved M4a holdout",
+        },
     ];
-    for (label, h_start, h_end) in unconditional {
-        if start <= u64::from(h_end) && end > u64::from(h_start) {
-            return Err(format!(
-                "refusing seed range {start}..{end} which overlaps pre-registered {label} holdout range {h_start}..={h_end} (unconditionally forbidden under verify-m3)"
-            ));
-        }
-    }
-    if start <= u64::from(M3_HOLDOUT_SEED_END)
-        && end > u64::from(M3_HOLDOUT_SEED_START)
-        && !allow_holdout
-    {
-        return Err(format!(
-            "refusing seed range {start}..{end} which overlaps pre-registered holdout range {M3_HOLDOUT_SEED_START}..={M3_HOLDOUT_SEED_END} without --holdout flag"
-        ));
-    }
-    Ok(())
+    check_seed_range_holdouts(
+        "verify-m3",
+        u64::from(seed_offset),
+        u64::from(seeds.max(1)),
+        allow_holdout,
+        &ranges,
+    )
 }
 
 /// Summary report for one M3 gate in single-bank verification mode (`arkhe verify-m3`).
@@ -177,6 +212,8 @@ pub struct M3GateReport {
     pub aux_metric_summary: Option<String>,
     /// Sample failure diagnostics recorded during evaluation.
     pub failures: Vec<String>,
+    /// Statistical Policy Option A + D regime-stratified & per-task tail audit.
+    pub stratified: StratifiedGateAudit,
 }
 
 /// Complete verification summary emitted by `arkhe verify-m3` in single-bank mode.
@@ -225,6 +262,8 @@ pub struct M3BankGateReport {
     pub pooled_metric_passed: bool,
     /// Sample failure strings recorded across banks.
     pub failures: Vec<String>,
+    /// Statistical Policy Option A + D regime-stratified & per-task tail audit.
+    pub stratified: StratifiedGateAudit,
 }
 
 /// Multi-bank Milestone 3 verification report (`arkhe verify-m3 --banks N`).
@@ -263,6 +302,12 @@ struct GateTally {
     excluded_cases: usize,
     cliff_counters: CliffCountersSummary,
     failures: Vec<String>,
+    task_counts: BTreeMap<(String, GateRegime), (usize, usize)>,
+    task_tails: BTreeMap<String, BTreeMap<String, f64>>,
+    task_dt_samples: BTreeMap<String, Vec<f64>>,
+    task_n8k_samples: BTreeMap<String, Vec<f64>>,
+    clean_seed_conj_succ: usize,
+    clean_seed_conj_trials: usize,
 }
 
 impl GateTally {
@@ -277,9 +322,27 @@ impl GateTally {
         cliff: &CliffCountersSummary,
         detail: Option<String>,
     ) {
+        self.record_with_regime(label, GateRegime::Clean, functional_pass, cliff, detail);
+    }
+
+    fn record_with_regime(
+        &mut self,
+        label: String,
+        regime: GateRegime,
+        functional_pass: bool,
+        cliff: &CliffCountersSummary,
+        detail: Option<String>,
+    ) {
         self.cliff_counters.accumulate(cliff);
-        match classify_case_outcome(functional_pass, cliff) {
-            CaseOutcome::Passed => self.passed_cases += 1,
+        let outcome = classify_case_outcome(functional_pass, cliff);
+        let task_key = (strip_seed_suffix(&label).to_owned(), regime);
+        let entry = self.task_counts.entry(task_key).or_insert((0, 0));
+        entry.1 += 1;
+        match outcome {
+            CaseOutcome::Passed => {
+                self.passed_cases += 1;
+                entry.0 += 1;
+            }
             CaseOutcome::Failed => {
                 self.failed_cases += 1;
                 if let Some(msg) = detail {
@@ -298,12 +361,95 @@ impl GateTally {
         }
     }
 
-    fn merge(&mut self, other: Self) {
+    fn record_tail_max(&mut self, task_label: &str, key: &str, value: f64) {
+        let map = self.task_tails.entry(task_label.to_owned()).or_default();
+        update_max_finite(map, key, value);
+    }
+
+    fn record_dt_samples(&mut self, task_label: &str, dts: &[f64]) {
+        if dts.is_empty() {
+            return;
+        }
+        let buf = self
+            .task_dt_samples
+            .entry(task_label.to_owned())
+            .or_default();
+        let mut max_dt = f64::NEG_INFINITY;
+        for &dt in dts {
+            if dt.is_finite() {
+                buf.push(dt);
+                if dt > max_dt {
+                    max_dt = dt;
+                }
+            }
+        }
+        if max_dt.is_finite() {
+            self.record_tail_max(task_label, "max_excise_dt", max_dt);
+        }
+    }
+
+    fn record_n8k_sample(&mut self, task_label: &str, value: f64) {
+        if value.is_finite() {
+            self.task_n8k_samples
+                .entry(task_label.to_owned())
+                .or_default()
+                .push(value);
+        }
+    }
+
+    fn clean_seed_passed(&self) -> Option<bool> {
+        let mut has_clean = false;
+        let mut all_ok = self.excluded_cases == 0;
+        for ((_, regime), &(succ, trials)) in &self.task_counts {
+            if *regime == GateRegime::Clean && trials > 0 {
+                has_clean = true;
+                if succ != trials {
+                    all_ok = false;
+                }
+            }
+        }
+        has_clean.then_some(all_ok)
+    }
+
+    fn clean_seed_bank(&self) -> Option<Vec<BankSample>> {
+        if self.clean_seed_conj_trials > 0 {
+            Some(vec![BankSample::new(
+                self.clean_seed_conj_succ,
+                self.clean_seed_conj_trials,
+            )])
+        } else {
+            self.clean_seed_passed()
+                .map(|ok| vec![BankSample::new(usize::from(ok), 1)])
+        }
+    }
+
+    fn merge_seed(&mut self, other: Self) {
+        if let Some(ok) = other.clean_seed_passed() {
+            self.clean_seed_conj_trials += 1;
+            if ok {
+                self.clean_seed_conj_succ += 1;
+            }
+        }
         self.passed_cases += other.passed_cases;
         self.failed_cases += other.failed_cases;
         self.excluded_cases += other.excluded_cases;
         self.cliff_counters.accumulate(&other.cliff_counters);
         self.failures.extend(other.failures);
+        for (k, (s, n)) in other.task_counts {
+            let entry = self.task_counts.entry(k).or_insert((0, 0));
+            entry.0 += s;
+            entry.1 += n;
+        }
+        for (task, tails) in other.task_tails {
+            let entry = self.task_tails.entry(task).or_default();
+            merge_tail_metric_map(entry, &tails);
+        }
+        for (task, dts) in other.task_dt_samples {
+            self.task_dt_samples.entry(task).or_default().extend(dts);
+        }
+        for (task, vals) in other.task_n8k_samples {
+            self.task_n8k_samples.entry(task).or_default().extend(vals);
+        }
     }
 
     const fn bank_sample(&self) -> BankSample {
@@ -326,6 +472,18 @@ impl GateTally {
                 total - 64
             ));
         }
+        let overrides =
+            build_m3_percentile_overrides(&self.task_dt_samples, &self.task_n8k_samples);
+        let clean_conj = self.clean_seed_bank();
+        let stratified = evaluate_stratified_from_bank_maps(
+            &[&self.task_counts],
+            &[&self.task_tails],
+            Some(&overrides),
+            clean_conj.as_deref(),
+            target_rate,
+            target_rate,
+            false,
+        );
         let total = self.total_cases();
         let empirical_rate = if total == 0 {
             0.0
@@ -333,9 +491,17 @@ impl GateTally {
             (self.passed_cases as f64) / (total as f64)
         };
         let passed = if (target_rate - 1.0).abs() <= 1e-12 {
-            total > 0 && self.excluded_cases == 0 && self.passed_cases == total && extra_ok
+            total > 0
+                && self.excluded_cases == 0
+                && self.passed_cases == total
+                && extra_ok
+                && stratified.passed
         } else {
-            total > 0 && self.excluded_cases == 0 && empirical_rate >= target_rate && extra_ok
+            total > 0
+                && self.excluded_cases == 0
+                && empirical_rate >= target_rate
+                && extra_ok
+                && stratified.passed
         };
         M3GateReport {
             gate: gate.to_owned(),
@@ -349,8 +515,36 @@ impl GateTally {
             cliff_counters: self.cliff_counters,
             aux_metric_summary,
             failures: self.failures,
+            stratified,
         }
     }
+}
+
+fn build_m3_percentile_overrides(
+    dt_samples: &BTreeMap<String, Vec<f64>>,
+    n8k_samples: &BTreeMap<String, Vec<f64>>,
+) -> BTreeMap<String, BTreeMap<String, f64>> {
+    let mut out: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+    for (task, raw) in dt_samples {
+        if !raw.is_empty() {
+            let mut sorted = raw.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            out.entry(task.clone())
+                .or_default()
+                .insert("p95_excise_dt".to_owned(), percentile_sorted(&sorted, 0.95));
+        }
+    }
+    for (task, raw) in n8k_samples {
+        if !raw.is_empty() {
+            let mut sorted = raw.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            out.entry(task.clone()).or_default().insert(
+                "p95_n_primary_8000".to_owned(),
+                percentile_sorted(&sorted, 0.95),
+            );
+        }
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -939,7 +1133,28 @@ fn target_cone_signature(
     economy: &EconomyState,
     target_port: u16,
 ) -> (Vec<(NodeId, Primitive)>, usize) {
-    let pri = primary_cone_nodes(circuit, economy, target_port);
+    target_cone_signature_inner(circuit, economy, target_port, false)
+}
+
+fn target_cone_signature_without_comparator_taps(
+    circuit: &Circuit,
+    economy: &EconomyState,
+    target_port: u16,
+) -> (Vec<(NodeId, Primitive)>, usize) {
+    target_cone_signature_inner(circuit, economy, target_port, true)
+}
+
+fn target_cone_signature_inner(
+    circuit: &Circuit,
+    economy: &EconomyState,
+    target_port: u16,
+    exclude_comparator_taps: bool,
+) -> (Vec<(NodeId, Primitive)>, usize) {
+    let pri = if exclude_comparator_taps {
+        primary_cone_nodes_without_comparator_taps(circuit, economy, target_port)
+    } else {
+        primary_cone_nodes(circuit, economy, target_port)
+    };
     let comp = comparator_cone_set(circuit, economy, Some(target_port));
     let mut nodes: Vec<(NodeId, Primitive)> = pri
         .union(&comp)
@@ -1627,15 +1842,23 @@ fn evaluate_g31_seed(seed: u32) -> G31SeedResult {
                                 "mdl_err={mdl_err:.3e}, de_err={pre_excision_de_err:.3e}, exog_err={exog_err:.3e}, transp={transp_err:?}"
                             )
                         });
-                        tally.record(
-                            format!(
-                                "G3.1:Cons({family},k={},eps={eps},{mode:?},{class}):seed={seed}",
-                                width.bits()
-                            ),
+                        let g31_task = format!(
+                            "G3.1:Cons({family},k={},eps={eps},{mode:?},{class})",
+                            width.bits()
+                        );
+                        let g31_regime = if eps > 0.0 {
+                            GateRegime::Noisy
+                        } else {
+                            GateRegime::Clean
+                        };
+                        tally.record_with_regime(
+                            format!("{g31_task}:seed={seed}"),
+                            g31_regime,
                             ok,
                             &cliff,
                             msg,
                         );
+                        tally.record_tail_max(&g31_task, "max_epistemic_mdl_err", mdl_err);
                     }
                 }
             }
@@ -2409,7 +2632,7 @@ fn run_spontaneous_case(
     let is_noisy_constant =
         matches!(spec.gen_cfg, GeneratorConfig::T1_Constant { .. }) && spec.epsilon > 0.0;
     let mut clean_window: VecDeque<bool> = VecDeque::with_capacity(w_obs as usize);
-    let mut last_sig = target_cone_signature(
+    let mut last_sig = target_cone_signature_without_comparator_taps(
         learner.editable().circuit(),
         learner.editable().economy(),
         spec.target_port,
@@ -2442,7 +2665,7 @@ fn run_spontaneous_case(
         if epoch_now != cached_sig_epoch || comps_now != cached_sig_comps {
             cached_sig_epoch = epoch_now;
             cached_sig_comps = comps_now;
-            let curr_sig = target_cone_signature(
+            let curr_sig = target_cone_signature_without_comparator_taps(
                 learner.editable().circuit(),
                 learner.editable().economy(),
                 spec.target_port,
@@ -2456,7 +2679,7 @@ fn run_spontaneous_case(
             raw_t_settle = Some(t + 1);
             if t < M3_SPONTANEOUS_T2000 {
                 n_primary_at_settle = Some(
-                    primary_cone_nodes(
+                    primary_cone_nodes_without_comparator_taps(
                         learner.editable().circuit(),
                         learner.editable().economy(),
                         spec.target_port,
@@ -2493,7 +2716,7 @@ fn run_spontaneous_case(
             }
         }
         if t + 1 == M3_SPONTANEOUS_T2000 {
-            n_primary_2000 = primary_cone_nodes(
+            n_primary_2000 = primary_cone_nodes_without_comparator_taps(
                 learner.editable().circuit(),
                 learner.editable().economy(),
                 spec.target_port,
@@ -2507,7 +2730,9 @@ fn run_spontaneous_case(
 
     let final_circuit = learner.editable().circuit();
     let final_econ = learner.editable().economy();
-    let n_primary_8000 = primary_cone_nodes(final_circuit, final_econ, spec.target_port).len();
+    let n_primary_8000 =
+        primary_cone_nodes_without_comparator_taps(final_circuit, final_econ, spec.target_port)
+            .len();
     let max_comp_per_port_8000 = max_comparators_on_any_port(final_circuit, final_econ);
     let tel = learner.telemetry();
     let final_code_bits = circuit_code_bits_with_tax(final_circuit, 0, split_code_tax);
@@ -2831,6 +3056,8 @@ struct TrajectoryDetourObservation<'a> {
     detour_class: DetourClass,
     functional_ok: bool,
     excise_dt: Option<u64>,
+    post_excision_kt_excess: f64,
+    post_excision_paired_kt_diff: f64,
     cliff: &'a CliffCountersSummary,
     detail: Option<String>,
 }
@@ -2841,6 +3068,9 @@ struct TrajectoryUnitAccum {
     raw_total: usize,
     cliff: CliffCountersSummary,
     failing_details: Vec<String>,
+    excise_dts: Vec<f64>,
+    max_post_exc_kt_excess: Option<f64>,
+    max_paired_kt_diff: Option<f64>,
 }
 
 fn evaluate_vle_detour_outcome(
@@ -2912,16 +3142,18 @@ fn evaluate_vle_detour_outcome(
     }
 }
 
-fn record_injection_trajectory_units<'a, F>(
+fn record_injection_trajectory_units<'a, F, R>(
     gate_label: &str,
     seed: u32,
     num_groups: usize,
     observations: impl IntoIterator<Item = TrajectoryDetourObservation<'a>>,
     label_for_group: F,
+    regime_for_group: R,
     tally: &mut GateTally,
 ) -> (Option<u64>, usize, usize)
 where
     F: Fn(usize) -> String,
+    R: Fn(usize) -> GateRegime,
 {
     let mut units: Vec<Option<TrajectoryUnitAccum>> = (0..num_groups).map(|_| None).collect();
     let mut max_dt: Option<u64> = None;
@@ -2931,6 +3163,25 @@ where
         }
         let acc = units[obs.settle_group_idx].get_or_insert_with(TrajectoryUnitAccum::default);
         acc.cliff.accumulate(obs.cliff);
+        if let Some(dt) = obs.excise_dt {
+            acc.excise_dts.push(dt as f64);
+        }
+        if obs.post_excision_kt_excess.is_finite() {
+            acc.max_post_exc_kt_excess = Some(
+                acc.max_post_exc_kt_excess
+                    .map_or(obs.post_excision_kt_excess, |m| {
+                        m.max(obs.post_excision_kt_excess)
+                    }),
+            );
+        }
+        if obs.post_excision_paired_kt_diff.is_finite() {
+            acc.max_paired_kt_diff = Some(
+                acc.max_paired_kt_diff
+                    .map_or(obs.post_excision_paired_kt_diff, |m| {
+                        m.max(obs.post_excision_paired_kt_diff)
+                    }),
+            );
+        }
         acc.raw_total += 1;
         if classify_case_outcome(obs.functional_ok, obs.cliff) == CaseOutcome::Passed {
             acc.raw_passed += 1;
@@ -2959,8 +3210,17 @@ where
                 unit.failing_details.join("; ")
             )
         });
-        let unit_label = format!("{gate_label}:{}:seed={seed}", label_for_group(group_idx));
-        tally.record(unit_label, unit_ok, &unit.cliff, detail);
+        let task_name = format!("{gate_label}:{}", label_for_group(group_idx));
+        let regime = regime_for_group(group_idx);
+        let unit_label = format!("{task_name}:seed={seed}");
+        tally.record_with_regime(unit_label, regime, unit_ok, &unit.cliff, detail);
+        tally.record_dt_samples(&task_name, &unit.excise_dts);
+        if let Some(v) = unit.max_post_exc_kt_excess {
+            tally.record_tail_max(&task_name, "max_post_exc_kt_excess", v);
+        }
+        if let Some(v) = unit.max_paired_kt_diff {
+            tally.record_tail_max(&task_name, "max_paired_kt_diff", v);
+        }
     }
     (max_dt, raw_passed, raw_total)
 }
@@ -3448,6 +3708,8 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                     detour_class: job.detour_class,
                     functional_ok: ok,
                     excise_dt: out.excise_dt,
+                    post_excision_kt_excess: out.post_excision_kt_excess,
+                    post_excision_paired_kt_diff: out.post_excision_paired_kt_diff,
                     cliff: &out.cliff,
                     detail,
                 };
@@ -3462,6 +3724,13 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                 let task = &tasks[g.task_idx];
                 format!("{}({:?},eps={:.2})", task.label, g.wire_delay, g.epsilon)
             };
+            let regime_for_group = |group_idx: usize| -> GateRegime {
+                if settle_groups[group_idx].epsilon > 0.0 {
+                    GateRegime::Noisy
+                } else {
+                    GateRegime::Clean
+                }
+            };
             let (g32_max_dt, g32_raw_detour_passed, g32_raw_detour_total) =
                 record_injection_trajectory_units(
                     "G3.2",
@@ -3469,6 +3738,7 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                     settle_groups.len(),
                     g32_obs,
                     label_for_group,
+                    regime_for_group,
                     &mut g32,
                 );
             let (g33_max_dt, g33_raw_detour_passed, g33_raw_detour_total) =
@@ -3478,6 +3748,7 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                     settle_groups.len(),
                     g33_obs,
                     label_for_group,
+                    regime_for_group,
                     &mut g33,
                 );
 
@@ -3570,15 +3841,36 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                         spont_n_mins[si]
                     )
                 });
-                g34.record(
-                    format!(
-                        "G3.4:{}({:?},eps={:.2}):seed={seed}",
-                        spec.label, spec.wire_delay, spec.epsilon
-                    ),
+                let g34_task = format!(
+                    "G3.4:{}({:?},eps={:.2})",
+                    spec.label, spec.wire_delay, spec.epsilon
+                );
+                let spont_regime = if spec.epsilon > 0.0 {
+                    GateRegime::Noisy
+                } else {
+                    GateRegime::Clean
+                };
+                g34.record_with_regime(
+                    format!("{g34_task}:seed={seed}"),
+                    spont_regime,
                     g34_ok,
                     &r_true.cliff,
                     g34_detail,
                 );
+                g34.record_tail_max(
+                    &g34_task,
+                    "max_comp_per_port_8000",
+                    r_true.max_comp_per_port_8000 as f64,
+                );
+                g34.record_tail_max(
+                    &g34_task,
+                    "max_n_primary_8000",
+                    r_true.n_primary_8000 as f64,
+                );
+                g34.record_n8k_sample(&g34_task, r_true.n_primary_8000 as f64);
+                if let Some(tl) = r_true.t_lock {
+                    g34.record_tail_max(&g34_task, "max_t_lock", tl as f64);
+                }
 
                 // G3.5(b): exact pricing & solvability per-case + aggregate Split discipline.
                 spont_all_splits_true += r_true.final_split_count;
@@ -3615,11 +3907,12 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                         r_false.final_code_bits
                     )
                 });
-                g35b.record(
+                g35b.record_with_regime(
                     format!(
                         "G3.5b:{}({:?},eps={:.2}):seed={seed}",
                         spec.label, spec.wire_delay, spec.epsilon
                     ),
+                    spont_regime,
                     g35b_ok,
                     &combined_cliff,
                     g35b_detail,
@@ -3723,23 +4016,23 @@ fn aggregate_bank_slice(seed_offset: u32, outcomes: Vec<SeedAllGatesRaw>) -> Ban
     let mut inj_excised_tax_false = 0usize;
 
     for r in outcomes {
-        g31.merge(r.g31);
+        g31.merge_seed(r.g31);
         g31_max_mdl_err = g31_max_mdl_err.max(r.g31_max_mdl_err);
-        g32.merge(r.g32);
+        g32.merge_seed(r.g32);
         if let Some(dt) = r.g32_max_excise_dt {
             g32_max_excise_dt = Some(g32_max_excise_dt.map_or(dt, |m| m.max(dt)));
         }
         g32_raw_detour_passed += r.g32_raw_detour_passed;
         g32_raw_detour_total += r.g32_raw_detour_total;
-        g33.merge(r.g33);
+        g33.merge_seed(r.g33);
         if let Some(dt) = r.g33_max_excise_dt {
             g33_max_excise_dt = Some(g33_max_excise_dt.map_or(dt, |m| m.max(dt)));
         }
         g33_raw_detour_passed += r.g33_raw_detour_passed;
         g33_raw_detour_total += r.g33_raw_detour_total;
-        g34.merge(r.g34);
-        g35a.merge(r.g35a);
-        g35b.merge(r.g35b);
+        g34.merge_seed(r.g34);
+        g35a.merge_seed(r.g35a);
+        g35b.merge_seed(r.g35b);
         g35b_min_tax = g35b_min_tax.min(r.g35b_min_analytical_split_tax_bits);
         if spont_clean_splits_true.is_empty() {
             spont_clean_splits_true = r.spont_clean_splits_true;
@@ -3935,6 +4228,11 @@ pub fn run_m3_bank_evaluation(
     let mut samples: [Vec<BankSample>; 6] = Default::default();
     let mut excl = [0usize; 6];
     let mut failures: [Vec<String>; 6] = Default::default();
+    let mut bank_counts: [Vec<BankTaskCountMap>; 6] = Default::default();
+    let mut bank_tails: [Vec<BankTailMetricMap>; 6] = Default::default();
+    let mut pooled_dt_samples: [BTreeMap<String, Vec<f64>>; 6] = Default::default();
+    let mut pooled_n8k_samples: [BTreeMap<String, Vec<f64>>; 6] = Default::default();
+    let mut clean_conj_banks: [Vec<BankSample>; 6] = Default::default();
     let mut total_cliff = CliffCountersSummary::default();
 
     let mut g31_max_mdl_err = 0.0f64;
@@ -3993,14 +4291,26 @@ pub fn run_m3_bank_evaluation(
         pooled_inj_exc_true += agg.inj_excised_tax_true;
         pooled_inj_exc_false += agg.inj_excised_tax_false;
 
+        let seed_offset = agg.seed_offset;
         let tallies = [agg.g31, agg.g32, agg.g33, agg.g34, agg.g35a, agg.g35b];
         for (gi, tally) in tallies.into_iter().enumerate() {
             samples[gi].push(tally.bank_sample());
             excl[gi] += tally.excluded_cases;
             total_cliff.accumulate(&tally.cliff_counters);
+            if let Some(cb) = tally.clean_seed_bank() {
+                clean_conj_banks[gi].extend(cb);
+            }
+            for (task, dts) in tally.task_dt_samples {
+                pooled_dt_samples[gi].entry(task).or_default().extend(dts);
+            }
+            for (task, vals) in tally.task_n8k_samples {
+                pooled_n8k_samples[gi].entry(task).or_default().extend(vals);
+            }
+            bank_counts[gi].push(tally.task_counts);
+            bank_tails[gi].push(tally.task_tails);
             for f in tally.failures {
                 if failures[gi].len() < 32 {
-                    failures[gi].push(format!("bank {b_idx} (offset {}): {f}", agg.seed_offset));
+                    failures[gi].push(format!("bank {b_idx} (offset {seed_offset}): {f}"));
                 }
             }
         }
@@ -4035,14 +4345,49 @@ pub fn run_m3_bank_evaluation(
     let mb5a = evaluate_multi_bank_gate(&samples[4], G35A_TARGET_RATE);
     let mb5b = evaluate_multi_bank_gate(&samples[5], G35B_TARGET_RATE);
 
+    let targets = [
+        G31_TARGET_RATE,
+        G32_TARGET_RATE,
+        G33_TARGET_RATE,
+        G34_TARGET_RATE,
+        G35A_TARGET_RATE,
+        G35B_TARGET_RATE,
+    ];
+    let mut strat: [Option<StratifiedGateAudit>; 6] = Default::default();
+    for gi in 0..6 {
+        let count_refs: Vec<&_> = bank_counts[gi].iter().collect();
+        let tail_refs: Vec<&_> = bank_tails[gi].iter().collect();
+        let overrides =
+            build_m3_percentile_overrides(&pooled_dt_samples[gi], &pooled_n8k_samples[gi]);
+        let conj_opt =
+            (!clean_conj_banks[gi].is_empty()).then_some(clean_conj_banks[gi].as_slice());
+        strat[gi] = Some(evaluate_stratified_from_bank_maps(
+            &count_refs,
+            &tail_refs,
+            Some(&overrides),
+            conj_opt,
+            targets[gi],
+            targets[gi],
+            true,
+        ));
+    }
+    let s1 = strat[0].take().expect("strat g31");
+    let s2 = strat[1].take().expect("strat g32");
+    let s3 = strat[2].take().expect("strat g33");
+    let s4 = strat[3].take().expect("strat g34");
+    let s5a = strat[4].take().expect("strat g35a");
+    let s5b = strat[5].take().expect("strat g35b");
+
     let g31_exact_ok = mb1.pooled.total_trials > 0
         && mb1.pooled.total_successes == mb1.pooled.total_trials
         && excl[0] == 0
-        && g31_extra_ok;
+        && g31_extra_ok
+        && s1.passed;
     let g35b_exact_ok = mb5b.pooled.total_trials > 0
         && mb5b.pooled.total_successes == mb5b.pooled.total_trials
         && excl[5] == 0
-        && g35b_extra_ok;
+        && g35b_extra_ok
+        && s5b.passed;
 
     let gates = vec![
         M3BankGateReport {
@@ -4054,10 +4399,11 @@ pub fn run_m3_bank_evaluation(
             pooled_metric_value: Some(g31_max_mdl_err),
             pooled_metric_passed: g31_extra_ok,
             failures: std::mem::take(&mut failures[0]),
+            stratified: s1,
         },
         M3BankGateReport {
             gate: "G3.2".to_owned(),
-            passed: mb2.passed && excl[1] == 0,
+            passed: mb2.passed && s2.passed && excl[1] == 0,
             excluded_cases: excl[1],
             multi_bank: mb2,
             pooled_metric_name: Some(format_excise_raw_summary(
@@ -4068,10 +4414,11 @@ pub fn run_m3_bank_evaluation(
             pooled_metric_value: g32_max_dt.map(|dt| dt as f64),
             pooled_metric_passed: true,
             failures: std::mem::take(&mut failures[1]),
+            stratified: s2,
         },
         M3BankGateReport {
             gate: "G3.3".to_owned(),
-            passed: mb3.passed && excl[2] == 0,
+            passed: mb3.passed && s3.passed && excl[2] == 0,
             excluded_cases: excl[2],
             multi_bank: mb3,
             pooled_metric_name: Some(format_excise_raw_summary(
@@ -4082,26 +4429,29 @@ pub fn run_m3_bank_evaluation(
             pooled_metric_value: g33_max_dt.map(|dt| dt as f64),
             pooled_metric_passed: true,
             failures: std::mem::take(&mut failures[2]),
+            stratified: s3,
         },
         M3BankGateReport {
             gate: "G3.4".to_owned(),
-            passed: mb4.passed && excl[3] == 0,
+            passed: mb4.passed && s4.passed && excl[3] == 0,
             excluded_cases: excl[3],
             multi_bank: mb4,
             pooled_metric_name: None,
             pooled_metric_value: None,
             pooled_metric_passed: true,
             failures: std::mem::take(&mut failures[3]),
+            stratified: s4,
         },
         M3BankGateReport {
             gate: "G3.5a".to_owned(),
-            passed: mb5a.passed && excl[4] == 0,
+            passed: mb5a.passed && s5a.passed && excl[4] == 0,
             excluded_cases: excl[4],
             multi_bank: mb5a,
             pooled_metric_name: None,
             pooled_metric_value: None,
             pooled_metric_passed: true,
             failures: std::mem::take(&mut failures[4]),
+            stratified: s5a,
         },
         M3BankGateReport {
             gate: "G3.5b".to_owned(),
@@ -4112,6 +4462,7 @@ pub fn run_m3_bank_evaluation(
             pooled_metric_value: Some(g35b_min_tax),
             pooled_metric_passed: g35b_extra_ok,
             failures: std::mem::take(&mut failures[5]),
+            stratified: s5b,
         },
     ];
 
@@ -4140,23 +4491,24 @@ mod tests {
 
     #[test]
     fn holdout_guards_reject_m1_m2a_m2b_m3_and_m4a_ranges() {
-        // M1 (10_000..=10_019), M2a (30_000..=30_019), M2b (40_000..=40_019),
-        // and M4a (60_000..=60_019) are unconditionally rejected even with allow_holdout=true.
-        for blocked in [10_000u32, 30_000, 40_000, 60_000] {
+        // M1 (10_000..=10_019), closed M2a (30_000..=30_019), closed M2b (40_000..=40_019),
+        // closed M3 v1 (50_000..=50_019), and M4a (60_000..=60_099) are unconditionally rejected
+        // even with allow_holdout=true.
+        for blocked in [10_000u32, 30_000, 40_000, 50_000, 60_000, 60_050] {
             assert!(check_m3_seed_range_holdout(blocked, 20, false).is_err());
             assert!(check_m3_seed_range_holdout(blocked, 20, true).is_err());
             assert!(check_m3_seed_range_holdout(blocked - 5, 10, true).is_err());
         }
 
-        // M3 holdout 50_000..=50_019 requires allow_holdout=true.
-        let err = check_m3_seed_range_holdout(50_000, 20, false).unwrap_err();
-        assert!(err.contains("50000..=50019"));
-        assert!(check_m3_seed_range_holdout(49_990, 20, false).is_err());
-        assert!(check_m3_seed_range_holdout(50_000, 20, true).is_ok());
+        // Fresh M3 v2 holdout 50_100..=50_199 requires allow_holdout=true.
+        let err = check_m3_seed_range_holdout(50_100, 20, false).unwrap_err();
+        assert!(err.contains("50100..=50199"));
+        assert!(check_m3_seed_range_holdout(50_090, 20, false).is_err());
+        assert!(check_m3_seed_range_holdout(50_100, 100, true).is_ok());
 
         for safe in [
-            0u32, 9_980, 10_020, 20_060, 29_980, 30_020, 39_980, 40_020, 49_980, 50_020, 59_980,
-            60_020,
+            0u32, 9_980, 10_020, 20_060, 20_100, 29_980, 30_020, 39_980, 40_020, 49_980, 50_020,
+            50_200, 59_980, 60_100,
         ] {
             assert!(
                 check_m3_seed_range_holdout(safe, 20, false).is_ok(),
@@ -4352,6 +4704,8 @@ mod tests {
                 detour_class: DetourClass::D0Dead,
                 functional_ok: true,
                 excise_dt: Some(12),
+                post_excision_kt_excess: 0.001,
+                post_excision_paired_kt_diff: 0.001,
                 cliff: &zero_cliff,
                 detail: None,
             },
@@ -4360,6 +4714,8 @@ mod tests {
                 detour_class: DetourClass::D1AddZero,
                 functional_ok: true,
                 excise_dt: Some(18),
+                post_excision_kt_excess: 0.002,
+                post_excision_paired_kt_diff: 0.002,
                 cliff: &zero_cliff,
                 detail: None,
             },
@@ -4368,6 +4724,8 @@ mod tests {
                 detour_class: DetourClass::D0Dead,
                 functional_ok: true,
                 excise_dt: Some(5),
+                post_excision_kt_excess: 0.001,
+                post_excision_paired_kt_diff: 0.001,
                 cliff: &zero_cliff,
                 detail: None,
             },
@@ -4376,6 +4734,8 @@ mod tests {
                 detour_class: DetourClass::D7bAgreementGate,
                 functional_ok: false,
                 excise_dt: None,
+                post_excision_kt_excess: f64::INFINITY,
+                post_excision_paired_kt_diff: f64::INFINITY,
                 cliff: &zero_cliff,
                 detail: Some("paired_diff=inf".to_owned()),
             },
@@ -4384,6 +4744,8 @@ mod tests {
                 detour_class: DetourClass::D0Dead,
                 functional_ok: false,
                 excise_dt: None,
+                post_excision_kt_excess: f64::INFINITY,
+                post_excision_paired_kt_diff: f64::INFINITY,
                 cliff: &zero_cliff,
                 detail: Some("miss".to_owned()),
             },
@@ -4392,6 +4754,8 @@ mod tests {
                 detour_class: DetourClass::D2OneFire,
                 functional_ok: true,
                 excise_dt: Some(40),
+                post_excision_kt_excess: 0.003,
+                post_excision_paired_kt_diff: 0.003,
                 cliff: &blocked_cliff,
                 detail: None,
             },
@@ -4404,6 +4768,7 @@ mod tests {
             3,
             obs,
             |g| format!("Task{g}(Combinational,eps=0.05)"),
+            |_| GateRegime::Noisy,
             &mut tally,
         );
         assert_eq!(max_dt, Some(40));
@@ -4418,6 +4783,39 @@ mod tests {
             format_excise_raw_summary(max_dt, raw_passed, raw_total),
             "max_excise_dt=40 ticks; raw_detours=3/6"
         );
+    }
+
+    #[test]
+    fn g34_stratified_audit_rejects_concentrated_single_task_failure() {
+        let mut agg = GateTally::default();
+        let cliff = CliffCountersSummary::default();
+        for seed in 0..20 {
+            let mut per_seed = GateTally::default();
+            for ti in 0..9 {
+                per_seed.record_with_regime(
+                    format!("G3.4:NoisyTask{ti}:seed={seed}"),
+                    GateRegime::Noisy,
+                    true,
+                    &cliff,
+                    None,
+                );
+            }
+            per_seed.record_with_regime(
+                format!("G3.4:BrokenNoisyTask:seed={seed}"),
+                GateRegime::Noisy,
+                false,
+                &cliff,
+                Some("comp_per_port=2".to_owned()),
+            );
+            per_seed.record_tail_max("G3.4:BrokenNoisyTask", "max_comp_per_port_8000", 2.0);
+            agg.merge_seed(per_seed);
+        }
+        let report = agg.into_report("G3.4", G34_TARGET_RATE, true, None);
+        assert!(
+            !report.passed,
+            "G3.4 must fail when one noisy task fails 0/20 despite 90% pooled"
+        );
+        assert!(!report.stratified.passed);
     }
 
     #[test]

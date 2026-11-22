@@ -1,8 +1,15 @@
 # Milestone M3: Free-Rider Resistance and Verified Local Excision (H4) Pre-Registration Plan
 
-**Date:** 2026-11-20  
-**Status:** `Completed & verified`  
-**Charter Links:** [Foundational Research Charter v3](foundational_research_charter_v3.md), [Parameter Inventory](parameter_inventory.md), [Research Record](research_record.md), [Chief Scientist Skill](../.agents/skills/arkhe-chief-scientist/SKILL.md)
+> [!WARNING]
+> **M3 v2 Remediation Status Banner (Pre-S3):** M3 v1 (`9b5b950`–`dd13839`, single-shot holdout `50000..=50019`) was **superseded** after [milestone_3_review.md](milestone_3_review.md) identified a retained `verify-m2b` `G2B.2` regression (`180/200` on `0..20`, `900/1000` on 5-bank `20..120` with `LB99 = 0.875814 < 0.90`, concentrated in `MV_AddEqz_k2_Comb` `0/20` / `0/100`) that had been masked by heterogeneous task pooling and single-bank empirical scoring.
+>
+> - **Code fixes landed in M3 v2:** (1) `G2B.2` (`MV_AddEqz_k2_Comb`) fixed via `new_acyclic_register_depth` and `prime_non_surviving_registers` in `evaluate_sprout_motif` / `evaluate_stage3_candidate_pre` (`src/structural/growth.rs`, `tests/m2b_comparators.rs`); (2) `G3.4` (`T2_MultiViewCoupled(k=2)(Combinational,eps=0.05)`) fixed via `disagree_diag` rejection in `evaluate_stage3_candidate_pre` (`src/structural/growth.rs`), high-disagreement mismatch refutation (`2 * disagreements >= win_after.disagree.len()`) in `process_wake_comparator_events` (`src/structural/learner.rs`), and `comparator_tap_split_nodes` / `primary_cone_nodes_without_comparator_taps` (`src/structural/surgery.rs`) in `run_spontaneous_case` (`src/verify_m3/mod.rs`, `tests/m3_free_riders.rs`).
+> - **Statistical & holdout governance upgrades ([Charter §2.8](foundational_research_charter_v3.md#28-statistical-policy-holdout-governance-and-retained-baseline-regression-gate), DR #47–#48):** Adopted Statistical Policy **Option A** (`StratifiedGateAudit`: `Clean` vs. `Noisy` stratification, per-task FWER at `0.01 / M_stratum`, per-seed `Clean` conjunction), **Option B** (100-seed `5 × 20` confirmation `20100..=20199` and fresh 100-seed holdout `50100..=50199`; permanent unconditional CLI closure `allow_with_flag: false` of consumed `10000..=10019`, `30000..=30019`, `40000..=40019`, and `50000..=50019`), **Option D** (finite per-task `tail_metrics`), and mandatory `python3 scripts/check_retained_baselines.py --require-clean` before `S3`/`S4`.
+> - **Current status:** Retained M3 v1 plan/attainment ledger preserved below for historical provenance; **M3 v2 Pre-S3 dev (`0..20`, `20..120`), 100-seed confirmation (`20100..=20199`), and retained-baseline (`golden_traces`, `m2a_dev100`, `m2b_dev100`) checks passed on the pre-commit working tree, awaiting clean-commit `--require-clean` sign-off, 50-bank dev (`20..1020`), and `S3`/`S4` on `50100..=50199`** (see [research_record.md §12.5](research_record.md#125-milestone-3-v2-remediation--statistical-policy-upgrade-pre-s3-evidence-packet)).
+
+**Date:** 2026-11-20 (M3 v2 Remediation Status updated 2026-11-22)  
+**Status:** `M3 v1 Superseded — M3 v2 Remediation Pending S3/S4 on 50100..=50199`  
+**Charter Links:** [Foundational Research Charter v3](foundational_research_charter_v3.md), [Parameter Inventory](parameter_inventory.md), [Research Record](research_record.md), [Milestone 3 Review](milestone_3_review.md), [Chief Scientist Skill](../.agents/skills/arkhe-chief-scientist/SKILL.md)
 
 ## 1. Charter Hypotheses & Decision Rights
 

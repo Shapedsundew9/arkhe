@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "golden_traces": {
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--test",
+      "golden_traces"
+    ]
+  },
+  "suites": {
+    "m2a": {
+      "subcommand": "verify-m2a",
+      "expected_gates": [
+        "G2A.1",
+        "G2A.2",
+        "G2A.3",
+        "G2A.4",
+        "G2A.5"
+      ],
+      "tiers": {
+        "standard": {
+          "args": [
+            "--banks",
+            "5",
+            "--seed-offset",
+            "20",
+            "--seeds",
+            "20"
+          ],
+          "artifact_name": "m2a_dev100.json"
+        },
+        "fast": {
+          "args": [
+            "--seed-offset",
+            "0",
+            "--seeds",
+            "20"
+          ],
+          "artifact_name": "m2a_dev20.json"
+        }
+      }
+    },
+    "m2b": {
+      "subcommand": "verify-m2b",
+      "expected_gates": [
+        "G2B.1",
+        "G2B.2",
+        "G2B.3",
+        "G2B.4",
+        "G2B.5"
+      ],
+      "tiers": {
+        "standard": {
+          "args": [
+            "--banks",
+            "5",
+            "--seed-offset",
+            "20",
+            "--seeds",
+            "20"
+          ],
+          "artifact_name": "m2b_dev100.json"
+        },
+        "fast": {
+          "args": [
+            "--seed-offset",
+            "0",
+            "--seeds",
+            "20"
+          ],
+          "artifact_name": "m2b_dev20.json"
+        }
+      }
+    }
+  },
+  "requirements": {
+    "require_all_passed": true,
+    "max_excluded_cases": 0,
+    "max_sprout_blocked_max_nodes": 0,
+    "require_stratified_passed": true,
+    "require_per_task_passed": true,
+    "require_finite_tail_metrics": true
+  }
+}
