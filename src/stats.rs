@@ -366,7 +366,7 @@ pub struct TaskBankInput {
     pub task_label: String,
     pub regime: GateRegime,
     pub banks: Vec<BankSample>,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(default)]
     pub tail_metrics: std::collections::BTreeMap<String, f64>,
 }
 
@@ -384,7 +384,7 @@ pub struct PerTaskGateResult {
     pub passes_fwer_binomial: bool,
     pub distribution: BankDistributionSummary,
     pub passed: bool,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(default)]
     pub tail_metrics: std::collections::BTreeMap<String, f64>,
 }
 
@@ -640,23 +640,25 @@ fn evaluate_regime_stratum(
             c.pooled.total_trials > 0 && c.pooled.total_successes == c.pooled.total_trials
         });
         pooled_exact && conj_exact && all_tasks_passed
-    } else if regime == GateRegime::Clean
-        && let Some(conj) = &seed_conjunction_multi_bank
-    {
-        let macro_ok = if enforce_pooled_cp {
-            conj.passed
-        } else {
-            conj.pooled.total_trials > 0 && conj.pooled.pooled_rate >= target_rate
-        };
-        macro_ok && all_tasks_passed
     } else {
-        let macro_ok = if enforce_pooled_cp {
+        let pooled_ok = if enforce_pooled_cp {
             pooled_multi_bank.passed
         } else {
             pooled_multi_bank.pooled.total_trials > 0
                 && pooled_multi_bank.pooled.pooled_rate >= target_rate
         };
-        macro_ok && all_tasks_passed
+        let conj_ok = if regime == GateRegime::Clean
+            && let Some(conj) = &seed_conjunction_multi_bank
+        {
+            if enforce_pooled_cp {
+                conj.passed
+            } else {
+                conj.pooled.total_trials > 0 && conj.pooled.pooled_rate >= target_rate
+            }
+        } else {
+            true
+        };
+        pooled_ok && conj_ok && all_tasks_passed
     };
 
     Some(RegimeStratumResult {
@@ -1247,5 +1249,26 @@ mod tests {
             classify_case_outcome(false, &search_bound_counters),
             CaseOutcome::Failed
         );
+    }
+
+    #[test]
+    fn r3_clean_stratum_rejects_failed_pooled_homogeneity_even_when_conjunction_passes() {
+        let inputs: Vec<TaskBankInput> = (0..5)
+            .map(|i| TaskBankInput {
+                task_label: format!("CleanTask{i}"),
+                regime: GateRegime::Clean,
+                banks: vec![BankSample::new(199, 200), BankSample::new(195, 200)],
+                tail_metrics: std::collections::BTreeMap::from([(
+                    "max_target_kt_bits".to_owned(),
+                    0.0,
+                )]),
+            })
+            .collect();
+        let conj_banks = [BankSample::new(195, 200), BankSample::new(195, 200)];
+        let audit = evaluate_stratified_gate_audit(&inputs, Some(&conj_banks), 0.90, 0.90, true);
+        let clean = audit.clean.as_ref().expect("clean stratum present");
+        assert!(!clean.pooled_multi_bank.passed);
+        assert!(!clean.passed);
+        assert!(!audit.passed);
     }
 }

@@ -942,7 +942,7 @@ fn build_epistemic_conservation_circuit(
     (c, comp_defs)
 }
 
-fn check_epistemic_mdl_for_seed(seed: u64) -> Result<f64, String> {
+fn check_epistemic_mdl_for_seed(seed: u64, max_err_out: &mut f64) -> Result<(), String> {
     let mut max_err_b_per_sym = 0.0f64;
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x51a7_c0de);
 
@@ -1065,6 +1065,7 @@ fn check_epistemic_mdl_for_seed(seed: u64) -> Result<f64, String> {
 
                 let err_b_per_sym = (live_delta_e - (-mdl_delta)).abs() / (t_total as f64);
                 max_err_b_per_sym = max_err_b_per_sym.max(err_b_per_sym);
+                *max_err_out = max_err_b_per_sym;
                 if err_b_per_sym > G2B1_EPISTEMIC_MDL_TOL_BITS_PER_SYMBOL {
                     return Err(format!(
                         "width={width:?} M={m} noisy={noisy}: err={err_b_per_sym:.3e} > {:.3e}",
@@ -1074,7 +1075,7 @@ fn check_epistemic_mdl_for_seed(seed: u64) -> Result<f64, String> {
             }
         }
     }
-    Ok(max_err_b_per_sym)
+    Ok(())
 }
 
 fn build_wake_comparator_starve_live(
@@ -1151,7 +1152,10 @@ fn build_wake_comparator_starve_live(
     Ok((live, sub, eqz))
 }
 
-fn check_comparator_starvation_for_seed(seed: u64) -> Result<(), String> {
+fn check_comparator_starvation_for_seed(
+    seed: u64,
+    max_starved_energy_out: &mut f64,
+) -> Result<(), String> {
     let width = Width::BITS_1;
     let config = EconomyConfig::default();
 
@@ -1164,9 +1168,10 @@ fn check_comparator_starvation_for_seed(seed: u64) -> Result<(), String> {
             live.predict(&[x, 0]).expect("predict");
             live.settle(&[next_x]).expect("settle");
         }
-        if live.economy().nodes()[eqz.index()].energy > 0.0
-            && live.economy().nodes()[sub.index()].energy > 0.0
-        {
+        let e_eqz = live.economy().nodes()[eqz.index()].energy;
+        let e_sub = live.economy().nodes()[sub.index()].energy;
+        *max_starved_energy_out = (*max_starved_energy_out).max(e_eqz.max(e_sub));
+        if e_eqz > 0.0 && e_sub > 0.0 {
             return Err("silent comparator failed to starve in Wake".to_owned());
         }
     }
@@ -1254,10 +1259,11 @@ fn check_comparator_starvation_for_seed(seed: u64) -> Result<(), String> {
             )
             .expect("tick");
         }
-        if flux_sleep.abs() > 1e-12 || econ.nodes()[eqz.index()].energy > 0.0 {
+        let e_eqz = econ.nodes()[eqz.index()].energy;
+        *max_starved_energy_out = (*max_starved_energy_out).max(e_eqz);
+        if flux_sleep.abs() > 1e-12 || e_eqz > 0.0 {
             return Err(format!(
-                "constant Sleep comparator did not starve with 0 flux (flux={flux_sleep:.3e}, e_eqz={:.3})",
-                econ.nodes()[eqz.index()].energy
+                "constant Sleep comparator did not starve with 0 flux (flux={flux_sleep:.3e}, e_eqz={e_eqz:.3})",
             ));
         }
     }
@@ -1275,6 +1281,7 @@ fn check_comparator_starvation_for_seed(seed: u64) -> Result<(), String> {
         let comp_flux = live.economy().cumulative_comparator_flux();
         let e_eqz = live.economy().nodes()[eqz.index()].energy;
         let e_sub = live.economy().nodes()[sub.index()].energy;
+        *max_starved_energy_out = (*max_starved_energy_out).max(e_eqz.max(e_sub));
         if comp_flux >= 0.0
             || live.economy().comparator_disagreement_ticks() != 0
             || (e_eqz > 0.0 && e_sub > 0.0)
@@ -1295,14 +1302,11 @@ fn evaluate_g2b1_seed(seed: u32, horizon: u64, warmup: u64) -> (GateTally, f64) 
     let mut max_mdl_err = 0.0f64;
 
     // (a) Deterministic epistemic MDL + starvation
-    let (mdl_ok, mdl_msg) = match check_epistemic_mdl_for_seed(seed64) {
-        Ok(err) => {
-            max_mdl_err = err;
-            tally.record_tail_max("G2B.1a:epistemic_mdl", "max_epistemic_mdl_err", err);
-            (true, None)
-        }
+    let (mdl_ok, mdl_msg) = match check_epistemic_mdl_for_seed(seed64, &mut max_mdl_err) {
+        Ok(()) => (true, None),
         Err(msg) => (false, Some(msg)),
     };
+    tally.record_tail_max("G2B.1a:epistemic_mdl", "max_epistemic_mdl_err", max_mdl_err);
     tally.record(
         format!("G2B.1a:epistemic_mdl:seed={seed}"),
         mdl_ok,
@@ -1310,10 +1314,17 @@ fn evaluate_g2b1_seed(seed: u32, horizon: u64, warmup: u64) -> (GateTally, f64) 
         mdl_msg,
     );
 
-    let (starv_ok, starv_msg) = match check_comparator_starvation_for_seed(seed64) {
-        Ok(()) => (true, None),
-        Err(msg) => (false, Some(msg)),
-    };
+    let mut max_starved_energy = 0.0f64;
+    let (starv_ok, starv_msg) =
+        match check_comparator_starvation_for_seed(seed64, &mut max_starved_energy) {
+            Ok(()) => (true, None),
+            Err(msg) => (false, Some(msg)),
+        };
+    tally.record_tail_max(
+        "G2B.1a:starvation",
+        "max_starved_energy",
+        max_starved_energy,
+    );
     tally.record(
         format!("G2B.1a:starvation:seed={seed}"),
         starv_ok,
@@ -1421,7 +1432,9 @@ fn evaluate_g2b1_seed(seed: u32, horizon: u64, warmup: u64) -> (GateTally, f64) 
         let kt = trace.post_warmup_kt[target_ch];
         let ok = clean_mis == 0 && kt <= G2B1_EXCESS_BITS_MAX;
         let msg = (!ok).then(|| format!("clean_mis={clean_mis}, excess={kt:.5}"));
-        tally.record(format!("G2B.1b:{label}:seed={seed}"), ok, &trace.cliff, msg);
+        let g2b1_task = format!("G2B.1b:{label}");
+        tally.record(format!("{g2b1_task}:seed={seed}"), ok, &trace.cliff, msg);
+        tally.record_tail_max(&g2b1_task, "max_target_kt_bits", kt);
     }
 
     let m1_compat = [
@@ -1512,7 +1525,9 @@ fn evaluate_g2b1_seed(seed: u32, horizon: u64, warmup: u64) -> (GateTally, f64) 
                 trace.telemetry.final_node_count
             )
         });
-        tally.record(format!("G2B.1b:{label}:seed={seed}"), ok, &trace.cliff, msg);
+        let g2b1_task = format!("G2B.1b:{label}");
+        tally.record(format!("{g2b1_task}:seed={seed}"), ok, &trace.cliff, msg);
+        tally.record_tail_max(&g2b1_task, "max_target_kt_bits", kt);
     }
 
     (tally, max_mdl_err)
@@ -1800,7 +1815,22 @@ fn evaluate_g2b2_seed(seed: u32, horizon: u64, warmup: u64) -> GateTally {
                 (good, err_msg)
             }
         };
-        tally.record(format!("G2B.2:{label}:seed={seed}"), ok, &trace.cliff, msg);
+        let g2b2_task = format!("G2B.2:{label}");
+        let target_comps_count = trace
+            .learner
+            .editable()
+            .economy()
+            .comparators()
+            .iter()
+            .filter(|c| c.target_port == 2)
+            .count();
+        tally.record(format!("{g2b2_task}:seed={seed}"), ok, &trace.cliff, msg);
+        tally.record_tail_min(&g2b2_task, "min_target_comps", target_comps_count as f64);
+        tally.record_tail_min(
+            &g2b2_task,
+            "min_settled_comp_ticks",
+            trace.settled_comparator_ticks as f64,
+        );
     }
 
     let t1_tasks = [
@@ -1855,7 +1885,22 @@ fn evaluate_g2b2_seed(seed: u32, horizon: u64, warmup: u64) -> GateTally {
                 (good, err_msg)
             }
         };
-        tally.record(format!("G2B.2:{label}:seed={seed}"), ok, &trace.cliff, msg);
+        let g2b2_task = format!("G2B.2:{label}");
+        let target_comps_count = trace
+            .learner
+            .editable()
+            .economy()
+            .comparators()
+            .iter()
+            .filter(|c| c.target_port == 0)
+            .count();
+        tally.record(format!("{g2b2_task}:seed={seed}"), ok, &trace.cliff, msg);
+        tally.record_tail_min(&g2b2_task, "min_target_comps", target_comps_count as f64);
+        tally.record_tail_min(
+            &g2b2_task,
+            "min_settled_comp_ticks",
+            trace.settled_comparator_ticks as f64,
+        );
     }
 
     let d11 = lfsr_deg11();
@@ -1895,7 +1940,22 @@ fn evaluate_g2b2_seed(seed: u32, horizon: u64, warmup: u64) -> GateTally {
                 trace.telemetry.active_comparator_count, trace.telemetry.redundancy_sprout_events
             )
         });
-        tally.record(format!("G2B.2:{label}:seed={seed}"), ok, &trace.cliff, msg);
+        let g2b2_task = format!("G2B.2:{label}");
+        let target_comps_count = trace
+            .learner
+            .editable()
+            .economy()
+            .comparators()
+            .iter()
+            .filter(|c| c.target_port == 2)
+            .count();
+        tally.record(format!("{g2b2_task}:seed={seed}"), ok, &trace.cliff, msg);
+        tally.record_tail_min(&g2b2_task, "min_target_comps", target_comps_count as f64);
+        tally.record_tail_min(
+            &g2b2_task,
+            "min_settled_comp_ticks",
+            trace.settled_comparator_ticks as f64,
+        );
     }
 
     tally
@@ -1955,11 +2015,17 @@ fn evaluate_g2b3_seed(seed: u32, horizon: u64, warmup: u64) -> GateTally {
             && rep.sleep_comparator_flux > 0.0
             && rep.minority_routes_pruned == 0;
         let msg = (!ok).then(|| format!("loopback_rep={rep:?}"));
-        tally.record(
-            format!("G2B.3a:T1_Alternating:seed={seed}"),
-            ok,
-            &trace.cliff,
-            msg,
+        let g2b3_task = "G2B.3a:T1_Alternating";
+        tally.record(format!("{g2b3_task}:seed={seed}"), ok, &trace.cliff, msg);
+        tally.record_tail_max(
+            g2b3_task,
+            "max_loopback_disagreement_ticks",
+            rep.comparator_disagreement_ticks as f64,
+        );
+        tally.record_tail_max(
+            g2b3_task,
+            "max_circular_discrepancy",
+            rep.max_circular_discrepancy as f64,
         );
     }
 
@@ -2007,11 +2073,17 @@ fn evaluate_g2b3_seed(seed: u32, horizon: u64, warmup: u64) -> GateTally {
             && !rep.contradiction_detected
             && rep.sleep_comparator_flux > 0.0;
         let msg = (!ok).then(|| format!("pre_comps={pre_comps}, loopback_rep={rep:?}"));
-        tally.record(
-            format!("G2B.3a:T2_MultiViewEntrained:seed={seed}"),
-            ok,
-            &trace.cliff,
-            msg,
+        let g2b3_task = "G2B.3a:T2_MultiViewEntrained";
+        tally.record(format!("{g2b3_task}:seed={seed}"), ok, &trace.cliff, msg);
+        tally.record_tail_max(
+            g2b3_task,
+            "max_loopback_disagreement_ticks",
+            rep.comparator_disagreement_ticks as f64,
+        );
+        tally.record_tail_max(
+            g2b3_task,
+            "max_circular_discrepancy",
+            rep.max_circular_discrepancy as f64,
         );
     }
 
@@ -2049,11 +2121,22 @@ fn evaluate_g2b3_seed(seed: u32, horizon: u64, warmup: u64) -> GateTally {
         let rep = learner.run_offline_loopback(t_loop);
         let ok = rep.sleep_comparator_flux == 0.0 && rep.comparator_disagreement_ticks == 0;
         let msg = (!ok).then(|| format!("const0 loopback_rep={rep:?}"));
+        let g2b3_task = "G2B.3a:Constant0";
         tally.record(
-            format!("G2B.3a:Constant0:seed={seed}"),
+            format!("{g2b3_task}:seed={seed}"),
             ok,
             &CliffCountersSummary::default(),
             msg,
+        );
+        tally.record_tail_max(
+            g2b3_task,
+            "max_loopback_disagreement_ticks",
+            rep.comparator_disagreement_ticks as f64,
+        );
+        tally.record_tail_max(
+            g2b3_task,
+            "max_circular_discrepancy",
+            rep.max_circular_discrepancy as f64,
         );
     }
 
@@ -2094,11 +2177,22 @@ fn evaluate_g2b3_seed(seed: u32, horizon: u64, warmup: u64) -> GateTally {
             && rep.max_circular_discrepancy >= 1
             && rep.sleep_comparator_flux < 0.0;
         let msg = (!ok).then(|| format!("deceptive_p6 loopback_rep={rep:?}"));
+        let g2b3_task = "G2B.3b:DeceptivePeriod6";
         tally.record(
-            format!("G2B.3b:DeceptivePeriod6:seed={seed}"),
+            format!("{g2b3_task}:seed={seed}"),
             ok,
             &CliffCountersSummary::default(),
             msg,
+        );
+        tally.record_tail_max(
+            g2b3_task,
+            "max_loopback_disagreement_ticks",
+            rep.comparator_disagreement_ticks as f64,
+        );
+        tally.record_tail_max(
+            g2b3_task,
+            "max_circular_discrepancy",
+            rep.max_circular_discrepancy as f64,
         );
     }
 
@@ -2137,11 +2231,22 @@ fn evaluate_g2b3_seed(seed: u32, horizon: u64, warmup: u64) -> GateTally {
             && rep.max_circular_discrepancy >= 1
             && rep.sleep_comparator_flux < 0.0;
         let msg = (!ok).then(|| format!("spurious_cross loopback_rep={rep:?}"));
+        let g2b3_task = "G2B.3b:SpuriousCrossLag";
         tally.record(
-            format!("G2B.3b:SpuriousCrossLag:seed={seed}"),
+            format!("{g2b3_task}:seed={seed}"),
             ok,
             &CliffCountersSummary::default(),
             msg,
+        );
+        tally.record_tail_max(
+            g2b3_task,
+            "max_loopback_disagreement_ticks",
+            rep.comparator_disagreement_ticks as f64,
+        );
+        tally.record_tail_max(
+            g2b3_task,
+            "max_circular_discrepancy",
+            rep.max_circular_discrepancy as f64,
         );
     }
 
@@ -2190,11 +2295,22 @@ fn evaluate_g2b3_seed(seed: u32, horizon: u64, warmup: u64) -> GateTally {
                 learner.active_comparator_count()
             )
         });
+        let g2b3_task = format!("G2B.3c:Majority3(pri_min={primary_is_minority})");
         tally.record(
-            format!("G2B.3c:Majority3(pri_min={primary_is_minority}):seed={seed}"),
+            format!("{g2b3_task}:seed={seed}"),
             ok,
             &CliffCountersSummary::default(),
             msg,
+        );
+        tally.record_tail_max(
+            &g2b3_task,
+            "max_loopback_disagreement_ticks",
+            rep.comparator_disagreement_ticks as f64,
+        );
+        tally.record_tail_max(
+            &g2b3_task,
+            "max_circular_discrepancy",
+            rep.max_circular_discrepancy as f64,
         );
     }
 
@@ -2475,11 +2591,18 @@ fn evaluate_g2b4_seed(seed: u32, horizon: u64, warmup: u64) -> G2b4SeedResult {
                     trace.telemetry.active_comparator_count
                 )
             });
+            let g2b4_const_task = format!("G2B.4:Noisy{tag}(k={})", width.bits());
             tally.record_noisy(
-                format!("G2B.4:Noisy{tag}(k={}):seed={seed}", width.bits()),
+                format!("{g2b4_const_task}:seed={seed}"),
                 ok,
                 &trace.cliff,
                 msg,
+            );
+            let h_const = channel_substitution_entropy_bits(G2B4_NOISE_EPSILON, width.bits());
+            tally.record_tail_max(
+                &g2b4_const_task,
+                "max_abs_kt_diff",
+                (trace.post_warmup_kt[0] - h_const).abs(),
             );
         }
     }
@@ -3138,9 +3261,12 @@ mod tests {
 
     #[test]
     fn g2b1a_epistemic_mdl_conservation_and_starvation_single_seed() {
-        let max_err = check_epistemic_mdl_for_seed(0).expect("epistemic MDL conservation");
+        let mut max_err = 0.0f64;
+        check_epistemic_mdl_for_seed(0, &mut max_err).expect("epistemic MDL conservation");
         assert!(max_err <= G2B1_EPISTEMIC_MDL_TOL_BITS_PER_SYMBOL);
-        check_comparator_starvation_for_seed(0).expect("comparator starvation calibrated");
+        let mut max_starved_energy = 0.0f64;
+        check_comparator_starvation_for_seed(0, &mut max_starved_energy)
+            .expect("comparator starvation calibrated");
     }
 
     #[test]

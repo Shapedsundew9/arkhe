@@ -554,6 +554,7 @@ struct TaskOutcomePiece {
     excluded: bool,
     cliff: CliffCountersSummary,
     failure: Option<String>,
+    target_kt: f64,
 }
 
 struct G2a1TaskSpec {
@@ -798,6 +799,7 @@ fn run_g2a1_task(spec: &G2a1TaskSpec, master_seed: u64, horizon: u64) -> (TaskOu
             excluded: excluded_count > 0,
             cliff,
             failure,
+            target_kt: target_sc.prequential_kt_residual_bits_per_symbol,
         },
         excluded_count,
     )
@@ -941,6 +943,7 @@ fn run_g2a2_deep_task(spec: &G2a2DeepSpec, master_seed: u64, horizon: u64) -> Ta
         excluded: res.excluded,
         cliff: res.cliff,
         failure,
+        target_kt: target_sc.prequential_kt_residual_bits_per_symbol,
     }
 }
 
@@ -977,6 +980,7 @@ fn run_g2a2_m1_ring_task(master_seed: u64, horizon: u64) -> TaskOutcomePiece {
         excluded: res.excluded,
         cliff: res.cliff,
         failure,
+        target_kt: res.scorecard.per_channel[0].prequential_kt_residual_bits_per_symbol,
     }
 }
 
@@ -1015,6 +1019,7 @@ fn run_g2a2_tph_task(spec: &G2a2TphSpec, master_seed: u64, horizon: u64) -> Task
         excluded: res.excluded,
         cliff: res.cliff,
         failure,
+        target_kt: target_sc.prequential_kt_residual_bits_per_symbol,
     }
 }
 
@@ -1111,6 +1116,7 @@ struct G2a3SoloOutcome {
 struct G2a3MultiOutcome {
     cliff: CliffCountersSummary,
     excluded: bool,
+    horizon: u64,
     channels: Vec<(Option<u64>, u64)>,
 }
 
@@ -1176,6 +1182,7 @@ fn run_g2a3_multi_task(spec: &G2a3MultiSpec, master_seed: u64, horizon: u64) -> 
     G2a3MultiOutcome {
         cliff: m_res.cliff,
         excluded: m_res.excluded,
+        horizon,
         channels,
     }
 }
@@ -1216,9 +1223,19 @@ fn reduce_g2a3_seed(
             all_ok = false;
         }
         let mut task_ok = !m_out.excluded && !solo_excl;
+        let mut max_multi_lock_tick = 0.0f64;
+        let mut max_lock_time_ratio: Option<f64> = None;
         for (ch, &solo_idx) in m_spec.solo_indices.iter().enumerate() {
             let solo_t = solos[solo_idx].t_lock;
             let (tm_opt, clean_mis) = m_out.channels[ch];
+            let multi_tick = tm_opt.unwrap_or(m_out.horizon) as f64;
+            max_multi_lock_tick = max_multi_lock_tick.max(multi_tick);
+            if let (Some(ts), Some(tm)) = (solo_t, tm_opt) {
+                let ratio = (tm as f64) / (ts as f64).max(w_diag);
+                if ratio.is_finite() {
+                    max_lock_time_ratio = Some(max_lock_time_ratio.map_or(ratio, |m| m.max(ratio)));
+                }
+            }
             let ch_ok = match (solo_t, tm_opt) {
                 (Some(ts), Some(tm)) if !m_out.excluded => {
                     clean_mis == 0 && (tm as f64) <= 1.50 * (ts as f64).max(w_diag)
@@ -1235,12 +1252,16 @@ fn reduce_g2a3_seed(
                 ));
             }
         }
+        let mut tail_metrics = vec![("max_multi_lock_tick", max_multi_lock_tick)];
+        if let Some(ratio) = max_lock_time_ratio {
+            tail_metrics.push(("max_lock_time_ratio", ratio));
+        }
         task_records.push(M2aTaskRecord {
             gate_idx: 2,
             task_label: format!("G2A.3:{}({:?})", m_spec.panel_label, m_spec.wire_delay),
             regime: GateRegime::Clean,
             passed: task_ok,
-            tail_metrics: Vec::new(),
+            tail_metrics,
         });
     }
 
@@ -1561,6 +1582,7 @@ fn run_g2a4a_task(
             excluded: res.excluded,
             cliff: res.cliff,
             failure,
+            target_kt: target_sc.prequential_kt_residual_bits_per_symbol,
         },
         regret,
     )
@@ -1624,6 +1646,7 @@ fn run_g2a4b_task(
             excluded: res.excluded,
             cliff: res.cliff,
             failure,
+            target_kt: kt,
         },
         (kt, h_react),
         paired_diff,
@@ -1842,6 +1865,7 @@ fn run_g2a5_task(
             excluded: arkhe.excluded,
             cliff,
             failure,
+            target_kt: arkhe_m.target_kt,
         },
         [arkhe_m, rs_m, cgp_m, ctw_m, bm_m, cross_ctw_m, rnn_m],
     )
@@ -2370,7 +2394,7 @@ impl SeedTaskAccumulator {
                     task_label: format!("G2A.1:{}", specs.g1[i].label),
                     regime: GateRegime::Clean,
                     passed: p.ok && !p.excluded,
-                    tail_metrics: Vec::new(),
+                    tail_metrics: vec![("max_target_kt_bits", p.target_kt)],
                 });
                 (p, ex)
             })
@@ -2389,7 +2413,7 @@ impl SeedTaskAccumulator {
                 ),
                 regime: GateRegime::Clean,
                 passed: p.ok && !p.excluded,
-                tail_metrics: Vec::new(),
+                tail_metrics: vec![("max_target_kt_bits", p.target_kt)],
             });
             g2_items.push(unit_excl(p));
         }
@@ -2399,7 +2423,7 @@ impl SeedTaskAccumulator {
             task_label: "G2A.2:M1_PeriodicRing(k=1)".to_owned(),
             regime: GateRegime::Clean,
             passed: ring_p.ok && !ring_p.excluded,
-            tail_metrics: Vec::new(),
+            tail_metrics: vec![("max_target_kt_bits", ring_p.target_kt)],
         });
         g2_items.push(unit_excl(ring_p));
         for (i, x) in self.g2_tph.into_iter().enumerate() {
@@ -2409,7 +2433,7 @@ impl SeedTaskAccumulator {
                 task_label: format!("G2A.2:{}", specs.g2_tph[i].label),
                 regime: GateRegime::Clean,
                 passed: p.ok && !p.excluded,
-                tail_metrics: Vec::new(),
+                tail_metrics: vec![("max_target_kt_bits", p.target_kt)],
             });
             g2_items.push(unit_excl(p));
         }
@@ -2431,10 +2455,10 @@ impl SeedTaskAccumulator {
         let mut g4_pieces = Vec::with_capacity(self.g4a.len() + self.g4b.len());
         for (i, x) in self.g4a.into_iter().enumerate() {
             let (piece, regret) = x.expect("G2A.4a task completed");
-            let tail_metrics = regret
-                .into_iter()
-                .map(|r| ("max_paired_regret", r.abs()))
-                .collect();
+            let mut tail_metrics = vec![("max_target_kt_bits", piece.target_kt)];
+            if let Some(r) = regret {
+                tail_metrics.push(("max_paired_regret", r.abs()));
+            }
             task_records.push(M2aTaskRecord {
                 gate_idx: 3,
                 task_label: format!("G2A.4a:{}", specs.g4a[i].label),
@@ -2453,6 +2477,7 @@ impl SeedTaskAccumulator {
                 regime: GateRegime::Noisy,
                 passed: piece.ok && !piece.excluded,
                 tail_metrics: vec![
+                    ("max_target_kt_bits", piece.target_kt),
                     ("max_abs_kt_diff", paired_diff),
                     ("max_h_reactive_dev", (sample.0 - sample.1).abs()),
                 ],

@@ -37,7 +37,7 @@ use crate::stats::{
     BankSample, BankTailMetricMap, BankTaskCountMap, CaseOutcome, GateRegime, HoldoutRangeSpec,
     MultiBankGateResult, StratifiedGateAudit, check_seed_range_holdouts, classify_case_outcome,
     evaluate_multi_bank_gate, evaluate_stratified_from_bank_maps, merge_tail_metric_map,
-    percentile_sorted, strip_seed_suffix, update_max_finite,
+    percentile_sorted, strip_seed_suffix, update_max_finite, update_min_finite,
 };
 use crate::structural::graph_edit::source_has_cycle;
 use crate::structural::growth::ExcisionMode;
@@ -364,6 +364,11 @@ impl GateTally {
     fn record_tail_max(&mut self, task_label: &str, key: &str, value: f64) {
         let map = self.task_tails.entry(task_label.to_owned()).or_default();
         update_max_finite(map, key, value);
+    }
+
+    fn record_tail_min(&mut self, task_label: &str, key: &str, value: f64) {
+        let map = self.task_tails.entry(task_label.to_owned()).or_default();
+        update_min_finite(map, key, value);
     }
 
     fn record_dt_samples(&mut self, task_label: &str, dts: &[f64]) {
@@ -1909,14 +1914,23 @@ fn evaluate_g31_seed(seed: u32) -> G31SeedResult {
                 };
                 let ok = win_res.is_ok() && spec_ok;
                 let msg = (!ok).then(|| format!("win={win_res:?}, spec_ok={spec_ok}"));
+                let g31_spec_task =
+                    format!("G3.1:SpecTransp(k={},{wire_delay:?},{class})", width.bits());
                 tally.record(
-                    format!(
-                        "G3.1:SpecTransp(k={},{wire_delay:?},{class}):seed={seed}",
-                        width.bits()
-                    ),
+                    format!("{g31_spec_task}:seed={seed}"),
                     ok,
                     &CliffCountersSummary::default(),
                     msg,
+                );
+                tally.record_tail_max(
+                    &g31_spec_task,
+                    "max_spec_transp_failed",
+                    if ok { 0.0 } else { 1.0 },
+                );
+                tally.record_tail_max(
+                    &g31_spec_task,
+                    "max_post_edit_nodes",
+                    edit.circuit.node_count() as f64,
                 );
             }
         }
@@ -3155,6 +3169,8 @@ where
     F: Fn(usize) -> String,
     R: Fn(usize) -> GateRegime,
 {
+    let fallback_excise_dt =
+        (3 * observation_horizon(&EconomyConfig::default(), &GrowthConfig::default())) as f64;
     let mut units: Vec<Option<TrajectoryUnitAccum>> = (0..num_groups).map(|_| None).collect();
     let mut max_dt: Option<u64> = None;
     for obs in observations {
@@ -3214,7 +3230,11 @@ where
         let regime = regime_for_group(group_idx);
         let unit_label = format!("{task_name}:seed={seed}");
         tally.record_with_regime(unit_label, regime, unit_ok, &unit.cliff, detail);
-        tally.record_dt_samples(&task_name, &unit.excise_dts);
+        if unit.excise_dts.is_empty() {
+            tally.record_dt_samples(&task_name, &[fallback_excise_dt]);
+        } else {
+            tally.record_dt_samples(&task_name, &unit.excise_dts);
+        }
         if let Some(v) = unit.max_post_exc_kt_excess {
             tally.record_tail_max(&task_name, "max_post_exc_kt_excess", v);
         }
@@ -3784,14 +3804,22 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                             base_out.final_total_code_bits
                         )
                     });
+                    let g35a_task = format!("G3.5a:{}({})", task.label, base_job.detour_class);
                     g35a.record(
-                        format!(
-                            "G3.5a:{}({}):seed={seed}",
-                            task.label, base_job.detour_class
-                        ),
+                        format!("{g35a_task}:seed={seed}"),
                         ok,
                         &combined_cliff,
                         detail,
+                    );
+                    g35a.record_tail_min(
+                        &g35a_task,
+                        "min_vle_code_bits_advantage",
+                        base_out.final_total_code_bits - vle_out.final_total_code_bits,
+                    );
+                    g35a.record_tail_max(
+                        &g35a_task,
+                        "max_vle_final_code_bits",
+                        vle_out.final_total_code_bits,
                     );
                 }
             }
@@ -3885,12 +3913,16 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
 
                 let mut combined_cliff = r_true.cliff;
                 combined_cliff.accumulate(&r_false.cliff);
-                if let Some(delta) = r_true.analytical_split_tax_delta
-                    && r_true.final_split_count > 0
-                {
-                    let per_split = delta / (r_true.final_split_count as f64);
-                    min_split_tax_delta = min_split_tax_delta.min(per_split);
-                }
+                let per_split_tax = match r_true.analytical_split_tax_delta {
+                    Some(delta) if r_true.final_split_count > 0 => {
+                        let per_split = delta / (r_true.final_split_count as f64);
+                        min_split_tax_delta = min_split_tax_delta.min(per_split);
+                        per_split
+                    }
+                    _ => canonical_split_tax,
+                };
+                let split_count_delta =
+                    (r_true.final_split_count as f64) - (r_false.final_split_count as f64);
                 let analytical_ok = g35b_analytical_tax_ok(r_true);
                 let solvability_ok = g35b_solvability_ok(spec.epsilon, r_true);
                 let g35b_ok = canonical_split_tax >= G35B_MIN_SPLIT_TAX_BITS
@@ -3907,16 +3939,19 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                         r_false.final_code_bits
                     )
                 });
+                let g35b_task = format!(
+                    "G3.5b:{}({:?},eps={:.2})",
+                    spec.label, spec.wire_delay, spec.epsilon
+                );
                 g35b.record_with_regime(
-                    format!(
-                        "G3.5b:{}({:?},eps={:.2}):seed={seed}",
-                        spec.label, spec.wire_delay, spec.epsilon
-                    ),
+                    format!("{g35b_task}:seed={seed}"),
                     spont_regime,
                     g35b_ok,
                     &combined_cliff,
                     g35b_detail,
                 );
+                g35b.record_tail_min(&g35b_task, "min_split_tax_bits", per_split_tax);
+                g35b.record_tail_max(&g35b_task, "max_split_count_delta", split_count_delta);
             }
 
             // Paired injection `split_code_tax` ablation (sharing tax=true VLE runs with tax=false).
