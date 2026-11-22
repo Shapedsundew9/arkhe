@@ -1518,30 +1518,35 @@ fn evaluate_g31_seed(seed: u32) -> G31SeedResult {
 
                             env.step_frame(&mut clean, &mut obs);
                             let p = learner.predict(&mut budget);
-                            for ch in 0..num_out {
-                                if ch == usize::from(target_port) {
-                                    preds[ch].push(p[ch]);
-                                    facts[ch].push(obs[ch]);
-                                } else {
-                                    preds[ch].push(0);
-                                    facts[ch].push(0);
-                                }
-                            }
-                            phases.push(EpistemicTickPhase::Wake);
-                            if has_comp
+                            let (pri_val, alt_val) = if has_comp
                                 && let Some(comp) =
                                     learner.editable().economy().comparators().first()
                             {
                                 let wires = learner.editable().state().wire_values();
                                 let sub_in = &learner.editable().compiled().node_input_wires()
                                     [comp.sub_node.index()];
-                                comp_pri.push(width.normalize(wires[sub_in[0]]));
-                                comp_alt.push(width.normalize(wires[sub_in[1]]));
+                                (
+                                    width.normalize(wires[sub_in[0]]),
+                                    width.normalize(wires[sub_in[1]]),
+                                )
                             } else {
-                                comp_pri.push(0);
-                                comp_alt.push(0);
-                            }
+                                (0, 0)
+                            };
                             learner.observe(&obs, &mut budget);
+                            if learner.port_scored_last_observe(usize::from(target_port)) {
+                                for ch in 0..num_out {
+                                    if ch == usize::from(target_port) {
+                                        preds[ch].push(p[ch]);
+                                        facts[ch].push(obs[ch]);
+                                    } else {
+                                        preds[ch].push(0);
+                                        facts[ch].push(0);
+                                    }
+                                }
+                                phases.push(EpistemicTickPhase::Wake);
+                                comp_pri.push(pri_val);
+                                comp_alt.push(alt_val);
+                            }
 
                             if t == pre_ticks + 16 {
                                 let tel = learner.telemetry();
@@ -2771,8 +2776,12 @@ struct SeedAllGatesRaw {
     g31_max_mdl_err: f64,
     g32: GateTally,
     g32_max_excise_dt: Option<u64>,
+    g32_raw_detour_passed: usize,
+    g32_raw_detour_total: usize,
     g33: GateTally,
     g33_max_excise_dt: Option<u64>,
+    g33_raw_detour_passed: usize,
+    g33_raw_detour_total: usize,
     g34: GateTally,
     g35a: GateTally,
     g35b: GateTally,
@@ -2795,8 +2804,12 @@ struct BankAggRaw {
     g31_max_mdl_err: f64,
     g32: GateTally,
     g32_max_excise_dt: Option<u64>,
+    g32_raw_detour_passed: usize,
+    g32_raw_detour_total: usize,
     g33: GateTally,
     g33_max_excise_dt: Option<u64>,
+    g33_raw_detour_passed: usize,
+    g33_raw_detour_total: usize,
     g34: GateTally,
     g35a: GateTally,
     g35b: GateTally,
@@ -2810,6 +2823,163 @@ struct BankAggRaw {
     inj_paired_count: usize,
     inj_excised_tax_true: usize,
     inj_excised_tax_false: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TrajectoryDetourObservation<'a> {
+    settle_group_idx: usize,
+    detour_class: DetourClass,
+    functional_ok: bool,
+    excise_dt: Option<u64>,
+    cliff: &'a CliffCountersSummary,
+    detail: Option<String>,
+}
+
+#[derive(Default)]
+struct TrajectoryUnitAccum {
+    raw_passed: usize,
+    raw_total: usize,
+    cliff: CliffCountersSummary,
+    failing_details: Vec<String>,
+}
+
+fn evaluate_vle_detour_outcome(
+    job: &InjJobDesc,
+    out: &InjCaseResult,
+    w_obs: u64,
+) -> (bool, Option<String>) {
+    match job.injection_mode {
+        InjectionMode::Established => {
+            let pred_ok = if job.epsilon == 0.0 {
+                out.post_excision_clean_mismatches == 0
+                    && out.post_excision_paired_kt_diff <= G32_CLEAN_EXCESS_MAX
+                    && out.post_excision_kt_excess <= G32_CLEAN_RAW_KT_MAX
+            } else {
+                out.post_excision_paired_kt_diff <= G32_NOISY_KT_DIFF_MAX
+            };
+            let ok = out.settled
+                && out.excised_within_w_obs
+                && !out.collapsed
+                && out.primary_restored
+                && out.comparator_preserved
+                && pred_ok;
+            let detail = (!ok).then(|| {
+                out.detail.clone().unwrap_or_else(|| {
+                    format!(
+                        "dt={:?} (limit={w_obs}), clean_mis={}, clean_kt={:.5}, paired_diff={:.5}",
+                        out.excise_dt,
+                        out.post_excision_clean_mismatches,
+                        out.post_excision_kt_excess,
+                        out.post_excision_paired_kt_diff
+                    )
+                })
+            });
+            (ok, detail)
+        }
+        InjectionMode::Juvenile => {
+            let transient_ok = if job.epsilon == 0.0 {
+                if job.detour_class == DetourClass::D2OneFire {
+                    out.post_inj_clean_mismatches <= 1
+                        && out.post_excision_clean_mismatches == 0
+                        && out.post_inj_kt_excess <= G33_D2_TRANSIENT_KT_EXCESS_MAX
+                        && out.post_inj_paired_kt_diff <= G33_D2_PAIRED_KT_DIFF_MAX
+                } else {
+                    out.post_inj_clean_mismatches == 0
+                }
+            } else {
+                true
+            };
+            let ok = out.settled
+                && out.excised_within_3w_obs
+                && !out.collapsed
+                && out.primary_restored
+                && out.comparator_preserved
+                && transient_ok;
+            let detail = (!ok).then(|| {
+                out.detail.clone().unwrap_or_else(|| {
+                    format!(
+                        "dt={:?} (limit={}), post_inj_mis={}, post_inj_kt={:.5}, post_inj_paired={:.5}",
+                        out.excise_dt,
+                        3 * w_obs,
+                        out.post_inj_clean_mismatches,
+                        out.post_inj_kt_excess,
+                        out.post_inj_paired_kt_diff
+                    )
+                })
+            });
+            (ok, detail)
+        }
+    }
+}
+
+fn record_injection_trajectory_units<'a, F>(
+    gate_label: &str,
+    seed: u32,
+    num_groups: usize,
+    observations: impl IntoIterator<Item = TrajectoryDetourObservation<'a>>,
+    label_for_group: F,
+    tally: &mut GateTally,
+) -> (Option<u64>, usize, usize)
+where
+    F: Fn(usize) -> String,
+{
+    let mut units: Vec<Option<TrajectoryUnitAccum>> = (0..num_groups).map(|_| None).collect();
+    let mut max_dt: Option<u64> = None;
+    for obs in observations {
+        if let Some(dt) = obs.excise_dt {
+            max_dt = Some(max_dt.map_or(dt, |m| m.max(dt)));
+        }
+        let acc = units[obs.settle_group_idx].get_or_insert_with(TrajectoryUnitAccum::default);
+        acc.cliff.accumulate(obs.cliff);
+        acc.raw_total += 1;
+        if classify_case_outcome(obs.functional_ok, obs.cliff) == CaseOutcome::Passed {
+            acc.raw_passed += 1;
+        }
+        if !obs.functional_ok {
+            let reason = obs.detail.unwrap_or_else(|| "failed".to_owned());
+            acc.failing_details
+                .push(format!("{}: {}", obs.detour_class, reason));
+        }
+    }
+
+    let mut raw_passed = 0usize;
+    let mut raw_total = 0usize;
+    for (group_idx, unit_opt) in units.into_iter().enumerate() {
+        let Some(unit) = unit_opt else {
+            continue;
+        };
+        raw_passed += unit.raw_passed;
+        raw_total += unit.raw_total;
+        let unit_ok = unit.failing_details.is_empty();
+        let detail = (!unit_ok).then(|| {
+            format!(
+                "failed_detours={}/{}: {}",
+                unit.failing_details.len(),
+                unit.raw_total,
+                unit.failing_details.join("; ")
+            )
+        });
+        let unit_label = format!("{gate_label}:{}:seed={seed}", label_for_group(group_idx));
+        tally.record(unit_label, unit_ok, &unit.cliff, detail);
+    }
+    (max_dt, raw_passed, raw_total)
+}
+
+fn format_excise_raw_summary(max_dt: Option<u64>, raw_passed: usize, raw_total: usize) -> String {
+    match max_dt {
+        Some(dt) => format!("max_excise_dt={dt} ticks; raw_detours={raw_passed}/{raw_total}"),
+        None => format!("max_excise_dt=None; raw_detours={raw_passed}/{raw_total}"),
+    }
+}
+
+const fn g35b_solvability_ok(epsilon: f64, res: &SpontCaseResult) -> bool {
+    epsilon > 0.0 || res.clean_locked_8000
+}
+
+fn g35b_analytical_tax_ok(res: &SpontCaseResult) -> bool {
+    res.analytical_split_tax_delta.is_none_or(|delta| {
+        delta >= G35B_MIN_SPLIT_TAX_BITS * (res.final_split_count.max(1) as f64)
+    })
 }
 
 fn clean_spont_spec_labels(spont_specs: &[SpontaneousSpec]) -> Vec<String> {
@@ -3264,96 +3434,52 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                 .collect();
 
             let mut g32 = GateTally::default();
-            let mut g32_max_dt: Option<u64> = None;
             let mut g33 = GateTally::default();
-            let mut g33_max_dt: Option<u64> = None;
+            let mut g32_obs = Vec::new();
+            let mut g33_obs = Vec::new();
 
             for (job, out) in vle_jobs.iter().zip(vle_outs.iter()) {
                 if out.tph_non_autonomous_skipped {
                     continue;
                 }
-                let task = &tasks[job.task_idx];
-                let label = format!(
-                    "{}:{}({:?},eps={:.2},{}):seed={seed}",
-                    if job.injection_mode == InjectionMode::Established {
-                        "G3.2"
-                    } else {
-                        "G3.3"
-                    },
-                    task.label,
-                    job.wire_delay,
-                    job.epsilon,
-                    job.detour_class
-                );
+                let (ok, detail) = evaluate_vle_detour_outcome(job, out, w_obs);
+                let obs = TrajectoryDetourObservation {
+                    settle_group_idx: job.settle_group_idx,
+                    detour_class: job.detour_class,
+                    functional_ok: ok,
+                    excise_dt: out.excise_dt,
+                    cliff: &out.cliff,
+                    detail,
+                };
                 match job.injection_mode {
-                    InjectionMode::Established => {
-                        if let Some(dt) = out.excise_dt {
-                            g32_max_dt = Some(g32_max_dt.map_or(dt, |m| m.max(dt)));
-                        }
-                        let pred_ok = if job.epsilon == 0.0 {
-                            out.post_excision_clean_mismatches == 0
-                                && out.post_excision_paired_kt_diff <= G32_CLEAN_EXCESS_MAX
-                                && out.post_excision_kt_excess <= G32_CLEAN_RAW_KT_MAX
-                        } else {
-                            out.post_excision_paired_kt_diff <= G32_NOISY_KT_DIFF_MAX
-                        };
-                        let ok = out.settled
-                            && out.excised_within_w_obs
-                            && !out.collapsed
-                            && out.primary_restored
-                            && out.comparator_preserved
-                            && pred_ok;
-                        let detail = (!ok).then(|| {
-                            out.detail.clone().unwrap_or_else(|| {
-                                format!(
-                                    "dt={:?} (limit={w_obs}), clean_mis={}, clean_kt={:.5}, paired_diff={:.5}",
-                                    out.excise_dt,
-                                    out.post_excision_clean_mismatches,
-                                    out.post_excision_kt_excess,
-                                    out.post_excision_paired_kt_diff
-                                )
-                            })
-                        });
-                        g32.record(label, ok, &out.cliff, detail);
-                    }
-                    InjectionMode::Juvenile => {
-                        if let Some(dt) = out.excise_dt {
-                            g33_max_dt = Some(g33_max_dt.map_or(dt, |m| m.max(dt)));
-                        }
-                        let transient_ok = if job.epsilon == 0.0 {
-                            if job.detour_class == DetourClass::D2OneFire {
-                                out.post_inj_clean_mismatches <= 1
-                                    && out.post_excision_clean_mismatches == 0
-                                    && out.post_inj_kt_excess <= G33_D2_TRANSIENT_KT_EXCESS_MAX
-                                    && out.post_inj_paired_kt_diff <= G33_D2_PAIRED_KT_DIFF_MAX
-                            } else {
-                                out.post_inj_clean_mismatches == 0
-                            }
-                        } else {
-                            true
-                        };
-                        let ok = out.settled
-                            && out.excised_within_3w_obs
-                            && !out.collapsed
-                            && out.primary_restored
-                            && out.comparator_preserved
-                            && transient_ok;
-                        let detail = (!ok).then(|| {
-                            out.detail.clone().unwrap_or_else(|| {
-                                format!(
-                                    "dt={:?} (limit={}), post_inj_mis={}, post_inj_kt={:.5}, post_inj_paired={:.5}",
-                                    out.excise_dt,
-                                    3 * w_obs,
-                                    out.post_inj_clean_mismatches,
-                                    out.post_inj_kt_excess,
-                                    out.post_inj_paired_kt_diff
-                                )
-                            })
-                        });
-                        g33.record(label, ok, &out.cliff, detail);
-                    }
+                    InjectionMode::Established => g32_obs.push(obs),
+                    InjectionMode::Juvenile => g33_obs.push(obs),
                 }
             }
+
+            let label_for_group = |group_idx: usize| -> String {
+                let g = &settle_groups[group_idx];
+                let task = &tasks[g.task_idx];
+                format!("{}({:?},eps={:.2})", task.label, g.wire_delay, g.epsilon)
+            };
+            let (g32_max_dt, g32_raw_detour_passed, g32_raw_detour_total) =
+                record_injection_trajectory_units(
+                    "G3.2",
+                    seed,
+                    settle_groups.len(),
+                    g32_obs,
+                    label_for_group,
+                    &mut g32,
+                );
+            let (g33_max_dt, g33_raw_detour_passed, g33_raw_detour_total) =
+                record_injection_trajectory_units(
+                    "G3.3",
+                    seed,
+                    settle_groups.len(),
+                    g33_obs,
+                    label_for_group,
+                    &mut g33,
+                );
 
             // G3.5(a): Share CombMain Established clean VLE trajectories vs BaselineD1b1 (`D1`–`D6`, `D7b`).
             let mut g35a = GateTally::default();
@@ -3473,14 +3599,8 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                     let per_split = delta / (r_true.final_split_count as f64);
                     min_split_tax_delta = min_split_tax_delta.min(per_split);
                 }
-                let analytical_ok = r_true.analytical_split_tax_delta.is_none_or(|delta| {
-                    delta >= G35B_MIN_SPLIT_TAX_BITS * (r_true.final_split_count.max(1) as f64)
-                });
-                let solvability_ok = if spec.epsilon == 0.0 {
-                    r_true.clean_locked_8000
-                } else {
-                    r_true.locked
-                };
+                let analytical_ok = g35b_analytical_tax_ok(r_true);
+                let solvability_ok = g35b_solvability_ok(spec.epsilon, r_true);
                 let g35b_ok = canonical_split_tax >= G35B_MIN_SPLIT_TAX_BITS
                     && analytical_ok
                     && solvability_ok;
@@ -3550,8 +3670,12 @@ fn evaluate_seed_range_parallel(seed_offset: u32, total_seeds: u32) -> Vec<SeedA
                 g31_max_mdl_err: g31_res.max_mdl_err,
                 g32,
                 g32_max_excise_dt: g32_max_dt,
+                g32_raw_detour_passed,
+                g32_raw_detour_total,
                 g33,
                 g33_max_excise_dt: g33_max_dt,
+                g33_raw_detour_passed,
+                g33_raw_detour_total,
                 g34,
                 g35a,
                 g35b,
@@ -3578,8 +3702,12 @@ fn aggregate_bank_slice(seed_offset: u32, outcomes: Vec<SeedAllGatesRaw>) -> Ban
     let mut g31_max_mdl_err = 0.0f64;
     let mut g32 = GateTally::default();
     let mut g32_max_excise_dt: Option<u64> = None;
+    let mut g32_raw_detour_passed = 0usize;
+    let mut g32_raw_detour_total = 0usize;
     let mut g33 = GateTally::default();
     let mut g33_max_excise_dt: Option<u64> = None;
+    let mut g33_raw_detour_passed = 0usize;
+    let mut g33_raw_detour_total = 0usize;
     let mut g34 = GateTally::default();
     let mut g35a = GateTally::default();
     let mut g35b = GateTally::default();
@@ -3601,10 +3729,14 @@ fn aggregate_bank_slice(seed_offset: u32, outcomes: Vec<SeedAllGatesRaw>) -> Ban
         if let Some(dt) = r.g32_max_excise_dt {
             g32_max_excise_dt = Some(g32_max_excise_dt.map_or(dt, |m| m.max(dt)));
         }
+        g32_raw_detour_passed += r.g32_raw_detour_passed;
+        g32_raw_detour_total += r.g32_raw_detour_total;
         g33.merge(r.g33);
         if let Some(dt) = r.g33_max_excise_dt {
             g33_max_excise_dt = Some(g33_max_excise_dt.map_or(dt, |m| m.max(dt)));
         }
+        g33_raw_detour_passed += r.g33_raw_detour_passed;
+        g33_raw_detour_total += r.g33_raw_detour_total;
         g34.merge(r.g34);
         g35a.merge(r.g35a);
         g35b.merge(r.g35b);
@@ -3642,8 +3774,12 @@ fn aggregate_bank_slice(seed_offset: u32, outcomes: Vec<SeedAllGatesRaw>) -> Ban
         g31_max_mdl_err,
         g32,
         g32_max_excise_dt,
+        g32_raw_detour_passed,
+        g32_raw_detour_total,
         g33,
         g33_max_excise_dt,
+        g33_raw_detour_passed,
+        g33_raw_detour_total,
         g34,
         g35a,
         g35b,
@@ -3707,15 +3843,21 @@ pub fn run_m3_verification_suite(
             "G3.2",
             G32_TARGET_RATE,
             true,
-            agg.g32_max_excise_dt
-                .map(|dt| format!("max_excise_dt={dt} ticks")),
+            Some(format_excise_raw_summary(
+                agg.g32_max_excise_dt,
+                agg.g32_raw_detour_passed,
+                agg.g32_raw_detour_total,
+            )),
         ),
         agg.g33.into_report(
             "G3.3",
             G33_TARGET_RATE,
             true,
-            agg.g33_max_excise_dt
-                .map(|dt| format!("max_excise_dt={dt} ticks")),
+            Some(format_excise_raw_summary(
+                agg.g33_max_excise_dt,
+                agg.g33_raw_detour_passed,
+                agg.g33_raw_detour_total,
+            )),
         ),
         agg.g34.into_report("G3.4", G34_TARGET_RATE, true, None),
         agg.g35a.into_report("G3.5a", G35A_TARGET_RATE, true, None),
@@ -3797,7 +3939,11 @@ pub fn run_m3_bank_evaluation(
 
     let mut g31_max_mdl_err = 0.0f64;
     let mut g32_max_dt: Option<u64> = None;
+    let mut g32_raw_passed = 0usize;
+    let mut g32_raw_total = 0usize;
     let mut g33_max_dt: Option<u64> = None;
+    let mut g33_raw_passed = 0usize;
+    let mut g33_raw_total = 0usize;
     let mut g35b_min_tax = f64::INFINITY;
     let mut pooled_clean_true: Vec<usize> = Vec::new();
     let mut pooled_clean_false: Vec<usize> = Vec::new();
@@ -3814,9 +3960,13 @@ pub fn run_m3_bank_evaluation(
         if let Some(dt) = agg.g32_max_excise_dt {
             g32_max_dt = Some(g32_max_dt.map_or(dt, |m| m.max(dt)));
         }
+        g32_raw_passed += agg.g32_raw_detour_passed;
+        g32_raw_total += agg.g32_raw_detour_total;
         if let Some(dt) = agg.g33_max_excise_dt {
             g33_max_dt = Some(g33_max_dt.map_or(dt, |m| m.max(dt)));
         }
+        g33_raw_passed += agg.g33_raw_detour_passed;
+        g33_raw_total += agg.g33_raw_detour_total;
         g35b_min_tax = g35b_min_tax.min(agg.g35b_min_analytical_split_tax_bits);
         if pooled_clean_true.is_empty() {
             pooled_clean_true = agg.spont_clean_splits_true;
@@ -3910,7 +4060,11 @@ pub fn run_m3_bank_evaluation(
             passed: mb2.passed && excl[1] == 0,
             excluded_cases: excl[1],
             multi_bank: mb2,
-            pooled_metric_name: g32_max_dt.map(|_| "max_excise_dt_ticks".to_owned()),
+            pooled_metric_name: Some(format_excise_raw_summary(
+                g32_max_dt,
+                g32_raw_passed,
+                g32_raw_total,
+            )),
             pooled_metric_value: g32_max_dt.map(|dt| dt as f64),
             pooled_metric_passed: true,
             failures: std::mem::take(&mut failures[1]),
@@ -3920,7 +4074,11 @@ pub fn run_m3_bank_evaluation(
             passed: mb3.passed && excl[2] == 0,
             excluded_cases: excl[2],
             multi_bank: mb3,
-            pooled_metric_name: g33_max_dt.map(|_| "max_excise_dt_ticks".to_owned()),
+            pooled_metric_name: Some(format_excise_raw_summary(
+                g33_max_dt,
+                g33_raw_passed,
+                g33_raw_total,
+            )),
             pooled_metric_value: g33_max_dt.map(|dt| dt as f64),
             pooled_metric_passed: true,
             failures: std::mem::take(&mut failures[2]),
@@ -4170,6 +4328,132 @@ mod tests {
                 shared_snap.pre_inj_total_code_bits.to_bits(),
                 fresh_snap.pre_inj_total_code_bits.to_bits()
             );
+        }
+    }
+
+    #[test]
+    fn g31_conservation_handles_seed23_starved_unconnected_probe() {
+        let res = evaluate_g31_seed(23);
+        let report = res.tally.into_report("G3.1", G31_TARGET_RATE, true, None);
+        assert!(report.passed, "G3.1 seed=23 failed: {:?}", report.failures);
+        assert!(res.max_mdl_err <= G31_CONSERVATION_TOL_BITS_PER_SYMBOL);
+    }
+
+    #[test]
+    fn g32_trajectory_unit_aggregation_reduces_detours_and_preserves_raw_counts() {
+        let zero_cliff = CliffCountersSummary::default();
+        let blocked_cliff = CliffCountersSummary {
+            sprout_blocked_max_nodes: 1,
+            ..CliffCountersSummary::default()
+        };
+        let obs = vec![
+            TrajectoryDetourObservation {
+                settle_group_idx: 0,
+                detour_class: DetourClass::D0Dead,
+                functional_ok: true,
+                excise_dt: Some(12),
+                cliff: &zero_cliff,
+                detail: None,
+            },
+            TrajectoryDetourObservation {
+                settle_group_idx: 0,
+                detour_class: DetourClass::D1AddZero,
+                functional_ok: true,
+                excise_dt: Some(18),
+                cliff: &zero_cliff,
+                detail: None,
+            },
+            TrajectoryDetourObservation {
+                settle_group_idx: 1,
+                detour_class: DetourClass::D0Dead,
+                functional_ok: true,
+                excise_dt: Some(5),
+                cliff: &zero_cliff,
+                detail: None,
+            },
+            TrajectoryDetourObservation {
+                settle_group_idx: 1,
+                detour_class: DetourClass::D7bAgreementGate,
+                functional_ok: false,
+                excise_dt: None,
+                cliff: &zero_cliff,
+                detail: Some("paired_diff=inf".to_owned()),
+            },
+            TrajectoryDetourObservation {
+                settle_group_idx: 2,
+                detour_class: DetourClass::D0Dead,
+                functional_ok: false,
+                excise_dt: None,
+                cliff: &zero_cliff,
+                detail: Some("miss".to_owned()),
+            },
+            TrajectoryDetourObservation {
+                settle_group_idx: 2,
+                detour_class: DetourClass::D2OneFire,
+                functional_ok: true,
+                excise_dt: Some(40),
+                cliff: &blocked_cliff,
+                detail: None,
+            },
+        ];
+
+        let mut tally = GateTally::default();
+        let (max_dt, raw_passed, raw_total) = record_injection_trajectory_units(
+            "G3.2",
+            7,
+            3,
+            obs,
+            |g| format!("Task{g}(Combinational,eps=0.05)"),
+            &mut tally,
+        );
+        assert_eq!(max_dt, Some(40));
+        assert_eq!(raw_passed, 3);
+        assert_eq!(raw_total, 6);
+        assert_eq!(tally.passed_cases, 1);
+        assert_eq!(tally.failed_cases, 1);
+        assert_eq!(tally.excluded_cases, 1);
+        assert_eq!(tally.total_cases(), 3);
+        assert_eq!(tally.bank_sample(), BankSample::new(1, 3));
+        assert_eq!(
+            format_excise_raw_summary(max_dt, raw_passed, raw_total),
+            "max_excise_dt=40 ticks; raw_detours=3/6"
+        );
+    }
+
+    #[test]
+    fn g35b_exempts_noisy_solvability_for_seed156_t2_cross_sum() {
+        let spec = spontaneous_panel()
+            .into_iter()
+            .find(|s| {
+                s.label == "T2_CrossSum(k=1)"
+                    && s.wire_delay == WireDelayMode::Combinational
+                    && s.epsilon > 0.0
+            })
+            .expect("noisy T2_CrossSum(k=1) spec present");
+        let res = run_spontaneous_case(&spec, true, 156);
+        assert_eq!(res.cliff.sprout_blocked_max_nodes, 0);
+        assert!(g35b_solvability_ok(spec.epsilon, &res));
+        assert!(g35b_analytical_tax_ok(&res));
+    }
+
+    #[test]
+    fn multiview_k2_noisy_seeds_535_812_833_clear_stage3_without_max_nodes_block() {
+        let spec = spontaneous_panel()
+            .into_iter()
+            .find(|s| {
+                s.label == "T2_MultiViewCoupled(k=2)"
+                    && s.wire_delay == WireDelayMode::Combinational
+                    && s.epsilon > 0.0
+            })
+            .expect("noisy T2_MultiViewCoupled(k=2) spec present");
+        for seed in [535u64, 812, 833] {
+            for split_tax in [true, false] {
+                let res = run_spontaneous_case(&spec, split_tax, seed);
+                assert_eq!(
+                    res.cliff.sprout_blocked_max_nodes, 0,
+                    "seed={seed}, split_tax={split_tax} hit sprout_blocked_max_nodes"
+                );
+            }
         }
     }
 }

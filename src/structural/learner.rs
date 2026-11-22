@@ -69,6 +69,7 @@ pub struct PortDevelopmentalState {
     pub stage2_mature_at_tick: u64,
     pub stage2_exhausted: bool,
     pub stage3_exhausted: bool,
+    pub scored_last_observe: bool,
 }
 
 impl PortDevelopmentalState {
@@ -84,6 +85,7 @@ impl PortDevelopmentalState {
             stage2_mature_at_tick: 0,
             stage2_exhausted: false,
             stage3_exhausted: false,
+            scored_last_observe: false,
         }
     }
 }
@@ -467,6 +469,15 @@ impl ArkheLearner {
     #[must_use]
     pub fn port_states(&self) -> &[PortDevelopmentalState] {
         &self.port_states
+    }
+
+    /// Whether output `port` was driven with non-zero causal ancestry and scored
+    /// during the most recent [`ArkheLearner::observe`] call.
+    #[must_use]
+    pub fn port_scored_last_observe(&self, port: usize) -> bool {
+        self.port_states
+            .get(port)
+            .is_some_and(|state| state.scored_last_observe)
     }
 
     /// Primary port 0 diagnostic buffer (for telemetry and backward-compatible access).
@@ -2429,7 +2440,9 @@ impl PredictorBaseline for ArkheLearner {
                 .port_shares
                 .get(p)
                 .is_some_and(|shares| shares.iter().sum::<f64>() > 0.0);
-            if is_driven && has_causal_ancestry {
+            let scored = is_driven && has_causal_ancestry;
+            self.port_states[p].scored_last_observe = scored;
+            if scored {
                 *reward_slot = self
                     .editable
                     .economy_mut()

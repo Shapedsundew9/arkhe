@@ -115,15 +115,23 @@ pub fn effective_comparator_juvenile_ticks(
 /// Derives the coordinate-free per-circuit node guardrail scaled linearly by channel count.
 ///
 /// Reduces identically to `growth_config.max_nodes` when `num_channels <= 1`. For multi-channel
-/// circuits (`num_channels > 1`), guarantees at least `2 * deepening_max_lag + 8` nodes per
-/// channel so concurrent ports can evaluate lag-deepened binary pairings without starving siblings.
+/// circuits (`num_channels > 1`), guarantees `(2 * deepening_max_lag + 8)` nodes per channel for
+/// Stage-2 lag-deepened binary pairings, plus `(deepening_max_lag + COMPARATOR_PRIMITIVE_COUNT + 2)`
+/// nodes per channel when `redundancy_sprouting` is enabled so Stage 3 can evaluate and maintain a
+/// causal-disjoint backup derivation and comparator (`Sub`, `Eqz`, fan-out `Split`s) without
+/// starving siblings.
 #[must_use]
 pub const fn effective_max_nodes(num_channels: u16, growth_config: &GrowthConfig) -> usize {
     if num_channels <= 1 {
         return growth_config.max_nodes;
     }
     let tau_deep = growth_config.deepening_max_lag as usize;
-    let floor = 2 * tau_deep + 8;
+    let stage3_allowance = if growth_config.redundancy_sprouting {
+        tau_deep + COMPARATOR_PRIMITIVE_COUNT + 2
+    } else {
+        0
+    };
+    let floor = (2 * tau_deep + 8) + stage3_allowance;
     let per_channel = if growth_config.max_nodes > floor {
         growth_config.max_nodes
     } else {
@@ -7064,17 +7072,39 @@ mod tests {
         let growth = GrowthConfig::default();
         assert_eq!(effective_max_nodes(0, &growth), growth.max_nodes);
         assert_eq!(effective_max_nodes(1, &growth), growth.max_nodes);
-        assert_eq!(effective_max_nodes(2, &growth), 64);
-        assert_eq!(effective_max_nodes(4, &growth), 128);
+        assert_eq!(effective_max_nodes(2, &growth), 96);
+        assert_eq!(effective_max_nodes(3, &growth), 144);
+        assert_eq!(effective_max_nodes(4, &growth), 192);
+
+        let no_stage3 = GrowthConfig {
+            redundancy_sprouting: false,
+            ..GrowthConfig::default()
+        };
+        assert_eq!(effective_max_nodes(0, &no_stage3), no_stage3.max_nodes);
+        assert_eq!(effective_max_nodes(1, &no_stage3), no_stage3.max_nodes);
+        assert_eq!(effective_max_nodes(2, &no_stage3), 64);
+        assert_eq!(effective_max_nodes(3, &no_stage3), 96);
+        assert_eq!(effective_max_nodes(4, &no_stage3), 128);
 
         let small_growth = GrowthConfig {
             max_nodes: 8,
             deepening_max_lag: 12,
+            redundancy_sprouting: false,
             ..GrowthConfig::default()
         };
         assert_eq!(effective_max_nodes(1, &small_growth), 8);
         // floor = 2 * 12 + 8 = 32 > max_nodes (8) => K * 32.
         assert_eq!(effective_max_nodes(3, &small_growth), 96);
+
+        let small_growth_stage3 = GrowthConfig {
+            max_nodes: 8,
+            deepening_max_lag: 12,
+            redundancy_sprouting: true,
+            ..GrowthConfig::default()
+        };
+        assert_eq!(effective_max_nodes(1, &small_growth_stage3), 8);
+        // floor = (2 * 12 + 8) + (12 + 2 + 2) = 48 > max_nodes (8) => K * 48.
+        assert_eq!(effective_max_nodes(3, &small_growth_stage3), 144);
 
         // Mixed loop: Eqz(BoundaryIn(0)) / Identity(LagIn(0, 2)) fit within max_nodes = 1 while
         // Eqz(LagIn(0, 2)) requires 2 nodes (BlockedMaxNodes). Proposal-level counter stays 0.
