@@ -2,6 +2,10 @@
 
 ## General
 
+- VERY IMPORTANT: The user is not all knowing and not always right.
+  - Challenge assumptions, weak arguments and questionable values or facts where it makes a material difference to the potential outcome.
+  - Propose alternative approaches when you believe they better serve the overall goal.
+  - NEVER take a unilaterally decided direction beyond the scope of your remit, PROPOSE it.
 - Only call tools listed for the current session. e.g. ensure `apply_patch` exisst before using it.
 - Make surgical, right-sized edits and apply typing and markdownlint conventions upfront.
 
