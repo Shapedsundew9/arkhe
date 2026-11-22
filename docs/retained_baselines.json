@@ -81,6 +81,50 @@
     "max_sprout_blocked_max_nodes": 0,
     "require_stratified_passed": true,
     "require_per_task_passed": true,
-    "require_finite_tail_metrics": true
+    "require_finite_tail_metrics": true,
+    "min_tail_metrics_per_task": 1
+  },
+  "required_tail_metrics": {
+    "m2a": {
+      "G2A.1": {
+        "default": ["max_target_kt_bits"]
+      },
+      "G2A.2": {
+        "default": ["max_target_kt_bits"]
+      },
+      "G2A.3": {
+        "default": ["max_multi_lock_tick"]
+      },
+      "G2A.4": {
+        "default": ["max_target_kt_bits"],
+        "prefixes": {
+          "G2A.4b:": ["max_target_kt_bits", "max_abs_kt_diff", "max_h_reactive_dev"]
+        }
+      },
+      "G2A.5": {
+        "default": ["min_kt_advantage"]
+      }
+    },
+    "m2b": {
+      "G2B.1": {
+        "prefixes": {
+          "G2B.1a:epistemic_mdl": ["max_epistemic_mdl_err"],
+          "G2B.1a:starvation": ["max_starved_energy"],
+          "G2B.1b:": ["max_target_kt_bits"]
+        }
+      },
+      "G2B.2": {
+        "default": ["min_target_comps", "min_settled_comp_ticks"]
+      },
+      "G2B.3": {
+        "default": ["max_loopback_disagreement_ticks", "max_circular_discrepancy"]
+      },
+      "G2B.4": {
+        "default": ["max_abs_kt_diff"]
+      },
+      "G2B.5": {
+        "default": ["min_post_fault_kt_advantage"]
+      }
+    }
   }
 }
