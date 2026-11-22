@@ -4,6 +4,8 @@
 **Reviewed HEAD:** `7cb1ee0`  
 **Scope:** Implementation evidence, recorded M3 outcomes, retained M2 regressions, documentation consistency, and information useful to M4 planning.
 
+> **Latest re-review:** [2026-11-22 at `b33c550`](#re-review-at-b33c550-2026-11-22). The original comparator regression is addressed, but M3 v2 remains pre-S3 and the re-review identifies additional replay and verification defects. The original review below is preserved as evidence about `7cb1ee0`.
+
 ## Executive Summary
 
 The planned M3 mechanisms, verification harnesses, and closeout records are present. The M3 plan and research record document successful dev, confirmation, and single-shot holdout runs, and the M3 holdout is recorded as passing.
@@ -60,3 +62,80 @@ The regression is already present at the Phase 1 commit `9b5b950` and remains at
 ## Audit Boundaries
 
 This review did not rerun M3’s 1,000-seed suite or its consumed holdout. It did reproduce the pre-M3/current 20-seed M2a/M2b comparisons and the current five-bank M2b slice described above. No source, plan, inventory, charter, or existing research-record file was changed as part of this review.
+
+## Re-review at b33c550 (2026-11-22)
+
+### Assessment and Resolved Findings
+
+The remediation is substantive, but **M3 v2 is not yet ready for an unqualified completion or S3 recommendation**. Its plan correctly records it as pre-S3 rather than retaining the superseded v1 completion claim. The additional defects below should be resolved before collecting final acceptance evidence.
+
+- **Original G2B.2 regression:** The acyclic-register priming change addresses the reported `MV_AddEqz_k2_Comb` failure. Its new focused test, `mv_addeqz_k2_comb_forms_causal_disjoint_comparator_on_seed_0`, passed during this re-review. [Research record section 12.5](research_record.md#125-milestone-3-v2-remediation--statistical-policy-upgrade-pre-s3-evidence-packet) records `G2B.2 = 1000/1000`, including `MV_AddEqz_k2_Comb = 100/100`, in the pre-commit retained-baseline run.
+- **Anti-masking changes:** Clean/noisy stratification, per-task FWER tests, clean-seed conjunctions, and concentrated-failure regression tests are implemented. These directly address the original pooling failure, subject to the consistency defects below.
+- **Consumed holdouts:** M2a, M2b, and M3 v1 ranges are now unconditionally blocked, including with `--holdout`. The fresh M3 v2 holdout is `50100..=50199`; the M4a reservation is expanded to `60000..=60099`. Neither was accessed in this re-review.
+- **Documentation:** The plan, charter, and research record now explain the v1 supersession, the priming and comparator-refutation/accounting fixes, the new statistical policy, and pending v2 verification. M4a confirmation is now allocated as `20200..=20299`, replacing the initial review's unapproved suggestion.
+- **Evidence checked:** The existing M3 v2 dev-20, dev-100, and confirmation-100 JSON reports agree with the recorded passing outcomes and zero exclusions. All identify pre-commit `05ca3d5`, `git_dirty = true`, and source digest `5ee45123a16157ced68df776181f2fa4`; they are not clean-commit sign-off evidence.
+
+### R1 - High: Priming Still Resets Surviving-State History
+
+**Source:** [growth.rs](../src/structural/growth.rs), `prime_non_surviving_registers`, line 2564 at the reviewed commit.
+
+The helper initializes its shadow simulation with `ScalarState::new(staged_compiled)`. It does not restore the surviving circuit's historical registers at `prime_start`. Meanwhile, `new_acyclic_register_depth` stops at surviving nodes. Consequently, replaying only the newly added pipeline depth is insufficient when a new Delay consumes an existing stateful node.
+
+**Reproduced:** A surviving `Delay { init: 0 }` feeds a newly added `Delay { init: 0 }` in a combinational circuit. With observed frames `[3, 2, 1]` and `start_idx = eval_start_idx = 3`, full historical replay gives registers `[2, 3]`. Calling the new priming helper on `[2, 0]`, with the old register mapped as surviving, leaves `[2, 0]`. The new register should contain `3`, not `0`; the old register is correctly left unchanged.
+
+This means the fix works for the reported boundary-fed comparator but can still mis-score candidates that use live interior state. Restore the surviving state at the beginning of the priming interval, or use another state-consistent replay method, and add coverage for this case without changing gate thresholds.
+
+### R2 - High: Clean Sign-off Is Not Bound to the Reviewed Revision
+
+**Source:** [check_retained_baselines.py](../scripts/check_retained_baselines.py), provenance validation at line 240 and binary execution at line 897.
+
+`--require-clean` checks only the report's `provenance.git_dirty == false`. It neither checks the current worktree nor requires the reported commit/source digest to match the code being approved. The script runs golden traces from the current checkout but executes an existing release binary without rebuilding it or checking its revision.
+
+**Reproduced:** `validate_suite_report(..., require_clean=True)` accepted an otherwise passing report carrying the old `7cb1ee0` commit and v1 source digest with `git_dirty = false`. This was a synthetic validator probe, not a claim that the old binary passes the new gates.
+
+A stale clean binary can therefore supply baseline evidence for newer, untested source while golden traces exercise a different revision. Bind every suite report and the golden-trace run to the current clean revision/source, rebuilding or rejecting stale binaries before sign-off.
+
+### R3 - Medium: Clean-Stratum Acceptance Skips a Required Macro Check
+
+**Source:** [stats.rs](../src/stats.rs), `evaluate_regime_stratum`, lines 642-652 at the reviewed commit; [Charter section 2.8](foundational_research_charter_v3.md#28-statistical-policy-holdout-governance-and-retained-baseline-regression-gate).
+
+When a clean-seed conjunction is present, the non-exact branch uses `conj.passed && all_tasks_passed` but does not require `pooled_multi_bank.passed`. The charter requires the conjunction alongside stratum-level pooled confidence/homogeneity checks; the Python checker also rejects a failed `pooled_multi_bank`.
+
+**Reproduced:** Five clean tasks, each with two banks scoring `199/200` and `195/200`, and clean conjunction banks of `195/200` and `195/200`, at target `0.90`. Every per-task test and the conjunction pass, but pooled homogeneity fails. `evaluate_stratified_gate_audit(..., enforce_pooled_cp=true)` nevertheless returns `passed = true`.
+
+Align the Rust acceptance rule, checker, and charter. If conjunction is intended to replace rather than supplement pooled checks, that requires an explicit policy clarification instead of inconsistent verdicts.
+
+### R4 - Medium: Mandatory Statistical Evidence Can Be Missing or Contradictory
+
+**Source:** [check_retained_baselines.py](../scripts/check_retained_baselines.py), `_validate_task` and `_validate_stratum`, especially lines 92-119 and 145-182.
+
+The checker trusts nested pass flags without validating their consistency with numeric results. It never validates `seed_conjunction_multi_bank`; `tail_metrics` is checked only when present.
+
+**Reproduced:** The validator returned success for each of these modifications to its passing synthetic fixture:
+
+- A clean conjunction explicitly reporting `passed = false`, with `0/100` successes.
+- A task with zero successes, `empirical_rate = 0`, and `binomial_lower_tail_p = 0`, while its pass flags remained true.
+- All task `tail_metrics` fields removed, despite `require_finite_tail_metrics = true`.
+
+This is not solely hypothetical missing telemetry. The existing M3 v2 dev-100 and confirmation-100 JSON reports omit tails for 36/144 clean G3.1 tasks, all 77 G3.5a tasks, and all 37 G3.5b tasks. Omission does not establish a scientific failure, but it does not meet the documented "every per-task audit" evidence contract.
+
+Define required per-gate evidence, check conjunctions and numerical/flag consistency, and reject missing required metrics rather than treating absent data as valid finite data. The current 26 self-tests pass but do not cover these counterexamples.
+
+### R5 - Medium: Additional Priming Simulation Is Unmetered
+
+**Source:** [growth.rs](../src/structural/growth.rs), the shadow-step loop beginning at line 2566 and callers at lines 3105 and 5819.
+
+The callers charge `baseline.w_replay` ticks to the candidate budget. The new helper then performs additional full-circuit `shadow.step` calls over `prime_start..start_idx` without receiving or debiting that budget. These steps lie before the charged replay interval.
+
+Charge the additional simulation through the existing budget/telemetry mechanism. Otherwise candidate-replay cost and budget exhaustion understate the actual work, which is particularly relevant to M4a equal-compute comparisons. This finding follows directly from the call path; no large benchmark was rerun to quantify its frequency.
+
+### Remaining Verification and Review Boundaries
+
+The existing [pre-S3 evidence packet](research_record.md#125-milestone-3-v2-remediation--statistical-policy-upgrade-pre-s3-evidence-packet) still lists these completion prerequisites:
+
+1. Resolve the findings and obtain clean-commit retained-baseline evidence using `--require-clean` after repairing its validation gaps.
+2. Complete the M3 v2 50-bank dev sweep (`20..1020`) and ensure confirmation evidence corresponds to the final reviewed source.
+3. Obtain S3 authorization before the fresh 100-seed holdout (`50100..=50199`).
+4. Obtain S4 closeout after acceptance, permanently close the consumed v2 range, and retain the raw JSON evidence durably.
+
+This re-review ran only the original comparator regression test (passed), the checker self-tests (`26/26` passed), two isolated regression probes (both failed as detailed in R1/R3), synthetic validator counterexamples, and documentation-link validation. The probes ran in a temporary worktree of `b33c550` with no production-mechanism edits; that worktree was removed. No broad scientific suite or holdout was rerun. Only this review document was changed in the main worktree.
