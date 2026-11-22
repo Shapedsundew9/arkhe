@@ -1,0 +1,2152 @@
+{
+  "provenance": {
+    "package_version": "0.1.0",
+    "rustc_version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "target_triple": "x86_64-unknown-linux-gnu",
+    "git_commit_sha": "2b62140ecc605b557ef526ae7cad622681478340",
+    "git_dirty": false,
+    "cargo_lock_fnv1a128": "8d29cd24b1fbdbb743cf5c0b3933b22d",
+    "source_tree_fnv1a128": "bf22516980817549723269218e209d56"
+  },
+  "seed_offset": 20,
+  "seeds_per_bank": 20,
+  "banks_evaluated": 5,
+  "horizon": 2000,
+  "gates": [
+    {
+      "gate": "G2A.1",
+      "stats": {
+        "pooled": {
+          "total_trials": 100,
+          "total_successes": 100,
+          "pooled_rate": 1.0,
+          "lower_bound_99": 0.954992586021436,
+          "target_rate": 0.9,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 1.0,
+          "std_dev": 0.0,
+          "percentile_5th": 1.0,
+          "chi_squared": 0.0,
+          "df": 4,
+          "p_value": 1.0,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "banks_above_target": 5,
+      "total_banks": 5,
+      "excluded_cases": 0,
+      "cliff_counters": {
+        "reserve_clipped_count": 1271000,
+        "reserve_clipped_bits": 2276586.2297618547,
+        "reserve_mismatch_floored": 0,
+        "sprout_blocked_max_nodes": 0,
+        "candidate_undecidable": 84800,
+        "candidate_list_truncated": 52600,
+        "lag_horizon_bound": 3400,
+        "ring_period_bound": 0,
+        "lag_deepening_steps": 12100,
+        "sprout_budget_exhausted": 128200
+      },
+      "passed": true,
+      "stratified": {
+        "clean": {
+          "regime": "clean",
+          "task_count": 15,
+          "target_rate": 0.9,
+          "fwer_alpha": 0.0006666666666666666,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 1500,
+              "total_successes": 1500,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.9969345945217527,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "seed_conjunction_multi_bank": {
+            "pooled": {
+              "total_trials": 100,
+              "total_successes": 100,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2A.1:CrossAdd(d=1,2,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:CrossAdd(d=1,2,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:CrossAddEqz(d=1,2,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:CrossAddEqz(d=1,2,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:CrossMul(d=1,2,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:CrossMul(d=1,2,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:CrossMulEqz(d=1,2,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:CrossMulEqz(d=1,2,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:CrossSub(d=1,2,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:DelayedAffine(d=1,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:DelayedAffine(d=1,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:DelayedAffine(d=2,3x+2,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:DelayedAffine(d=2,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:DelayedAffine(d=4,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.1:DelayedAffine(d=4,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            }
+          ],
+          "worst_task_label": "G2A.1:CrossAdd(d=1,2,k=1)",
+          "worst_task_rate": 1.0,
+          "passed": true
+        },
+        "passed": true
+      }
+    },
+    {
+      "gate": "G2A.2",
+      "stats": {
+        "pooled": {
+          "total_trials": 100,
+          "total_successes": 100,
+          "pooled_rate": 1.0,
+          "lower_bound_99": 0.954992586021436,
+          "target_rate": 0.9,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 1.0,
+          "std_dev": 0.0,
+          "percentile_5th": 1.0,
+          "chi_squared": 0.0,
+          "df": 4,
+          "p_value": 1.0,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "banks_above_target": 5,
+      "total_banks": 5,
+      "excluded_cases": 0,
+      "cliff_counters": {
+        "reserve_clipped_count": 956700,
+        "reserve_clipped_bits": 1236816.7027421675,
+        "reserve_mismatch_floored": 0,
+        "sprout_blocked_max_nodes": 0,
+        "candidate_undecidable": 13700,
+        "candidate_list_truncated": 64200,
+        "lag_horizon_bound": 200,
+        "ring_period_bound": 0,
+        "lag_deepening_steps": 14900,
+        "sprout_budget_exhausted": 69900
+      },
+      "passed": true,
+      "stratified": {
+        "clean": {
+          "regime": "clean",
+          "task_count": 13,
+          "target_rate": 0.9,
+          "fwer_alpha": 0.0007692307692307692,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 1300,
+              "total_successes": 1300,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.9964638284286499,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "seed_conjunction_multi_bank": {
+            "pooled": {
+              "total_trials": 100,
+              "total_successes": 100,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2A.2:DeepLag(d=5,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:DeepLag(d=5,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:DeepLag(d=6,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:DeepLag(d=6,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:DeepLag(d=8,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:DeepLag(d=8,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:M1_PeriodicRing(k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:TphAddEqz(d=3,4,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:TphCrossSum(d=3,3,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:TphCrossSum(d=3,5,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:TphDelayedAffine(d=3,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:TphDelayedAffine(d=3,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2A.2:TphMulEqzPair(d=4,4,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0007692307692307692,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            }
+          ],
+          "worst_task_label": "G2A.2:DeepLag(d=5,k=1)",
+          "worst_task_rate": 1.0,
+          "passed": true
+        },
+        "passed": true
+      }
+    },
+    {
+      "gate": "G2A.3",
+      "stats": {
+        "pooled": {
+          "total_trials": 100,
+          "total_successes": 100,
+          "pooled_rate": 1.0,
+          "lower_bound_99": 0.954992586021436,
+          "target_rate": 0.9,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 1.0,
+          "std_dev": 0.0,
+          "percentile_5th": 1.0,
+          "chi_squared": 0.0,
+          "df": 4,
+          "p_value": 1.0,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "banks_above_target": 5,
+      "total_banks": 5,
+      "excluded_cases": 0,
+      "cliff_counters": {
+        "reserve_clipped_count": 1363300,
+        "reserve_clipped_bits": 825022.7257723426,
+        "reserve_mismatch_floored": 0,
+        "sprout_blocked_max_nodes": 0,
+        "candidate_undecidable": 8400,
+        "candidate_list_truncated": 21800,
+        "lag_horizon_bound": 0,
+        "ring_period_bound": 0,
+        "lag_deepening_steps": 4800,
+        "sprout_budget_exhausted": 0
+      },
+      "passed": true,
+      "stratified": {
+        "clean": {
+          "regime": "clean",
+          "task_count": 12,
+          "target_rate": 0.9,
+          "fwer_alpha": 0.0008333333333333334,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 1200,
+              "total_successes": 1200,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.9961697125149411,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "seed_conjunction_multi_bank": {
+            "pooled": {
+              "total_trials": 100,
+              "total_successes": 100,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2A.3:K=2,k=1(Combinational)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.0,
+                "max_multi_lock_tick": 255.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=2,k=1(TicksPerHop)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.046875,
+                "max_multi_lock_tick": 67.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=2,k=2(Combinational)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.03125,
+                "max_multi_lock_tick": 256.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=2,k=2(TicksPerHop)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.0303030303030303,
+                "max_multi_lock_tick": 68.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=3,k=1(Combinational)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.0151515151515151,
+                "max_multi_lock_tick": 67.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=3,k=1(TicksPerHop)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.0,
+                "max_multi_lock_tick": 66.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=3,k=2(Combinational)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.0,
+                "max_multi_lock_tick": 66.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=3,k=2(TicksPerHop)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.0,
+                "max_multi_lock_tick": 66.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=4,k=1(Combinational)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.0303030303030303,
+                "max_multi_lock_tick": 68.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=4,k=1(TicksPerHop)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.046875,
+                "max_multi_lock_tick": 69.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=4,k=2(Combinational)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.0454545454545454,
+                "max_multi_lock_tick": 69.0
+              }
+            },
+            {
+              "task_label": "G2A.3:K=4,k=2(TicksPerHop)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0008333333333333334,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_lock_time_ratio": 1.0454545454545454,
+                "max_multi_lock_tick": 69.0
+              }
+            }
+          ],
+          "worst_task_label": "G2A.3:K=2,k=1(Combinational)",
+          "worst_task_rate": 1.0,
+          "passed": true
+        },
+        "passed": true
+      }
+    },
+    {
+      "gate": "G2A.4",
+      "stats": {
+        "pooled": {
+          "total_trials": 100,
+          "total_successes": 99,
+          "pooled_rate": 0.99,
+          "lower_bound_99": 0.9354572679514073,
+          "target_rate": 0.85,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 0.99,
+          "std_dev": 0.022360679774997918,
+          "percentile_5th": 0.96,
+          "chi_squared": 4.040404040404036,
+          "df": 4,
+          "p_value": 1.0,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "banks_above_target": 5,
+      "total_banks": 5,
+      "excluded_cases": 0,
+      "cliff_counters": {
+        "reserve_clipped_count": 1346512,
+        "reserve_clipped_bits": 1619039.9362477069,
+        "reserve_mismatch_floored": 0,
+        "sprout_blocked_max_nodes": 0,
+        "candidate_undecidable": 46782,
+        "candidate_list_truncated": 41157,
+        "lag_horizon_bound": 512,
+        "ring_period_bound": 0,
+        "lag_deepening_steps": 19674,
+        "sprout_budget_exhausted": 112564
+      },
+      "max_g2a4b_mean_h_reactive_dev_bits": 0.007083858970740486,
+      "passed": true,
+      "stratified": {
+        "noisy": {
+          "regime": "noisy",
+          "task_count": 9,
+          "target_rate": 0.85,
+          "fwer_alpha": 0.0011111111111111111,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 900,
+              "total_successes": 899,
+              "pooled_rate": 0.9988888888888889,
+              "lower_bound_99": 0.9926471152717224,
+              "target_rate": 0.85,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 0.9988888888888889,
+              "std_dev": 0.0024845199749997573,
+              "percentile_5th": 0.9955555555555555,
+              "chi_squared": 4.004449388209296,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2A.4a:TargetNoise:CrossAdd(d=1,2,k=1)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_paired_regret": 0.003734696853437691,
+                "max_target_kt_bits": 0.3519966948926485
+              }
+            },
+            {
+              "task_label": "G2A.4a:TargetNoise:CrossAdd(d=1,2,k=2)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_paired_regret": 0.0037346968534379688,
+                "max_target_kt_bits": 0.4555475782730974
+              }
+            },
+            {
+              "task_label": "G2A.4a:TargetNoise:CrossMulEqz(d=1,2,k=2)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_paired_regret": 0.0037346968534379688,
+                "max_target_kt_bits": 0.4555475782730974
+              }
+            },
+            {
+              "task_label": "G2A.4a:TargetNoise:DelayedAffine(d=2,k=1)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_paired_regret": 0.003734696853437136,
+                "max_target_kt_bits": 0.3746143428273026
+              }
+            },
+            {
+              "task_label": "G2A.4a:TargetNoise:DelayedAffine(d=2,k=2)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_paired_regret": 0.00373469685343758,
+                "max_target_kt_bits": 0.4806055707463183
+              }
+            },
+            {
+              "task_label": "G2A.4b:AllNoise:CrossAdd(d=1,2,k=1)",
+              "regime": "noisy",
+              "total_successes": 99,
+              "total_trials": 100,
+              "empirical_rate": 0.99,
+              "lower_bound_99": 0.9354572679514073,
+              "binomial_lower_tail_p": 0.9999999125232637,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 0.99,
+                "std_dev": 0.022360679774997918,
+                "percentile_5th": 0.96,
+                "chi_squared": 4.040404040404036,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.4280104809334444,
+                "max_h_reactive_dev": 0.43129907701549386,
+                "max_target_kt_bits": 1.0036303647503786
+              }
+            },
+            {
+              "task_label": "G2A.4b:AllNoise:CrossAdd(d=1,2,k=2)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.0,
+                "max_h_reactive_dev": 0.14177657655991693,
+                "max_target_kt_bits": 0.9488440364219286
+              }
+            },
+            {
+              "task_label": "G2A.4b:AllNoise:DelayedAffine(d=2,k=1)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.0,
+                "max_h_reactive_dev": 0.11909884563256884,
+                "max_target_kt_bits": 0.572041393819852
+              }
+            },
+            {
+              "task_label": "G2A.4b:AllNoise:DelayedAffine(d=2,k=2)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.0,
+                "max_h_reactive_dev": 0.1556654120667491,
+                "max_target_kt_bits": 0.7672176807470124
+              }
+            }
+          ],
+          "worst_task_label": "G2A.4b:AllNoise:CrossAdd(d=1,2,k=1)",
+          "worst_task_rate": 0.99,
+          "passed": true
+        },
+        "passed": true
+      }
+    },
+    {
+      "gate": "G2A.5",
+      "stats": {
+        "pooled": {
+          "total_trials": 100,
+          "total_successes": 98,
+          "pooled_rate": 0.98,
+          "lower_bound_99": 0.9185880536971687,
+          "target_rate": 0.85,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 0.9800000000000001,
+          "std_dev": 0.02738612787525833,
+          "percentile_5th": 0.95,
+          "chi_squared": 3.0612244897959155,
+          "df": 4,
+          "p_value": 1.0,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "banks_above_target": 5,
+      "total_banks": 5,
+      "excluded_cases": 0,
+      "cliff_counters": {
+        "reserve_clipped_count": 17800,
+        "reserve_clipped_bits": 409148.1944322173,
+        "reserve_mismatch_floored": 0,
+        "sprout_blocked_max_nodes": 0,
+        "candidate_undecidable": 12300,
+        "candidate_list_truncated": 39800,
+        "lag_horizon_bound": 0,
+        "ring_period_bound": 0,
+        "lag_deepening_steps": 4700,
+        "sprout_budget_exhausted": 80900
+      },
+      "min_required_mean_margin_bits": 0.9278574410719546,
+      "passed": true,
+      "stratified": {
+        "clean": {
+          "regime": "clean",
+          "task_count": 4,
+          "target_rate": 0.85,
+          "fwer_alpha": 0.0025,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 400,
+              "total_successes": 398,
+              "pooled_rate": 0.995,
+              "lower_bound_99": 0.9791527001872122,
+              "target_rate": 0.85,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 0.9949999999999999,
+              "std_dev": 0.0068465319688145515,
+              "percentile_5th": 0.9875,
+              "chi_squared": 3.0150753768844196,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "seed_conjunction_multi_bank": {
+            "pooled": {
+              "total_trials": 100,
+              "total_successes": 98,
+              "pooled_rate": 0.98,
+              "lower_bound_99": 0.9185880536971687,
+              "target_rate": 0.85,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 0.9800000000000001,
+              "std_dev": 0.02738612787525833,
+              "percentile_5th": 0.95,
+              "chi_squared": 3.0612244897959155,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2A.5:CrossAddEqz(d=1,2,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0025,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_kt_advantage": 1.0855982909641024
+              }
+            },
+            {
+              "task_label": "G2A.5:CrossMulEqz(d=1,2,k=2)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0025,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_kt_advantage": 0.0
+              }
+            },
+            {
+              "task_label": "G2A.5:CrossSum(d=1,2,k=1)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0025,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_kt_advantage": 0.0
+              }
+            },
+            {
+              "task_label": "G2A.5:CrossSum(d=1,2,k=2)",
+              "regime": "clean",
+              "total_successes": 98,
+              "total_trials": 100,
+              "empirical_rate": 0.98,
+              "lower_bound_99": 0.9185880536971687,
+              "binomial_lower_tail_p": 0.9999983688161524,
+              "fwer_alpha": 0.0025,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 0.9800000000000001,
+                "std_dev": 0.02738612787525833,
+                "percentile_5th": 0.95,
+                "chi_squared": 3.0612244897959155,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_kt_advantage": 0.0
+              }
+            }
+          ],
+          "worst_task_label": "G2A.5:CrossSum(d=1,2,k=2)",
+          "worst_task_rate": 0.98,
+          "passed": true
+        },
+        "passed": true
+      }
+    }
+  ],
+  "g2a5_benchmarks": [
+    {
+      "task": "CrossSum(d=1,2,k=1)",
+      "k_bits": 1,
+      "nonlinear": false,
+      "baselines": [
+        {
+          "baseline": "ArkheM1",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 0.0040674944546905635,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 1.0,
+          "mean_compute_ticks_consumed": 78386.0,
+          "mean_arkhe_kt_advantage_bits": 0.0,
+          "runs": 100
+        },
+        {
+          "baseline": "RandomSearch",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 1.017067574604383,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.48666666666666636,
+          "mean_compute_ticks_consumed": 199892.0,
+          "mean_arkhe_kt_advantage_bits": 1.0130000801496923,
+          "runs": 100
+        },
+        {
+          "baseline": "CGP",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 1.0020052584857018,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.4980666666666666,
+          "mean_compute_ticks_consumed": 199941.53,
+          "mean_arkhe_kt_advantage_bits": 0.9979377640310112,
+          "runs": 100
+        },
+        {
+          "baseline": "CTW",
+          "budget_accounting_mode": "AnalyticalUnmetered",
+          "mean_target_kt_bits_per_symbol": 1.003445683066629,
+          "mean_native_prob_log_loss_bits_per_symbol": 0.8812295927738448,
+          "mean_target_clean_match_rate": 0.5099999999999997,
+          "mean_compute_ticks_consumed": 0.0,
+          "mean_arkhe_kt_advantage_bits": 0.9993781886119384,
+          "runs": 100
+        },
+        {
+          "baseline": "ReedsSloane",
+          "budget_accounting_mode": "AnalyticalUnmetered",
+          "mean_target_kt_bits_per_symbol": 0.0040674944546905635,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 1.0,
+          "mean_compute_ticks_consumed": 0.0,
+          "mean_arkhe_kt_advantage_bits": 0.0,
+          "runs": 100
+        },
+        {
+          "baseline": "CrossChannelCTW",
+          "budget_accounting_mode": "ContextTreeDepthSteps",
+          "mean_target_kt_bits_per_symbol": 0.0040674944546905635,
+          "mean_native_prob_log_loss_bits_per_symbol": 0.6753422561512759,
+          "mean_target_clean_match_rate": 1.0,
+          "mean_compute_ticks_consumed": 54000.0,
+          "mean_arkhe_kt_advantage_bits": 0.0,
+          "runs": 100
+        },
+        {
+          "baseline": "RnnBptt",
+          "budget_accounting_mode": "BpttUnrollSteps",
+          "mean_target_kt_bits_per_symbol": 0.42525067158949875,
+          "mean_native_prob_log_loss_bits_per_symbol": 0.8723941858310614,
+          "mean_target_clean_match_rate": 0.8494066666666668,
+          "mean_compute_ticks_consumed": 31880.0,
+          "mean_arkhe_kt_advantage_bits": 0.4211831771348082,
+          "runs": 100
+        }
+      ]
+    },
+    {
+      "task": "CrossSum(d=1,2,k=2)",
+      "k_bits": 2,
+      "nonlinear": false,
+      "baselines": [
+        {
+          "baseline": "ArkheM1",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 0.0040674944546905635,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 1.0,
+          "mean_compute_ticks_consumed": 199815.0,
+          "mean_arkhe_kt_advantage_bits": 0.0,
+          "runs": 100
+        },
+        {
+          "baseline": "RandomSearch",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 1.1036729507204832,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.5924,
+          "mean_compute_ticks_consumed": 199892.0,
+          "mean_arkhe_kt_advantage_bits": 1.0996054562657926,
+          "runs": 100
+        },
+        {
+          "baseline": "CGP",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 1.5942753866630128,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.40064666666666626,
+          "mean_compute_ticks_consumed": 199939.37,
+          "mean_arkhe_kt_advantage_bits": 1.5902078922083223,
+          "runs": 100
+        },
+        {
+          "baseline": "CTW",
+          "budget_accounting_mode": "AnalyticalUnmetered",
+          "mean_target_kt_bits_per_symbol": 2.0044009435597814,
+          "mean_native_prob_log_loss_bits_per_symbol": 1.9403026540027575,
+          "mean_target_clean_match_rate": 0.2493333333333328,
+          "mean_compute_ticks_consumed": 0.0,
+          "mean_arkhe_kt_advantage_bits": 2.000333449105091,
+          "runs": 100
+        },
+        {
+          "baseline": "ReedsSloane",
+          "budget_accounting_mode": "AnalyticalUnmetered",
+          "mean_target_kt_bits_per_symbol": 0.0040674944546905635,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 1.0,
+          "mean_compute_ticks_consumed": 0.0,
+          "mean_arkhe_kt_advantage_bits": 0.0,
+          "runs": 100
+        },
+        {
+          "baseline": "CrossChannelCTW",
+          "budget_accounting_mode": "ContextTreeDepthSteps",
+          "mean_target_kt_bits_per_symbol": 1.9501745882614827,
+          "mean_native_prob_log_loss_bits_per_symbol": 1.9377040893113793,
+          "mean_target_clean_match_rate": 0.3733333333333341,
+          "mean_compute_ticks_consumed": 108000.0,
+          "mean_arkhe_kt_advantage_bits": 1.9461070938067921,
+          "runs": 100
+        },
+        {
+          "baseline": "RnnBptt",
+          "budget_accounting_mode": "BpttUnrollSteps",
+          "mean_target_kt_bits_per_symbol": 2.005296169026774,
+          "mean_native_prob_log_loss_bits_per_symbol": 2.1693256407027643,
+          "mean_target_clean_match_rate": 0.25561333333333336,
+          "mean_compute_ticks_consumed": 31880.0,
+          "mean_arkhe_kt_advantage_bits": 2.0012286745720833,
+          "runs": 100
+        }
+      ]
+    },
+    {
+      "task": "CrossMulEqz(d=1,2,k=2)",
+      "k_bits": 2,
+      "nonlinear": true,
+      "baselines": [
+        {
+          "baseline": "ArkheM1",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 0.0040674944546905635,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 1.0,
+          "mean_compute_ticks_consumed": 199826.0,
+          "mean_arkhe_kt_advantage_bits": 0.0,
+          "runs": 100
+        },
+        {
+          "baseline": "RandomSearch",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 1.0625593947122483,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.7905466666666665,
+          "mean_compute_ticks_consumed": 199892.0,
+          "mean_arkhe_kt_advantage_bits": 1.0584919002575577,
+          "runs": 100
+        },
+        {
+          "baseline": "CGP",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 0.9319249355266451,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.826959999999999,
+          "mean_compute_ticks_consumed": 199942.21,
+          "mean_arkhe_kt_advantage_bits": 0.9278574410719546,
+          "runs": 100
+        },
+        {
+          "baseline": "CTW",
+          "budget_accounting_mode": "AnalyticalUnmetered",
+          "mean_target_kt_bits_per_symbol": 0.9462915874101155,
+          "mean_native_prob_log_loss_bits_per_symbol": 1.5884983629590588,
+          "mean_target_clean_match_rate": 0.8259999999999988,
+          "mean_compute_ticks_consumed": 0.0,
+          "mean_arkhe_kt_advantage_bits": 0.942224092955425,
+          "runs": 100
+        },
+        {
+          "baseline": "ReedsSloane",
+          "budget_accounting_mode": "AnalyticalUnmetered",
+          "mean_target_kt_bits_per_symbol": 2.015734276893115,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.23799999999999963,
+          "mean_compute_ticks_consumed": 0.0,
+          "mean_arkhe_kt_advantage_bits": 2.0116667824384242,
+          "runs": 100
+        },
+        {
+          "baseline": "CrossChannelCTW",
+          "budget_accounting_mode": "ContextTreeDepthSteps",
+          "mean_target_kt_bits_per_symbol": 0.48767500121207746,
+          "mean_native_prob_log_loss_bits_per_symbol": 1.4370382715960943,
+          "mean_target_clean_match_rate": 0.9286666666666679,
+          "mean_compute_ticks_consumed": 108000.0,
+          "mean_arkhe_kt_advantage_bits": 0.4836075067573869,
+          "runs": 100
+        },
+        {
+          "baseline": "RnnBptt",
+          "budget_accounting_mode": "BpttUnrollSteps",
+          "mean_target_kt_bits_per_symbol": 0.11616458510738133,
+          "mean_native_prob_log_loss_bits_per_symbol": 1.442269669560477,
+          "mean_target_clean_match_rate": 0.9862466666666668,
+          "mean_compute_ticks_consumed": 31880.0,
+          "mean_arkhe_kt_advantage_bits": 0.11209709065269076,
+          "runs": 100
+        }
+      ]
+    },
+    {
+      "task": "CrossAddEqz(d=1,2,k=2)",
+      "k_bits": 2,
+      "nonlinear": true,
+      "baselines": [
+        {
+          "baseline": "ArkheM1",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 0.0040674944546905635,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 1.0,
+          "mean_compute_ticks_consumed": 199845.0,
+          "mean_arkhe_kt_advantage_bits": 0.0,
+          "runs": 100
+        },
+        {
+          "baseline": "RandomSearch",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 1.1573358147383213,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.766666666666666,
+          "mean_compute_ticks_consumed": 199892.0,
+          "mean_arkhe_kt_advantage_bits": 1.1532683202836307,
+          "runs": 100
+        },
+        {
+          "baseline": "CGP",
+          "budget_accounting_mode": "CandidateHistoryReplay",
+          "mean_target_kt_bits_per_symbol": 1.1573358147383213,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.766666666666666,
+          "mean_compute_ticks_consumed": 199933.17,
+          "mean_arkhe_kt_advantage_bits": 1.1532683202836307,
+          "runs": 100
+        },
+        {
+          "baseline": "CTW",
+          "budget_accounting_mode": "AnalyticalUnmetered",
+          "mean_target_kt_bits_per_symbol": 2.0035287069834173,
+          "mean_native_prob_log_loss_bits_per_symbol": 1.9403507395523725,
+          "mean_target_clean_match_rate": 0.25733333333333275,
+          "mean_compute_ticks_consumed": 0.0,
+          "mean_arkhe_kt_advantage_bits": 1.9994612125287268,
+          "runs": 100
+        },
+        {
+          "baseline": "ReedsSloane",
+          "budget_accounting_mode": "AnalyticalUnmetered",
+          "mean_target_kt_bits_per_symbol": 1.0896657854187912,
+          "mean_native_prob_log_loss_bits_per_symbol": null,
+          "mean_target_clean_match_rate": 0.7866666666666664,
+          "mean_compute_ticks_consumed": 0.0,
+          "mean_arkhe_kt_advantage_bits": 1.0855982909641007,
+          "runs": 100
+        },
+        {
+          "baseline": "CrossChannelCTW",
+          "budget_accounting_mode": "ContextTreeDepthSteps",
+          "mean_target_kt_bits_per_symbol": 0.7815722055879931,
+          "mean_native_prob_log_loss_bits_per_symbol": 1.5087340733749075,
+          "mean_target_clean_match_rate": 0.8666666666666651,
+          "mean_compute_ticks_consumed": 108000.0,
+          "mean_arkhe_kt_advantage_bits": 0.7775047111333026,
+          "runs": 100
+        },
+        {
+          "baseline": "RnnBptt",
+          "budget_accounting_mode": "BpttUnrollSteps",
+          "mean_target_kt_bits_per_symbol": 1.0446758254447817,
+          "mean_native_prob_log_loss_bits_per_symbol": 1.6744503740906427,
+          "mean_target_clean_match_rate": 0.7888400000000001,
+          "mean_compute_ticks_consumed": 31880.0,
+          "mean_arkhe_kt_advantage_bits": 1.040608330990091,
+          "runs": 100
+        }
+      ]
+    }
+  ],
+  "excluded_cases": 0,
+  "cliff_counters": {
+    "reserve_clipped_count": 4955312,
+    "reserve_clipped_bits": 6366613.788956288,
+    "reserve_mismatch_floored": 0,
+    "sprout_blocked_max_nodes": 0,
+    "candidate_undecidable": 165982,
+    "candidate_list_truncated": 219557,
+    "lag_horizon_bound": 4112,
+    "ring_period_bound": 0,
+    "lag_deepening_steps": 56174,
+    "sprout_budget_exhausted": 391564
+  },
+  "all_passed": true
+}

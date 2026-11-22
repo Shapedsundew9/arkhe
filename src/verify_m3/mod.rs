@@ -122,9 +122,8 @@ pub const G35B_TARGET_RATE: f64 = 1.0;
 /// Guards `verify-m3` runs against pre-registered milestone holdout seed banks.
 ///
 /// Unconditionally rejects overlaps with M1 (`10000..=10019`), closed M2a (`30000..=30019`),
-/// closed M2b (`40000..=40019`), closed M3 v1 (`50000..=50019`), and reserved M4a
-/// (`60000..=60099`) even when `allow_holdout == true`, and rejects fresh M3 v2 holdout
-/// (`50100..=50199`) unless `allow_holdout == true`.
+/// closed M2b (`40000..=40019`), closed M3 v1 (`50000..=50019`), closed M3 v2
+/// (`50100..=50199`), and reserved M4a (`60000..=60099`) even when `allow_holdout == true`.
 ///
 /// # Errors
 ///
@@ -167,8 +166,8 @@ pub fn check_m3_seed_range_holdout(
             label: "M3_v2",
             start: u64::from(M3_V2_HOLDOUT_SEED_START),
             end_inclusive: u64::from(M3_V2_HOLDOUT_SEED_END),
-            allow_with_flag: true,
-            status_note: "fresh 100-seed M3 v2 holdout",
+            allow_with_flag: false,
+            status_note: "consumed at 2b62140; permanently closed",
         },
         HoldoutRangeSpec {
             label: "M4a",
@@ -4527,19 +4526,23 @@ mod tests {
     #[test]
     fn holdout_guards_reject_m1_m2a_m2b_m3_and_m4a_ranges() {
         // M1 (10_000..=10_019), closed M2a (30_000..=30_019), closed M2b (40_000..=40_019),
-        // closed M3 v1 (50_000..=50_019), and M4a (60_000..=60_099) are unconditionally rejected
-        // even with allow_holdout=true.
-        for blocked in [10_000u32, 30_000, 40_000, 50_000, 60_000, 60_050] {
+        // closed M3 v1 (50_000..=50_019), closed M3 v2 (50_100..=50_199), and reserved M4a
+        // (60_000..=60_099) are unconditionally rejected even with allow_holdout=true.
+        for blocked in [
+            10_000u32, 30_000, 40_000, 50_000, 50_100, 50_150, 60_000, 60_050,
+        ] {
             assert!(check_m3_seed_range_holdout(blocked, 20, false).is_err());
             assert!(check_m3_seed_range_holdout(blocked, 20, true).is_err());
             assert!(check_m3_seed_range_holdout(blocked - 5, 10, true).is_err());
         }
 
-        // Fresh M3 v2 holdout 50_100..=50_199 requires allow_holdout=true.
+        // Closed M3 v2 holdout 50_100..=50_199 is unconditionally rejected even with allow_holdout=true.
         let err = check_m3_seed_range_holdout(50_100, 20, false).unwrap_err();
         assert!(err.contains("50100..=50199"));
+        let err_flag = check_m3_seed_range_holdout(50_100, 100, true).unwrap_err();
+        assert!(err_flag.contains("50100..=50199"));
         assert!(check_m3_seed_range_holdout(50_090, 20, false).is_err());
-        assert!(check_m3_seed_range_holdout(50_100, 100, true).is_ok());
+        assert!(check_m3_seed_range_holdout(50_090, 20, true).is_err());
 
         for safe in [
             0u32, 9_980, 10_020, 20_060, 20_100, 29_980, 30_020, 39_980, 40_020, 49_980, 50_020,

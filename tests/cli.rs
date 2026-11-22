@@ -179,8 +179,11 @@ fn cli_verify_m3_refuses_holdout_ranges() {
     }
 
     // M1 (10000), closed M2a (30000), closed M2b (40000), closed M3 v1 (50000),
-    // and M4a (60000..=60099) remain unconditionally forbidden even with --holdout.
-    for seed_offset in ["10000", "30000", "40000", "50000", "60000", "60050"] {
+    // closed M3 v2 (50100..=50199), and reserved M4a (60000..=60099) remain unconditionally
+    // forbidden even with --holdout.
+    for seed_offset in [
+        "10000", "30000", "40000", "50000", "50100", "50150", "60000", "60050",
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_arkhe"))
             .args([
                 "verify-m3",
@@ -217,6 +220,25 @@ fn cli_verify_m3_refuses_holdout_ranges() {
         .expect("spawn arkhe verify-m3 --banks overlapping M3 v2 holdout without --holdout");
     assert!(!bank_m3_v2.status.success());
     assert!(String::from_utf8_lossy(&bank_m3_v2.stderr).contains("overlaps pre-registered"));
+
+    let bank_m3_v2_holdout = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+        .args([
+            "verify-m3",
+            "--banks",
+            "5",
+            "--seed-offset",
+            "50020",
+            "--seeds",
+            "20",
+            "--holdout",
+        ])
+        .output()
+        .expect("spawn arkhe verify-m3 --banks overlapping closed M3 v2 holdout with --holdout");
+    assert!(!bank_m3_v2_holdout.status.success());
+    assert!(
+        String::from_utf8_lossy(&bank_m3_v2_holdout.stderr)
+            .contains("unconditionally forbidden under verify-m3")
+    );
 
     let bank_m4a = Command::new(env!("CARGO_BIN_EXE_arkhe"))
         .args([

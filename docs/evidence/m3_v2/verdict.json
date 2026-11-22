@@ -1,0 +1,239 @@
+{
+  "passed": true,
+  "tier": "standard",
+  "require_clean": true,
+  "rebuild": false,
+  "live_provenance": {
+    "git_commit_sha": "2b62140ecc605b557ef526ae7cad622681478340",
+    "git_dirty": false,
+    "source_tree_fnv1a128": "bf22516980817549723269218e209d56",
+    "cargo_lock_fnv1a128": "8d29cd24b1fbdbb743cf5c0b3933b22d"
+  },
+  "golden_traces": {
+    "skipped": false,
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--test",
+      "golden_traces"
+    ],
+    "passed": true,
+    "returncode": 0,
+    "provenance": {
+      "git_commit_sha": "2b62140ecc605b557ef526ae7cad622681478340",
+      "git_dirty": false,
+      "source_tree_fnv1a128": "bf22516980817549723269218e209d56",
+      "cargo_lock_fnv1a128": "8d29cd24b1fbdbb743cf5c0b3933b22d"
+    }
+  },
+  "suites": {
+    "m2a": {
+      "suite": "m2a",
+      "passed": true,
+      "excluded_cases": 0,
+      "cliff_counters": {
+        "reserve_clipped_count": 4955312,
+        "reserve_clipped_bits": 6366613.788956288,
+        "reserve_mismatch_floored": 0,
+        "sprout_blocked_max_nodes": 0,
+        "candidate_undecidable": 165982,
+        "candidate_list_truncated": 219557,
+        "lag_horizon_bound": 4112,
+        "ring_period_bound": 0,
+        "lag_deepening_steps": 56174,
+        "sprout_budget_exhausted": 391564
+      },
+      "provenance": {
+        "git_commit_sha": "2b62140ecc605b557ef526ae7cad622681478340",
+        "git_dirty": false,
+        "source_tree_fnv1a128": "bf22516980817549723269218e209d56",
+        "cargo_lock_fnv1a128": "8d29cd24b1fbdbb743cf5c0b3933b22d",
+        "package_version": "0.1.0",
+        "rustc_version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+        "target_triple": "x86_64-unknown-linux-gnu"
+      },
+      "gates": [
+        {
+          "gate": "G2A.1",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "clean": {
+              "passed": true,
+              "task_count": 15,
+              "target_rate": 0.9,
+              "fwer_alpha": 0.0006666666666666666,
+              "worst_task_label": "G2A.1:CrossAdd(d=1,2,k=1)",
+              "worst_task_rate": 1.0
+            }
+          }
+        },
+        {
+          "gate": "G2A.2",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "clean": {
+              "passed": true,
+              "task_count": 13,
+              "target_rate": 0.9,
+              "fwer_alpha": 0.0007692307692307692,
+              "worst_task_label": "G2A.2:DeepLag(d=5,k=1)",
+              "worst_task_rate": 1.0
+            }
+          }
+        },
+        {
+          "gate": "G2A.3",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "clean": {
+              "passed": true,
+              "task_count": 12,
+              "target_rate": 0.9,
+              "fwer_alpha": 0.0008333333333333334,
+              "worst_task_label": "G2A.3:K=2,k=1(Combinational)",
+              "worst_task_rate": 1.0
+            }
+          }
+        },
+        {
+          "gate": "G2A.4",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "noisy": {
+              "passed": true,
+              "task_count": 9,
+              "target_rate": 0.85,
+              "fwer_alpha": 0.0011111111111111111,
+              "worst_task_label": "G2A.4b:AllNoise:CrossAdd(d=1,2,k=1)",
+              "worst_task_rate": 0.99
+            }
+          }
+        },
+        {
+          "gate": "G2A.5",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "clean": {
+              "passed": true,
+              "task_count": 4,
+              "target_rate": 0.85,
+              "fwer_alpha": 0.0025,
+              "worst_task_label": "G2A.5:CrossSum(d=1,2,k=2)",
+              "worst_task_rate": 0.98
+            }
+          }
+        }
+      ]
+    },
+    "m2b": {
+      "suite": "m2b",
+      "passed": true,
+      "excluded_cases": 0,
+      "cliff_counters": {
+        "reserve_clipped_count": 10066939,
+        "reserve_clipped_bits": 7252260.983227403,
+        "reserve_mismatch_floored": 0,
+        "sprout_blocked_max_nodes": 0,
+        "candidate_undecidable": 52405,
+        "candidate_list_truncated": 77277,
+        "lag_horizon_bound": 0,
+        "ring_period_bound": 0,
+        "lag_deepening_steps": 27270,
+        "sprout_budget_exhausted": 100044
+      },
+      "provenance": {
+        "git_commit_sha": "2b62140ecc605b557ef526ae7cad622681478340",
+        "git_dirty": false,
+        "source_tree_fnv1a128": "bf22516980817549723269218e209d56",
+        "cargo_lock_fnv1a128": "8d29cd24b1fbdbb743cf5c0b3933b22d",
+        "package_version": "0.1.0",
+        "rustc_version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+        "target_triple": "x86_64-unknown-linux-gnu"
+      },
+      "gates": [
+        {
+          "gate": "G2B.1",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "clean": {
+              "passed": true,
+              "task_count": 15,
+              "target_rate": 0.9,
+              "fwer_alpha": 0.0006666666666666666,
+              "worst_task_label": "G2B.1a:epistemic_mdl",
+              "worst_task_rate": 1.0
+            }
+          }
+        },
+        {
+          "gate": "G2B.2",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "clean": {
+              "passed": true,
+              "task_count": 10,
+              "target_rate": 0.9,
+              "fwer_alpha": 0.001,
+              "worst_task_label": "G2B.2:MV_AddEqz_k2_Comb",
+              "worst_task_rate": 1.0
+            }
+          }
+        },
+        {
+          "gate": "G2B.3",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "clean": {
+              "passed": true,
+              "task_count": 7,
+              "target_rate": 0.95,
+              "fwer_alpha": 0.0014285714285714286,
+              "worst_task_label": "G2B.3a:Constant0",
+              "worst_task_rate": 1.0
+            }
+          }
+        },
+        {
+          "gate": "G2B.4",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "noisy": {
+              "passed": true,
+              "task_count": 9,
+              "target_rate": 0.85,
+              "fwer_alpha": 0.0011111111111111111,
+              "worst_task_label": "G2B.4:MV_AllChNoise_k2",
+              "worst_task_rate": 0.89
+            }
+          }
+        },
+        {
+          "gate": "G2B.5",
+          "passed": true,
+          "excluded_cases": 0,
+          "strata": {
+            "clean": {
+              "passed": true,
+              "task_count": 2,
+              "target_rate": 0.9,
+              "fwer_alpha": 0.005,
+              "worst_task_label": "G2B.5:MV_Fault_k1",
+              "worst_task_rate": 1.0
+            }
+          }
+        }
+      ]
+    }
+  },
+  "errors": []
+}

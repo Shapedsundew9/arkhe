@@ -130,7 +130,7 @@ pub enum Commands {
         /// Number of consecutive seed banks to score (when set, activates multi-bank mode).
         #[arg(long)]
         banks: Option<u32>,
-        /// Explicit authorization to run against fresh M3 v2 100-seed holdout seeds 50100..=50199 (50000..=50019 permanently closed).
+        /// Reserved holdout override flag (50000..=50019 M3 v1 and 50100..=50199 M3 v2 are both permanently closed unconditionally; 60000..=60099 M4a remains reserved/blocked until M4a S3).
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
         /// Optional path to write the JSON verification report (prints to stdout when omitted).

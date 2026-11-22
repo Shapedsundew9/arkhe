@@ -1,0 +1,1555 @@
+{
+  "provenance": {
+    "package_version": "0.1.0",
+    "rustc_version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "target_triple": "x86_64-unknown-linux-gnu",
+    "git_commit_sha": "2b62140ecc605b557ef526ae7cad622681478340",
+    "git_dirty": false,
+    "cargo_lock_fnv1a128": "8d29cd24b1fbdbb743cf5c0b3933b22d",
+    "source_tree_fnv1a128": "bf22516980817549723269218e209d56"
+  },
+  "seed_offset": 20,
+  "seeds_per_bank": 20,
+  "banks": 5,
+  "horizon": 2000,
+  "gates": [
+    {
+      "gate": "G2B.1",
+      "passed": true,
+      "excluded_cases": 0,
+      "multi_bank": {
+        "pooled": {
+          "total_trials": 1500,
+          "total_successes": 1500,
+          "pooled_rate": 1.0,
+          "lower_bound_99": 0.9969345945217527,
+          "target_rate": 0.9,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 1.0,
+          "std_dev": 0.0,
+          "percentile_5th": 1.0,
+          "chi_squared": 0.0,
+          "df": 4,
+          "p_value": 1.0,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "pooled_metric_name": "max_epistemic_mdl_err_b_per_sym",
+      "pooled_metric_value": 1.8947806286936005e-15,
+      "pooled_metric_passed": true,
+      "failures": [],
+      "stratified": {
+        "clean": {
+          "regime": "clean",
+          "task_count": 15,
+          "target_rate": 0.9,
+          "fwer_alpha": 0.0006666666666666666,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 1500,
+              "total_successes": 1500,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.9969345945217527,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "seed_conjunction_multi_bank": {
+            "pooled": {
+              "total_trials": 100,
+              "total_successes": 100,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2B.1a:epistemic_mdl",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_epistemic_mdl_err": 1.8947806286936005e-15
+              }
+            },
+            {
+              "task_label": "G2B.1a:starvation",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_starved_energy": 3.1678422930012466
+              }
+            },
+            {
+              "task_label": "G2B.1b:M1_AffineLag1",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:M1_Alternating(Comb)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:M1_Alternating(TPH)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:M1_Const(0)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:M1_CounterMod3",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:M1_CounterPow2",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:M1_PeriodicMotif",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:T2_CrossLinear(Add,Comb)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:T2_CrossLinear(Sub,TPH)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:T2_CrossNonlinear(AddEqz,Comb)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:T2_CrossNonlinear(MulEqz,TPH)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:T2_DelayedAffine(Comb)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            },
+            {
+              "task_label": "G2B.1b:T2_DelayedAffine(TPH)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0006666666666666666,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_target_kt_bits": 0.004067494454690556
+              }
+            }
+          ],
+          "worst_task_label": "G2B.1a:epistemic_mdl",
+          "worst_task_rate": 1.0,
+          "passed": true
+        },
+        "passed": true
+      }
+    },
+    {
+      "gate": "G2B.2",
+      "passed": true,
+      "excluded_cases": 0,
+      "multi_bank": {
+        "pooled": {
+          "total_trials": 1000,
+          "total_successes": 1000,
+          "pooled_rate": 1.0,
+          "lower_bound_99": 0.995405417351527,
+          "target_rate": 0.9,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 1.0,
+          "std_dev": 0.0,
+          "percentile_5th": 1.0,
+          "chi_squared": 0.0,
+          "df": 4,
+          "p_value": 1.0,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "pooled_metric_name": null,
+      "pooled_metric_value": null,
+      "pooled_metric_passed": true,
+      "failures": [],
+      "stratified": {
+        "clean": {
+          "regime": "clean",
+          "task_count": 10,
+          "target_rate": 0.9,
+          "fwer_alpha": 0.001,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 1000,
+              "total_successes": 1000,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.995405417351527,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "seed_conjunction_multi_bank": {
+            "pooled": {
+              "total_trials": 100,
+              "total_successes": 100,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2B.2:MV_AddEqz_k2_Comb",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 2592.0,
+                "min_target_comps": 1.0
+              }
+            },
+            {
+              "task_label": "G2B.2:MV_Affine_k1_Comb",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 2757.0,
+                "min_target_comps": 1.0
+              }
+            },
+            {
+              "task_label": "G2B.2:MV_Affine_k2_Comb",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 4032.0,
+                "min_target_comps": 1.0
+              }
+            },
+            {
+              "task_label": "G2B.2:MV_Affine_k2_TphSplit",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 1500.0,
+                "min_target_comps": 1.0
+              }
+            },
+            {
+              "task_label": "G2B.2:MV_Eqz_k2_Comb",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 1217.0,
+                "min_target_comps": 1.0
+              }
+            },
+            {
+              "task_label": "G2B.2:MV_MulEqz_k2_Comb",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 3795.0,
+                "min_target_comps": 1.0
+              }
+            },
+            {
+              "task_label": "G2B.2:T1_Alternating_k1",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 1500.0,
+                "min_target_comps": 1.0
+              }
+            },
+            {
+              "task_label": "G2B.2:T1_PeriodicMotif_k2",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 1500.0,
+                "min_target_comps": 1.0
+              }
+            },
+            {
+              "task_label": "G2B.2:T2_NonRedundant_deg11xdeg9_Comb",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 0.0,
+                "min_target_comps": 0.0
+              }
+            },
+            {
+              "task_label": "G2B.2:T2_NonRedundant_deg11xdeg9_TPH",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.001,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_settled_comp_ticks": 0.0,
+                "min_target_comps": 0.0
+              }
+            }
+          ],
+          "worst_task_label": "G2B.2:MV_AddEqz_k2_Comb",
+          "worst_task_rate": 1.0,
+          "passed": true
+        },
+        "passed": true
+      }
+    },
+    {
+      "gate": "G2B.3",
+      "passed": true,
+      "excluded_cases": 0,
+      "multi_bank": {
+        "pooled": {
+          "total_trials": 700,
+          "total_successes": 700,
+          "pooled_rate": 1.0,
+          "lower_bound_99": 0.9934427784709274,
+          "target_rate": 0.95,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 1.0,
+          "std_dev": 0.0,
+          "percentile_5th": 1.0,
+          "chi_squared": 0.0,
+          "df": 4,
+          "p_value": 1.0,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "pooled_metric_name": null,
+      "pooled_metric_value": null,
+      "pooled_metric_passed": true,
+      "failures": [],
+      "stratified": {
+        "clean": {
+          "regime": "clean",
+          "task_count": 7,
+          "target_rate": 0.95,
+          "fwer_alpha": 0.0014285714285714286,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 700,
+              "total_successes": 700,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.9934427784709274,
+              "target_rate": 0.95,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "seed_conjunction_multi_bank": {
+            "pooled": {
+              "total_trials": 100,
+              "total_successes": 100,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "target_rate": 0.95,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2B.3a:Constant0",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0014285714285714286,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_circular_discrepancy": 0.0,
+                "max_loopback_disagreement_ticks": 0.0
+              }
+            },
+            {
+              "task_label": "G2B.3a:T1_Alternating",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0014285714285714286,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_circular_discrepancy": 0.0,
+                "max_loopback_disagreement_ticks": 0.0
+              }
+            },
+            {
+              "task_label": "G2B.3a:T2_MultiViewEntrained",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0014285714285714286,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_circular_discrepancy": 0.0,
+                "max_loopback_disagreement_ticks": 0.0
+              }
+            },
+            {
+              "task_label": "G2B.3b:DeceptivePeriod6",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0014285714285714286,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_circular_discrepancy": 1.0,
+                "max_loopback_disagreement_ticks": 44.0
+              }
+            },
+            {
+              "task_label": "G2B.3b:SpuriousCrossLag",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0014285714285714286,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_circular_discrepancy": 1.0,
+                "max_loopback_disagreement_ticks": 104.0
+              }
+            },
+            {
+              "task_label": "G2B.3c:Majority3(pri_min=false)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0014285714285714286,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_circular_discrepancy": 1.0,
+                "max_loopback_disagreement_ticks": 15.0
+              }
+            },
+            {
+              "task_label": "G2B.3c:Majority3(pri_min=true)",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0014285714285714286,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_circular_discrepancy": 1.0,
+                "max_loopback_disagreement_ticks": 30.0
+              }
+            }
+          ],
+          "worst_task_label": "G2B.3a:Constant0",
+          "worst_task_rate": 1.0,
+          "passed": true
+        },
+        "passed": true
+      }
+    },
+    {
+      "gate": "G2B.4",
+      "passed": true,
+      "excluded_cases": 0,
+      "multi_bank": {
+        "pooled": {
+          "total_trials": 900,
+          "total_successes": 886,
+          "pooled_rate": 0.9844444444444445,
+          "lower_bound_99": 0.9719062534172571,
+          "target_rate": 0.85,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 0.9844444444444445,
+          "std_dev": 0.007243558228002973,
+          "percentile_5th": 0.9777777777777779,
+          "chi_squared": 2.4669461464043874,
+          "df": 4,
+          "p_value": 0.7581,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "pooled_metric_name": "pooled_abs_kt_minus_h_bayes_class_b_per_sym",
+      "pooled_metric_value": 0.00422973074814638,
+      "pooled_metric_passed": true,
+      "failures": [
+        "bank 0 (offset 20): G2B.4:MV_AllChNoise_k2:seed=23: kt=0.6281, oracle_kt=0.6281, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 1 (offset 40): G2B.4:MV_AllChNoise_k2:seed=44: kt=0.6872, oracle_kt=0.6407, h_bayes_class=0.6116, paired_diff=0.0465, dis_prunes=0, active_comps=1, dis_rate=Some(0.09732142857142857) (theory=0.0967, m_pri=1, m_alt=1)",
+        "bank 1 (offset 40): G2B.4:MV_AllChNoise_k2:seed=50: kt=0.5697, oracle_kt=0.5697, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 1 (offset 40): G2B.4:MV_AllChNoise_k2:seed=59: kt=0.6407, oracle_kt=0.6407, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 2 (offset 60): G2B.4:MV_TargetNoise_k1:seed=64: kt=0.3259, oracle_kt=0.3259, h_bayes_class=0.2864, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 2 (offset 60): G2B.4:MV_TargetNoise_k1:seed=69: kt=0.2460, oracle_kt=0.2460, h_bayes_class=0.2864, paired_diff=0.0000, dis_prunes=0, active_comps=2, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 2 (offset 60): G2B.4:MV_AllChNoise_k2:seed=72: kt=0.5630, oracle_kt=0.5630, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 2 (offset 60): G2B.4:MV_AllChNoise_k2:seed=79: kt=0.5597, oracle_kt=0.5597, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 3 (offset 80): G2B.4:MV_AllChNoise_k1:seed=83: kt=0.4490, oracle_kt=0.4490, h_bayes_class=0.4529, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 3 (offset 80): G2B.4:MV_AllChNoise_k2:seed=87: kt=0.6344, oracle_kt=0.6344, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 4 (offset 100): G2B.4:MV_AllChNoise_k2:seed=100: kt=0.5597, oracle_kt=0.5597, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 4 (offset 100): G2B.4:MV_AllChNoise_k2:seed=115: kt=0.6056, oracle_kt=0.6056, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0967, m_pri=1, m_alt=1)",
+        "bank 4 (offset 100): G2B.4:MV_AllChNoise_k2:seed=116: kt=0.5429, oracle_kt=0.5429, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)",
+        "bank 4 (offset 100): G2B.4:MV_AllChNoise_k2:seed=119: kt=0.6470, oracle_kt=0.6470, h_bayes_class=0.6116, paired_diff=0.0000, dis_prunes=0, active_comps=1, dis_rate=None (theory=0.0000, m_pri=0, m_alt=0)"
+      ],
+      "stratified": {
+        "noisy": {
+          "regime": "noisy",
+          "task_count": 9,
+          "target_rate": 0.85,
+          "fwer_alpha": 0.0011111111111111111,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 900,
+              "total_successes": 886,
+              "pooled_rate": 0.9844444444444445,
+              "lower_bound_99": 0.9719062534172571,
+              "target_rate": 0.85,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 0.9844444444444445,
+              "std_dev": 0.007243558228002973,
+              "percentile_5th": 0.9777777777777779,
+              "chi_squared": 2.4669461464043874,
+              "df": 4,
+              "p_value": 0.7581,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2B.4:MV_AllChNoise_k1",
+              "regime": "noisy",
+              "total_successes": 99,
+              "total_trials": 100,
+              "empirical_rate": 0.99,
+              "lower_bound_99": 0.9354572679514073,
+              "binomial_lower_tail_p": 0.9999999125232637,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 0.99,
+                "std_dev": 0.022360679774997918,
+                "percentile_5th": 0.96,
+                "chi_squared": 4.040404040404036,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.026991579593162895,
+                "max_disagreement_dev": 0.027718691000629236
+              }
+            },
+            {
+              "task_label": "G2B.4:MV_AllChNoise_k2",
+              "regime": "noisy",
+              "total_successes": 89,
+              "total_trials": 100,
+              "empirical_rate": 0.89,
+              "lower_bound_99": 0.7962754158739804,
+              "binomial_lower_tail_p": 0.9005525995012047,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 0.89,
+                "std_dev": 0.06519202405202645,
+                "percentile_5th": 0.8100000000000002,
+                "chi_squared": 3.4729315628192037,
+                "df": 4,
+                "p_value": 0.61392,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.0464652742453433,
+                "max_disagreement_dev": 0.02867799811142588
+              }
+            },
+            {
+              "task_label": "G2B.4:MV_TargetNoise_k1",
+              "regime": "noisy",
+              "total_successes": 98,
+              "total_trials": 100,
+              "empirical_rate": 0.98,
+              "lower_bound_99": 0.9185880536971687,
+              "binomial_lower_tail_p": 0.9999983688161524,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 0.9800000000000001,
+                "std_dev": 0.04472135954999578,
+                "percentile_5th": 0.9200000000000002,
+                "chi_squared": 8.163265306122442,
+                "df": 4,
+                "p_value": 0.19065,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.0,
+                "max_disagreement_dev": 0.0
+              }
+            },
+            {
+              "task_label": "G2B.4:MV_TargetNoise_k2",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.0,
+                "max_disagreement_dev": 0.0
+              }
+            },
+            {
+              "task_label": "G2B.4:NoisyAlternating_k1",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.008860304554375031,
+                "max_disagreement_dev": 0.01837606837606834
+              }
+            },
+            {
+              "task_label": "G2B.4:NoisyConst0(k=1)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.06559973777669226
+              }
+            },
+            {
+              "task_label": "G2B.4:NoisyConst0(k=2)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 0.10428224849553475
+              }
+            },
+            {
+              "task_label": "G2B.4:NoisyConstMax(k=1)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 1.1793372841550944
+              }
+            },
+            {
+              "task_label": "G2B.4:NoisyConstMax(k=2)",
+              "regime": "noisy",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.0011111111111111111,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "max_abs_kt_diff": 1.8780891947411027
+              }
+            }
+          ],
+          "worst_task_label": "G2B.4:MV_AllChNoise_k2",
+          "worst_task_rate": 0.89,
+          "passed": true
+        },
+        "passed": true
+      }
+    },
+    {
+      "gate": "G2B.5",
+      "passed": true,
+      "excluded_cases": 0,
+      "multi_bank": {
+        "pooled": {
+          "total_trials": 200,
+          "total_successes": 200,
+          "pooled_rate": 1.0,
+          "lower_bound_99": 0.9772372209558107,
+          "target_rate": 0.9,
+          "passes_pooled": true
+        },
+        "distribution": {
+          "bank_count": 5,
+          "mean": 1.0,
+          "std_dev": 0.0,
+          "percentile_5th": 1.0,
+          "chi_squared": 0.0,
+          "df": 4,
+          "p_value": 1.0,
+          "passes_homogeneity": true
+        },
+        "passed": true
+      },
+      "pooled_metric_name": "pooled_post_fault_kt_advantage_b_per_sym",
+      "pooled_metric_value": 1.4234034041838932,
+      "pooled_metric_passed": true,
+      "failures": [],
+      "stratified": {
+        "clean": {
+          "regime": "clean",
+          "task_count": 2,
+          "target_rate": 0.9,
+          "fwer_alpha": 0.005,
+          "pooled_multi_bank": {
+            "pooled": {
+              "total_trials": 200,
+              "total_successes": 200,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.9772372209558107,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "seed_conjunction_multi_bank": {
+            "pooled": {
+              "total_trials": 100,
+              "total_successes": 100,
+              "pooled_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "target_rate": 0.9,
+              "passes_pooled": true
+            },
+            "distribution": {
+              "bank_count": 5,
+              "mean": 1.0,
+              "std_dev": 0.0,
+              "percentile_5th": 1.0,
+              "chi_squared": 0.0,
+              "df": 4,
+              "p_value": 1.0,
+              "passes_homogeneity": true
+            },
+            "passed": true
+          },
+          "tasks": [
+            {
+              "task_label": "G2B.5:MV_Fault_k1",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.005,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_post_fault_kt_advantage": 0.9429045748771886
+              }
+            },
+            {
+              "task_label": "G2B.5:MV_Fault_k2",
+              "regime": "clean",
+              "total_successes": 100,
+              "total_trials": 100,
+              "empirical_rate": 1.0,
+              "lower_bound_99": 0.954992586021436,
+              "binomial_lower_tail_p": 1.0,
+              "fwer_alpha": 0.005,
+              "passes_fwer_binomial": true,
+              "distribution": {
+                "bank_count": 5,
+                "mean": 1.0,
+                "std_dev": 0.0,
+                "percentile_5th": 1.0,
+                "chi_squared": 0.0,
+                "df": 4,
+                "p_value": 1.0,
+                "passes_homogeneity": true
+              },
+              "passed": true,
+              "tail_metrics": {
+                "min_post_fault_kt_advantage": 1.7941915768352097
+              }
+            }
+          ],
+          "worst_task_label": "G2B.5:MV_Fault_k1",
+          "worst_task_rate": 1.0,
+          "passed": true
+        },
+        "passed": true
+      }
+    }
+  ],
+  "all_passed": true,
+  "excluded_cases": 0,
+  "cliff_counters": {
+    "reserve_clipped_count": 10066939,
+    "reserve_clipped_bits": 7252260.983227403,
+    "reserve_mismatch_floored": 0,
+    "sprout_blocked_max_nodes": 0,
+    "candidate_undecidable": 52405,
+    "candidate_list_truncated": 77277,
+    "lag_horizon_bound": 0,
+    "ring_period_bound": 0,
+    "lag_deepening_steps": 27270,
+    "sprout_budget_exhausted": 100044
+  },
+  "g2b1_max_epistemic_mdl_err": 1.8947806286936005e-15,
+  "g2b4_pooled_abs_kt_minus_h_bayes_class": 0.00422973074814638,
+  "g2b5_pooled_post_fault_kt_advantage": 1.4234034041838932
+}
