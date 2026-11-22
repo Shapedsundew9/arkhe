@@ -2383,21 +2383,56 @@ fn replay_current_baseline(
     }
 }
 
-fn new_acyclic_register_depth(
+fn compute_cyclic_nodes(staged: &Circuit) -> Vec<bool> {
+    let n = staged.node_count();
+    let mut adj = vec![Vec::new(); n];
+    for edge in staged.edges() {
+        if let (SignalSource::NodeOut { node: u, .. }, SignalSink::NodeIn { node: v, .. }) =
+            (edge.src, edge.dst)
+            && u.index() < n
+            && v.index() < n
+        {
+            adj[u.index()].push(v.index());
+        }
+    }
+    let mut is_cyclic = vec![false; n];
+    let mut visited = vec![false; n];
+    let mut stack = Vec::new();
+    for start in 0..n {
+        visited.fill(false);
+        stack.clear();
+        stack.extend_from_slice(&adj[start]);
+        while let Some(curr) = stack.pop() {
+            if curr == start {
+                is_cyclic[start] = true;
+                break;
+            }
+            if !visited[curr] {
+                visited[curr] = true;
+                stack.extend_from_slice(&adj[curr]);
+            }
+        }
+    }
+    is_cyclic
+}
+
+fn acyclic_register_depth(
     staged: &Circuit,
     is_surviving_node: &[bool],
     is_cyclic_node: &[bool],
+    stop_at_surviving: bool,
 ) -> usize {
     fn rec(
         circuit: &Circuit,
         node: NodeId,
         is_surviving_node: &[bool],
         is_cyclic_node: &[bool],
+        stop_at_surviving: bool,
         memo: &mut [Option<usize>],
         on_path: &mut [bool],
     ) -> usize {
         let idx = node.index();
-        if is_surviving_node.get(idx).copied().unwrap_or(false)
+        if (stop_at_surviving && is_surviving_node.get(idx).copied().unwrap_or(false))
             || is_cyclic_node.get(idx).copied().unwrap_or(false)
             || on_path[idx]
         {
@@ -2424,6 +2459,7 @@ fn new_acyclic_register_depth(
                                 src,
                                 is_surviving_node,
                                 is_cyclic_node,
+                                stop_at_surviving,
                                 memo,
                                 on_path,
                             )
@@ -2449,6 +2485,7 @@ fn new_acyclic_register_depth(
                 NodeId(u32::try_from(idx).expect("node index fits in u32")),
                 is_surviving_node,
                 is_cyclic_node,
+                stop_at_surviving,
                 &mut memo,
                 &mut on_path,
             ));
@@ -2470,20 +2507,24 @@ fn new_acyclic_register_depth(
     max_depth
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prime_non_surviving_registers(
+struct PrimingPlan {
+    is_surviving_node: Vec<bool>,
+    is_cyclic_node: Vec<bool>,
+    prime_start: usize,
+    prime_steps: usize,
+}
+
+fn plan_non_surviving_register_priming(
     staged: &Circuit,
-    staged_compiled: &CompiledCircuit,
     old_to_new: &[Option<NodeId>],
-    reg_map: &[Option<usize>],
     protected_new_node: Option<NodeId>,
     obs_window: &ObservationWindow,
+    structure_epoch: u64,
     start_idx: usize,
     eval_start_idx: usize,
-    regs: &mut [u64],
-) {
+) -> Option<PrimingPlan> {
     if start_idx == 0 {
-        return;
+        return None;
     }
     let n = staged.node_count();
     let mut is_surviving_node = vec![false; n];
@@ -2497,23 +2538,58 @@ fn prime_non_surviving_registers(
     {
         is_surviving_node[p_node.index()] = true;
     }
-    let is_cyclic_node: Vec<bool> = (0..n)
-        .map(|idx| {
-            !is_surviving_node[idx]
-                && source_has_cycle(
-                    staged,
-                    SignalSource::NodeOut {
-                        node: NodeId(u32::try_from(idx).expect("node index fits in u32")),
-                        port: 0,
-                    },
-                )
-        })
-        .collect();
-    let d_new = new_acyclic_register_depth(staged, &is_surviving_node, &is_cyclic_node);
+    let is_cyclic_node = compute_cyclic_nodes(staged);
+    let d_new = acyclic_register_depth(staged, &is_surviving_node, &is_cyclic_node, true);
     if eval_start_idx.saturating_sub(start_idx) >= d_new {
-        return;
+        return None;
     }
 
+    let prime_start_new = start_idx.saturating_sub(d_new);
+    let has_new_snapshot = obs_window
+        .state_snapshot_at(prime_start_new)
+        .is_some_and(|(snap_epoch, _)| snap_epoch == structure_epoch);
+    let prime_start = if has_new_snapshot {
+        prime_start_new
+    } else {
+        let d_full = acyclic_register_depth(staged, &is_surviving_node, &is_cyclic_node, false);
+        start_idx.saturating_sub(d_full)
+    };
+    let prime_steps = start_idx.saturating_sub(prime_start);
+    if prime_steps == 0 {
+        return None;
+    }
+
+    Some(PrimingPlan {
+        is_surviving_node,
+        is_cyclic_node,
+        prime_start,
+        prime_steps,
+    })
+}
+
+fn map_snapshot_regs_into(reg_map: &[Option<usize>], snap_regs: &[u64], dst: &mut [u64]) {
+    for (old_r, new_r) in reg_map.iter().enumerate() {
+        if let Some(nr) = new_r
+            && old_r < snap_regs.len()
+            && *nr < dst.len()
+        {
+            dst[*nr] = snap_regs[old_r];
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prime_non_surviving_registers_with_plan(
+    plan: &PrimingPlan,
+    staged: &Circuit,
+    staged_compiled: &CompiledCircuit,
+    reg_map: &[Option<usize>],
+    protected_new_node: Option<NodeId>,
+    obs_window: &ObservationWindow,
+    start_idx: usize,
+    regs: &mut [u64],
+    seed_shadow_at: impl FnOnce(usize, &mut ScalarState) -> bool,
+) {
     let mut is_untouched_reg = vec![false; regs.len()];
     for nr in reg_map.iter().flatten().copied() {
         if nr < is_untouched_reg.len() {
@@ -2523,7 +2599,9 @@ fn prime_non_surviving_registers(
     let mut exp_reg = 0usize;
     for (idx, prim) in staged.nodes().iter().enumerate() {
         if prim.is_stateful() {
-            if exp_reg < is_untouched_reg.len() && (is_surviving_node[idx] || is_cyclic_node[idx]) {
+            if exp_reg < is_untouched_reg.len()
+                && (plan.is_surviving_node[idx] || plan.is_cyclic_node[idx])
+            {
                 is_untouched_reg[exp_reg] = true;
             }
             exp_reg += 1;
@@ -2533,23 +2611,18 @@ fn prime_non_surviving_registers(
         let mut base = staged_compiled.explicit_delay_count();
         for edge in staged.edges() {
             let hops = usize::from(edge.hops);
-            let untouched = match edge.src {
-                SignalSource::NodeOut { node, .. } => {
-                    is_surviving_node
-                        .get(node.index())
-                        .copied()
-                        .unwrap_or(false)
-                        || is_cyclic_node.get(node.index()).copied().unwrap_or(false)
+            let incident_to_protected = protected_new_node.is_some_and(|p_node| {
+                matches!(edge.src, SignalSource::NodeOut { node, .. } if node == p_node)
+                    || matches!(edge.dst, SignalSink::NodeIn { node, .. } if node == p_node)
+            });
+            let cyclic_internal = match (edge.src, edge.dst) {
+                (SignalSource::NodeOut { node: s, .. }, SignalSink::NodeIn { node: d, .. }) => {
+                    plan.is_cyclic_node.get(s.index()).copied().unwrap_or(false)
+                        && plan.is_cyclic_node.get(d.index()).copied().unwrap_or(false)
                 }
-                SignalSource::BoundaryIn(_) => match edge.dst {
-                    SignalSink::NodeIn { node, .. } => is_surviving_node
-                        .get(node.index())
-                        .copied()
-                        .unwrap_or(false),
-                    SignalSink::BoundaryOut(_) => true,
-                },
+                _ => false,
             };
-            if untouched {
+            if incident_to_protected || cyclic_internal {
                 for s in 0..hops {
                     if base + s < is_untouched_reg.len() {
                         is_untouched_reg[base + s] = true;
@@ -2560,10 +2633,12 @@ fn prime_non_surviving_registers(
         }
     }
 
-    let prime_start = start_idx.saturating_sub(d_new);
     let mut shadow = ScalarState::new(staged_compiled);
+    if !seed_shadow_at(plan.prime_start, &mut shadow) {
+        return;
+    }
     let mut dummy_pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
-    for idx in prime_start..start_idx {
+    for idx in plan.prime_start..start_idx {
         let input = if idx == 0 {
             obs_window.prior_frame()
         } else {
@@ -2582,6 +2657,53 @@ fn prime_non_surviving_registers(
             regs[r] = shadow_regs[r];
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn prime_non_surviving_registers(
+    staged: &Circuit,
+    staged_compiled: &CompiledCircuit,
+    old_to_new: &[Option<NodeId>],
+    reg_map: &[Option<usize>],
+    protected_new_node: Option<NodeId>,
+    obs_window: &ObservationWindow,
+    structure_epoch: u64,
+    start_idx: usize,
+    eval_start_idx: usize,
+    regs: &mut [u64],
+) {
+    let Some(plan) = plan_non_surviving_register_priming(
+        staged,
+        old_to_new,
+        protected_new_node,
+        obs_window,
+        structure_epoch,
+        start_idx,
+        eval_start_idx,
+    ) else {
+        return;
+    };
+    prime_non_surviving_registers_with_plan(
+        &plan,
+        staged,
+        staged_compiled,
+        reg_map,
+        protected_new_node,
+        obs_window,
+        start_idx,
+        regs,
+        |prime_idx, shadow| {
+            if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(prime_idx)
+                && snap_epoch == structure_epoch
+            {
+                let mut shadow_regs = shadow.registers().to_vec();
+                map_snapshot_regs_into(reg_map, snap_regs, &mut shadow_regs);
+                let _ = shadow.set_registers(staged_compiled, &shadow_regs);
+            }
+            true
+        },
+    );
 }
 
 enum SproutMotifOutcome {
@@ -2648,6 +2770,14 @@ impl CombSourceSpec {
         }
     }
 
+    const fn register_depth(self) -> usize {
+        match self {
+            Self::BoundaryIn(_) => 0,
+            Self::LagIn { tau, .. } | Self::LagYhat { tau } => tau,
+            Self::LagRes { tau_m1, .. } => tau_m1 + 1,
+        }
+    }
+
     #[inline(always)]
     fn eval_at(self, i: usize, width: Width, baseline: &BaselineReplayMetrics) -> u64 {
         let num_inputs = baseline.num_inputs;
@@ -2701,6 +2831,32 @@ enum FastCombKind {
     AddEqz(CombSourceSpec, CombSourceSpec),
     MulEqz(CombSourceSpec, CombSourceSpec),
     MulEqzPair(CombSourceSpec, CombSourceSpec),
+}
+
+impl FastCombKind {
+    const fn register_depth(self) -> usize {
+        match self {
+            Self::ConstLoop(_) => 0,
+            Self::Identity(s)
+            | Self::Eqz(s)
+            | Self::AddSelf(s)
+            | Self::AddConst(s, _)
+            | Self::EqzAddConst(s, _)
+            | Self::NegAddConst(s, _)
+            | Self::Neg(s)
+            | Self::ScaleEqz(s, _) => s.register_depth(),
+            Self::AddPair(s1, s2)
+            | Self::SubPair(s1, s2)
+            | Self::MulPair(s1, s2)
+            | Self::AddEqz(s1, s2)
+            | Self::MulEqz(s1, s2)
+            | Self::MulEqzPair(s1, s2) => {
+                let d1 = s1.register_depth();
+                let d2 = s2.register_depth();
+                if d1 > d2 { d1 } else { d2 }
+            }
+        }
+    }
 }
 
 struct FastCombPlan {
@@ -2861,6 +3017,9 @@ impl FastCombPlan {
         };
         let _ = min_added;
         if base_nodes.saturating_add(max_added) > max_nodes {
+            return FastCombPrep::Fallback;
+        }
+        if baseline.start_idx > 0 && kind.register_depth() > baseline.eval_offset {
             return FastCombPrep::Fallback;
         }
         FastCombPrep::Plan(Self { kind, is_epoch_1 })
@@ -3100,9 +3259,32 @@ fn evaluate_sprout_motif(
     {
         return SproutMotifOutcome::Rejected;
     }
-    if !budget_consumed
+    let start_snap = obs_window
+        .state_snapshot_at(baseline.start_idx)
+        .filter(|&(snap_epoch, _)| snap_epoch == editable.structure_epoch());
+    let priming_plan = if start_snap.is_some() {
+        plan_non_surviving_register_priming(
+            &staged,
+            &baseline.survivor_map,
+            None,
+            obs_window,
+            editable.structure_epoch(),
+            baseline.start_idx,
+            baseline.eval_start_idx,
+        )
+    } else {
+        None
+    };
+    let prime_steps = priming_plan.as_ref().map_or(0, |p| p.prime_steps);
+    let replay_ticks = if budget_consumed {
+        0
+    } else {
+        baseline.w_replay
+    };
+    let needed_ticks = (replay_ticks + prime_steps) as u64;
+    if needed_ticks > 0
         && let Some(b) = budget
-        && !b.try_consume(baseline.w_replay as u64)
+        && !b.try_consume(needed_ticks)
     {
         if let Some(tel) = telemetry {
             tel.sprout_budget_exhausted += 1;
@@ -3114,9 +3296,7 @@ fn evaluate_sprout_motif(
     };
 
     let mut state = ScalarState::new(&staged_compiled);
-    if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(baseline.start_idx)
-        && snap_epoch == editable.structure_epoch()
-    {
+    if let Some((_, snap_regs)) = start_snap {
         let reg_map = register_mapping(
             editable.circuit(),
             &staged,
@@ -3125,24 +3305,31 @@ fn evaluate_sprout_motif(
             &baseline.survivor_map,
         );
         let mut staged_regs = state.registers().to_vec();
-        for (old_r, new_r) in reg_map.iter().enumerate() {
-            if let Some(nr) = new_r
-                && old_r < snap_regs.len()
-            {
-                staged_regs[*nr] = snap_regs[old_r];
-            }
+        map_snapshot_regs_into(&reg_map, snap_regs, &mut staged_regs);
+        if let Some(ref plan) = priming_plan {
+            let structure_epoch = editable.structure_epoch();
+            prime_non_surviving_registers_with_plan(
+                plan,
+                &staged,
+                &staged_compiled,
+                &reg_map,
+                None,
+                obs_window,
+                baseline.start_idx,
+                &mut staged_regs,
+                |prime_idx, shadow| {
+                    if let Some((prime_epoch, prime_snap_regs)) =
+                        obs_window.state_snapshot_at(prime_idx)
+                        && prime_epoch == structure_epoch
+                    {
+                        let mut shadow_regs = shadow.registers().to_vec();
+                        map_snapshot_regs_into(&reg_map, prime_snap_regs, &mut shadow_regs);
+                        let _ = shadow.set_registers(&staged_compiled, &shadow_regs);
+                    }
+                    true
+                },
+            );
         }
-        prime_non_surviving_registers(
-            &staged,
-            &staged_compiled,
-            &baseline.survivor_map,
-            &reg_map,
-            None,
-            obs_window,
-            baseline.start_idx,
-            baseline.eval_start_idx,
-            &mut staged_regs,
-        );
         let _ = state.set_registers(&staged_compiled, &staged_regs);
     }
     let num_outputs = usize::from(staged_compiled.num_outputs());
@@ -5816,7 +6003,30 @@ fn evaluate_stage3_candidate_pre(
         return None;
     }
 
-    if !budget.try_consume(baseline.w_replay as u64) {
+    let old_to_new: Vec<Option<NodeId>> = (0..editable.circuit().node_count())
+        .map(|i| Some(NodeId(i as u32)))
+        .collect();
+    let protected_new_node = spliced
+        .inserted_split
+        .filter(|_| spliced.primary_autonomous_shifted);
+    let start_snap = obs_window
+        .state_snapshot_at(baseline.start_idx)
+        .filter(|&(snap_epoch, _)| snap_epoch == editable.structure_epoch());
+    let priming_plan = if start_snap.is_some() {
+        plan_non_surviving_register_priming(
+            &staged,
+            &old_to_new,
+            protected_new_node,
+            obs_window,
+            editable.structure_epoch(),
+            baseline.start_idx,
+            baseline.eval_start_idx,
+        )
+    } else {
+        None
+    };
+    let prime_steps = priming_plan.as_ref().map_or(0, |p| p.prime_steps);
+    if !budget.try_consume((baseline.w_replay + prime_steps) as u64) {
         telemetry.sprout_budget_exhausted += 1;
         return Some(Err(()));
     }
@@ -5824,13 +6034,20 @@ fn evaluate_stage3_candidate_pre(
     let Ok(staged_compiled) = staged.compile() else {
         return None;
     };
-    let old_to_new: Vec<Option<NodeId>> = (0..editable.circuit().node_count())
-        .map(|i| Some(NodeId(i as u32)))
-        .collect();
     let mut state = ScalarState::new(&staged_compiled);
-    if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(baseline.start_idx)
-        && snap_epoch == editable.structure_epoch()
-    {
+    let seed_autonomous_ring_at = |idx: usize, regs: &mut [u64]| -> bool {
+        if let Some((period, ref mu, ref delay_nodes)) = autonomous_ring {
+            let align_tick = (obs_window.start_tick() as usize) + idx;
+            for (j, &delay_node) in delay_nodes.iter().enumerate() {
+                let Some(reg_idx) = explicit_delay_register_index(&staged, delay_node) else {
+                    return false;
+                };
+                regs[reg_idx] = mu[(align_tick + (period - 1 - j)) % period];
+            }
+        }
+        true
+    };
+    if let Some((_, snap_regs)) = start_snap {
         let reg_map = register_mapping(
             editable.circuit(),
             &staged,
@@ -5838,60 +6055,69 @@ fn evaluate_stage3_candidate_pre(
             &staged_compiled,
             &old_to_new,
         );
+        let seed_snapshot_regs = |snap: &[u64], regs: &mut Vec<u64>| {
+            if let Some(split_node) = protected_new_node
+                && let Some(adj_regs) =
+                    crate::structural::graph_edit::advance_tph_autonomous_ring_phase(
+                        editable.circuit(),
+                        editable.compiled(),
+                        snap,
+                        &staged,
+                        &staged_compiled,
+                        &old_to_new,
+                        out_port,
+                        split_node,
+                        spliced.sub_node,
+                    )
+            {
+                *regs = adj_regs;
+            } else {
+                map_snapshot_regs_into(&reg_map, snap, regs);
+            }
+        };
+
         let mut regs = state.registers().to_vec();
-        if let Some(split_node) = spliced
-            .inserted_split
-            .filter(|_| spliced.primary_autonomous_shifted)
-        {
-            if let Some(adj_regs) = crate::structural::graph_edit::advance_tph_autonomous_ring_phase(
-                editable.circuit(),
-                editable.compiled(),
-                snap_regs,
+        seed_snapshot_regs(snap_regs, &mut regs);
+        if let Some(ref plan) = priming_plan {
+            let structure_epoch = editable.structure_epoch();
+            let mut ring_ok = true;
+            prime_non_surviving_registers_with_plan(
+                plan,
                 &staged,
                 &staged_compiled,
-                &old_to_new,
-                out_port,
-                split_node,
-                spliced.sub_node,
-            ) {
-                regs = adj_regs;
-            }
-        } else {
-            for (old_r, new_r) in reg_map.iter().enumerate() {
-                if let Some(nr) = new_r
-                    && old_r < snap_regs.len()
-                {
-                    regs[*nr] = snap_regs[old_r];
-                }
+                &reg_map,
+                protected_new_node,
+                obs_window,
+                baseline.start_idx,
+                &mut regs,
+                |prime_idx, shadow| {
+                    let mut shadow_regs = shadow.registers().to_vec();
+                    if let Some((prime_epoch, prime_snap_regs)) =
+                        obs_window.state_snapshot_at(prime_idx)
+                        && prime_epoch == structure_epoch
+                    {
+                        seed_snapshot_regs(prime_snap_regs, &mut shadow_regs);
+                    }
+                    if !seed_autonomous_ring_at(prime_idx, &mut shadow_regs) {
+                        ring_ok = false;
+                        return false;
+                    }
+                    let _ = shadow.set_registers(&staged_compiled, &shadow_regs);
+                    true
+                },
+            );
+            if !ring_ok {
+                return None;
             }
         }
-        prime_non_surviving_registers(
-            &staged,
-            &staged_compiled,
-            &old_to_new,
-            &reg_map,
-            spliced
-                .inserted_split
-                .filter(|_| spliced.primary_autonomous_shifted),
-            obs_window,
-            baseline.start_idx,
-            baseline.eval_start_idx,
-            &mut regs,
-        );
-        if let Some((period, ref mu, ref delay_nodes)) = autonomous_ring {
-            let align_tick = (obs_window.start_tick() as usize) + baseline.start_idx;
-            for (j, &delay_node) in delay_nodes.iter().enumerate() {
-                let reg_idx = explicit_delay_register_index(&staged, delay_node)?;
-                regs[reg_idx] = mu[(align_tick + (period - 1 - j)) % period];
-            }
+        if !seed_autonomous_ring_at(baseline.start_idx, &mut regs) {
+            return None;
         }
         let _ = state.set_registers(&staged_compiled, &regs);
-    } else if let Some((period, ref mu, ref delay_nodes)) = autonomous_ring {
+    } else if autonomous_ring.is_some() {
         let mut regs = state.registers().to_vec();
-        let align_tick = (obs_window.start_tick() as usize) + baseline.start_idx;
-        for (j, &delay_node) in delay_nodes.iter().enumerate() {
-            let reg_idx = explicit_delay_register_index(&staged, delay_node)?;
-            regs[reg_idx] = mu[(align_tick + (period - 1 - j)) % period];
+        if !seed_autonomous_ring_at(baseline.start_idx, &mut regs) {
+            return None;
         }
         let _ = state.set_registers(&staged_compiled, &regs);
     }
@@ -7819,5 +8045,572 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn r1_repro_surviving_delay_feeds_new_delay_with_and_without_snapshot() {
+        let mut old = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let d0 = old.add_node(Primitive::Delay { init: 0 });
+        old.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn { node: d0, port: 0 },
+        );
+        old.connect(
+            SignalSource::NodeOut { node: d0, port: 0 },
+            SignalSink::BoundaryOut(0),
+        );
+        let old_compiled = old.compile().unwrap();
+
+        let mut staged = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let s_d0 = staged.add_node(Primitive::Delay { init: 0 });
+        let s_d1 = staged.add_node(Primitive::Delay { init: 0 });
+        staged.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn {
+                node: s_d0,
+                port: 0,
+            },
+        );
+        staged.connect(
+            SignalSource::NodeOut {
+                node: s_d0,
+                port: 0,
+            },
+            SignalSink::NodeIn {
+                node: s_d1,
+                port: 0,
+            },
+        );
+        staged.connect(
+            SignalSource::NodeOut {
+                node: s_d1,
+                port: 0,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        let staged_compiled = staged.compile().unwrap();
+
+        let old_to_new = vec![Some(s_d0)];
+        let reg_map = register_mapping(&old, &staged, &old_compiled, &staged_compiled, &old_to_new);
+        assert_eq!(reg_map, vec![Some(0)]);
+
+        // (a) Same-epoch snapshot `[3]` at `idx = 2` (`prime_start = start_idx - d_new = 2`).
+        let mut obs_a = ObservationWindow::new(1, 16);
+        obs_a.push_frame_with_state(&[3], 1, &[0]);
+        obs_a.push_frame_with_state(&[2], 1, &[0]);
+        obs_a.push_frame_with_state(&[1], 1, &[3]);
+        let mut regs_a = [2u64, 0u64];
+        prime_non_surviving_registers(
+            &staged,
+            &staged_compiled,
+            &old_to_new,
+            &reg_map,
+            None,
+            &obs_a,
+            1,
+            3,
+            3,
+            &mut regs_a,
+        );
+        assert_eq!(regs_a, [2, 3]);
+
+        // (b) NO same-epoch snapshot at `idx = 2` (only `[2]` at `idx = 3`); falls back to `d_full = 2`.
+        let mut obs_b = ObservationWindow::new(1, 16);
+        obs_b.push_frame(&[3]);
+        obs_b.push_frame(&[2]);
+        obs_b.push_frame_with_state(&[1], 0, &[3]);
+        obs_b.push_frame_with_state(&[1], 1, &[2]);
+        let mut regs_b = [2u64, 0u64];
+        prime_non_surviving_registers(
+            &staged,
+            &staged_compiled,
+            &old_to_new,
+            &reg_map,
+            None,
+            &obs_b,
+            1,
+            3,
+            3,
+            &mut regs_b,
+        );
+        assert_eq!(regs_b, [2, 3]);
+
+        // End-to-end check through `evaluate_sprout_motif` for case (b) where edit happened at `idx = 3`:
+        // At `idx = 3`, `d0 = 2`, primed `d1 = 3` -> `LagYhat(0, 1)` predicts `(2 + 3) mod 4 = 1 == truth[3]`.
+        // At `idx = 4`, `d0 = 0`, `d1 = 2` -> `LagYhat(0, 1)` predicts `(0 + 2) mod 4 = 2 == truth[4]`.
+        let mut obs_e2e = ObservationWindow::new(1, 16);
+        obs_e2e.push_frame(&[3]);
+        obs_e2e.push_frame(&[2]);
+        obs_e2e.push_frame_with_state(&[0], 0, &[3]);
+        obs_e2e.push_frame_with_state(&[1], 1, &[2]);
+        obs_e2e.push_frame_with_state(&[2], 1, &[0]);
+        let econ = EconomyConfig {
+            juvenile_ticks: 0,
+            ..EconomyConfig::default()
+        };
+        let growth = GrowthConfig {
+            diagnostic_window: 2,
+            min_match_gain: 1,
+            ..GrowthConfig::default()
+        };
+        let mut editable = EditableCircuit::new(old.clone(), econ).unwrap();
+        editable
+            .recompile_preserving_state(old, &[Some(d0)])
+            .unwrap();
+        assert_eq!(editable.structure_epoch(), 1);
+        let baseline = replay_current_baseline(&editable, &obs_e2e, &growth, &econ, 0, false);
+        assert_eq!(baseline.start_idx, 3);
+        assert_eq!(baseline.eval_start_idx, 3);
+        assert_eq!(baseline.w_replay, 2);
+        assert_eq!(baseline.e_curr, 2);
+
+        let mut budget = TickBudget::new(100);
+        let mut tel = SproutTelemetry::default();
+        let outcome = evaluate_sprout_motif(
+            &editable,
+            &obs_e2e,
+            &growth,
+            &econ,
+            0,
+            &CandidateMotif::Identity(SourceFeature::LagYhat { port: 0, tau: 1 }),
+            false,
+            false,
+            &baseline,
+            Some(&mut budget),
+            Some(&mut tel),
+        );
+        match outcome {
+            SproutMotifOutcome::Accepted { e_cand, .. } => assert_eq!(e_cand, 0),
+            _ => panic!("expected LagYhat(0, 1) to accept once primed to [2, 3]"),
+        }
+        assert_eq!(budget.consumed(), 4); // w_replay (2) + prime_steps (2)
+        assert_eq!(tel.sprout_budget_exhausted, 0);
+    }
+
+    #[test]
+    fn r1_priming_surviving_cyclic_ring_feeds_new_delay() {
+        // Surviving period-3 autonomous ring [1, 2, 3] feeding a newly added Delay { init: 0 }.
+        let mut old = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let (ring_delays, ring_split) = build_autonomous_ring(&mut old, 3, &[1, 2, 3], 0);
+        let old_compiled = old.compile().unwrap();
+
+        let mut sim = ScalarState::new(&old_compiled);
+        let mut obs = ObservationWindow::new(1, 16);
+        let mut pred = [0u64];
+        for _ in 0..4 {
+            let pre_regs = sim.registers().to_vec();
+            sim.step(&old_compiled, &[0], &mut pred).unwrap();
+            obs.push_frame_with_state(&pred, 0, &pre_regs);
+        }
+        // Snapshot at `idx = 2` holds [2, 1, 3] (r2 = 3); snapshot at `idx = 3` holds [3, 2, 1] (r2 = 1).
+        assert_eq!(obs.state_snapshot_at(2).unwrap().1, &[2, 1, 3]);
+        assert_eq!(obs.state_snapshot_at(3).unwrap().1, &[3, 2, 1]);
+
+        let mut staged = old.clone();
+        let d_new = staged.add_node(Primitive::Delay { init: 0 });
+        let tapped = tap_source(
+            &mut staged,
+            SignalSource::NodeOut {
+                node: ring_split,
+                port: 1,
+            },
+        );
+        staged.connect(
+            tapped,
+            SignalSink::NodeIn {
+                node: d_new,
+                port: 0,
+            },
+        );
+        let staged_compiled = staged.compile().unwrap();
+
+        let mut old_to_new: Vec<Option<NodeId>> = (0..old.node_count())
+            .map(|i| Some(NodeId(i as u32)))
+            .collect();
+        let reg_map = register_mapping(&old, &staged, &old_compiled, &staged_compiled, &old_to_new);
+        let d_new_reg = explicit_delay_register_index(&staged, d_new).unwrap();
+        assert_eq!(ring_delays.len(), 3);
+
+        let mut regs = vec![0u64; staged_compiled.total_registers()];
+        map_snapshot_regs_into(&reg_map, obs.state_snapshot_at(3).unwrap().1, &mut regs);
+        assert_eq!(regs[d_new_reg], 0);
+
+        prime_non_surviving_registers(
+            &staged,
+            &staged_compiled,
+            &old_to_new,
+            &reg_map,
+            None,
+            &obs,
+            0,
+            3,
+            3,
+            &mut regs,
+        );
+        // Surviving ring registers at idx = 3 stay [3, 2, 1]; new Delay primed from idx = 2 ring output (3).
+        assert_eq!(regs[..3], [3, 2, 1]);
+        assert_eq!(regs[d_new_reg], 3);
+
+        // Second check: TicksPerHop Stage 3 `primary_autonomous_shifted` with reactive `alt_src` Delay.
+        let mut tph_old = Circuit::new(Width::BITS_2, 2, 1, WireDelayMode::TicksPerHop);
+        let tph_d0 = tph_old.add_node(Primitive::Delay { init: 1 });
+        let tph_d1 = tph_old.add_node(Primitive::Delay { init: 2 });
+        let tph_split = tph_old.add_node(Primitive::Split);
+        tph_old.connect(
+            SignalSource::NodeOut {
+                node: tph_d0,
+                port: 0,
+            },
+            SignalSink::NodeIn {
+                node: tph_d1,
+                port: 0,
+            },
+        );
+        tph_old.connect(
+            SignalSource::NodeOut {
+                node: tph_d1,
+                port: 0,
+            },
+            SignalSink::NodeIn {
+                node: tph_split,
+                port: 0,
+            },
+        );
+        tph_old.connect(
+            SignalSource::NodeOut {
+                node: tph_split,
+                port: 0,
+            },
+            SignalSink::NodeIn {
+                node: tph_d0,
+                port: 0,
+            },
+        );
+        tph_old.connect(
+            SignalSource::NodeOut {
+                node: tph_split,
+                port: 1,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        let econ = EconomyConfig {
+            juvenile_ticks: 0,
+            ..EconomyConfig::default()
+        };
+        let growth = GrowthConfig {
+            diagnostic_window: 1,
+            min_match_gain: 1,
+            ..GrowthConfig::default()
+        };
+        let tph_editable = EditableCircuit::new(tph_old, econ).unwrap();
+        let mut tph_sim = ScalarState::new(tph_editable.compiled());
+        let mut tph_obs = ObservationWindow::new(2, 16);
+        let mut tph_pred = [0u64];
+        let mut ch1_hist = Vec::new();
+        for t in 0..8usize {
+            let pre_regs = tph_sim.registers().to_vec();
+            let ch1 = ((t % 3) + 1) as u64;
+            ch1_hist.push(ch1);
+            let prev_ch1 = if t == 0 { 0 } else { ch1_hist[t - 1] };
+            tph_sim
+                .step(tph_editable.compiled(), &[0, prev_ch1], &mut tph_pred)
+                .unwrap();
+            // Frame carries pre-ring output on port 0 shifted by 1 tick vs post-splice, wait:
+            // `advance_tph_autonomous_ring_phase` keeps `BoundaryOut(0)` phase-aligned to pre-splice!
+            tph_obs.push_frame_with_state(&[tph_pred[0], ch1], 0, &pre_regs);
+        }
+        // Check with `start_idx = 6, eval_start_idx = 6` (`BaselineReplayMetrics` manually aligned or via replay):
+        let tph_baseline = BaselineReplayMetrics {
+            e_curr: 1,
+            e_const_mode: 1,
+            flux_curr: 0.0,
+            l_curr: 0.0,
+            facts_curr: 0.0,
+            driven_ports: vec![true],
+            e_curr_by_port: vec![1],
+            e_comp_curr: Vec::new(),
+            comp_cone_edges: Vec::new(),
+            start_idx: 6,
+            eval_start_idx: 6,
+            eval_offset: 0,
+            w_replay: 2,
+            num_inputs: 2,
+            can_fast_comb: false,
+            norm_inputs: Vec::new(),
+            out_pred_trace: Vec::new(),
+            out_truth_trace: Vec::new(),
+            survivor_map: (0..tph_editable.circuit().node_count())
+                .map(|i| Some(NodeId(i as u32)))
+                .collect(),
+        };
+        let mut tph_staged = tph_editable.circuit().clone();
+        let alt_delay = tph_staged.add_node(Primitive::Delay { init: 0 });
+        tph_staged.connect(
+            SignalSource::BoundaryIn(1),
+            SignalSink::NodeIn {
+                node: alt_delay,
+                port: 0,
+            },
+        );
+        let alt_src = SignalSource::NodeOut {
+            node: alt_delay,
+            port: 0,
+        };
+        let spliced = splice_comparator_onto_port(&mut tph_staged, 0, alt_src).unwrap();
+        assert!(spliced.primary_autonomous_shifted);
+        // Verify snapshot-loader closure primes `alt_delay` + `alt_delay -> sub.in(1)` without
+        // disturbing the shifted primary autonomous ring phase.
+        old_to_new = (0..tph_editable.circuit().node_count())
+            .map(|i| Some(NodeId(i as u32)))
+            .collect();
+        let excl = derivation_cone_info(tph_editable.circuit(), &[SignalSink::BoundaryOut(0)]);
+        let plan = plan_non_surviving_register_priming(
+            &tph_staged,
+            &old_to_new,
+            spliced.inserted_split,
+            &tph_obs,
+            0,
+            tph_baseline.start_idx,
+            tph_baseline.eval_start_idx,
+        )
+        .expect("priming plan needed for TPH alt Delay");
+        assert_eq!(plan.prime_steps, 4); // BoundaryIn(1) -[1]-> alt_delay(1) -[1]-> sub_node -[1]-> eqz_node
+        let mut tph_budget = TickBudget::new((tph_baseline.w_replay + plan.prime_steps) as u64);
+        let mut tph_tel = SproutTelemetry::default();
+        let mut blocked = 0usize;
+        let _ = evaluate_stage3_candidate_pre(
+            &tph_editable,
+            &tph_obs,
+            &growth,
+            &econ,
+            &mut tph_budget,
+            0,
+            0,
+            &excl,
+            &tph_baseline,
+            2,
+            tph_staged,
+            spliced,
+            alt_src,
+            None,
+            &mut blocked,
+            &mut tph_tel,
+        );
+        assert_eq!(
+            tph_budget.consumed(),
+            (tph_baseline.w_replay + plan.prime_steps) as u64
+        );
+        assert_eq!(tph_tel.sprout_budget_exhausted, 0);
+    }
+
+    #[test]
+    fn r5_priming_steps_metered_in_stage2_and_stage3_budget() {
+        let econ = EconomyConfig {
+            juvenile_ticks: 0,
+            ..EconomyConfig::default()
+        };
+        let growth = GrowthConfig {
+            diagnostic_window: 2,
+            min_match_gain: 1,
+            max_reactive_lag: 4,
+            ..GrowthConfig::default()
+        };
+
+        // 1. Stage 2 (`evaluate_sprout_motif`): `obs.len() = 8`, `w_diag = 2` => `start_idx = 4`,
+        //    `eval_start_idx = 6`, `w_replay = 4`, `eval_offset = 2`. Motif `LagIn(0, 3)` has
+        //    `d_new = 3 > eval_offset = 2`, so `prime_start = 4 - 3 = 1` and `prime_steps = 3`.
+        let mut circ1 = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let c1_d0 = circ1.add_node(Primitive::Delay { init: 0 });
+        circ1.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn {
+                node: c1_d0,
+                port: 0,
+            },
+        );
+        circ1.connect(
+            SignalSource::NodeOut {
+                node: c1_d0,
+                port: 0,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        let editable1 = EditableCircuit::new(circ1, econ).unwrap();
+        let mut obs1_p4 = ObservationWindow::new(1, 16);
+        let mut sim1_p4 = ScalarState::new(editable1.compiled());
+        let mut pred1 = [0u64];
+        let p4 = [0u64, 1, 2, 3];
+        for t in 0..8usize {
+            let pre_regs = sim1_p4.registers().to_vec();
+            let prev = if t == 0 { 0 } else { p4[(t - 1) % 4] };
+            sim1_p4
+                .step(editable1.compiled(), &[prev], &mut pred1)
+                .unwrap();
+            obs1_p4.push_frame_with_state(&[p4[t % 4]], 0, &pre_regs);
+        }
+        let baseline1 = replay_current_baseline(&editable1, &obs1_p4, &growth, &econ, 0, false);
+        assert_eq!(baseline1.start_idx, 4);
+        assert_eq!(baseline1.eval_start_idx, 6);
+        assert_eq!(baseline1.w_replay, 4);
+
+        let motif = CandidateMotif::Identity(SourceFeature::LagIn { channel: 0, tau: 3 });
+        let mut budget_short = TickBudget::new(baseline1.w_replay as u64);
+        let mut tel_short = SproutTelemetry::default();
+        let out_short = evaluate_sprout_motif(
+            &editable1,
+            &obs1_p4,
+            &growth,
+            &econ,
+            0,
+            &motif,
+            false,
+            false,
+            &baseline1,
+            Some(&mut budget_short),
+            Some(&mut tel_short),
+        );
+        assert!(matches!(out_short, SproutMotifOutcome::OutOfBudget));
+        assert_eq!(tel_short.sprout_budget_exhausted, 1);
+
+        let expected_prime_steps1 = 3usize;
+        let mut budget_exact = TickBudget::new((baseline1.w_replay + expected_prime_steps1) as u64);
+        let mut tel_exact = SproutTelemetry::default();
+        let out_exact = evaluate_sprout_motif(
+            &editable1,
+            &obs1_p4,
+            &growth,
+            &econ,
+            0,
+            &motif,
+            false,
+            false,
+            &baseline1,
+            Some(&mut budget_exact),
+            Some(&mut tel_exact),
+        );
+        assert!(!matches!(out_exact, SproutMotifOutcome::OutOfBudget));
+        assert_eq!(tel_exact.sprout_budget_exhausted, 0);
+        assert_eq!(
+            budget_exact.consumed(),
+            (baseline1.w_replay + expected_prime_steps1) as u64
+        );
+        assert_eq!(budget_exact.remaining(), 0);
+
+        // 2. Stage 3 (`evaluate_stage3_candidate_pre`): primary on ch0, disjoint 3-Delay alt on ch1.
+        let mut circ3 = Circuit::new(Width::BITS_2, 2, 1, WireDelayMode::Combinational);
+        let c3_d0 = circ3.add_node(Primitive::Delay { init: 0 });
+        circ3.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn {
+                node: c3_d0,
+                port: 0,
+            },
+        );
+        circ3.connect(
+            SignalSource::NodeOut {
+                node: c3_d0,
+                port: 0,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        let editable3 = EditableCircuit::new(circ3, econ).unwrap();
+        let mut obs3 = ObservationWindow::new(2, 16);
+        let mut sim3 = ScalarState::new(editable3.compiled());
+        let mut pred3 = [0u64];
+        for t in 0..8usize {
+            let pre_regs = sim3.registers().to_vec();
+            let prev0 = if t == 0 { 0 } else { p4[(t - 1) % 4] };
+            let prev1 = if t == 0 { 0 } else { p4[(t - 1) % 4] };
+            sim3.step(editable3.compiled(), &[prev0, prev1], &mut pred3)
+                .unwrap();
+            // Truth matches channel 1 delayed by 4 (3 delays + input boundary step), while ch0 lags by 1.
+            let y_alt = p4[(t + 1) % 4];
+            let ch1 = p4[(t + 1) % 4];
+            obs3.push_frame_with_state(&[y_alt, ch1], 0, &pre_regs);
+        }
+        let baseline3 = replay_current_baseline(&editable3, &obs3, &growth, &econ, 0, false);
+        assert_eq!(baseline3.start_idx, 4);
+        assert_eq!(baseline3.eval_start_idx, 6);
+        assert_eq!(baseline3.w_replay, 4);
+
+        let mut staged3 = editable3.circuit().clone();
+        let a0 = staged3.add_node(Primitive::Delay { init: 0 });
+        let a1 = staged3.add_node(Primitive::Delay { init: 0 });
+        let a2 = staged3.add_node(Primitive::Delay { init: 0 });
+        staged3.connect(
+            SignalSource::BoundaryIn(1),
+            SignalSink::NodeIn { node: a0, port: 0 },
+        );
+        staged3.connect(
+            SignalSource::NodeOut { node: a0, port: 0 },
+            SignalSink::NodeIn { node: a1, port: 0 },
+        );
+        staged3.connect(
+            SignalSource::NodeOut { node: a1, port: 0 },
+            SignalSink::NodeIn { node: a2, port: 0 },
+        );
+        let alt_src = SignalSource::NodeOut { node: a2, port: 0 };
+        let spliced3 = splice_comparator_onto_port(&mut staged3, 0, alt_src).unwrap();
+        let excl3 = derivation_cone_info(editable3.circuit(), &[SignalSink::BoundaryOut(0)]);
+        let primary_mask3 = cone_channel_mask(
+            editable3.circuit(),
+            SignalSource::NodeOut {
+                node: c3_d0,
+                port: 0,
+            },
+        );
+
+        let mut b3_short = TickBudget::new(baseline3.w_replay as u64);
+        let mut t3_short = SproutTelemetry::default();
+        let mut blocked3 = 0usize;
+        let res_short = evaluate_stage3_candidate_pre(
+            &editable3,
+            &obs3,
+            &growth,
+            &econ,
+            &mut b3_short,
+            0,
+            primary_mask3,
+            &excl3,
+            &baseline3,
+            2,
+            staged3.clone(),
+            spliced3,
+            alt_src,
+            None,
+            &mut blocked3,
+            &mut t3_short,
+        );
+        assert!(matches!(res_short, Some(Err(()))));
+        assert_eq!(t3_short.sprout_budget_exhausted, 1);
+
+        let expected_prime_steps3 = 3usize;
+        let mut b3_exact = TickBudget::new((baseline3.w_replay + expected_prime_steps3) as u64);
+        let mut t3_exact = SproutTelemetry::default();
+        let res_exact = evaluate_stage3_candidate_pre(
+            &editable3,
+            &obs3,
+            &growth,
+            &econ,
+            &mut b3_exact,
+            0,
+            primary_mask3,
+            &excl3,
+            &baseline3,
+            2,
+            staged3,
+            spliced3,
+            alt_src,
+            None,
+            &mut blocked3,
+            &mut t3_exact,
+        );
+        assert!(!matches!(res_exact, Some(Err(()))));
+        assert_eq!(t3_exact.sprout_budget_exhausted, 0);
+        assert_eq!(
+            b3_exact.consumed(),
+            (baseline3.w_replay + expected_prime_steps3) as u64
+        );
+        assert_eq!(b3_exact.remaining(), 0);
     }
 }
