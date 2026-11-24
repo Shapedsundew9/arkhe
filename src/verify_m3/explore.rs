@@ -39,31 +39,6 @@ use crate::substrate::{
 };
 use crate::verify_m3::detours::{DetourClass, build_detour_edit};
 
-/// Pre-registered M1 holdout range start seed (unconditionally rejected).
-pub const M1_HOLDOUT_SEED_START: u64 = 10_000;
-/// Pre-registered M1 holdout range end seed (inclusive).
-pub const M1_HOLDOUT_SEED_END: u64 = 10_019;
-/// Pre-registered M2a holdout range start seed (unconditionally rejected).
-pub const M2A_HOLDOUT_SEED_START: u64 = 30_000;
-/// Pre-registered M2a holdout range end seed (inclusive).
-pub const M2A_HOLDOUT_SEED_END: u64 = 30_019;
-/// Pre-registered M2b holdout range start seed (unconditionally rejected).
-pub const M2B_HOLDOUT_SEED_START: u64 = 40_000;
-/// Pre-registered M2b holdout range end seed (inclusive).
-pub const M2B_HOLDOUT_SEED_END: u64 = 40_019;
-/// Pre-registered M3 v1 holdout range start seed (consumed at `dd13839`; permanently closed).
-pub const M3_HOLDOUT_SEED_START: u64 = 50_000;
-/// Pre-registered M3 v1 holdout range end seed (inclusive).
-pub const M3_HOLDOUT_SEED_END: u64 = 50_019;
-/// Pre-registered M3 v2 holdout range start seed (100 seeds; unconditionally rejected in `explore-m3`).
-pub const M3_V2_HOLDOUT_SEED_START: u64 = 50_100;
-/// Pre-registered M3 v2 holdout range end seed (inclusive).
-pub const M3_V2_HOLDOUT_SEED_END: u64 = 50_199;
-/// Pre-registered M4a reserved holdout range start seed (100 seeds; unconditionally rejected).
-pub const M4A_HOLDOUT_SEED_START: u64 = 60_000;
-/// Pre-registered M4a reserved holdout range end seed (inclusive).
-pub const M4A_HOLDOUT_SEED_END: u64 = 60_099;
-
 const MAX_SETTLE_TICKS: u64 = 2_000;
 const INJECTION_TICK_BUDGET: u64 = 200_000;
 const SPONTANEOUS_T2000: u64 = 2_000;
@@ -79,52 +54,14 @@ const CONSERVATION_TOL: f64 = 1e-11;
 ///
 /// Returns a descriptive error if the requested range overlaps any holdout bank.
 pub fn check_explore_m3_seed_range_holdout(seed_offset: u64, seeds: usize) -> Result<(), String> {
-    let ranges = [
-        crate::stats::HoldoutRangeSpec {
-            label: "M1",
-            start: M1_HOLDOUT_SEED_START,
-            end_inclusive: M1_HOLDOUT_SEED_END,
-            allow_with_flag: false,
-            status_note: "reserved M1 holdout",
-        },
-        crate::stats::HoldoutRangeSpec {
-            label: "M2a",
-            start: M2A_HOLDOUT_SEED_START,
-            end_inclusive: M2A_HOLDOUT_SEED_END,
-            allow_with_flag: false,
-            status_note: "consumed at aa6fb6d; permanently closed",
-        },
-        crate::stats::HoldoutRangeSpec {
-            label: "M2b",
-            start: M2B_HOLDOUT_SEED_START,
-            end_inclusive: M2B_HOLDOUT_SEED_END,
-            allow_with_flag: false,
-            status_note: "consumed at b211afa; permanently closed",
-        },
-        crate::stats::HoldoutRangeSpec {
-            label: "M3",
-            start: M3_HOLDOUT_SEED_START,
-            end_inclusive: M3_HOLDOUT_SEED_END,
-            allow_with_flag: false,
-            status_note: "consumed at dd13839; permanently closed",
-        },
-        crate::stats::HoldoutRangeSpec {
-            label: "M3_v2",
-            start: M3_V2_HOLDOUT_SEED_START,
-            end_inclusive: M3_V2_HOLDOUT_SEED_END,
-            allow_with_flag: false,
-            status_note: "reserved for M3 v2 verification",
-        },
-        crate::stats::HoldoutRangeSpec {
-            label: "M4a",
-            start: M4A_HOLDOUT_SEED_START,
-            end_inclusive: M4A_HOLDOUT_SEED_END,
-            allow_with_flag: false,
-            status_note: "reserved for M4a",
-        },
-    ];
     let span = u64::try_from(seeds.max(1)).unwrap_or(u64::MAX);
-    crate::stats::check_seed_range_holdouts("explore-m3", seed_offset, span, false, &ranges)
+    crate::stats::check_seed_range_holdouts(
+        "explore-m3",
+        seed_offset,
+        span,
+        false,
+        crate::stats::HOLDOUT_BANKS,
+    )
 }
 
 /// Prune mechanism observed after detour injection.

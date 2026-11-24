@@ -24,6 +24,41 @@ fn documentation_relative_links_and_anchors_are_valid() {
 }
 
 #[test]
+fn all_holdout_guards_share_closed_boundaries_and_status() {
+    let checks = [
+        arkhe::verify_m2a::check_m2a_seed_range_holdout,
+        arkhe::verify_m2b::check_m2b_seed_range_holdout,
+        arkhe::verify_m3::check_m3_seed_range_holdout,
+    ];
+    for (start, end) in [
+        (10_000, 10_019),
+        (30_000, 30_019),
+        (40_000, 40_019),
+        (50_000, 50_019),
+        (50_100, 50_199),
+        (60_000, 60_099),
+    ] {
+        for check in checks {
+            for allow in [false, true] {
+                assert!(check(start - 1, 1, allow).is_ok());
+                assert!(check(end + 1, 1, allow).is_ok());
+                assert!(check(start - 1, 2, allow).is_err());
+                assert!(check(end, 1, allow).is_err());
+            }
+        }
+        assert!(arkhe::verify_m3::check_explore_m3_seed_range_holdout(start.into(), 1).is_err());
+        assert!(arkhe::verify_m3::check_explore_m3_seed_range_holdout(end.into(), 1).is_err());
+    }
+
+    for check in checks {
+        let error = check(50_100, 1, true).unwrap_err();
+        assert!(error.contains("consumed at 2b62140; permanently closed"));
+        let error = check(60_099, 1, true).unwrap_err();
+        assert!(error.contains("reserved for M4a"));
+    }
+}
+
+#[test]
 fn cli_verify_m2a_refuses_holdout_ranges() {
     for seed_offset in [
         "10000", "30000", "40000", "50000", "50100", "60000", "60050",

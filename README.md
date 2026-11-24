@@ -1,6 +1,6 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)**, and **Milestone 3 (`M3 — Free-rider resistance and structural compression`; Completed & verified — `M3 v2` passed `50100..=50199` holdout under Charter §2.8, ready for `M4a`)** from the [Foundational Research Charter v3](docs/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [docs/parameter_inventory.md](docs/parameter_inventory.md), Milestone 0–3 sign-off records, review findings, and derivations live in [docs/research_record.md](docs/research_record.md) and [docs/milestone_3_review.md](docs/milestone_3_review.md) (with the Milestone 3 plan and attainment ledger in [docs/milestone_3_plan.md](docs/milestone_3_plan.md)), and two-level swarm escalation skills live in [.agents/skills/arkhe-orchestrator/SKILL.md](.agents/skills/arkhe-orchestrator/SKILL.md), [.agents/skills/arkhe-chief-scientist/SKILL.md](.agents/skills/arkhe-chief-scientist/SKILL.md), and [.agents/skills/arkhe-watchdog/SKILL.md](.agents/skills/arkhe-watchdog/SKILL.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)**, and **Milestone 3 (`M3 — Free-rider resistance and structural compression`; Completed & verified — `M3 v2` passed `50100..=50199` holdout under Charter §2.8, ready for `M4a`)** from the [Foundational Research Charter v3](docs/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [docs/parameter_inventory.md](docs/parameter_inventory.md), Milestone 0–3 sign-off records, review findings, and derivations live in [docs/research_record.md](docs/research_record.md), and two-level swarm escalation skills live in [.agents/skills/arkhe-orchestrator/SKILL.md](.agents/skills/arkhe-orchestrator/SKILL.md), [.agents/skills/arkhe-chief-scientist/SKILL.md](.agents/skills/arkhe-chief-scientist/SKILL.md), and [.agents/skills/arkhe-watchdog/SKILL.md](.agents/skills/arkhe-watchdog/SKILL.md).
 
 ## Overview
 
@@ -27,8 +27,7 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   │   ├── blocker_report.md
 │   │   └── milestone_plan_template.md
 │   ├── foundational_research_charter_v3.md
-│   ├── milestone_3_plan.md
-│   ├── milestone_3_review.md
+│   ├── milestone_4a_plan.md
 │   ├── parameter_inventory.md
 │   ├── research_record.md
 │   └── retained_baselines.json
@@ -91,7 +90,7 @@ cargo run --locked --release -- verify-m2b --banks 50 --seed-offset 20 --seeds 2
 cargo run --locked --release -- verify-m2b --seed-offset 20040 --seeds 20
 ```
 
-1. Run the Milestone 3 free-rider resistance and verified local excision exploratory & verification suites (`G3.1`–`G3.5b`; M3 v2 uses 100-seed confirmation `20100..=20199`, while `50100..=50199` is now permanently closed unconditionally alongside `50000..=50019`, with durable `S3`/`S4` evidence archived in `docs/evidence/m3_v2/`):
+1. Run the Milestone 3 free-rider resistance and verified local excision exploratory and verification suites (`G3.1`–`G3.5b`):
 
 ```bash
 cargo run --locked --release -- explore-m3 --seed-offset 0 --seeds 20
@@ -99,6 +98,8 @@ cargo run --locked --release -- verify-m3 --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m3 --banks 50 --seed-offset 20 --seeds 20
 cargo run --locked --release -- verify-m3 --banks 5 --seed-offset 20100 --seeds 20
 ```
+
+1. M4a is next: see the [draft plan](docs/milestone_4a_plan.md). Its holdout `60000..=60099` is reserved and must not be used before authorization.
 
 1. Inspect analytical $\varepsilon$-machine and Reeds–Sloane ground-truth yardsticks for a generator:
 

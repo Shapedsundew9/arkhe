@@ -730,6 +730,55 @@ pub struct HoldoutRangeSpec {
     pub status_note: &'static str,
 }
 
+/// Holdout banks guarded by the existing verification and exploration commands.
+///
+/// Reserved banks stay blocked here even if a future milestone verifier is authorized to run
+/// its own holdout; that verifier must apply its authorization without opening earlier commands.
+pub const HOLDOUT_BANKS: &[HoldoutRangeSpec] = &[
+    HoldoutRangeSpec {
+        label: "M1",
+        start: 10_000,
+        end_inclusive: 10_019,
+        allow_with_flag: false,
+        status_note: "permanently closed",
+    },
+    HoldoutRangeSpec {
+        label: "M2a",
+        start: 30_000,
+        end_inclusive: 30_019,
+        allow_with_flag: false,
+        status_note: "consumed at aa6fb6d; permanently closed",
+    },
+    HoldoutRangeSpec {
+        label: "M2b",
+        start: 40_000,
+        end_inclusive: 40_019,
+        allow_with_flag: false,
+        status_note: "consumed at b211afa; permanently closed",
+    },
+    HoldoutRangeSpec {
+        label: "M3",
+        start: 50_000,
+        end_inclusive: 50_019,
+        allow_with_flag: false,
+        status_note: "consumed at dd13839; permanently closed",
+    },
+    HoldoutRangeSpec {
+        label: "M3_v2",
+        start: 50_100,
+        end_inclusive: 50_199,
+        allow_with_flag: false,
+        status_note: "consumed at 2b62140; permanently closed",
+    },
+    HoldoutRangeSpec {
+        label: "M4a",
+        start: 60_000,
+        end_inclusive: 60_099,
+        allow_with_flag: false,
+        status_note: "reserved for M4a; blocked in existing commands",
+    },
+];
+
 /// Validates `[seed_offset, seed_offset + seeds)` against guarded holdout ranges.
 ///
 /// # Errors

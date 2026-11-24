@@ -28,7 +28,7 @@ Separate `Clean` ($\varepsilon = 0.0$) and `Noisy` ($\varepsilon > 0.0$) tasks s
 
 Record finite per-task extrema and 95th-percentile bounds emitted via `update_max_finite` / `update_min_finite` (`src/stats.rs`, preventing non-finite `INFINITY` from serializing as JSON `null`):
 
-| Gate / Task Label | Tail Metric Key (e.g., `max_epistemic_mdl_err`, `max_excise_dt`, `p95_excise_dt`, `max_n_primary_8000`, `p95_n_primary_8000`, `max_t_lock`, `max_abs_kt_diff`, `min_kt_advantage`) | Pre-Registered Bound / Diagnostic Expectation |
+| Gate / Task Label | Tail Metric Key | Pre-Registered Bound / Diagnostic Expectation |
 | :--- | :--- | :--- |
 | `G...:<task>` | ... | ... |
 

@@ -18,7 +18,7 @@ use crate::env::{
 use crate::metrics::{BudgetAccountingMode, Scorecard};
 use crate::rng::SeedBank;
 use crate::stats::{
-    BankSample, BankTailMetricMap, BankTaskCountMap, CaseOutcome, GateRegime, HoldoutRangeSpec,
+    BankSample, BankTailMetricMap, BankTaskCountMap, CaseOutcome, GateRegime, HOLDOUT_BANKS,
     MultiBankGateResult, OnlineCaseSummary, StratifiedGateAudit, check_seed_range_holdouts,
     classify_case_outcome, evaluate_multi_bank_gate, evaluate_stratified_from_bank_maps,
     update_max_finite, update_min_finite,
@@ -32,31 +32,6 @@ pub const DEFAULT_M2A_HORIZON: u64 = 2_000;
 pub const DEFAULT_M2A_WARMUP: u64 = 500;
 /// Default Milestone 2a per-run candidate-replay / compute budget (§6).
 pub const DEFAULT_M2A_BUDGET: u64 = 200_000;
-
-/// Reserved M1 holdout seed range start (never touched by M2a).
-pub const M1_HOLDOUT_SEED_START: u32 = 10_000;
-/// Reserved M1 holdout seed range end (inclusive).
-pub const M1_HOLDOUT_SEED_END: u32 = 10_019;
-/// Pre-registered M2a single-shot holdout seed range start (consumed at `aa6fb6d`; permanently closed).
-pub const M2A_HOLDOUT_SEED_START: u32 = 30_000;
-/// Pre-registered M2a single-shot holdout seed range end (inclusive).
-pub const M2A_HOLDOUT_SEED_END: u32 = 30_019;
-/// Reserved M2b holdout seed range start (consumed at `b211afa`; permanently closed).
-pub const M2B_HOLDOUT_SEED_START: u32 = 40_000;
-/// Reserved M2b holdout seed range end (inclusive).
-pub const M2B_HOLDOUT_SEED_END: u32 = 40_019;
-/// Reserved M3 v1 holdout seed range start (consumed at `dd13839`; permanently closed).
-pub const M3_HOLDOUT_SEED_START: u32 = 50_000;
-/// Reserved M3 v1 holdout seed range end (inclusive).
-pub const M3_HOLDOUT_SEED_END: u32 = 50_019;
-/// Reserved M3 v2 100-seed holdout seed range start (never touched by M2a).
-pub const M3_V2_HOLDOUT_SEED_START: u32 = 50_100;
-/// Reserved M3 v2 100-seed holdout seed range end (inclusive).
-pub const M3_V2_HOLDOUT_SEED_END: u32 = 50_199;
-/// Reserved M4a 100-seed holdout seed range start (never touched by M2a).
-pub const M4A_HOLDOUT_SEED_START: u32 = 60_000;
-/// Reserved M4a 100-seed holdout seed range end (inclusive).
-pub const M4A_HOLDOUT_SEED_END: u32 = 60_099;
 
 /// Checks whether `[seed_offset, seed_offset + seeds)` overlaps any reserved or closed holdout range.
 ///
@@ -72,56 +47,12 @@ pub fn check_m2a_seed_range_holdout(
     seeds: u32,
     allow_holdout: bool,
 ) -> Result<(), String> {
-    let ranges = [
-        HoldoutRangeSpec {
-            label: "M1",
-            start: u64::from(M1_HOLDOUT_SEED_START),
-            end_inclusive: u64::from(M1_HOLDOUT_SEED_END),
-            allow_with_flag: false,
-            status_note: "reserved M1 holdout",
-        },
-        HoldoutRangeSpec {
-            label: "M2a",
-            start: u64::from(M2A_HOLDOUT_SEED_START),
-            end_inclusive: u64::from(M2A_HOLDOUT_SEED_END),
-            allow_with_flag: false,
-            status_note: "consumed at aa6fb6d; permanently closed",
-        },
-        HoldoutRangeSpec {
-            label: "M2b",
-            start: u64::from(M2B_HOLDOUT_SEED_START),
-            end_inclusive: u64::from(M2B_HOLDOUT_SEED_END),
-            allow_with_flag: false,
-            status_note: "consumed at b211afa; permanently closed",
-        },
-        HoldoutRangeSpec {
-            label: "M3",
-            start: u64::from(M3_HOLDOUT_SEED_START),
-            end_inclusive: u64::from(M3_HOLDOUT_SEED_END),
-            allow_with_flag: false,
-            status_note: "consumed at dd13839; permanently closed",
-        },
-        HoldoutRangeSpec {
-            label: "M3_v2",
-            start: u64::from(M3_V2_HOLDOUT_SEED_START),
-            end_inclusive: u64::from(M3_V2_HOLDOUT_SEED_END),
-            allow_with_flag: false,
-            status_note: "reserved M3 v2 holdout",
-        },
-        HoldoutRangeSpec {
-            label: "M4a",
-            start: u64::from(M4A_HOLDOUT_SEED_START),
-            end_inclusive: u64::from(M4A_HOLDOUT_SEED_END),
-            allow_with_flag: false,
-            status_note: "reserved M4a holdout",
-        },
-    ];
     check_seed_range_holdouts(
         "verify-m2a",
         u64::from(seed_offset),
         u64::from(seeds.max(1)),
         allow_holdout,
-        &ranges,
+        HOLDOUT_BANKS,
     )
 }
 
@@ -2746,8 +2677,7 @@ fn summarize_single_bank(
 /// # Errors
 ///
 /// Returns an error if `horizon <= DEFAULT_M2A_WARMUP` or if the seed range overlaps a guarded
-/// holdout bank (`10000..=10019`, `30000..=30019` without `--holdout`, `40000..=40019`,
-/// `50000..=50019`, or `60000..=60019`).
+/// holdout bank in [`HOLDOUT_BANKS`], even when `allow_holdout` is true.
 pub fn run_m2a_verification_suite(
     seed_offset: u32,
     seeds: u32,
