@@ -8,6 +8,7 @@ pub mod explore;
 pub mod oracle;
 pub mod planted;
 pub mod tasks;
+pub mod verify;
 
 pub use explore::{
     ArmDistributionSummary, ExploreM4aReport, GuardrailAggregateSummary, H6PairedContrast,
@@ -28,4 +29,9 @@ pub use planted::{
 pub use tasks::{
     DEFAULT_M4A_FAULT_TICK, DEFAULT_M4A_HORIZON, DEFAULT_M4A_NOISE_EPSILON, DEFAULT_M4A_PL_HORIZON,
     M4aRegime, M4aTaskFamily, M4aTaskKind, M4aTaskSpec, PlantedSpec, m4a0_task_registry,
+};
+pub use verify::{
+    ArmGateAudit, H6Decision, H6DecisionReport, H6TaskDelta, M4aGateReport, M4aVerificationReport,
+    SleepArm, SpArmCharacterisation, SpCharacterisationRow, VERIFY_M4A_HOLDOUT_BANKS,
+    check_m4a_seed_range_holdout, run_m4a_verification,
 };

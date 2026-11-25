@@ -492,82 +492,83 @@ pub struct ExploreM4aReport {
 }
 
 #[derive(Clone, Debug)]
-struct FrozenEvalMetrics {
-    eval_kt_all_ch: f64,
-    eval_kt_target: f64,
-    eval_l_epistemic_bits: f64,
-    eval_l_epistemic_target_bits: f64,
-    eval_delta_l_epistemic_bits: f64,
-    eval_delta_l_epistemic_target_bits: f64,
-    eval_clean_zero_error_target: bool,
+pub(crate) struct FrozenEvalMetrics {
+    pub(crate) eval_kt_all_ch: f64,
+    pub(crate) eval_kt_target: f64,
+    pub(crate) eval_l_epistemic_bits: f64,
+    pub(crate) eval_l_epistemic_target_bits: f64,
+    pub(crate) eval_delta_l_epistemic_bits: f64,
+    pub(crate) eval_delta_l_epistemic_target_bits: f64,
+    pub(crate) eval_clean_zero_error_target: bool,
 }
 
 #[derive(Clone, Debug)]
-struct CheckpointSnapshot {
-    cumulative_net_flux: f64,
-    frozen: FrozenEvalMetrics,
+pub(crate) struct CheckpointSnapshot {
+    pub(crate) cumulative_net_flux: f64,
+    pub(crate) frozen: FrozenEvalMetrics,
 }
 
 #[derive(Clone, Debug)]
-struct DreamProbeCounts {
-    alt_cones_probed: usize,
-    alt_single_live_spurious: usize,
-    alt_perturbed_8lanes_spurious: usize,
-    alt_perturbed_only_reveals: usize,
-    primary_cones_probed: usize,
-    primary_single_live_spurious: usize,
-    primary_perturbed_8lanes_spurious: usize,
-    primary_perturbed_only_reveals: usize,
+pub(crate) struct DreamProbeCounts {
+    pub(crate) alt_cones_probed: usize,
+    pub(crate) alt_single_live_spurious: usize,
+    pub(crate) alt_perturbed_8lanes_spurious: usize,
+    pub(crate) alt_perturbed_only_reveals: usize,
+    pub(crate) primary_cones_probed: usize,
+    pub(crate) primary_single_live_spurious: usize,
+    pub(crate) primary_perturbed_8lanes_spurious: usize,
+    pub(crate) primary_perturbed_only_reveals: usize,
 }
 
 #[derive(Clone, Debug)]
-struct ArmRunOutcome {
-    pl_settled: bool,
-    episode_ticks: u64,
-    env_steps: u64,
-    facts_forgone: u64,
-    wake_preds_prefix: Vec<Vec<u64>>,
-    wake_obs_prefix: Vec<Vec<u64>>,
-    final_circuit_code_bits: f64,
-    final_node_count: usize,
-    cumulative_net_flux: f64,
-    cumulative_delta_l_epistemic_bits: f64,
-    cumulative_delta_l_epistemic_per_tick: f64,
-    frozen: FrozenEvalMetrics,
-    final_port_oracle_correct: bool,
-    final_active_comparators: usize,
-    epistemic_mdl_err: f64,
-    episode_total_node_evals: u64,
-    episode_live_step_node_evals: u64,
-    episode_candidate_replay_node_evals: u64,
-    episode_sensitivity_node_evals: u64,
-    cliff: CliffCountersSummary,
-    sleep_telemetry: SleepTelemetry,
-    first_onset_wake_tick: Option<u64>,
-    onset_has_incorrect_comp: bool,
-    onset_wrong_primary: bool,
-    onset_wrong_alt: bool,
-    any_segment_has_incorrect_comp: bool,
-    recoverable_bits_at_onset: f64,
-    recoverable_bits_at_end: f64,
-    wrongful_excisions: usize,
-    oracle_correct_port_locks_lost: usize,
-    i6_ok: bool,
-    i7_ok: bool,
-    pl_excised: bool,
-    pl_spurious_extinguished: bool,
-    pl_spurious_survival_segments: u64,
-    pl_segments_to_excise: Option<u64>,
-    pl_refutation_wake_ticks: Option<u64>,
-    pl_refutation_substrate_ticks: Option<u64>,
-    spontaneous_incorrect_born: usize,
-    spontaneous_incorrect_refuted: usize,
-    spontaneous_refutation_latencies: Vec<u64>,
-    checkpoints_by_wake_step: BTreeMap<u64, CheckpointSnapshot>,
-    dream_probe: Option<DreamProbeCounts>,
+#[allow(dead_code)]
+pub(crate) struct ArmRunOutcome {
+    pub(crate) pl_settled: bool,
+    pub(crate) episode_ticks: u64,
+    pub(crate) env_steps: u64,
+    pub(crate) facts_forgone: u64,
+    pub(crate) wake_preds_prefix: Vec<Vec<u64>>,
+    pub(crate) wake_obs_prefix: Vec<Vec<u64>>,
+    pub(crate) final_circuit_code_bits: f64,
+    pub(crate) final_node_count: usize,
+    pub(crate) cumulative_net_flux: f64,
+    pub(crate) cumulative_delta_l_epistemic_bits: f64,
+    pub(crate) cumulative_delta_l_epistemic_per_tick: f64,
+    pub(crate) frozen: FrozenEvalMetrics,
+    pub(crate) final_port_oracle_correct: bool,
+    pub(crate) final_active_comparators: usize,
+    pub(crate) epistemic_mdl_err: f64,
+    pub(crate) episode_total_node_evals: u64,
+    pub(crate) episode_live_step_node_evals: u64,
+    pub(crate) episode_candidate_replay_node_evals: u64,
+    pub(crate) episode_sensitivity_node_evals: u64,
+    pub(crate) cliff: CliffCountersSummary,
+    pub(crate) sleep_telemetry: SleepTelemetry,
+    pub(crate) first_onset_wake_tick: Option<u64>,
+    pub(crate) onset_has_incorrect_comp: bool,
+    pub(crate) onset_wrong_primary: bool,
+    pub(crate) onset_wrong_alt: bool,
+    pub(crate) any_segment_has_incorrect_comp: bool,
+    pub(crate) recoverable_bits_at_onset: f64,
+    pub(crate) recoverable_bits_at_end: f64,
+    pub(crate) wrongful_excisions: usize,
+    pub(crate) oracle_correct_port_locks_lost: usize,
+    pub(crate) i6_ok: bool,
+    pub(crate) i7_ok: bool,
+    pub(crate) pl_excised: bool,
+    pub(crate) pl_spurious_extinguished: bool,
+    pub(crate) pl_spurious_survival_segments: u64,
+    pub(crate) pl_segments_to_excise: Option<u64>,
+    pub(crate) pl_refutation_wake_ticks: Option<u64>,
+    pub(crate) pl_refutation_substrate_ticks: Option<u64>,
+    pub(crate) spontaneous_incorrect_born: usize,
+    pub(crate) spontaneous_incorrect_refuted: usize,
+    pub(crate) spontaneous_refutation_latencies: Vec<u64>,
+    pub(crate) checkpoints_by_wake_step: BTreeMap<u64, CheckpointSnapshot>,
+    pub(crate) dream_probe: Option<DreamProbeCounts>,
 }
 
-fn family_name(family: M4aTaskFamily) -> &'static str {
+pub(crate) fn family_name(family: M4aTaskFamily) -> &'static str {
     match family {
         M4aTaskFamily::Sp => "SP",
         M4aTaskFamily::Pl => "PL",
@@ -575,14 +576,14 @@ fn family_name(family: M4aTaskFamily) -> &'static str {
     }
 }
 
-fn regime_name(regime: M4aRegime) -> &'static str {
+pub(crate) fn regime_name(regime: M4aRegime) -> &'static str {
     match regime {
         M4aRegime::Clean => "clean",
         M4aRegime::Noisy => "noisy",
     }
 }
 
-fn kind_name(kind: M4aTaskKind) -> &'static str {
+pub(crate) fn kind_name(kind: M4aTaskKind) -> &'static str {
     match kind {
         M4aTaskKind::SpMultiViewPeriodic => "SpMultiViewPeriodic",
         M4aTaskKind::SpMultiViewLfsr => "SpMultiViewLfsr",
@@ -2158,15 +2159,16 @@ fn run_arm_episode_core(
     (outcome, traj)
 }
 
-struct PairedSeedResult {
-    wake: ArmRunOutcome,
-    sa: ArmRunOutcome,
-    sb: ArmRunOutcome,
-    i2_sa_pre_onset_ok: bool,
-    i2_sb_pre_onset_ok: bool,
-    i2_sa_no_onset_exact: Option<bool>,
-    i2_sb_no_onset_exact: Option<bool>,
-    sensitivity_runs: Vec<(SleepSchedule, u64, ArmRunOutcome)>,
+#[allow(dead_code)]
+pub(crate) struct PairedSeedResult {
+    pub(crate) wake: ArmRunOutcome,
+    pub(crate) sa: ArmRunOutcome,
+    pub(crate) sb: ArmRunOutcome,
+    pub(crate) i2_sa_pre_onset_ok: bool,
+    pub(crate) i2_sb_pre_onset_ok: bool,
+    pub(crate) i2_sa_no_onset_exact: Option<bool>,
+    pub(crate) i2_sb_no_onset_exact: Option<bool>,
+    pub(crate) sensitivity_runs: Vec<(SleepSchedule, u64, ArmRunOutcome)>,
 }
 
 fn check_i2_pre_onset(wake: &ArmRunOutcome, sleep: &ArmRunOutcome) -> (bool, Option<bool>) {
@@ -2193,7 +2195,7 @@ fn check_i2_pre_onset(wake: &ArmRunOutcome, sleep: &ArmRunOutcome) -> (bool, Opt
     (pre_ok, no_onset_exact)
 }
 
-fn run_paired_task_seed(
+pub(crate) fn run_paired_task_seed(
     task: &M4aTaskSpec,
     spec: &FiniteStateSpec,
     oracle: &PortLanguageOracle,
@@ -2458,7 +2460,7 @@ fn summarize_arm_outcomes(
     }
 }
 
-fn sleep_over_wake_node_eval_ratio(wake: &ArmRunOutcome, sleep: &ArmRunOutcome) -> f64 {
+pub(crate) fn sleep_over_wake_node_eval_ratio(wake: &ArmRunOutcome, sleep: &ArmRunOutcome) -> f64 {
     let wake_active = wake
         .episode_candidate_replay_node_evals
         .saturating_add(wake.episode_sensitivity_node_evals);

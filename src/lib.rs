@@ -109,6 +109,27 @@ pub enum Commands {
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
     },
+    /// Run Milestone 4a confirmatory wake-sleep verification gates (`G4A.1`–`G4A.7`).
+    VerifyM4a {
+        /// Starting master seed offset (`seed_offset .. seed_offset + banks * seeds`).
+        #[arg(long, default_value_t = 0)]
+        seed_offset: u64,
+        /// Number of master seeds evaluated per bank.
+        #[arg(long, default_value_t = 20)]
+        seeds: usize,
+        /// Number of consecutive seed banks to score.
+        #[arg(long, default_value_t = 1)]
+        banks: usize,
+        /// Single-shot M4a holdout override (`60000..=60099`; requires S3 authorization; prior holdouts stay blocked).
+        #[arg(long, alias = "allow-holdout", default_value_t = false)]
+        holdout: bool,
+        /// Optional worker thread count (defaults to `std::thread::available_parallelism()`).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Optional path to write the JSON `M4aVerificationReport` (prints to stdout when omitted).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Run Milestone 4a-0 exploratory wake-sleep characterisation sweep on non-holdout seeds.
     ExploreM4a {
         /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
@@ -296,6 +317,28 @@ where
                 } else {
                     Err("Milestone 2b verification failed one or more acceptance gates".into())
                 }
+            }
+        }
+        Some(Commands::VerifyM4a {
+            seed_offset,
+            seeds,
+            banks,
+            holdout,
+            threads,
+            output,
+        }) => {
+            let report =
+                verify_m4a::run_m4a_verification(seed_offset, seeds, banks, holdout, threads)?;
+            let json = serde_json::to_string_pretty(&report)?;
+            if let Some(out_path) = output {
+                fs::write(out_path, json)?;
+            } else {
+                println!("{json}");
+            }
+            if report.overall_passed {
+                Ok(())
+            } else {
+                Err("Milestone 4a verification failed one or more gates".into())
             }
         }
         Some(Commands::ExploreM4a {
