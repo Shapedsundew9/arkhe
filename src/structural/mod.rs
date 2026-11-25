@@ -40,16 +40,17 @@ pub use live::{
 pub use sensitivity::{
     CausalAncestry, ComparatorCausalAncestry, ComparatorSensitivitySnapshot, ComparatorTarget,
     EXACT_SENSITIVITY_MAX_BITS, NodeActivity, SensitivityError, SensitivitySnapshot,
-    assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
-    counterfactual_sensitivity, counterfactual_sensitivity_audited,
+    SleepSensitivityMask, assemble_causal_ancestry, assemble_causal_ancestry_sleep_masked,
+    assemble_causal_ancestry_with_comparators, counterfactual_sensitivity,
+    counterfactual_sensitivity_audited, counterfactual_sensitivity_sleep_masked_audited,
     counterfactual_sensitivity_with_comparators,
-    counterfactual_sensitivity_with_comparators_audited, ring_identity_input_weights,
-    source_node_for_wire,
+    counterfactual_sensitivity_with_comparators_audited, exact_wake_sensitivity_node_evals,
+    ring_identity_input_weights, source_node_for_wire,
 };
 pub use sleep::{
     ComputeLedger, EpistemicConservationReport, EpistemicTraceCollector, FactBuffer, SleepSchedule,
     SleepSegmentReport, SleepTelemetry, TwoSampleKtResult, WakeSleepEpisodeReport,
     derived_wake_sleep_windows, run_wake_sleep_episode, run_wake_sleep_episode_audited,
-    two_sample_kt_match_test, verify_epistemic_mdl_conservation,
+    run_wake_sleep_episode_with_cap, two_sample_kt_match_test, verify_epistemic_mdl_conservation,
 };
 pub use surgery::{EditableCircuit, MarginalDebtLedger, SurgeryError};

@@ -849,8 +849,9 @@ impl EconomyState {
         })
     }
 
-    /// Releases escrowed non-negative `S-B` comparator agreement payouts through the conserved
-    /// reserve ceiling path without double-advancing `juvenile_ticks` or `smoothed_drain_rate` (`R5(b)`, `I4`).
+    /// Releases escrowed non-negative (`S-A` / `S-B`, `R5(b)` / `R5(c)`) comparator agreement
+    /// payouts through the conserved reserve ceiling path without double-advancing `juvenile_ticks`
+    /// or `smoothed_drain_rate` (`I4`).
     pub fn apply_escrowed_comparator_flux(
         &mut self,
         node_credits: &[f64],
@@ -1090,41 +1091,52 @@ impl EconomyState {
                     ReserveCap::Fixed(cap) => (Some(cap), node.smoothed_drain_rate),
                     ReserveCap::HorizonDerived => {
                         let w_obs = self.observation_horizon as f64;
-                        let mut drain_rate = 0.0;
-                        for (port, ancestry) in port_ancestry.iter().enumerate() {
-                            let total_ancestry: f64 = ancestry.iter().sum();
-                            if total_ancestry > 0.0 {
-                                let share = ancestry[index] / total_ancestry;
-                                if share > 0.0 && port < self.scorers.len() {
-                                    drain_rate += share
-                                        * reserve_drain_loss(
-                                            &self.scorers[port],
-                                            self.width,
-                                            &mut node_floored,
-                                        );
+                        if self.pause_juvenile_countdown {
+                            // I6 corollary (`DR #50`): sleep comparator losses never mutate wake reserve ceilings.
+                            (
+                                Some(
+                                    (w_obs * node.smoothed_drain_rate)
+                                        .max(self.config.initial_energy),
+                                ),
+                                node.smoothed_drain_rate,
+                            )
+                        } else {
+                            let mut drain_rate = 0.0;
+                            for (port, ancestry) in port_ancestry.iter().enumerate() {
+                                let total_ancestry: f64 = ancestry.iter().sum();
+                                if total_ancestry > 0.0 {
+                                    let share = ancestry[index] / total_ancestry;
+                                    if share > 0.0 && port < self.scorers.len() {
+                                        drain_rate += share
+                                            * reserve_drain_loss(
+                                                &self.scorers[port],
+                                                self.width,
+                                                &mut node_floored,
+                                            );
+                                    }
                                 }
                             }
-                        }
-                        for (comp_idx, ancestry) in comparator_ancestry.iter().enumerate() {
-                            let total_ancestry: f64 = ancestry.iter().sum();
-                            if total_ancestry > 0.0 {
-                                let share = ancestry[index] / total_ancestry;
-                                if share > 0.0 && comp_idx < self.comparators.len() {
-                                    drain_rate += share
-                                        * reserve_drain_loss(
-                                            self.comparators[comp_idx].active_scorer(),
-                                            self.width,
-                                            &mut node_floored,
-                                        );
+                            for (comp_idx, ancestry) in comparator_ancestry.iter().enumerate() {
+                                let total_ancestry: f64 = ancestry.iter().sum();
+                                if total_ancestry > 0.0 {
+                                    let share = ancestry[index] / total_ancestry;
+                                    if share > 0.0 && comp_idx < self.comparators.len() {
+                                        drain_rate += share
+                                            * reserve_drain_loss(
+                                                self.comparators[comp_idx].active_scorer(),
+                                                self.width,
+                                                &mut node_floored,
+                                            );
+                                    }
                                 }
                             }
+                            let effective_drain = drain_rate
+                                .max(self.config.trace_discount * node.smoothed_drain_rate);
+                            (
+                                Some((w_obs * effective_drain).max(self.config.initial_energy)),
+                                effective_drain,
+                            )
                         }
-                        let effective_drain =
-                            drain_rate.max(self.config.trace_discount * node.smoothed_drain_rate);
-                        (
-                            Some((w_obs * effective_drain).max(self.config.initial_energy)),
-                            effective_drain,
-                        )
                     }
                 };
                 if let Some(cap) = maybe_cap {

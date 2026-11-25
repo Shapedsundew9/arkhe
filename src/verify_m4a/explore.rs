@@ -9,8 +9,8 @@
 //! confirmation bank `20200..=20299`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rand_core::Rng;
@@ -745,28 +745,30 @@ pub fn compute_recoverable_comparator_bits(
     (initial_bits - reduced_bits).max(0.0)
 }
 
-fn evaluate_frozen_window(
-    learner: &ArkheLearner,
+#[allow(clippy::too_many_arguments)]
+fn evaluate_frozen_window_state(
+    circuit: &Circuit,
+    compiled: &crate::substrate::CompiledCircuit,
+    registers: &[u64],
+    prev_observed_frame: &[u64],
     env: &NoisyEnvironment<crate::env::TierGenerator>,
+    econ_cfg: EconomyConfig,
     target_port: u16,
     w_eval: u64,
     split_code_tax: bool,
 ) -> FrozenEvalMetrics {
-    let circuit = learner.editable().circuit();
-    let compiled = learner.editable().compiled();
     let width = circuit.width();
     let num_in = usize::from(circuit.num_inputs());
     let num_out = usize::from(circuit.num_outputs());
     let channels = usize::from(env.generator().channels());
-    let econ_cfg = learner.economy_config();
 
     let mut state = ScalarState::new(compiled);
     state
-        .set_registers(compiled, learner.editable().state().registers())
+        .set_registers(compiled, registers)
         .expect("valid live registers for frozen evaluation");
     let mut eval_env = env.clone();
 
-    let mut curr_input = learner.prev_observed_frame().to_vec();
+    let mut curr_input = prev_observed_frame.to_vec();
     curr_input.resize(num_in, 0);
     let mut preds = vec![0u64; num_out];
     let mut clean = vec![0u64; channels];
@@ -834,6 +836,26 @@ fn evaluate_frozen_window(
         eval_delta_l_epistemic_target_bits: l_c - net_reward_target,
         eval_clean_zero_error_target: clean_mismatches_target == 0,
     }
+}
+
+fn evaluate_frozen_window(
+    learner: &ArkheLearner,
+    env: &NoisyEnvironment<crate::env::TierGenerator>,
+    target_port: u16,
+    w_eval: u64,
+    split_code_tax: bool,
+) -> FrozenEvalMetrics {
+    evaluate_frozen_window_state(
+        learner.editable().circuit(),
+        learner.editable().compiled(),
+        learner.editable().state().registers(),
+        learner.prev_observed_frame(),
+        env,
+        *learner.economy_config(),
+        target_port,
+        w_eval,
+        split_code_tax,
+    )
 }
 
 type ScorerSnap = (u64, u64, u64, Vec<u64>);
@@ -1274,6 +1296,114 @@ fn settle_pl_prefix(
     true
 }
 
+#[derive(Clone)]
+struct PreOnsetForkState {
+    learner: ArkheLearner,
+    env: NoisyEnvironment<crate::env::TierGenerator>,
+    budget: TickBudget,
+    start_ledger: crate::structural::ComputeLedger,
+    start_ticks: u64,
+    env_steps: u64,
+    skipped_sleep_segments: u64,
+    cached_epoch: u64,
+    cached_labels: Option<CircuitOracleLabels>,
+    pl_excised: bool,
+    pl_spurious_extinguished: bool,
+    pl_refutation_wake_ticks: Option<u64>,
+    pl_refutation_substrate_ticks: Option<u64>,
+    tracked_incorrect: BTreeMap<NodeId, u64>,
+    spontaneous_incorrect_born: usize,
+    spontaneous_incorrect_refuted: usize,
+    spontaneous_refutation_latencies: Vec<u64>,
+    wake_preds_prefix: Vec<Vec<u64>>,
+    wake_obs_prefix: Vec<Vec<u64>>,
+}
+
+struct WakeStepState {
+    cumulative_net_flux: f64,
+    prev_observed_frame: Vec<u64>,
+    registers: Vec<u64>,
+    structure_epoch: u64,
+}
+
+struct WakeTrajectoryRecord {
+    base_env: NoisyEnvironment<crate::env::TierGenerator>,
+    circuits_by_epoch: BTreeMap<u64, Arc<Circuit>>,
+    states_by_step: Vec<WakeStepState>,
+    sa_fork: Option<PreOnsetForkState>,
+    sb_fork: Option<PreOnsetForkState>,
+    sa_skipped: u64,
+    sb_skipped: u64,
+}
+
+impl WakeTrajectoryRecord {
+    fn resolve_checkpoints(
+        &self,
+        checkpoint_steps: &[u64],
+        econ_cfg: EconomyConfig,
+        target_port: u16,
+        w_obs: u64,
+    ) -> BTreeMap<u64, CheckpointSnapshot> {
+        let limit = self.states_by_step.len() as u64;
+        let mut sorted: Vec<u64> = checkpoint_steps
+            .iter()
+            .copied()
+            .filter(|&s| s > 0 && s < limit)
+            .collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut out = BTreeMap::new();
+        if sorted.is_empty() {
+            return out;
+        }
+        let mut eval_env = self.base_env.clone();
+        let ch_usize = usize::from(eval_env.generator().channels());
+        let mut clean = vec![0u64; ch_usize];
+        let mut obs = vec![0u64; ch_usize];
+        let mut cur_step = 0u64;
+        for step in sorted {
+            while cur_step < step {
+                eval_env.step_frame(&mut clean, &mut obs);
+                cur_step += 1;
+            }
+            let st = &self.states_by_step[(step - 1) as usize];
+            if let Some(circ) = self.circuits_by_epoch.get(&st.structure_epoch)
+                && let Ok(compiled) = circ.compile()
+            {
+                let frozen = evaluate_frozen_window_state(
+                    circ,
+                    &compiled,
+                    &st.registers,
+                    &st.prev_observed_frame,
+                    &eval_env,
+                    econ_cfg,
+                    target_port,
+                    w_obs,
+                    econ_cfg.split_code_tax,
+                );
+                out.insert(
+                    step,
+                    CheckpointSnapshot {
+                        cumulative_net_flux: st.cumulative_net_flux,
+                        frozen,
+                    },
+                );
+            }
+        }
+        out
+    }
+}
+
+fn learner_has_scoreable_for_schedule(learner: &ArkheLearner, schedule: SleepSchedule) -> bool {
+    schedule != SleepSchedule::None
+        && learner
+            .editable()
+            .economy()
+            .comparators()
+            .iter()
+            .any(|comp| learner.comparator_is_scoreable_for_sleep(comp, schedule))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_arm_episode(
     task: &M4aTaskSpec,
@@ -1285,7 +1415,40 @@ fn run_arm_episode(
     checkpoint_wake_steps: &[u64],
     record_wake_prefix_len: Option<usize>,
     run_dream_probe: bool,
+    wake_node_eval_cap: Option<u64>,
 ) -> ArmRunOutcome {
+    run_arm_episode_core(
+        task,
+        spec,
+        oracle,
+        seed,
+        schedule,
+        sleep_window_override,
+        checkpoint_wake_steps,
+        record_wake_prefix_len,
+        run_dream_probe,
+        wake_node_eval_cap,
+        None,
+        false,
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_arm_episode_core(
+    task: &M4aTaskSpec,
+    spec: &FiniteStateSpec,
+    oracle: &PortLanguageOracle,
+    seed: u64,
+    schedule: SleepSchedule,
+    sleep_window_override: Option<u64>,
+    checkpoint_wake_steps: &[u64],
+    record_wake_prefix_len: Option<usize>,
+    run_dream_probe: bool,
+    wake_node_eval_cap: Option<u64>,
+    resume_fork: Option<PreOnsetForkState>,
+    capture_wake_trajectory: bool,
+) -> (ArmRunOutcome, Option<WakeTrajectoryRecord>) {
     let econ_cfg = EconomyConfig::default();
     let growth_cfg = GrowthConfig {
         sleep_schedule: schedule,
@@ -1294,125 +1457,211 @@ fn run_arm_episode(
     };
     let w_obs = observation_horizon(&econ_cfg, &growth_cfg) as u64;
     let (w_wake, w_sleep) = derived_wake_sleep_windows(&econ_cfg, &growth_cfg);
-    let sb = SeedBank::new(seed);
-    let mut env = task.build_environment(sb).expect("valid M4a environment");
-    let channels = env.generator().channels();
-    let ch_usize = usize::from(channels);
-    let mut learner = ArkheLearner::new_with_config(
-        task.width,
-        channels,
-        task.wire_delay,
-        econ_cfg,
-        growth_cfg,
-        sb,
-    )
-    .expect("valid ArkheLearner");
 
-    let mut pl_settled = true;
-    if let Some(planted) = &task.planted {
-        let mut settle_budget = TickBudget::new(PL_SETTLE_BUDGET);
-        pl_settled = settle_pl_prefix(
-            task,
-            &mut learner,
-            &mut env,
-            &mut settle_budget,
-            spec,
-            oracle,
-        );
-        if pl_settled {
-            learner.enable_epistemic_audit();
-            let phase_tick = learner.tick();
-            match planted {
-                PlantedSpec::Pl1 { short_motif } => {
-                    inject_pl1_short_cycle_alt(
-                        &mut learner,
-                        task.target_port,
-                        short_motif,
-                        phase_tick,
-                        crate::structural::learner::InjectionMode::Established,
-                    )
-                    .expect("PL1 injection after clean settlement");
-                }
-                PlantedSpec::Pl2 { clauses } => {
-                    inject_pl2_rare_context_alt(
-                        &mut learner,
-                        task.target_port,
-                        clauses,
-                        crate::structural::learner::InjectionMode::Established,
-                    )
-                    .expect("PL2 injection after clean settlement");
+    let (
+        pl_settled,
+        mut learner,
+        mut env,
+        mut budget,
+        start_ledger,
+        start_ticks,
+        mut env_steps,
+        mut wake_in_segment,
+        mut cached_epoch,
+        mut cached_labels,
+        mut pl_excised,
+        mut pl_spurious_extinguished,
+        mut pl_refutation_wake_ticks,
+        mut pl_refutation_substrate_ticks,
+        mut tracked_incorrect,
+        mut spontaneous_incorrect_born,
+        mut spontaneous_incorrect_refuted,
+        mut spontaneous_refutation_latencies,
+        mut wake_preds_prefix,
+        mut wake_obs_prefix,
+        mut enter_sleep_immediately,
+    ) = if let Some(mut fork) = resume_fork {
+        fork.learner.set_sleep_schedule_for_fork(schedule);
+        fork.learner
+            .add_skipped_sleep_segments(fork.skipped_sleep_segments);
+        (
+            true,
+            fork.learner,
+            fork.env,
+            fork.budget,
+            fork.start_ledger,
+            fork.start_ticks,
+            fork.env_steps,
+            0u64,
+            fork.cached_epoch,
+            fork.cached_labels,
+            fork.pl_excised,
+            fork.pl_spurious_extinguished,
+            fork.pl_refutation_wake_ticks,
+            fork.pl_refutation_substrate_ticks,
+            fork.tracked_incorrect,
+            fork.spontaneous_incorrect_born,
+            fork.spontaneous_incorrect_refuted,
+            fork.spontaneous_refutation_latencies,
+            fork.wake_preds_prefix,
+            fork.wake_obs_prefix,
+            true,
+        )
+    } else {
+        let sb = SeedBank::new(seed);
+        let mut env = task.build_environment(sb).expect("valid M4a environment");
+        let channels = env.generator().channels();
+        let mut learner = ArkheLearner::new_with_config(
+            task.width,
+            channels,
+            task.wire_delay,
+            econ_cfg,
+            growth_cfg,
+            sb,
+        )
+        .expect("valid ArkheLearner");
+
+        let mut pl_settled = true;
+        if let Some(planted) = &task.planted {
+            let mut settle_budget = TickBudget::new(PL_SETTLE_BUDGET);
+            pl_settled = settle_pl_prefix(
+                task,
+                &mut learner,
+                &mut env,
+                &mut settle_budget,
+                spec,
+                oracle,
+            );
+            if pl_settled {
+                learner.enable_epistemic_audit();
+                let phase_tick = learner.tick();
+                match planted {
+                    PlantedSpec::Pl1 { short_motif } => {
+                        inject_pl1_short_cycle_alt(
+                            &mut learner,
+                            task.target_port,
+                            short_motif,
+                            phase_tick,
+                            crate::structural::learner::InjectionMode::Established,
+                        )
+                        .expect("PL1 injection after clean settlement");
+                    }
+                    PlantedSpec::Pl2 { clauses } => {
+                        inject_pl2_rare_context_alt(
+                            &mut learner,
+                            task.target_port,
+                            clauses,
+                            crate::structural::learner::InjectionMode::Established,
+                        )
+                        .expect("PL2 injection after clean settlement");
+                    }
                 }
             }
+        } else {
+            learner.enable_epistemic_audit();
         }
-    } else {
-        learner.enable_epistemic_audit();
-    }
 
-    if task.planted.is_some() && !pl_settled {
-        let tel = learner.telemetry();
-        let ledger = learner.compute_ledger();
-        let frozen = evaluate_frozen_window(
-            &learner,
-            &env,
-            task.target_port,
-            w_obs,
-            econ_cfg.split_code_tax,
-        );
-        return ArmRunOutcome {
-            pl_settled: false,
-            episode_ticks: 0,
-            env_steps: 0,
-            facts_forgone: 0,
-            wake_preds_prefix: Vec::new(),
-            wake_obs_prefix: Vec::new(),
-            final_circuit_code_bits: circuit_code_bits_with_tax(
-                learner.editable().circuit(),
-                0,
+        if task.planted.is_some() && !pl_settled {
+            let tel = learner.telemetry();
+            let ledger = learner.compute_ledger();
+            let frozen = evaluate_frozen_window(
+                &learner,
+                &env,
+                task.target_port,
+                w_obs,
                 econ_cfg.split_code_tax,
-            ),
-            final_node_count: tel.final_node_count,
-            cumulative_net_flux: tel.cumulative_net_flux,
-            cumulative_delta_l_epistemic_bits: tel.null_calibrated_mdl_delta_bits,
-            cumulative_delta_l_epistemic_per_tick: 0.0,
-            frozen,
-            final_port_oracle_correct: false,
-            final_active_comparators: tel.active_comparator_count,
-            epistemic_mdl_err: 0.0,
-            episode_total_node_evals: ledger.total_node_evals(),
-            episode_live_step_node_evals: ledger.live_step_node_evals,
-            episode_candidate_replay_node_evals: ledger.candidate_replay_node_evals,
-            episode_sensitivity_node_evals: ledger.sensitivity_node_evals,
-            cliff: CliffCountersSummary::from(&tel),
-            sleep_telemetry: learner.sleep_telemetry(),
-            first_onset_wake_tick: None,
-            onset_has_incorrect_comp: false,
-            onset_wrong_primary: false,
-            onset_wrong_alt: false,
-            any_segment_has_incorrect_comp: false,
-            recoverable_bits_at_onset: 0.0,
-            recoverable_bits_at_end: 0.0,
-            wrongful_excisions: 0,
-            oracle_correct_port_locks_lost: 0,
-            i6_ok: true,
-            i7_ok: true,
-            pl_excised: false,
-            pl_spurious_extinguished: false,
-            pl_spurious_survival_segments: 0,
-            pl_segments_to_excise: None,
-            pl_refutation_wake_ticks: None,
-            pl_refutation_substrate_ticks: None,
-            spontaneous_incorrect_born: 0,
-            spontaneous_incorrect_refuted: 0,
-            spontaneous_refutation_latencies: Vec::new(),
-            checkpoints_by_wake_step: BTreeMap::new(),
-            dream_probe: None,
-        };
-    }
+            );
+            return (
+                ArmRunOutcome {
+                    pl_settled: false,
+                    episode_ticks: 0,
+                    env_steps: 0,
+                    facts_forgone: 0,
+                    wake_preds_prefix: Vec::new(),
+                    wake_obs_prefix: Vec::new(),
+                    final_circuit_code_bits: circuit_code_bits_with_tax(
+                        learner.editable().circuit(),
+                        0,
+                        econ_cfg.split_code_tax,
+                    ),
+                    final_node_count: tel.final_node_count,
+                    cumulative_net_flux: tel.cumulative_net_flux,
+                    cumulative_delta_l_epistemic_bits: tel.null_calibrated_mdl_delta_bits,
+                    cumulative_delta_l_epistemic_per_tick: 0.0,
+                    frozen,
+                    final_port_oracle_correct: false,
+                    final_active_comparators: tel.active_comparator_count,
+                    epistemic_mdl_err: 0.0,
+                    episode_total_node_evals: ledger.total_node_evals(),
+                    episode_live_step_node_evals: ledger.live_step_node_evals,
+                    episode_candidate_replay_node_evals: ledger.candidate_replay_node_evals,
+                    episode_sensitivity_node_evals: ledger.sensitivity_node_evals,
+                    cliff: CliffCountersSummary::from(&tel),
+                    sleep_telemetry: learner.sleep_telemetry(),
+                    first_onset_wake_tick: None,
+                    onset_has_incorrect_comp: false,
+                    onset_wrong_primary: false,
+                    onset_wrong_alt: false,
+                    any_segment_has_incorrect_comp: false,
+                    recoverable_bits_at_onset: 0.0,
+                    recoverable_bits_at_end: 0.0,
+                    wrongful_excisions: 0,
+                    oracle_correct_port_locks_lost: 0,
+                    i6_ok: true,
+                    i7_ok: true,
+                    pl_excised: false,
+                    pl_spurious_extinguished: false,
+                    pl_spurious_survival_segments: 0,
+                    pl_segments_to_excise: None,
+                    pl_refutation_wake_ticks: None,
+                    pl_refutation_substrate_ticks: None,
+                    spontaneous_incorrect_born: 0,
+                    spontaneous_incorrect_refuted: 0,
+                    spontaneous_refutation_latencies: Vec::new(),
+                    checkpoints_by_wake_step: BTreeMap::new(),
+                    dream_probe: None,
+                },
+                None,
+            );
+        }
 
-    let total_budget = task.horizon.saturating_mul(100);
-    let mut budget = TickBudget::new(total_budget);
-    let start_ledger = learner.compute_ledger();
-    let start_ticks = start_ledger.total_substrate_ticks();
+        let total_budget = task.horizon.saturating_mul(100);
+        let budget = TickBudget::new(total_budget);
+        let start_ledger = learner.compute_ledger();
+        let start_ticks = start_ledger.total_substrate_ticks();
+        let mut cached_epoch = u64::MAX;
+        let mut cached_labels = None;
+        if task.planted.is_some() {
+            let lbl = label_learner_oracle(&learner, spec, oracle);
+            cached_epoch = learner.editable().structure_epoch();
+            cached_labels = Some(lbl);
+        }
+        (
+            pl_settled,
+            learner,
+            env,
+            budget,
+            start_ledger,
+            start_ticks,
+            0u64,
+            0u64,
+            cached_epoch,
+            cached_labels,
+            false,
+            false,
+            None,
+            None,
+            BTreeMap::new(),
+            0usize,
+            0usize,
+            Vec::new(),
+            Vec::with_capacity(record_wake_prefix_len.unwrap_or(0)),
+            Vec::with_capacity(record_wake_prefix_len.unwrap_or(0)),
+            false,
+        )
+    };
+
+    let ch_usize = usize::from(env.generator().channels());
     let mut clean = vec![0u64; ch_usize];
     let mut obs = vec![0u64; ch_usize];
 
@@ -1422,11 +1671,7 @@ fn run_arm_episode(
         .filter(|&step| step > 0 && step < task.horizon)
         .collect();
     let mut checkpoints_by_wake_step = BTreeMap::new();
-    let mut wake_preds_prefix = Vec::with_capacity(record_wake_prefix_len.unwrap_or(0));
-    let mut wake_obs_prefix = Vec::with_capacity(record_wake_prefix_len.unwrap_or(0));
 
-    let mut env_steps = 0u64;
-    let mut wake_in_segment = 0u64;
     let mut onset_captured = false;
     let mut first_onset_wake_tick = None;
     let mut onset_has_incorrect_comp = false;
@@ -1438,31 +1683,30 @@ fn run_arm_episode(
     let mut oracle_correct_port_locks_lost = 0usize;
     let mut i6_ok = true;
     let mut i7_ok = true;
-
-    let mut cached_epoch = u64::MAX;
-    let mut cached_labels: Option<CircuitOracleLabels> = None;
     let mut dream_probe: Option<DreamProbeCounts> = None;
-
-    // PL & spontaneous comparator tracking across wake and sleep
-    let mut pl_excised = false;
-    let mut pl_spurious_extinguished = false;
     let mut pl_spurious_survival_segments = 0u64;
     let mut pl_segments_to_excise: Option<u64> = None;
-    let mut pl_refutation_wake_ticks: Option<u64> = None;
-    let mut pl_refutation_substrate_ticks: Option<u64> = None;
     let mut executed_segments = 0u64;
+    let mut wake_envelope_armed = false;
 
-    // Spontaneous incorrect comparator birth/refutation tracking (by `sub_node`)
-    let mut tracked_incorrect: BTreeMap<NodeId, u64> = BTreeMap::new();
-    let mut spontaneous_incorrect_born = 0usize;
-    let mut spontaneous_incorrect_refuted = 0usize;
-    let mut spontaneous_refutation_latencies = Vec::new();
-
-    if task.planted.is_some() {
-        let lbl = label_learner_oracle(&learner, spec, oracle);
-        cached_epoch = learner.editable().structure_epoch();
-        cached_labels = Some(lbl);
-    }
+    let mut traj = if capture_wake_trajectory && schedule == SleepSchedule::None {
+        let mut circuits_by_epoch = BTreeMap::new();
+        circuits_by_epoch.insert(
+            learner.editable().structure_epoch(),
+            Arc::new(learner.editable().circuit().clone()),
+        );
+        Some(WakeTrajectoryRecord {
+            base_env: env.clone(),
+            circuits_by_epoch,
+            states_by_step: Vec::with_capacity(task.horizon as usize),
+            sa_fork: None,
+            sb_fork: None,
+            sa_skipped: 0,
+            sb_skipped: 0,
+        })
+    } else {
+        None
+    };
 
     let get_or_refresh_labels = |learner: &ArkheLearner,
                                  cached_epoch: &mut u64,
@@ -1483,92 +1727,114 @@ fn run_arm_episode(
         }
     };
 
-    while learner
-        .compute_ledger()
-        .total_substrate_ticks()
-        .saturating_sub(start_ticks)
-        < task.horizon
-    {
-        let pre_wake_epoch = learner.editable().structure_epoch();
-        let pred = learner.predict(&mut budget);
-        env.step_frame(&mut clean, &mut obs);
-        let _ = learner.observe(&obs, &mut budget);
+    loop {
+        if !enter_sleep_immediately {
+            let elapsed_before = learner
+                .compute_ledger()
+                .total_substrate_ticks()
+                .saturating_sub(start_ticks);
+            if elapsed_before >= task.horizon {
+                break;
+            }
+            let pre_wake_epoch = learner.editable().structure_epoch();
+            let pred = learner.predict(&mut budget);
+            env.step_frame(&mut clean, &mut obs);
+            let _ = learner.observe(&obs, &mut budget);
 
-        if record_wake_prefix_len.is_some_and(|cap| wake_preds_prefix.len() < cap) {
-            wake_preds_prefix.push(pred);
-            wake_obs_prefix.push(obs.clone());
-        }
-        env_steps += 1;
-        wake_in_segment += 1;
+            if record_wake_prefix_len.is_some_and(|cap| wake_preds_prefix.len() < cap) {
+                wake_preds_prefix.push(pred);
+                wake_obs_prefix.push(obs.clone());
+            }
+            env_steps += 1;
+            wake_in_segment += 1;
 
-        let post_wake_epoch = learner.editable().structure_epoch();
-        if post_wake_epoch != pre_wake_epoch {
-            let had_tracked = !tracked_incorrect.is_empty();
-            let has_comps = learner.active_comparator_count() > 0;
-            if has_comps || had_tracked || task.planted.is_some() {
-                let lbl =
-                    get_or_refresh_labels(&learner, &mut cached_epoch, &mut cached_labels, true);
-                let elapsed_now = learner
-                    .compute_ledger()
-                    .total_substrate_ticks()
-                    .saturating_sub(start_ticks);
-                if task.planted.is_some()
-                    && !pl_excised
-                    && !planted_spurious_still_present(&lbl, task.target_port)
-                {
-                    pl_excised = true;
-                    pl_refutation_wake_ticks = Some(env_steps);
-                    pl_refutation_substrate_ticks = Some(elapsed_now);
-                    if !planted_spurious_cycle_present(&lbl, task.target_port) {
-                        pl_spurious_extinguished = true;
-                    }
-                }
-                if task.planted.is_none() {
-                    let mut still_incorrect = BTreeSet::new();
-                    for c_lbl in &lbl.comparators {
-                        if !c_lbl.primary_oracle_correct || !c_lbl.alt_oracle_correct {
-                            still_incorrect.insert(c_lbl.sub_node);
-                            if let std::collections::btree_map::Entry::Vacant(e) =
-                                tracked_incorrect.entry(c_lbl.sub_node)
-                            {
-                                e.insert(elapsed_now);
-                                spontaneous_incorrect_born += 1;
-                            }
+            let post_wake_epoch = learner.editable().structure_epoch();
+            if post_wake_epoch != pre_wake_epoch {
+                let had_tracked = !tracked_incorrect.is_empty();
+                let has_comps = learner.active_comparator_count() > 0;
+                if has_comps || had_tracked || task.planted.is_some() {
+                    let lbl = get_or_refresh_labels(
+                        &learner,
+                        &mut cached_epoch,
+                        &mut cached_labels,
+                        true,
+                    );
+                    let elapsed_now = learner
+                        .compute_ledger()
+                        .total_substrate_ticks()
+                        .saturating_sub(start_ticks);
+                    if task.planted.is_some()
+                        && !pl_excised
+                        && !planted_spurious_still_present(&lbl, task.target_port)
+                    {
+                        pl_excised = true;
+                        pl_refutation_wake_ticks = Some(env_steps);
+                        pl_refutation_substrate_ticks = Some(elapsed_now);
+                        if !planted_spurious_cycle_present(&lbl, task.target_port) {
+                            pl_spurious_extinguished = true;
                         }
                     }
-                    let gone: Vec<NodeId> = tracked_incorrect
-                        .keys()
-                        .filter(|id| !still_incorrect.contains(id))
-                        .copied()
-                        .collect();
-                    for id in gone {
-                        if let Some(born_at) = tracked_incorrect.remove(&id) {
-                            spontaneous_incorrect_refuted += 1;
-                            spontaneous_refutation_latencies
-                                .push(elapsed_now.saturating_sub(born_at));
+                    if task.planted.is_none() {
+                        let mut still_incorrect = BTreeSet::new();
+                        for c_lbl in &lbl.comparators {
+                            if !c_lbl.primary_oracle_correct || !c_lbl.alt_oracle_correct {
+                                still_incorrect.insert(c_lbl.sub_node);
+                                if let std::collections::btree_map::Entry::Vacant(e) =
+                                    tracked_incorrect.entry(c_lbl.sub_node)
+                                {
+                                    e.insert(elapsed_now);
+                                    spontaneous_incorrect_born += 1;
+                                }
+                            }
+                        }
+                        let gone: Vec<NodeId> = tracked_incorrect
+                            .keys()
+                            .filter(|id| !still_incorrect.contains(id))
+                            .copied()
+                            .collect();
+                        for id in gone {
+                            if let Some(born_at) = tracked_incorrect.remove(&id) {
+                                spontaneous_incorrect_refuted += 1;
+                                spontaneous_refutation_latencies
+                                    .push(elapsed_now.saturating_sub(born_at));
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if checkpoint_set.contains(&env_steps) {
-            let tel_cp = learner.telemetry();
-            let frozen_cp = evaluate_frozen_window(
-                &learner,
-                &env,
-                task.target_port,
-                w_obs,
-                econ_cfg.split_code_tax,
-            );
-            checkpoints_by_wake_step.insert(
-                env_steps,
-                CheckpointSnapshot {
-                    cumulative_net_flux: tel_cp.cumulative_net_flux,
-                    frozen: frozen_cp,
-                },
-            );
+            if let Some(ref mut tr) = traj {
+                tr.circuits_by_epoch
+                    .entry(post_wake_epoch)
+                    .or_insert_with(|| Arc::new(learner.editable().circuit().clone()));
+                tr.states_by_step.push(WakeStepState {
+                    cumulative_net_flux: learner.cumulative_net_flux(),
+                    prev_observed_frame: learner.prev_observed_frame().to_vec(),
+                    registers: learner.editable().state().registers().to_vec(),
+                    structure_epoch: post_wake_epoch,
+                });
+            }
+
+            if checkpoint_set.contains(&env_steps) {
+                let tel_cp = learner.telemetry();
+                let frozen_cp = evaluate_frozen_window(
+                    &learner,
+                    &env,
+                    task.target_port,
+                    w_obs,
+                    econ_cfg.split_code_tax,
+                );
+                checkpoints_by_wake_step.insert(
+                    env_steps,
+                    CheckpointSnapshot {
+                        cumulative_net_flux: tel_cp.cumulative_net_flux,
+                        frozen: frozen_cp,
+                    },
+                );
+            }
         }
+        let resumed_this_tick = enter_sleep_immediately;
+        enter_sleep_immediately = false;
 
         let elapsed = learner
             .compute_ledger()
@@ -1579,9 +1845,62 @@ fn run_arm_episode(
             break;
         }
 
-        if schedule != SleepSchedule::None && wake_in_segment >= w_wake {
+        if resumed_this_tick || wake_in_segment >= w_wake {
             wake_in_segment = 0;
-            if learner.has_scoreable_comparator_for_sleep() {
+            if schedule == SleepSchedule::None {
+                if let Some(ref mut tr) = traj {
+                    let build_fork = |skipped: u64| PreOnsetForkState {
+                        learner: learner.clone(),
+                        env: env.clone(),
+                        budget,
+                        start_ledger,
+                        start_ticks,
+                        env_steps,
+                        skipped_sleep_segments: skipped,
+                        cached_epoch,
+                        cached_labels: cached_labels.clone(),
+                        pl_excised,
+                        pl_spurious_extinguished,
+                        pl_refutation_wake_ticks,
+                        pl_refutation_substrate_ticks,
+                        tracked_incorrect: tracked_incorrect.clone(),
+                        spontaneous_incorrect_born,
+                        spontaneous_incorrect_refuted,
+                        spontaneous_refutation_latencies: spontaneous_refutation_latencies.clone(),
+                        wake_preds_prefix: wake_preds_prefix.clone(),
+                        wake_obs_prefix: wake_obs_prefix.clone(),
+                    };
+                    if tr.sa_fork.is_none() {
+                        if learner_has_scoreable_for_schedule(
+                            &learner,
+                            SleepSchedule::ConsistencyOnly,
+                        ) {
+                            tr.sa_fork = Some(build_fork(tr.sa_skipped));
+                        } else {
+                            tr.sa_skipped += 1;
+                        }
+                    }
+                    if tr.sb_fork.is_none() {
+                        if learner_has_scoreable_for_schedule(
+                            &learner,
+                            SleepSchedule::ConsistencyReplay,
+                        ) {
+                            tr.sb_fork = Some(build_fork(tr.sb_skipped));
+                        } else {
+                            tr.sb_skipped += 1;
+                        }
+                    }
+                }
+            } else if learner.has_scoreable_comparator_for_sleep() {
+                if !wake_envelope_armed {
+                    wake_envelope_armed = true;
+                    if let Some(cap) = wake_node_eval_cap {
+                        learner.set_episode_node_eval_envelope(
+                            Some(start_ledger.total_node_evals().saturating_add(cap)),
+                            Some(start_ticks.saturating_add(task.horizon)),
+                        );
+                    }
+                }
                 let seg_ticks = w_sleep.min(remaining);
                 let pre_labels = get_or_refresh_labels(
                     &learner,
@@ -1631,15 +1950,10 @@ fn run_arm_episode(
                         if !learner.channel_is_grounded(tp) {
                             return true;
                         }
-                        if schedule == SleepSchedule::ConsistencyOnly {
-                            let mask = comp.primary_channel_mask | comp.alt_channel_mask;
-                            (0..64u32).any(|b| {
-                                (mask & (1u64 << b)) != 0
-                                    && !learner.channel_is_grounded(b as usize)
-                            })
-                        } else {
-                            false
-                        }
+                        let mask = comp.primary_channel_mask | comp.alt_channel_mask;
+                        (0..64u32).any(|b| {
+                            (mask & (1u64 << b)) != 0 && !learner.channel_is_grounded(b as usize)
+                        })
                     });
 
                 let seg_report: SleepSegmentReport = learner.run_sleep_segment(seg_ticks);
@@ -1783,7 +2097,7 @@ fn run_arm_episode(
     let final_circuit_code_bits =
         circuit_code_bits_with_tax(learner.editable().circuit(), 0, econ_cfg.split_code_tax);
 
-    ArmRunOutcome {
+    let outcome = ArmRunOutcome {
         pl_settled,
         episode_ticks,
         env_steps,
@@ -1840,7 +2154,8 @@ fn run_arm_episode(
         spontaneous_refutation_latencies,
         checkpoints_by_wake_step,
         dream_probe,
-    }
+    };
+    (outcome, traj)
 }
 
 struct PairedSeedResult {
@@ -1885,42 +2200,80 @@ fn run_paired_task_seed(
     seed: u64,
     include_sensitivity: bool,
 ) -> PairedSeedResult {
+    let econ_cfg = EconomyConfig::default();
+    let growth_cfg = GrowthConfig::default();
+    let w_obs = observation_horizon(&econ_cfg, &growth_cfg) as u64;
     let run_dream =
         include_sensitivity && matches!(task.family, M4aTaskFamily::Sp | M4aTaskFamily::Pl);
-    let sa = run_arm_episode(
-        task,
-        spec,
-        oracle,
-        seed,
-        SleepSchedule::ConsistencyOnly,
-        None,
-        &[],
-        Some(task.horizon as usize),
-        run_dream,
-    );
-    let sb = run_arm_episode(
-        task,
-        spec,
-        oracle,
-        seed,
-        SleepSchedule::ConsistencyReplay,
-        None,
-        &[],
-        Some(task.horizon as usize),
-        false,
-    );
-    let checkpoints = [sa.env_steps, sb.env_steps];
-    let mut wake = run_arm_episode(
+
+    let (mut wake, traj_opt) = run_arm_episode_core(
         task,
         spec,
         oracle,
         seed,
         SleepSchedule::None,
         None,
-        &checkpoints,
+        &[],
         Some(task.horizon as usize),
         false,
+        None,
+        None,
+        true,
     );
+    let mut traj = traj_opt.expect("wake trajectory captured for paired run");
+    let wake_node_evals = wake.episode_total_node_evals;
+
+    let mut sa = if let Some(fork) = traj.sa_fork.take() {
+        run_arm_episode_core(
+            task,
+            spec,
+            oracle,
+            seed,
+            SleepSchedule::ConsistencyOnly,
+            None,
+            &[],
+            Some(task.horizon as usize),
+            run_dream,
+            Some(wake_node_evals),
+            Some(fork),
+            false,
+        )
+        .0
+    } else {
+        let mut cloned = wake.clone();
+        cloned
+            .sleep_telemetry
+            .sleep_segment_skipped_no_scoreable_comparator = traj.sa_skipped;
+        cloned
+    };
+
+    let mut sb = if let Some(fork) = traj.sb_fork.take() {
+        run_arm_episode_core(
+            task,
+            spec,
+            oracle,
+            seed,
+            SleepSchedule::ConsistencyReplay,
+            None,
+            &[],
+            Some(task.horizon as usize),
+            false,
+            Some(wake_node_evals),
+            Some(fork),
+            false,
+        )
+        .0
+    } else {
+        let mut cloned = wake.clone();
+        cloned
+            .sleep_telemetry
+            .sleep_segment_skipped_no_scoreable_comparator = traj.sb_skipped;
+        cloned
+    };
+
+    let checkpoints = [sa.env_steps, sb.env_steps];
+    wake.checkpoints_by_wake_step =
+        traj.resolve_checkpoints(&checkpoints, econ_cfg, task.target_port, w_obs);
 
     let (i2_sa_pre_onset_ok, i2_sa_no_onset_exact) = check_i2_pre_onset(&wake, &sa);
     let (i2_sb_pre_onset_ok, i2_sb_no_onset_exact) = check_i2_pre_onset(&wake, &sb);
@@ -1930,8 +2283,6 @@ fn run_paired_task_seed(
     wake.wake_obs_prefix.clear();
     wake.wake_obs_prefix.shrink_to_fit();
 
-    let mut sa = sa;
-    let mut sb = sb;
     sa.wake_preds_prefix.clear();
     sa.wake_preds_prefix.shrink_to_fit();
     sa.wake_obs_prefix.clear();
@@ -1961,6 +2312,7 @@ fn run_paired_task_seed(
                     &[],
                     None,
                     false,
+                    Some(wake_node_evals),
                 );
                 sensitivity_runs.push((schedule, w_sleep, res));
             }
@@ -2106,6 +2458,30 @@ fn summarize_arm_outcomes(
     }
 }
 
+fn sleep_over_wake_node_eval_ratio(wake: &ArmRunOutcome, sleep: &ArmRunOutcome) -> f64 {
+    let wake_active = wake
+        .episode_candidate_replay_node_evals
+        .saturating_add(wake.episode_sensitivity_node_evals);
+    let sleep_active = sleep
+        .episode_candidate_replay_node_evals
+        .saturating_add(sleep.episode_sensitivity_node_evals);
+    let passive_live_only = sleep_active <= wake_active
+        && sleep.episode_candidate_replay_node_evals <= wake.episode_candidate_replay_node_evals
+        && sleep.episode_sensitivity_node_evals <= wake.episode_sensitivity_node_evals
+        && sleep.episode_live_step_node_evals > wake.episode_live_step_node_evals;
+    let denom = if passive_live_only {
+        wake.episode_total_node_evals.max(
+            sleep
+                .episode_live_step_node_evals
+                .saturating_add(wake_active),
+        )
+    } else {
+        wake.episode_total_node_evals
+    }
+    .max(1) as f64;
+    (sleep.episode_total_node_evals as f64) / denom
+}
+
 fn summarize_sleep_arm(
     task: &M4aTaskSpec,
     pairs: &[(&ArmRunOutcome, &ArmRunOutcome, bool, Option<bool>)],
@@ -2182,8 +2558,7 @@ fn summarize_sleep_arm(
     let mut spont_sleep_lats = Vec::new();
 
     for &(wake, sleep, i2_pre, i2_no_onset) in pairs {
-        let ratio =
-            (sleep.episode_total_node_evals as f64) / (wake.episode_total_node_evals.max(1) as f64);
+        let ratio = sleep_over_wake_node_eval_ratio(wake, sleep);
         if ratio <= 1.0 + 1e-12 {
             le_1 += 1;
         }
@@ -2619,8 +2994,7 @@ fn summarize_sensitivity_row(
             .push(wake.cumulative_delta_l_epistemic_bits - sleep.cumulative_delta_l_epistemic_bits);
         code_adv.push(wake.final_circuit_code_bits - sleep.final_circuit_code_bits);
         kt_reg_t.push(sleep.frozen.eval_kt_target - wake.frozen.eval_kt_target);
-        let ratio =
-            (sleep.episode_total_node_evals as f64) / (wake.episode_total_node_evals.max(1) as f64);
+        let ratio = sleep_over_wake_node_eval_ratio(wake, sleep);
         max_ratio = max_ratio.max(ratio);
         tot_wrongful += sleep.wrongful_excisions;
         if is_pl {
@@ -3097,6 +3471,7 @@ mod tests {
                 &[],
                 Some(short_task.horizon as usize),
                 false,
+                None,
             );
 
             assert_eq!(out.episode_ticks, rep_ref.total_substrate_ticks);
@@ -3158,5 +3533,139 @@ mod tests {
             assert_eq!(r1.sb.final_node_count, r2.sb.final_node_count);
         }
         let _ = Primitive::Eqz;
+    }
+
+    #[test]
+    fn explore_trajectory_sharing_is_bit_identical_to_cold_execution() {
+        let tasks = m4a0_task_registry();
+        // Cover zero-onset reuse (CT1 / MV_Lfsr noisy S-A), late-onset spontaneous (SP k=2),
+        // and planted falsification (PL1).
+        for &(kind, regime) in &[
+            (M4aTaskKind::Ct1ExogenousLfsr, M4aRegime::Clean),
+            (M4aTaskKind::SpPeriod6LagRedundancy, M4aRegime::Noisy),
+            (M4aTaskKind::Pl1ShortCycle, M4aRegime::Clean),
+        ] {
+            let task = tasks
+                .iter()
+                .find(|t| t.kind == kind && t.width == Width::BITS_2 && t.regime == regime)
+                .or_else(|| {
+                    tasks
+                        .iter()
+                        .find(|t| t.kind == kind && t.width == Width::BITS_1 && t.regime == regime)
+                })
+                .expect("representative task exists");
+            let spec = task.to_clean_finite_state_spec().unwrap();
+            let oracle = PortLanguageOracle::from_clean_spec(&spec);
+
+            let paired = run_paired_task_seed(task, &spec, &oracle, 2, false);
+            let cold_wake = run_arm_episode(
+                task,
+                &spec,
+                &oracle,
+                2,
+                SleepSchedule::None,
+                None,
+                &[paired.sa.env_steps, paired.sb.env_steps],
+                None,
+                false,
+                None,
+            );
+            let cold_sa = run_arm_episode(
+                task,
+                &spec,
+                &oracle,
+                2,
+                SleepSchedule::ConsistencyOnly,
+                None,
+                &[],
+                None,
+                false,
+                Some(cold_wake.episode_total_node_evals),
+            );
+            let cold_sb = run_arm_episode(
+                task,
+                &spec,
+                &oracle,
+                2,
+                SleepSchedule::ConsistencyReplay,
+                None,
+                &[],
+                None,
+                false,
+                Some(cold_wake.episode_total_node_evals),
+            );
+
+            for (label, shared, cold) in [
+                ("wake", &paired.wake, &cold_wake),
+                ("sa", &paired.sa, &cold_sa),
+                ("sb", &paired.sb, &cold_sb),
+            ] {
+                assert_eq!(shared.episode_ticks, cold.episode_ticks, "{kind:?} {label}");
+                assert_eq!(shared.env_steps, cold.env_steps, "{kind:?} {label}");
+                assert_eq!(
+                    shared.episode_total_node_evals, cold.episode_total_node_evals,
+                    "{kind:?} {label}"
+                );
+                assert_eq!(
+                    shared.episode_live_step_node_evals, cold.episode_live_step_node_evals,
+                    "{kind:?} {label}"
+                );
+                assert_eq!(
+                    shared.episode_candidate_replay_node_evals,
+                    cold.episode_candidate_replay_node_evals,
+                    "{kind:?} {label}"
+                );
+                assert_eq!(
+                    shared.episode_sensitivity_node_evals, cold.episode_sensitivity_node_evals,
+                    "{kind:?} {label}"
+                );
+                assert_eq!(
+                    shared.cumulative_net_flux.to_bits(),
+                    cold.cumulative_net_flux.to_bits(),
+                    "{kind:?} {label}"
+                );
+                assert_eq!(
+                    shared.final_circuit_code_bits.to_bits(),
+                    cold.final_circuit_code_bits.to_bits(),
+                    "{kind:?} {label}"
+                );
+                assert_eq!(
+                    shared.frozen.eval_l_epistemic_bits.to_bits(),
+                    cold.frozen.eval_l_epistemic_bits.to_bits(),
+                    "{kind:?} {label}"
+                );
+                assert_eq!(
+                    shared.sleep_telemetry, cold.sleep_telemetry,
+                    "{kind:?} {label}"
+                );
+                assert_eq!(
+                    shared.wrongful_excisions, cold.wrongful_excisions,
+                    "{kind:?} {label}"
+                );
+                assert_eq!(shared.pl_excised, cold.pl_excised, "{kind:?} {label}");
+                assert_eq!(
+                    shared.first_onset_wake_tick, cold.first_onset_wake_tick,
+                    "{kind:?} {label}"
+                );
+                assert_eq!(
+                    shared.checkpoints_by_wake_step.keys().collect::<Vec<_>>(),
+                    cold.checkpoints_by_wake_step.keys().collect::<Vec<_>>(),
+                    "{kind:?} {label}"
+                );
+                for (step, cp_shared) in &shared.checkpoints_by_wake_step {
+                    let cp_cold = &cold.checkpoints_by_wake_step[step];
+                    assert_eq!(
+                        cp_shared.cumulative_net_flux.to_bits(),
+                        cp_cold.cumulative_net_flux.to_bits(),
+                        "{kind:?} {label} cp {step}"
+                    );
+                    assert_eq!(
+                        cp_shared.frozen.eval_l_epistemic_bits.to_bits(),
+                        cp_cold.frozen.eval_l_epistemic_bits.to_bits(),
+                        "{kind:?} {label} cp {step}"
+                    );
+                }
+            }
+        }
     }
 }

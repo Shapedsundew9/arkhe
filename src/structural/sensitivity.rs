@@ -189,6 +189,18 @@ pub fn counterfactual_sensitivity_with_comparators(
     )
 }
 
+/// Target mask controlling which outputs, register latches, and comparators are evaluated during
+/// zero-flux sleep sensitivity checks (`R2`).
+#[derive(Clone, Copy, Debug)]
+pub struct SleepSensitivityMask<'a> {
+    /// Per-output-port flags (`true` only when `R5(a)` needs primary ancestry on that port).
+    pub include_outputs: &'a [bool],
+    /// Per-register latch flags (`true` only for registers in active cones).
+    pub include_latches: &'a [bool],
+    /// Per-comparator flags (`true` only for active non-suspended comparators).
+    pub include_comparators: &'a [bool],
+}
+
 /// Computes node-by-target counterfactual sensitivity while recording audited counterfactual node
 /// evaluations into `node_evals` without altering RNG consumption or outputs.
 #[allow(clippy::too_many_arguments)]
@@ -202,6 +214,170 @@ pub fn counterfactual_sensitivity_with_comparators_audited(
     comparators: &[ComparatorTarget],
     node_evals: &mut u64,
 ) -> Result<ComparatorSensitivitySnapshot, SensitivityError> {
+    counterfactual_sensitivity_core(
+        circuit,
+        compiled,
+        state,
+        seed_bank,
+        tick_block,
+        sample_count,
+        comparators,
+        None,
+        node_evals,
+    )
+}
+
+/// Computes masked sleep-segment counterfactual sensitivity (`R2`), skipping zero-flux boundary
+/// output ports, suspended comparators (`I7`), unused `SUB` sensitivities, and unrelated latches.
+#[allow(clippy::too_many_arguments)]
+pub fn counterfactual_sensitivity_sleep_masked_audited(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    seed_bank: SeedBank,
+    tick_block: u64,
+    sample_count: usize,
+    comparators: &[ComparatorTarget],
+    mask: SleepSensitivityMask<'_>,
+    node_evals: &mut u64,
+) -> Result<ComparatorSensitivitySnapshot, SensitivityError> {
+    counterfactual_sensitivity_core(
+        circuit,
+        compiled,
+        state,
+        seed_bank,
+        tick_block,
+        sample_count,
+        comparators,
+        Some(mask),
+        node_evals,
+    )
+}
+
+/// Computes the exact topological wake counterfactual sensitivity node evaluations per tick for
+/// `circuit` without performing counterfactual substitutions (`R2` wake-envelope reservation).
+#[must_use]
+pub fn exact_wake_sensitivity_node_evals(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    sample_count: usize,
+    comparators: &[ComparatorTarget],
+) -> u64 {
+    let dummy_state = ScalarState::new(compiled);
+    let mut node_evals = 0u64;
+    let Ok((wire_op_offsets, wire_op_list, node_out_base, comp_wires, latch_sources)) =
+        build_sensitivity_wiring(circuit, compiled, &dummy_state, comparators)
+    else {
+        return 0;
+    };
+    let nodes = circuit.nodes();
+    let wires = dummy_state.wire_values();
+    let wire_count = wires.len();
+    let ops = compiled.comb_ops();
+    let width = compiled.width();
+    let cand_len = if width.bits() <= EXACT_SENSITIVITY_MAX_BITS {
+        ((1u64 << width.bits()) - 1) as usize
+    } else {
+        let max_distinct = if width.bits() == 64 {
+            usize::MAX
+        } else {
+            ((1u64 << width.bits()) - 1) as usize
+        };
+        sample_count.min(max_distinct)
+    };
+    if cand_len == 0 {
+        return 0;
+    }
+
+    let mut visited_wire = vec![0u32; wire_count];
+    let mut visited_op = vec![0u32; ops.len()];
+    let mut vis_epoch = 0u32;
+    let mut dirty_wires = Vec::with_capacity(wire_count);
+
+    for (node_index, primitive) in nodes.iter().copied().enumerate() {
+        let out_base = node_out_base[node_index];
+        let out_count = usize::from(primitive.output_arity());
+        vis_epoch += 1;
+        dirty_wires.clear();
+        let mut active_ops_len = 0u64;
+        for port in 0..out_count {
+            let w = out_base + port;
+            visited_wire[w] = vis_epoch;
+            dirty_wires.push(w);
+        }
+        let mut qi = 0usize;
+        while qi < dirty_wires.len() {
+            let w = dirty_wires[qi];
+            qi += 1;
+            let start = wire_op_offsets[w];
+            let end = wire_op_offsets[w + 1];
+            for &op_idx in &wire_op_list[start..end] {
+                if visited_op[op_idx] == vis_epoch {
+                    continue;
+                }
+                let op = ops[op_idx];
+                if comb_op_output_base(op) == out_base {
+                    continue;
+                }
+                visited_op[op_idx] = vis_epoch;
+                active_ops_len += 1;
+                match op {
+                    CombOp::Add { out, .. }
+                    | CombOp::Sub { out, .. }
+                    | CombOp::Mul { out, .. }
+                    | CombOp::Eqz { out, .. } => {
+                        if visited_wire[out] != vis_epoch {
+                            visited_wire[out] = vis_epoch;
+                            dirty_wires.push(out);
+                        }
+                    }
+                    CombOp::Split { out0, out1, .. } => {
+                        if visited_wire[out0] != vis_epoch {
+                            visited_wire[out0] = vis_epoch;
+                            dirty_wires.push(out0);
+                        }
+                        if visited_wire[out1] != vis_epoch {
+                            visited_wire[out1] = vis_epoch;
+                            dirty_wires.push(out1);
+                        }
+                    }
+                }
+            }
+        }
+        let reaches_target = compiled
+            .output_drivers()
+            .iter()
+            .any(|driver| driver.is_some_and(|w| visited_wire[w] == vis_epoch))
+            || latch_sources
+                .iter()
+                .any(|driver| driver.is_some_and(|w| visited_wire[w] == vis_epoch))
+            || comp_wires
+                .iter()
+                .any(|&(sw, ew)| visited_wire[sw] == vis_epoch || visited_wire[ew] == vis_epoch);
+        if reaches_target {
+            node_evals = node_evals
+                .saturating_add((cand_len as u64).saturating_mul(active_ops_len.saturating_add(1)));
+        }
+    }
+    node_evals
+}
+
+#[allow(clippy::type_complexity)]
+fn build_sensitivity_wiring(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    comparators: &[ComparatorTarget],
+) -> Result<
+    (
+        Vec<usize>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<(usize, usize)>,
+        Vec<Option<usize>>,
+    ),
+    SensitivityError,
+> {
     let nodes = circuit.nodes();
     let wires = state.wire_values();
     if circuit.width() != compiled.width()
@@ -212,9 +388,6 @@ pub fn counterfactual_sensitivity_with_comparators_audited(
     }
     if wires.is_empty() && (!nodes.is_empty() || compiled.num_outputs() > 0) {
         return Err(SensitivityError::DimensionMismatch);
-    }
-    if compiled.width().bits() > EXACT_SENSITIVITY_MAX_BITS && sample_count == 0 {
-        return Err(SensitivityError::EmptySample);
     }
 
     let mut node_out_base = Vec::with_capacity(nodes.len());
@@ -241,11 +414,6 @@ pub fn counterfactual_sensitivity_with_comparators_audited(
         comp_wires.push((node_out_base[sub_idx], node_out_base[eqz_idx]));
     }
 
-    let output_baseline: Vec<u64> = compiled
-        .output_drivers()
-        .iter()
-        .map(|wire| wire.map_or(0, |index| wires[index]))
-        .collect();
     let latch_count = compiled.total_registers();
     let mut latch_sources = vec![None; latch_count];
     for &(register, input_wire) in compiled.delay_latches() {
@@ -302,6 +470,51 @@ pub fn counterfactual_sensitivity_with_comparators_audited(
             }
         }
     }
+    Ok((
+        wire_op_offsets,
+        wire_op_list,
+        node_out_base,
+        comp_wires,
+        latch_sources,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn counterfactual_sensitivity_core(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    seed_bank: SeedBank,
+    tick_block: u64,
+    sample_count: usize,
+    comparators: &[ComparatorTarget],
+    sleep_mask: Option<SleepSensitivityMask<'_>>,
+    node_evals: &mut u64,
+) -> Result<ComparatorSensitivitySnapshot, SensitivityError> {
+    let (wire_op_offsets, wire_op_list, node_out_base, comp_wires, latch_sources) =
+        build_sensitivity_wiring(circuit, compiled, state, comparators)?;
+    let nodes = circuit.nodes();
+    let wires = state.wire_values();
+    if compiled.width().bits() > EXACT_SENSITIVITY_MAX_BITS && sample_count == 0 {
+        return Err(SensitivityError::EmptySample);
+    }
+
+    let output_baseline: Vec<u64> = compiled
+        .output_drivers()
+        .iter()
+        .map(|wire| wire.map_or(0, |index| wires[index]))
+        .collect();
+    let latch_count = compiled.total_registers();
+    if let Some(mask) = sleep_mask
+        && (mask.include_outputs.len() != output_baseline.len()
+            || mask.include_latches.len() != latch_count
+            || mask.include_comparators.len() != comparators.len())
+    {
+        return Err(SensitivityError::DimensionMismatch);
+    }
+
+    let wire_count = wires.len();
+    let ops = compiled.comb_ops();
 
     let mut output_by_node = vec![vec![0.0; output_baseline.len()]; nodes.len()];
     let mut latch_by_node = vec![vec![0.0; latch_count]; nodes.len()];
@@ -392,6 +605,9 @@ pub fn counterfactual_sensitivity_with_comparators_audited(
 
         affected_ports.clear();
         for (port, driver) in compiled.output_drivers().iter().enumerate() {
+            if sleep_mask.is_some_and(|m| !m.include_outputs[port]) {
+                continue;
+            }
             if let Some(wire) = *driver
                 && visited_wire[wire] == vis_epoch
             {
@@ -400,6 +616,9 @@ pub fn counterfactual_sensitivity_with_comparators_audited(
         }
         affected_latches.clear();
         for (register, input_wire) in latch_sources.iter().enumerate() {
+            if sleep_mask.is_some_and(|m| !m.include_latches[register]) {
+                continue;
+            }
             if let Some(wire) = *input_wire
                 && visited_wire[wire] == vis_epoch
             {
@@ -409,11 +628,17 @@ pub fn counterfactual_sensitivity_with_comparators_audited(
         affected_comp_subs.clear();
         affected_comp_eqzs.clear();
         for (m, &(sub_wire, eqz_wire)) in comp_wires.iter().enumerate() {
-            if visited_wire[sub_wire] == vis_epoch {
-                affected_comp_subs.push((m, sub_wire));
-            }
-            if visited_wire[eqz_wire] == vis_epoch {
-                affected_comp_eqzs.push((m, eqz_wire));
+            if let Some(mask) = sleep_mask {
+                if mask.include_comparators[m] && visited_wire[eqz_wire] == vis_epoch {
+                    affected_comp_eqzs.push((m, eqz_wire));
+                }
+            } else {
+                if visited_wire[sub_wire] == vis_epoch {
+                    affected_comp_subs.push((m, sub_wire));
+                }
+                if visited_wire[eqz_wire] == vis_epoch {
+                    affected_comp_eqzs.push((m, eqz_wire));
+                }
             }
         }
 
@@ -513,6 +738,7 @@ pub fn assemble_causal_ancestry(
         trace_discount,
         &[],
         false,
+        None,
     )
     .map(|ancestry| ancestry.base)
 }
@@ -533,6 +759,64 @@ pub fn assemble_causal_ancestry_with_comparators(
     trace_discount: f64,
     comparators: &[ComparatorTarget],
     is_sleep: bool,
+) -> Result<ComparatorCausalAncestry, SensitivityError> {
+    assemble_causal_ancestry_with_comparators_masked(
+        circuit,
+        compiled,
+        state,
+        sensitivity,
+        activity,
+        register_eligibility,
+        trace_discount,
+        comparators,
+        is_sleep,
+        None,
+    )
+}
+
+/// Propagates masked sleep counterfactual sensitivity backward across only active outputs, active
+/// register latches, and non-suspended comparators (`R2`, `I7`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Masked sleep causal ancestry shares core validation and propagation with unmasked path"
+)]
+pub fn assemble_causal_ancestry_sleep_masked(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    sensitivity: &ComparatorSensitivitySnapshot,
+    activity: &[NodeActivity],
+    register_eligibility: &[Vec<f64>],
+    trace_discount: f64,
+    comparators: &[ComparatorTarget],
+    mask: SleepSensitivityMask<'_>,
+) -> Result<ComparatorCausalAncestry, SensitivityError> {
+    assemble_causal_ancestry_with_comparators_masked(
+        circuit,
+        compiled,
+        state,
+        sensitivity,
+        activity,
+        register_eligibility,
+        trace_discount,
+        comparators,
+        true,
+        Some(mask),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_causal_ancestry_with_comparators_masked(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    sensitivity: &ComparatorSensitivitySnapshot,
+    activity: &[NodeActivity],
+    register_eligibility: &[Vec<f64>],
+    trace_discount: f64,
+    comparators: &[ComparatorTarget],
+    is_sleep: bool,
+    sleep_mask: Option<SleepSensitivityMask<'_>>,
 ) -> Result<ComparatorCausalAncestry, SensitivityError> {
     let node_count = circuit.node_count();
     if sensitivity.comparator_sub_by_node.len() != node_count
@@ -567,6 +851,7 @@ pub fn assemble_causal_ancestry_with_comparators(
         trace_discount,
         comparators,
         is_sleep,
+        sleep_mask,
     )
 }
 
@@ -592,6 +877,7 @@ fn assemble_causal_ancestry_core(
     trace_discount: f64,
     comparators: &[ComparatorTarget],
     is_sleep: bool,
+    sleep_mask: Option<SleepSensitivityMask<'_>>,
 ) -> Result<ComparatorCausalAncestry, SensitivityError> {
     let node_count = circuit.node_count();
     let register_count = compiled.total_registers();
@@ -604,6 +890,13 @@ fn assemble_causal_ancestry_core(
         || sensitivity.latch_by_node.len() != node_count
         || !trace_discount.is_finite()
         || !(0.0..1.0).contains(&trace_discount)
+    {
+        return Err(SensitivityError::DimensionMismatch);
+    }
+    if let Some(mask) = sleep_mask
+        && (mask.include_outputs.len() != compiled.output_drivers().len()
+            || mask.include_latches.len() != register_count
+            || mask.include_comparators.len() != comparators.len())
     {
         return Err(SensitivityError::DimensionMismatch);
     }
@@ -717,6 +1010,9 @@ fn assemble_causal_ancestry_core(
     let mut cur_epoch = 0u32;
 
     for (port, shares) in port_shares.iter_mut().enumerate() {
+        if sleep_mask.is_some_and(|m| !m.include_outputs[port]) {
+            continue;
+        }
         let Some(driver) = compiled.output_drivers()[port] else {
             continue;
         };
@@ -758,6 +1054,9 @@ fn assemble_causal_ancestry_core(
         register_input_wires[chain.base_reg] = Some(chain.src_wire);
         for stage in 1..chain.hops {
             let current = chain.base_reg + stage;
+            if sleep_mask.is_some_and(|m| !m.include_latches[current]) {
+                continue;
+            }
             let previous = chain.base_reg + stage - 1;
             for node in 0..node_count {
                 next_register_eligibility[current][node] =
@@ -766,6 +1065,9 @@ fn assemble_causal_ancestry_core(
         }
     }
     for (register, input_wire_opt) in register_input_wires.iter().enumerate() {
+        if sleep_mask.is_some_and(|m| !m.include_latches[register]) {
+            continue;
+        }
         let Some(input_wire) = *input_wire_opt else {
             continue;
         };
@@ -800,6 +1102,9 @@ fn assemble_causal_ancestry_core(
     }
 
     for (m, comp) in comparators.iter().enumerate() {
+        if sleep_mask.is_some_and(|mask| !mask.include_comparators[m]) {
+            continue;
+        }
         let target = if is_sleep {
             Target::ComparatorSleep(m)
         } else {

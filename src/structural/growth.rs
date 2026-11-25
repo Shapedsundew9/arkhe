@@ -18,6 +18,7 @@ use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
     ComparatorTarget, assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
     counterfactual_sensitivity_audited, counterfactual_sensitivity_with_comparators_audited,
+    exact_wake_sensitivity_node_evals,
 };
 use crate::structural::sleep::SleepSchedule;
 use crate::structural::surgery::{
@@ -350,6 +351,32 @@ pub struct ResidualDiagnostics {
 pub(crate) struct GrowthEvalAudit {
     pub candidate_replay_node_evals: u64,
     pub sensitivity_node_evals: u64,
+    pub max_additional_node_evals: Option<u64>,
+    pub budget_cap_hit: bool,
+}
+
+impl GrowthEvalAudit {
+    #[must_use]
+    pub fn total_evals(&self) -> u64 {
+        self.candidate_replay_node_evals
+            .saturating_add(self.sensitivity_node_evals)
+    }
+
+    #[must_use]
+    pub fn can_afford(&self, additional: u64) -> bool {
+        self.max_additional_node_evals
+            .is_none_or(|cap| self.total_evals().saturating_add(additional) <= cap)
+    }
+
+    pub fn try_reserve_replay(&mut self, additional: u64) -> bool {
+        if !self.can_afford(additional) {
+            self.budget_cap_hit = true;
+            return false;
+        }
+        self.candidate_replay_node_evals =
+            self.candidate_replay_node_evals.saturating_add(additional);
+        true
+    }
 }
 
 /// Telemetry counters for structural growth guardrails and search horizons.
@@ -2323,9 +2350,9 @@ fn replay_current_baseline(
             &obs_window.frames()[idx - 1]
         };
         let truth = &obs_window.frames()[idx];
-        audit.candidate_replay_node_evals = audit
-            .candidate_replay_node_evals
-            .saturating_add(curr_node_count);
+        if !audit.try_reserve_replay(curr_node_count) {
+            break;
+        }
         let _ = curr_state.step(editable.compiled(), input, &mut curr_pred);
         let p_curr = if is_epoch_1 {
             0
@@ -2721,9 +2748,9 @@ fn prime_non_surviving_registers_with_plan(
     obs_window: &ObservationWindow,
     start_idx: usize,
     regs: &mut [u64],
-    replay_node_evals: &mut u64,
+    audit: &mut GrowthEvalAudit,
     seed_shadow_at: impl FnOnce(usize, &mut ScalarState) -> bool,
-) {
+) -> bool {
     let mut is_untouched_reg = vec![false; regs.len()];
     for nr in reg_map.iter().flatten().copied() {
         if nr < is_untouched_reg.len() {
@@ -2769,7 +2796,7 @@ fn prime_non_surviving_registers_with_plan(
 
     let mut shadow = ScalarState::new(staged_compiled);
     if !seed_shadow_at(plan.prime_start, &mut shadow) {
-        return;
+        return false;
     }
     let mut dummy_pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
     let staged_nodes = staged.node_count() as u64;
@@ -2779,12 +2806,14 @@ fn prime_non_surviving_registers_with_plan(
         } else {
             &obs_window.frames()[idx - 1]
         };
-        *replay_node_evals = replay_node_evals.saturating_add(staged_nodes);
+        if !audit.try_reserve_replay(staged_nodes) {
+            return false;
+        }
         if shadow
             .step(staged_compiled, input, &mut dummy_pred)
             .is_err()
         {
-            return;
+            return false;
         }
     }
     let shadow_regs = shadow.registers();
@@ -2793,6 +2822,7 @@ fn prime_non_surviving_registers_with_plan(
             regs[r] = shadow_regs[r];
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -2830,7 +2860,8 @@ fn prime_non_surviving_registers(
         PrimingPlanOutcome::Unavailable => return PrimingOutcome::Unavailable,
         PrimingPlanOutcome::Ready(plan) => plan,
     };
-    prime_non_surviving_registers_with_plan(
+    let mut dummy_audit = GrowthEvalAudit::default();
+    if prime_non_surviving_registers_with_plan(
         &plan,
         staged,
         staged_compiled,
@@ -2839,7 +2870,7 @@ fn prime_non_surviving_registers(
         obs_window,
         start_idx,
         regs,
-        &mut 0,
+        &mut dummy_audit,
         |prime_idx, shadow| {
             if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(prime_idx)
                 && snap_epoch == structure_epoch
@@ -2850,8 +2881,11 @@ fn prime_non_surviving_registers(
             }
             true
         },
-    );
-    PrimingOutcome::Primed
+    ) {
+        PrimingOutcome::Primed
+    } else {
+        PrimingOutcome::Unavailable
+    }
 }
 
 enum SproutMotifOutcome {
@@ -3183,11 +3217,14 @@ impl FastCombPlan {
         baseline: &BaselineReplayMetrics,
         width: Width,
         e_cand_upper: isize,
-    ) -> (bool, usize) {
+        audit: &mut GrowthEvalAudit,
+    ) -> Result<bool, ()> {
         let mut e_cand = 0usize;
-        let mut steps_evaluated = 0usize;
+        let per_step_evals = self.min_added_nodes.max(1) as u64;
         for i in baseline.eval_offset..baseline.w_replay {
-            steps_evaluated += 1;
+            if !audit.try_reserve_replay(per_step_evals) {
+                return Err(());
+            }
             let p_cand = match self.kind {
                 FastCombKind::ConstLoop(c) => {
                     if self.is_epoch_1 {
@@ -3331,11 +3368,11 @@ impl FastCombPlan {
             if p_cand != baseline.out_truth_trace[i] {
                 e_cand += 1;
                 if (e_cand as isize) > e_cand_upper {
-                    return (true, steps_evaluated);
+                    return Ok(true);
                 }
             }
         }
-        ((e_cand as isize) > e_cand_upper, steps_evaluated)
+        Ok((e_cand as isize) > e_cand_upper)
     }
 }
 
@@ -3395,13 +3432,15 @@ fn evaluate_sprout_motif(
                 return SproutMotifOutcome::OutOfBudget;
             }
             budget_consumed = true;
-            let (exceeded, steps_evaluated) =
-                plan.exceeds_error_upper_audited(baseline, width, e_cand_upper);
-            audit.candidate_replay_node_evals = audit.candidate_replay_node_evals.saturating_add(
-                (steps_evaluated as u64).saturating_mul(plan.min_added_nodes.max(1) as u64),
-            );
-            if exceeded {
-                return SproutMotifOutcome::Rejected;
+            match plan.exceeds_error_upper_audited(baseline, width, e_cand_upper, audit) {
+                Ok(true) => return SproutMotifOutcome::Rejected,
+                Ok(false) => {}
+                Err(()) => {
+                    if let Some(tel) = telemetry {
+                        tel.sprout_budget_exhausted += 1;
+                    }
+                    return SproutMotifOutcome::OutOfBudget;
+                }
             }
         }
         FastCombPrep::Fallback => {}
@@ -3446,6 +3485,14 @@ fn evaluate_sprout_motif(
         None
     };
     let prime_steps = priming_plan.as_ref().map_or(0, |p| p.prime_steps);
+    let prime_eval_cost = (prime_steps as u64).saturating_mul(staged.node_count() as u64);
+    if !audit.can_afford(prime_eval_cost) {
+        audit.budget_cap_hit = true;
+        if let Some(tel) = telemetry {
+            tel.sprout_budget_exhausted += 1;
+        }
+        return SproutMotifOutcome::OutOfBudget;
+    }
     let replay_ticks = if budget_consumed {
         0
     } else {
@@ -3478,7 +3525,7 @@ fn evaluate_sprout_motif(
         map_snapshot_regs_into(&reg_map, snap_regs, &mut staged_regs);
         if let Some(ref plan) = priming_plan {
             let structure_epoch = editable.structure_epoch();
-            prime_non_surviving_registers_with_plan(
+            if !prime_non_surviving_registers_with_plan(
                 plan,
                 &staged,
                 &staged_compiled,
@@ -3487,7 +3534,7 @@ fn evaluate_sprout_motif(
                 obs_window,
                 baseline.start_idx,
                 &mut staged_regs,
-                &mut audit.candidate_replay_node_evals,
+                audit,
                 |prime_idx, shadow| {
                     if let Some((prime_epoch, prime_snap_regs)) =
                         obs_window.state_snapshot_at(prime_idx)
@@ -3499,7 +3546,18 @@ fn evaluate_sprout_motif(
                     }
                     true
                 },
-            );
+            ) {
+                if audit.budget_cap_hit
+                    && let Some(tel) = telemetry
+                {
+                    tel.sprout_budget_exhausted += 1;
+                }
+                return if audit.budget_cap_hit {
+                    SproutMotifOutcome::OutOfBudget
+                } else {
+                    SproutMotifOutcome::Rejected
+                };
+            }
         }
         let _ = state.set_registers(&staged_compiled, &staged_regs);
     }
@@ -3549,9 +3607,12 @@ fn evaluate_sprout_motif(
             &obs_window.frames()[idx - 1]
         };
         let truth = &obs_window.frames()[idx];
-        audit.candidate_replay_node_evals = audit
-            .candidate_replay_node_evals
-            .saturating_add(staged_nodes);
+        if !audit.try_reserve_replay(staged_nodes) {
+            if let Some(tel) = telemetry {
+                tel.sprout_budget_exhausted += 1;
+            }
+            return SproutMotifOutcome::OutOfBudget;
+        }
         if state.step(&staged_compiled, input, pred).is_err() {
             return SproutMotifOutcome::Rejected;
         }
@@ -3692,9 +3753,15 @@ fn evaluate_sprout_motif(
             out_port,
             d_cone,
             eff_juv_base,
-            telemetry,
+            telemetry.as_deref_mut(),
             audit,
         ) else {
+            if audit.budget_cap_hit {
+                if let Some(tel) = telemetry {
+                    tel.sprout_budget_exhausted += 1;
+                }
+                return SproutMotifOutcome::OutOfBudget;
+            }
             return SproutMotifOutcome::Rejected;
         };
         t_juv
@@ -3731,9 +3798,9 @@ fn replay_causal_tick(
     audit: &mut GrowthEvalAudit,
 ) -> Option<(Vec<f64>, Option<f64>, Option<f64>)> {
     let num_outputs = usize::from(sim.compiled().num_outputs());
-    audit.candidate_replay_node_evals = audit
-        .candidate_replay_node_evals
-        .saturating_add(sim.circuit().node_count() as u64);
+    if !audit.try_reserve_replay(sim.circuit().node_count() as u64) {
+        return None;
+    }
     sim.step(input, predictions).ok()?;
     let node_outs = node_output_values(sim.circuit(), sim.state());
     sim.economy_mut().record_activity(&node_outs).ok()?;
@@ -3741,6 +3808,12 @@ fn replay_causal_tick(
         return Some((Vec::new(), None, None));
     }
     let eff_samples = sample_count.min(RING_SIM_SENSITIVITY_SAMPLES);
+    let est_sens =
+        exact_wake_sensitivity_node_evals(sim.circuit(), sim.compiled(), eff_samples, targets);
+    if !audit.can_afford(est_sens) {
+        audit.budget_cap_hit = true;
+        return None;
+    }
     if targets.is_empty() {
         let snapshot = counterfactual_sensitivity_audited(
             sim.circuit(),
@@ -4144,9 +4217,9 @@ fn verify_stage2_debt_amortization_and_survival(
                     } else {
                         &obs_window.frames()[w_idx - 1]
                     };
-                    audit.candidate_replay_node_evals = audit
-                        .candidate_replay_node_evals
-                        .saturating_add(sim_node_count);
+                    if !audit.try_reserve_replay(sim_node_count) {
+                        return None;
+                    }
                     grad_sim.step(w_in, &mut predictions).ok()?;
                 }
             }
@@ -4227,6 +4300,9 @@ fn has_admissible_deeper_lag(
     baseline: &BaselineReplayMetrics,
     audit: &mut GrowthEvalAudit,
 ) -> bool {
+    if audit.budget_cap_hit {
+        return false;
+    }
     let probe_max = (growth_config.diagnostic_window / 2)
         .min(obs_window.len().saturating_sub(1))
         .min(usize::from(u8::MAX));
@@ -4244,7 +4320,13 @@ fn has_admissible_deeper_lag(
     let num_channels = editable.circuit().num_inputs();
     let cross_only = max_tau > growth_config.max_reactive_lag;
     for tau in start_tau..=probe_max {
+        if audit.budget_cap_hit {
+            return false;
+        }
         for c in 0..usize::from(num_channels) {
+            if audit.budget_cap_hit {
+                return false;
+            }
             if cross_only && c == usize::from(out_port) {
                 continue;
             }
@@ -4262,6 +4344,9 @@ fn has_admissible_deeper_lag(
                     tau: tau as u8,
                 };
                 if for_each_u1_deeper_motif(&u1, width, |motif| {
+                    if audit.budget_cap_hit {
+                        return false;
+                    }
                     matches!(
                         evaluate_sprout_motif(
                             editable,
@@ -4281,6 +4366,9 @@ fn has_admissible_deeper_lag(
                     )
                 }) {
                     return true;
+                }
+                if audit.budget_cap_hit {
+                    return false;
                 }
             }
         }
@@ -4524,6 +4612,10 @@ pub(crate) fn propose_sprout_band_scored_internal_audited(
         is_epoch_1,
         audit,
     );
+    if audit.budget_cap_hit {
+        telemetry.sprout_budget_exhausted += 1;
+        return Ok((None, false));
+    }
 
     if !diagnostics.growth_criterion_met {
         if !compute_lag_bound {
@@ -4759,6 +4851,8 @@ pub(crate) fn propose_sprout_band_scored_internal_audited(
     if best_proposal.is_none() {
         if blocked_by_max_nodes > 0 {
             telemetry.sprout_blocked_max_nodes += 1;
+        } else if audit.budget_cap_hit {
+            // Wake-envelope node eval cap already tripped during search; skip diagnostic deeper-lag probe.
         } else if !compute_lag_bound {
             pending_deeper_check = true;
         } else if has_admissible_deeper_lag(
@@ -4810,6 +4904,9 @@ pub(crate) fn check_deeper_lag_for_port_audited(
         is_epoch_1,
         audit,
     );
+    if audit.budget_cap_hit {
+        return false;
+    }
     has_admissible_deeper_lag(
         editable,
         obs_window,
@@ -5020,14 +5117,24 @@ fn simulate_ring_juvenile_survival(
             &obs_window.frames()[frame_idx - 1]
         };
         let truth = &obs_window.frames()[frame_idx];
-        audit.candidate_replay_node_evals = audit
-            .candidate_replay_node_evals
-            .saturating_add(sim_node_count);
+        if !audit.try_reserve_replay(sim_node_count) {
+            return false;
+        }
         if sim.step(input, &mut predictions).is_err() {
             return false;
         }
         let node_outputs = node_output_values(sim.circuit(), sim.state());
         if sim.economy_mut().record_activity(&node_outputs).is_err() {
+            return false;
+        }
+        let est_sens = exact_wake_sensitivity_node_evals(
+            sim.circuit(),
+            sim.compiled(),
+            RING_SIM_SENSITIVITY_SAMPLES,
+            &[],
+        );
+        if !audit.can_afford(est_sens) {
+            audit.budget_cap_hit = true;
             return false;
         }
         let Ok(snapshot) = counterfactual_sensitivity_audited(
@@ -5349,9 +5456,12 @@ fn evaluate_ring_period(
         } else {
             &obs_window.frames()[i - 1]
         };
-        audit.candidate_replay_node_evals = audit
-            .candidate_replay_node_evals
-            .saturating_add(staged_nodes);
+        if !audit.try_reserve_replay(staged_nodes) {
+            if let Some(tel) = telemetry {
+                tel.sprout_budget_exhausted += 1;
+            }
+            return RingPeriodOutcome::OutOfBudget;
+        }
         if state.step(&staged_compiled, input, pred).is_err() {
             return RingPeriodOutcome::Rejected;
         }
@@ -5404,6 +5514,12 @@ fn evaluate_ring_period(
         economy_config,
         audit,
     ) {
+        if audit.budget_cap_hit {
+            if let Some(tel) = telemetry {
+                tel.sprout_budget_exhausted += 1;
+            }
+            return RingPeriodOutcome::OutOfBudget;
+        }
         return RingPeriodOutcome::Rejected;
     }
 
@@ -5520,8 +5636,10 @@ pub(crate) fn propose_autonomous_delay_ring_scored_audited(
         } else {
             &obs_window.frames()[i - 1]
         };
-        audit.candidate_replay_node_evals =
-            audit.candidate_replay_node_evals.saturating_add(curr_nodes);
+        if !audit.try_reserve_replay(curr_nodes) {
+            telemetry.sprout_budget_exhausted += 1;
+            return None;
+        }
         if curr_state
             .step(editable.compiled(), input, &mut curr_pred)
             .is_err()
@@ -5612,12 +5730,12 @@ pub(crate) fn propose_autonomous_delay_ring_scored_audited(
         }
     }
 
-    if best_ring.is_none() {
+    if best_ring.is_none() && !audit.budget_cap_hit {
         let probe_ceiling = (w_diag / 2).max(growth_config.max_ring_period);
         for p in (2..growth_config.min_ring_period)
             .chain((growth_config.max_ring_period + 1)..=probe_ceiling)
         {
-            if let RingPeriodOutcome::Accepted { .. } = evaluate_ring_period(
+            match evaluate_ring_period(
                 editable,
                 &ring_pre,
                 obs_window,
@@ -5633,8 +5751,12 @@ pub(crate) fn propose_autonomous_delay_ring_scored_audited(
                 None,
                 audit,
             ) {
-                telemetry.ring_period_bound += 1;
-                break;
+                RingPeriodOutcome::Accepted { .. } => {
+                    telemetry.ring_period_bound += 1;
+                    break;
+                }
+                RingPeriodOutcome::OutOfBudget => break,
+                RingPeriodOutcome::Rejected => {}
             }
         }
     }
@@ -6159,9 +6281,9 @@ fn stage3_measure_z_alt_and_survive(
                     } else {
                         &obs_window.frames()[w - 1]
                     };
-                    audit.candidate_replay_node_evals = audit
-                        .candidate_replay_node_evals
-                        .saturating_add(sim_node_count);
+                    if !audit.try_reserve_replay(sim_node_count) {
+                        return None;
+                    }
                     sim.step(w_in, &mut predictions).ok()?;
                 }
             }
@@ -6310,6 +6432,12 @@ fn evaluate_stage3_candidate_pre(
         None
     };
     let prime_steps = priming_plan.as_ref().map_or(0, |p| p.prime_steps);
+    let prime_eval_cost = (prime_steps as u64).saturating_mul(staged.node_count() as u64);
+    if !audit.can_afford(prime_eval_cost) {
+        audit.budget_cap_hit = true;
+        telemetry.sprout_budget_exhausted += 1;
+        return Some(Err(()));
+    }
     if !budget.try_consume((baseline.w_replay + prime_steps) as u64) {
         telemetry.sprout_budget_exhausted += 1;
         return Some(Err(()));
@@ -6365,7 +6493,7 @@ fn evaluate_stage3_candidate_pre(
         if let Some(ref plan) = priming_plan {
             let structure_epoch = editable.structure_epoch();
             let mut ring_ok = true;
-            prime_non_surviving_registers_with_plan(
+            if !prime_non_surviving_registers_with_plan(
                 plan,
                 &staged,
                 &staged_compiled,
@@ -6374,7 +6502,7 @@ fn evaluate_stage3_candidate_pre(
                 obs_window,
                 baseline.start_idx,
                 &mut regs,
-                &mut audit.candidate_replay_node_evals,
+                audit,
                 |prime_idx, shadow| {
                     let mut shadow_regs = shadow.registers().to_vec();
                     if let Some((prime_epoch, prime_snap_regs)) =
@@ -6390,8 +6518,8 @@ fn evaluate_stage3_candidate_pre(
                     let _ = shadow.set_registers(&staged_compiled, &shadow_regs);
                     true
                 },
-            );
-            if !ring_ok {
+            ) || !ring_ok
+            {
                 return None;
             }
         }
@@ -6430,9 +6558,10 @@ fn evaluate_stage3_candidate_pre(
             &obs_window.frames()[idx - 1]
         };
         let truth = &obs_window.frames()[idx];
-        audit.candidate_replay_node_evals = audit
-            .candidate_replay_node_evals
-            .saturating_add(staged_nodes);
+        if !audit.try_reserve_replay(staged_nodes) {
+            telemetry.sprout_budget_exhausted += 1;
+            return Some(Err(()));
+        }
         if state.step(&staged_compiled, input, &mut pred).is_err() {
             return None;
         }
@@ -6665,8 +6794,10 @@ pub(crate) fn evaluate_comparator_ring_promotion_audited(
         } else {
             &obs_window.frames()[i - 1]
         };
-        audit.candidate_replay_node_evals =
-            audit.candidate_replay_node_evals.saturating_add(curr_nodes);
+        if !audit.try_reserve_replay(curr_nodes) {
+            telemetry.sprout_budget_exhausted += 1;
+            return None;
+        }
         if curr_state
             .step(editable.compiled(), input, &mut curr_pred)
             .is_err()
@@ -6777,9 +6908,11 @@ pub(crate) fn evaluate_comparator_ring_promotion_audited(
             } else {
                 &obs_window.frames()[i - 1]
             };
-            audit.candidate_replay_node_evals = audit
-                .candidate_replay_node_evals
-                .saturating_add(swapped_nodes);
+            if !audit.try_reserve_replay(swapped_nodes) {
+                telemetry.sprout_budget_exhausted += 1;
+                ok = false;
+                break;
+            }
             if cand_state
                 .step(&swapped_compiled, input, &mut cand_pred)
                 .is_err()
@@ -6940,6 +7073,10 @@ pub(crate) fn propose_redundancy_sprout_audited(
         false,
         audit,
     );
+    if audit.budget_cap_hit {
+        telemetry.sprout_budget_exhausted += 1;
+        return Ok(None);
+    }
     let truth_slice: Vec<u64> = diag.truth.iter().map(|f| f[out_idx]).collect();
     let modal_counts = {
         let mut counts = BTreeMap::<u64, usize>::new();
@@ -7165,6 +7302,9 @@ pub(crate) fn propose_redundancy_sprout_audited(
     rank_stage3_candidates(&mut candidates);
 
     for cand in candidates {
+        if audit.budget_cap_hit {
+            break;
+        }
         if let Some((d_alt, z_alt, eff_juv)) = stage3_measure_z_alt_and_survive(
             editable,
             obs_window,
@@ -7197,6 +7337,10 @@ pub(crate) fn propose_redundancy_sprout_audited(
                 autonomous_ring: cand.autonomous_ring,
                 primary_tph_split: cand.primary_tph_split,
             }));
+        }
+        if audit.budget_cap_hit {
+            telemetry.sprout_budget_exhausted += 1;
+            break;
         }
     }
 

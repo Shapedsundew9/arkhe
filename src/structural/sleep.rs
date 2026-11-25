@@ -37,6 +37,7 @@ pub struct FactBuffer {
     prior_frame: Vec<u64>,
     frames: VecDeque<Vec<u64>>,
     state_snapshots: VecDeque<(u64, Vec<u64>)>,
+    consistent_masks: VecDeque<u64>,
 }
 
 impl FactBuffer {
@@ -50,6 +51,7 @@ impl FactBuffer {
             prior_frame: vec![0u64; usize::from(channels)],
             frames: VecDeque::with_capacity(capacity),
             state_snapshots: VecDeque::with_capacity(capacity),
+            consistent_masks: VecDeque::with_capacity(capacity),
         }
     }
 
@@ -63,6 +65,21 @@ impl FactBuffer {
         structure_epoch: u64,
         pre_step_registers: &[u64],
     ) -> bool {
+        self.push_frame_with_state_and_consistency(frame, structure_epoch, pre_step_registers, 0)
+    }
+
+    /// Appends a newly observed wake frame paired with its pre-step `(structure_epoch, registers)`
+    /// snapshot and per-channel prediction consistency mask (`consistent_channel_mask`, bit `c`
+    /// set iff `width.normalize(pred[c]) == width.normalize(obs[c])`, `R3`).
+    ///
+    /// Returns `true` iff an eviction occurred.
+    pub fn push_frame_with_state_and_consistency(
+        &mut self,
+        frame: &[u64],
+        structure_epoch: u64,
+        pre_step_registers: &[u64],
+        consistent_channel_mask: u64,
+    ) -> bool {
         if self.capacity == 0 {
             return false;
         }
@@ -73,6 +90,7 @@ impl FactBuffer {
                 self.prior_frame.extend_from_slice(&old_frame);
             }
             let _ = self.state_snapshots.pop_front();
+            let _ = self.consistent_masks.pop_front();
             self.start_tick = self.start_tick.saturating_add(1);
             self.evictions = self.evictions.saturating_add(1);
             evicted = true;
@@ -80,6 +98,7 @@ impl FactBuffer {
         self.frames.push_back(frame.to_vec());
         self.state_snapshots
             .push_back((structure_epoch, pre_step_registers.to_vec()));
+        self.consistent_masks.push_back(consistent_channel_mask);
         evicted
     }
 
@@ -144,6 +163,63 @@ impl FactBuffer {
         self.state_snapshots
             .get(idx)
             .map(|(epoch, regs)| (*epoch, regs.as_slice()))
+    }
+
+    /// Per-channel prediction consistency mask at relative index `idx` (`R3`).
+    #[must_use]
+    pub fn consistent_mask_at(&self, idx: usize) -> Option<u64> {
+        self.consistent_masks.get(idx).copied()
+    }
+
+    /// Returns `true` iff `required_mask == 0` or the trailing `steps` frames in `FactBuffer` all
+    /// satisfy `(mask & required_mask) == required_mask` (`R3`).
+    #[must_use]
+    pub fn has_consistent_tail(&self, required_mask: u64, steps: usize) -> bool {
+        if required_mask == 0 {
+            return true;
+        }
+        if steps == 0 || self.consistent_masks.len() < steps {
+            return false;
+        }
+        self.consistent_masks
+            .iter()
+            .rev()
+            .take(steps)
+            .all(|&mask| (mask & required_mask) == required_mask)
+    }
+
+    /// Searches backward in `FactBuffer` for the most recent `start_idx` whose `pre_step_registers`
+    /// snapshot has `snap_epoch == structure_epoch` and is followed by `steps` consecutive frames
+    /// consistent on all bits in `required_mask` (`R3`).
+    #[must_use]
+    pub fn find_latest_consistent_window_start(
+        &self,
+        structure_epoch: u64,
+        required_mask: u64,
+        steps: usize,
+    ) -> Option<usize> {
+        if steps == 0 || self.frames.len() < steps {
+            return None;
+        }
+        let max_start = self.frames.len() - steps;
+        for start_idx in (0..=max_start).rev() {
+            if self
+                .state_snapshots
+                .get(start_idx)
+                .is_none_or(|(epoch, _)| *epoch != structure_epoch)
+            {
+                continue;
+            }
+            let all_ok = (0..steps).all(|offset| {
+                self.consistent_masks
+                    .get(start_idx + offset)
+                    .is_some_and(|&mask| (mask & required_mask) == required_mask)
+            });
+            if all_ok {
+                return Some(start_idx);
+            }
+        }
+        None
     }
 }
 
@@ -655,7 +731,11 @@ pub fn verify_epistemic_mdl_conservation(
                     } else {
                         raw_r
                     };
-                    if current_schedule == SleepSchedule::ConsistencyReplay && reward > 0.0 {
+                    if matches!(
+                        current_schedule,
+                        SleepSchedule::ConsistencyOnly | SleepSchedule::ConsistencyReplay
+                    ) && reward > 0.0
+                    {
                         if let Some(eid) = ce.escrow_id {
                             pending_escrow.push((eid, tp, reward));
                         }
@@ -764,6 +844,29 @@ pub fn run_wake_sleep_episode<G: FiniteStateGenerator>(
         warmup_ticks,
         max_eval_ticks,
         false,
+        None,
+    )
+    .0
+}
+
+/// Executes [`run_wake_sleep_episode`] under an explicit paired wake-envelope cap `max_episode_node_evals`
+/// (`R2`, leaving `wake-only` / `I1` untouched when `None`).
+pub fn run_wake_sleep_episode_with_cap<G: FiniteStateGenerator>(
+    learner: &mut ArkheLearner,
+    env: &mut NoisyEnvironment<G>,
+    total_substrate_ticks: u64,
+    warmup_ticks: u64,
+    max_eval_ticks: u64,
+    max_episode_node_evals: Option<u64>,
+) -> WakeSleepEpisodeReport {
+    run_wake_sleep_episode_core(
+        learner,
+        env,
+        total_substrate_ticks,
+        warmup_ticks,
+        max_eval_ticks,
+        false,
+        max_episode_node_evals,
     )
     .0
 }
@@ -783,6 +886,7 @@ pub fn run_wake_sleep_episode_audited<G: FiniteStateGenerator>(
         warmup_ticks,
         max_eval_ticks,
         true,
+        None,
     );
     let audit = audit_opt.expect("audited episode must return collector");
     let conservation =
@@ -797,10 +901,21 @@ fn run_wake_sleep_episode_core<G: FiniteStateGenerator>(
     warmup_ticks: u64,
     max_eval_ticks: u64,
     enable_audit: bool,
+    max_episode_node_evals_override: Option<u64>,
 ) -> (WakeSleepEpisodeReport, Option<EpistemicTraceCollector>) {
     if enable_audit {
         learner.enable_epistemic_audit();
     }
+    let start_ticks = learner.compute_ledger().total_substrate_ticks();
+    let start_evals = learner.compute_ledger().total_node_evals();
+    let prev_cap = learner.max_episode_node_evals();
+    let cap_evals = max_episode_node_evals_override
+        .or(prev_cap)
+        .map(|budget_evals| start_evals.saturating_add(budget_evals));
+    learner.set_episode_node_eval_envelope(
+        cap_evals,
+        Some(start_ticks.saturating_add(total_substrate_ticks)),
+    );
 
     let width = env.generator().width();
     let channels = usize::from(env.generator().channels());
@@ -811,7 +926,6 @@ fn run_wake_sleep_episode_core<G: FiniteStateGenerator>(
     let (w_wake, w_sleep) =
         derived_wake_sleep_windows(learner.economy_config(), learner.growth_config());
     let schedule = learner.growth_config().sleep_schedule;
-    let start_ticks = learner.compute_ledger().total_substrate_ticks();
 
     let mut env_steps = 0u64;
     let mut wake_in_segment = 0u64;
@@ -880,6 +994,7 @@ fn run_wake_sleep_episode_core<G: FiniteStateGenerator>(
     } else {
         None
     };
+    learner.set_episode_node_eval_envelope(prev_cap, None);
 
     let report = WakeSleepEpisodeReport {
         total_substrate_ticks: elapsed,

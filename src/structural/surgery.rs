@@ -23,6 +23,31 @@ use crate::substrate::{
 pub(crate) struct SurgeryEvalAudit {
     pub replay_node_evals: u64,
     pub sensitivity_node_evals: u64,
+    pub max_additional_node_evals: Option<u64>,
+    pub budget_cap_hit: bool,
+}
+
+impl SurgeryEvalAudit {
+    #[must_use]
+    pub const fn total_evals(&self) -> u64 {
+        self.replay_node_evals
+            .saturating_add(self.sensitivity_node_evals)
+    }
+
+    #[must_use]
+    pub fn can_afford(&self, additional: u64) -> bool {
+        self.max_additional_node_evals
+            .is_none_or(|cap| self.total_evals().saturating_add(additional) <= cap)
+    }
+
+    pub fn try_reserve_replay(&mut self, additional: u64) -> bool {
+        if !self.can_afford(additional) {
+            self.budget_cap_hit = true;
+            return false;
+        }
+        self.replay_node_evals = self.replay_node_evals.saturating_add(additional);
+        true
+    }
 }
 
 /// Errors returned by a state-preserving circuit edit.
@@ -386,10 +411,19 @@ impl EditableCircuit {
                     &staged,
                     &staged_compiled,
                     &remapped,
-                    &mut audit.replay_node_evals,
+                    audit,
                 )
             })
             .flatten();
+        if audit.budget_cap_hit {
+            return Ok((0..self.circuit.node_count())
+                .map(|index| {
+                    Some(NodeId(
+                        u32::try_from(index).expect("node count fits in u32"),
+                    ))
+                })
+                .collect());
+        }
         self.recompile_preserving_state(staged, &old_to_new)?;
         if let Some(regs) = shifted_live {
             self.set_registers(&regs)?;
@@ -493,6 +527,9 @@ impl EditableCircuit {
         } else {
             let active =
                 self.comparator_and_boundary_active_nodes(past_inputs, &comp_targets, audit);
+            if audit.budget_cap_hit {
+                return Ok(identity_map());
+            }
             let retained: BTreeSet<NodeId> = idle_nodes
                 .iter()
                 .copied()
@@ -543,10 +580,13 @@ impl EditableCircuit {
                 &staged,
                 &staged_compiled,
                 &staged_regs,
-                &mut audit.replay_node_evals,
+                audit,
             )
         {
             staged_regs = aligned;
+        }
+        if audit.budget_cap_hit {
+            return Ok(identity_map());
         }
         if staged_state
             .set_registers(&staged_compiled, &staged_regs)
@@ -598,7 +638,14 @@ impl EditableCircuit {
         let orig_nodes = self.circuit.node_count() as u64;
         let staged_nodes = staged.node_count() as u64;
         for (frame_idx, input_frame) in past_inputs.iter().enumerate() {
-            audit.replay_node_evals = audit.replay_node_evals.saturating_add(staged_nodes);
+            let step_evals = staged_nodes.saturating_add(if orig_probe_state.is_some() {
+                orig_nodes
+            } else {
+                0
+            });
+            if !audit.try_reserve_replay(step_evals) {
+                return Ok(identity_map());
+            }
             if staged_state
                 .step(&staged_compiled, input_frame, &mut staged_pred)
                 .is_err()
@@ -609,7 +656,6 @@ impl EditableCircuit {
                 return Ok(identity_map());
             }
             if let Some(ref mut orig_state) = orig_probe_state {
-                audit.replay_node_evals = audit.replay_node_evals.saturating_add(orig_nodes);
                 if orig_state
                     .step(&self.compiled, input_frame, &mut orig_pred_buf)
                     .is_err()
@@ -651,10 +697,13 @@ impl EditableCircuit {
                     &staged,
                     &staged_compiled,
                     &remapped,
-                    &mut audit.replay_node_evals,
+                    audit,
                 )
             })
             .flatten();
+        if audit.budget_cap_hit {
+            return Ok(identity_map());
+        }
 
         self.recompile_preserving_state(staged, &old_to_new)?;
         if let Some(regs) = live_shifted {
@@ -842,13 +891,11 @@ impl EditableCircuit {
             };
 
             let const_loops = const_loops_cache.get_or_insert_with(|| {
-                detect_fixed_point_const_loops(
-                    &self.circuit,
-                    &self.compiled,
-                    &self.state,
-                    &mut audit.replay_node_evals,
-                )
+                detect_fixed_point_const_loops(&self.circuit, &self.compiled, &self.state, audit)
             });
+            if audit.budget_cap_hit {
+                return Ok(None);
+            }
             let l_old = *l_old_cache.get_or_insert_with(|| {
                 circuit_code_bits_with_tax(&self.circuit, 0, split_code_tax)
             });
@@ -869,9 +916,12 @@ impl EditableCircuit {
                     l_old,
                     split_code_tax,
                     false,
-                    &mut audit.replay_node_evals,
+                    audit,
                 )? {
                     return Ok(Some(old_to_new));
+                }
+                if audit.budget_cap_hit {
+                    return Ok(None);
                 }
             }
         }
@@ -961,12 +1011,11 @@ impl EditableCircuit {
             .flat_map(|c| [c.sub_node, c.eqz_node])
             .collect();
         let comp_exclusive = comparator_exclusive_nodes(&self.circuit, &self.economy);
-        let const_loops = detect_fixed_point_const_loops(
-            &self.circuit,
-            &self.compiled,
-            &self.state,
-            &mut audit.replay_node_evals,
-        );
+        let const_loops =
+            detect_fixed_point_const_loops(&self.circuit, &self.compiled, &self.state, audit);
+        if audit.budget_cap_hit {
+            return Ok(None);
+        }
         let l_old = circuit_code_bits_with_tax(&self.circuit, 0, split_code_tax);
         let comp_targets = self.comparator_targets();
         let num_outputs = self.circuit.num_outputs();
@@ -1047,9 +1096,12 @@ impl EditableCircuit {
                         l_old,
                         split_code_tax,
                         true,
-                        &mut audit.replay_node_evals,
+                        audit,
                     )? {
                         return Ok(Some(old_to_new));
+                    }
+                    if audit.budget_cap_hit {
+                        return Ok(None);
                     }
                 }
             }
@@ -1072,7 +1124,7 @@ impl EditableCircuit {
         l_old: f64,
         split_code_tax: bool,
         allow_juvenile: bool,
-        replay_node_evals: &mut u64,
+        audit: &mut SurgeryEvalAudit,
     ) -> Result<Option<Vec<Option<NodeId>>>, SurgeryError> {
         // Build candidate bypassed circuit C' and S = ExcisedSubgraph(v, x).
         let Some((staged, old_to_new, excised_set)) =
@@ -1151,10 +1203,13 @@ impl EditableCircuit {
                 &staged,
                 &staged_compiled,
                 &staged_live_regs,
-                replay_node_evals,
+                audit,
             )
         {
             staged_live_regs = aligned;
+        }
+        if audit.budget_cap_hit {
+            return Ok(None);
         }
 
         let replay_ok = if let Some(init_regs) = replay_initial_regs {
@@ -1174,10 +1229,13 @@ impl EditableCircuit {
                     &staged,
                     &staged_compiled,
                     &staged_start_regs,
-                    replay_node_evals,
+                    audit,
                 )
             {
                 staged_start_regs = aligned;
+            }
+            if audit.budget_cap_hit {
+                return Ok(None);
             }
             verify_replay_and_comparators(
                 &self.circuit,
@@ -1190,12 +1248,12 @@ impl EditableCircuit {
                 comp_targets,
                 past_inputs,
                 past_predictions,
-                replay_node_evals,
+                audit,
             )
         } else {
             true
         };
-        if !replay_ok {
+        if !replay_ok || audit.budget_cap_hit {
             return Ok(None);
         }
 
@@ -1221,10 +1279,13 @@ impl EditableCircuit {
                         &staged,
                         &staged_compiled,
                         &regs,
-                        replay_node_evals,
+                        audit,
                     )
                 {
                     regs = aligned;
+                }
+                if audit.budget_cap_hit {
+                    return Ok(None);
                 }
                 regs
             } else {
@@ -1239,11 +1300,11 @@ impl EditableCircuit {
                 &joint_start_staged,
                 &old_to_new,
                 comp_targets,
-                replay_node_evals,
+                audit,
             )
         };
 
-        if !certified {
+        if !certified || audit.budget_cap_hit {
             return Ok(None);
         }
 
@@ -1265,9 +1326,19 @@ impl EditableCircuit {
         let mut direct_active = vec![false; node_count];
         let mut any_latch_active = vec![false; node_count];
         let sample_count = usize::from(EXACT_SENSITIVITY_MAX_BITS) * 2;
+        let est_sens = crate::structural::sensitivity::exact_wake_sensitivity_node_evals(
+            &self.circuit,
+            &self.compiled,
+            sample_count,
+            comp_targets,
+        );
 
         let mut accumulate =
             |state: &ScalarState, tick_block: u64, audit: &mut SurgeryEvalAudit| {
+                if !audit.can_afford(est_sens) {
+                    audit.budget_cap_hit = true;
+                    return;
+                }
                 if let Ok(snap) = counterfactual_sensitivity_with_comparators_audited(
                     &self.circuit,
                     &self.compiled,
@@ -1292,11 +1363,13 @@ impl EditableCircuit {
             };
 
         accumulate(&self.state, 0, audit);
-        if !past_inputs.is_empty() {
+        if !past_inputs.is_empty() && !audit.budget_cap_hit {
             let mut probe_state = self.state.clone();
             let mut pred_buf = vec![0u64; usize::from(self.circuit.num_outputs())];
             for (idx, frame) in past_inputs.iter().enumerate() {
-                audit.replay_node_evals = audit.replay_node_evals.saturating_add(node_count as u64);
+                if !audit.try_reserve_replay(node_count as u64) {
+                    break;
+                }
                 if probe_state
                     .step(&self.compiled, frame, &mut pred_buf)
                     .is_err()
@@ -1304,6 +1377,9 @@ impl EditableCircuit {
                     break;
                 }
                 accumulate(&probe_state, (idx + 1) as u64, audit);
+                if audit.budget_cap_hit {
+                    break;
+                }
             }
         }
 
@@ -2523,7 +2599,7 @@ fn detect_fixed_point_const_loops(
     circuit: &Circuit,
     compiled: &CompiledCircuit,
     state: &ScalarState,
-    replay_node_evals: &mut u64,
+    audit: &mut SurgeryEvalAudit,
 ) -> BTreeMap<NodeId, u64> {
     let mut result = BTreeMap::new();
     let node_count = circuit.node_count();
@@ -2568,7 +2644,9 @@ fn detect_fixed_point_const_loops(
     let mut zero_in_probe = state.clone();
     let zeros_in = vec![0u64; usize::from(compiled.num_inputs())];
     let mut dummy_out = vec![0u64; usize::from(compiled.num_outputs())];
-    *replay_node_evals = replay_node_evals.saturating_add(node_count as u64);
+    if !audit.try_reserve_replay(node_count as u64) {
+        return result;
+    }
     if zero_in_probe
         .step(compiled, &zeros_in, &mut dummy_out)
         .is_ok()
@@ -2954,7 +3032,7 @@ fn verify_replay_and_comparators(
     comp_targets: &[ComparatorTarget],
     past_inputs: &[Vec<u64>],
     past_predictions: &[Vec<u64>],
-    replay_node_evals: &mut u64,
+    audit: &mut SurgeryEvalAudit,
 ) -> bool {
     let mut staged_state = ScalarState::new(staged_compiled);
     if staged_state
@@ -2993,7 +3071,11 @@ fn verify_replay_and_comparators(
     let orig_nodes = orig_circuit.node_count() as u64;
     let staged_nodes = staged.node_count() as u64;
     for (frame_idx, input_frame) in past_inputs.iter().enumerate() {
-        *replay_node_evals = replay_node_evals.saturating_add(staged_nodes);
+        let step_evals =
+            staged_nodes.saturating_add(if orig_probe.is_some() { orig_nodes } else { 0 });
+        if !audit.try_reserve_replay(step_evals) {
+            return false;
+        }
         if staged_state
             .step(staged_compiled, input_frame, &mut staged_pred)
             .is_err()
@@ -3004,7 +3086,6 @@ fn verify_replay_and_comparators(
             return false;
         }
         if let Some(ref mut orig_st) = orig_probe {
-            *replay_node_evals = replay_node_evals.saturating_add(orig_nodes);
             if orig_st
                 .step(orig_compiled, input_frame, &mut orig_pred)
                 .is_err()
@@ -3031,7 +3112,7 @@ fn certify_bounded_joint_state_equivalence(
     staged_init_regs: &[u64],
     old_to_new: &[Option<NodeId>],
     comp_targets: &[ComparatorTarget],
-    replay_node_evals: &mut u64,
+    audit: &mut SurgeryEvalAudit,
 ) -> bool {
     let width = orig_circuit.width();
     let k = width.bits();
@@ -3110,8 +3191,9 @@ fn certify_bounded_joint_state_equivalence(
             {
                 return false;
             }
-            *replay_node_evals =
-                replay_node_evals.saturating_add(orig_nodes.saturating_add(staged_nodes));
+            if !audit.try_reserve_replay(orig_nodes.saturating_add(staged_nodes)) {
+                return false;
+            }
             if orig_state
                 .step(orig_compiled, &input_buf, &mut orig_out)
                 .is_err()
@@ -3183,7 +3265,7 @@ fn align_tph_autonomous_after_prune(
     staged: &Circuit,
     staged_compiled: &CompiledCircuit,
     remapped_regs: &[u64],
-    replay_node_evals: &mut u64,
+    audit: &mut SurgeryEvalAudit,
 ) -> Option<Vec<u64>> {
     if orig_circuit.wire_delay() != WireDelayMode::TicksPerHop {
         return None;
@@ -3199,7 +3281,9 @@ fn align_tph_autonomous_after_prune(
     let mut orig_seq = vec![Vec::with_capacity(64); num_outputs];
     let mut out_buf = vec![0u64; num_outputs];
     for _ in 0..64 {
-        *replay_node_evals = replay_node_evals.saturating_add(orig_nodes);
+        if !audit.try_reserve_replay(orig_nodes) {
+            return None;
+        }
         orig_state
             .step(orig_compiled, &zeros_in, &mut out_buf)
             .ok()?;
@@ -3253,7 +3337,9 @@ fn align_tph_autonomous_after_prune(
         check0.set_registers(staged_compiled, &final_regs).ok()?;
         let mut already_ok = true;
         for &exp in &orig_seq[p_idx] {
-            *replay_node_evals = replay_node_evals.saturating_add(staged_nodes);
+            if !audit.try_reserve_replay(staged_nodes) {
+                return None;
+            }
             check0.step(staged_compiled, &zeros_in, &mut out_buf).ok()?;
             if out_buf[p_idx] != exp {
                 already_ok = false;
@@ -3288,7 +3374,9 @@ fn align_tph_autonomous_after_prune(
         let mut out_history = Vec::with_capacity(192);
         for _ in 0..192 {
             reg_history.push(probe.registers().to_vec());
-            *replay_node_evals = replay_node_evals.saturating_add(staged_nodes);
+            if !audit.try_reserve_replay(staged_nodes) {
+                return None;
+            }
             probe.step(staged_compiled, &zeros_in, &mut out_buf).ok()?;
             out_history.push(out_buf[p_idx]);
         }

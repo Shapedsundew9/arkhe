@@ -6,6 +6,7 @@ use arkhe::env::{
     MultiViewTransform, NoiseModel, NoisyEnvironment,
 };
 use arkhe::rng::SeedBank;
+use arkhe::structural::learner::InjectionMode;
 use arkhe::structural::sleep::SleepSchedule;
 use arkhe::structural::{
     ArkheLearner, EconomyConfig, EditableCircuit, ExecutionPhase, FactBuffer, GrowthConfig,
@@ -15,6 +16,8 @@ use arkhe::structural::{
     verify_epistemic_mdl_conservation,
 };
 use arkhe::substrate::{Circuit, Primitive, SignalSink, SignalSource, Width, WireDelayMode};
+use arkhe::verify_m4a::planted::inject_pl1_short_cycle_alt;
+use arkhe::verify_m4a::tasks::{M4aRegime, M4aTaskKind, PlantedSpec, m4a0_task_registry};
 
 fn multi_view_periodic_generator() -> GeneratorConfig {
     GeneratorConfig::T2_MultiViewCoupled {
@@ -1341,42 +1344,36 @@ fn i6_sleep_zero_boundary_reward_and_frozen_wake_null_models_and_scorers() {
 
 #[test]
 fn r5a_sb_fact_adjudication_excises_wrong_primary_while_ties_default_to_dr40() {
-    // Subcase 1: Wrong primary (lag-3 Delay chain on period-6 motif `[0, 1, 2, 0, 1, 3]` at k=2) vs
-    // oracle-correct period-6 autonomous ring alt.
-    // On `[0, 1, 2, 0, 1, 3]`, lag-3 agrees on 4/6 = 66.7% (> p_null <= 33.3%, unconditionally grounded)
-    // and disagrees on 2/6 ticks, while the period-6 ring agrees with facts on 6/6 ticks.
+    // Subcase 1: Wrong primary (lag-1 Delay refutable under replay: `buffer_net_bits(primary) <= 0.0`)
+    // vs oracle-correct period-5 autonomous ring alt (`buffer_net_bits(alt) > 0.0`) after a regime shift
+    // on `[0, 0, 1, 1, 2, 2, 3, 3]` -> `[0, 0, 1, 2, 3]`.
     // In S-A, DR #40 charges alt + SUB + EQZ, so wrong primary is NOT excised.
-    // In S-B, R5(a) detects `primary_fact_disagreements > alt_fact_disagreements`, charges primary,
-    // starves it, and promotes alt via `excise_port_comparator(m, true)`!
+    // In S-B, R5(a) detects `buffer_net_bits(primary) <= 0.0 && buffer_net_bits(alt) > 0.0`,
+    // routes disagreement charges to primary, starves it, and promotes alt via `excise_port_comparator(m, true)`.
     let width = Width::BITS_2;
-    let motif = [0u64, 1, 2, 0, 1, 3];
+    let motif = [0u64, 0, 0, 1, 2];
     let econ = EconomyConfig {
         juvenile_ticks: 0,
         reserve_cap: ReserveCap::Uncapped,
         ..EconomyConfig::default()
     };
 
-    let build_period6_conflict = || {
+    let build_lag2_conflict = || {
         let mut circ = Circuit::new(width, 2, 2, WireDelayMode::Combinational);
         let d1 = circ.add_node(Primitive::Delay { init: 0 });
-        let d2 = circ.add_node(Primitive::Delay { init: 1 });
         circ.connect(
             SignalSource::BoundaryIn(0),
             SignalSink::NodeIn { node: d1, port: 0 },
         );
         circ.connect(
             SignalSource::NodeOut { node: d1, port: 0 },
-            SignalSink::NodeIn { node: d2, port: 0 },
-        );
-        circ.connect(
-            SignalSource::NodeOut { node: d2, port: 0 },
             SignalSink::BoundaryOut(0),
         );
 
-        let (_, _, ring_src) = build_autonomous_ring_source(&mut circ, 6, &motif);
-        let sp = splice_comparator_onto_port(&mut circ, 0, ring_src).expect("splice period-6 ring");
+        let (_, _, ring_src) = build_autonomous_ring_source(&mut circ, 5, &motif);
+        let sp = splice_comparator_onto_port(&mut circ, 0, ring_src).expect("splice period-5 ring");
 
-        // Tail Delay on port 1 AFTER the primary nodes so register index shifts on primary excision!
+        // Tail Delay on port 1 AFTER the primary node so register index shifts on primary excision!
         let d_tail = circ.add_node(Primitive::Delay { init: 0 });
         let tap_tail = tap_source(&mut circ, SignalSource::BoundaryIn(0));
         circ.connect(
@@ -1397,33 +1394,43 @@ fn r5a_sb_fact_adjudication_excises_wrong_primary_while_ties_default_to_dr40() {
         let mut ed = EditableCircuit::new(circ, econ).unwrap();
         ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 1, 0)
             .unwrap();
-        (ed, d1, d2, d_tail)
+        (ed, d1, d_tail)
     };
 
     let run_conflict_case = |schedule| {
-        let (ed, d1, d2, d_tail) = build_period6_conflict();
+        let (ed, d1, d_tail) = build_lag2_conflict();
         let mut learner = ArkheLearner::from_editable(
             ed,
             GrowthConfig {
                 sleep_schedule: schedule,
-                // Keep W_diag > 72 wake ticks so wake Step-A handoff / Step-B refutation
-                // does not swap or prune the primary before sleep entry.
-                diagnostic_window: 100,
+                // Keep W_diag = 200 > 185 wake ticks so wake Step-A/Step-B does not swap or prune
+                // before S-B R5(a) sleep adjudication runs (`FactBuffer` capacity = 200).
+                diagnostic_window: 200,
+                sprout_interval: 1_000_000,
+                redundancy_sprouting: false,
                 ..GrowthConfig::default()
             },
             SeedBank::new(31),
         )
         .unwrap();
-        let mut regs = learner.editable().state().registers().to_vec();
-        // Align d1=y(-2)=motif[4], d2=y(-3)=motif[3] so step 0 emits y(-3)=motif[3]=0=motif[0]!
-        regs[0] = motif[4];
-        regs[1] = motif[3];
-        learner.editable_mut().set_registers(&regs).unwrap();
-        learner.set_prev_observed_frame(&[motif[5], motif[5]]);
+        learner.set_prev_observed_frame(&[0, 0]);
 
         let mut b = TickBudget::new(10_000);
-        for t in 0..72usize {
-            let sym = motif[t % 6];
+        // Phase 1 (120 ticks = 24 * 5, aligned mod 5): lag-2 matches [0,1,0,1] / [2,3,2,3] (~97%)
+        // with balanced `[30, 30, 30, 30]` null counts to keep channel 0 strongly grounded across Phase 2.
+        for t in 0..120usize {
+            let sym = if t < 60 {
+                (t % 2) as u64
+            } else {
+                2 + (t % 2) as u64
+            };
+            let _ = learner.predict(&mut b);
+            let _ = learner.observe(&[sym, sym], &mut b);
+        }
+        // Phase 2 (67 ticks >= replay_ticks=64): FactBuffer captures pure `[0, 0, 0, 1, 2]`, where
+        // lag-2 scores 1/5 <= null (`buffer_net_bits <= 0`) while period-5 alt scores 5/5 (`> 0`).
+        for t in 120..187usize {
+            let sym = motif[t % motif.len()];
             let _ = learner.predict(&mut b);
             let _ = learner.observe(&[sym, sym], &mut b);
         }
@@ -1436,14 +1443,14 @@ fn r5a_sb_fact_adjudication_excises_wrong_primary_while_ties_default_to_dr40() {
             .iter_mut()
             .enumerate()
         {
-            if idx != d1.index() && idx != d2.index() {
+            if idx != d1.index() {
                 ne.energy = 200.0;
             }
         }
         learner
             .editable_mut()
             .economy_mut()
-            .node_mut(d2.index())
+            .node_mut(d1.index())
             .unwrap()
             .energy = 1.5;
         let _ = d_tail;
@@ -1451,25 +1458,25 @@ fn r5a_sb_fact_adjudication_excises_wrong_primary_while_ties_default_to_dr40() {
         (learner, seg)
     };
 
-    // In S-B, primary disagrees on facts (~24/72) while alt ring has 0 fact disagreements -> primary excised & alt promoted!
+    // In S-B, primary is fact-refuted (`buffer_net_bits <= 0`) while alt is fact-supported (`> 0`) -> primary excised & alt promoted!
     let (mut l_sb, seg_sb) = run_conflict_case(SleepSchedule::ConsistencyReplay);
     assert!(
         seg_sb.starvation_excisions >= 1,
         "S-B R5(a) must excise wrong primary: {seg_sb:?}"
     );
     assert_eq!(l_sb.active_comparator_count(), 0);
-    // Verify promoted alt predicts full 6-cycle `[0, 1, 0, 1, 0, 0]` with 0 errors!
+    // Verify promoted alt predicts full 5-cycle `[0, 0, 0, 1, 2]` with 0 errors!
     let mut b_check = TickBudget::new(1_000);
     let mut errs = 0usize;
-    for t in 0..12usize {
+    for t in 0..10usize {
         let p = l_sb.predict(&mut b_check);
-        let expected = motif[t % 6];
+        let expected = motif[(187 + t) % 5];
         if p[0] != expected {
             errs += 1;
         }
         let _ = l_sb.observe(&[expected, expected], &mut b_check);
     }
-    assert_eq!(errs, 0, "promoted alt must predict period-6 motif exactly");
+    assert_eq!(errs, 0, "promoted alt must predict period-5 motif exactly");
 
     // In S-A (same setup), primary cannot be excised by 2-route sleep (DR #40 charges alt+SUB+EQZ)!
     let (l_sa, seg_sa) = run_conflict_case(SleepSchedule::ConsistencyOnly);
@@ -1506,7 +1513,7 @@ fn r5a_sb_fact_adjudication_excises_wrong_primary_while_ties_default_to_dr40() {
         let sp = splice_comparator_onto_port(&mut circ, 0, alt_src).unwrap();
 
         let mut ed = EditableCircuit::new(circ, econ).unwrap();
-        ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 1 << 60, 1 << 61)
+        ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 0, 0)
             .unwrap();
         let mut learner = ArkheLearner::from_editable(
             ed,
@@ -1566,7 +1573,7 @@ fn r5b_sb_kt_match_test_pass_and_fail_voids_positive_flux_only_preserving_i4() {
         let (_, _, alt) = build_autonomous_ring_source(&mut circ, 4, &[0, 1, 0, 1]);
         let sp = splice_comparator_onto_port(&mut circ, 0, alt).unwrap();
         let mut ed = EditableCircuit::new(circ, econ).unwrap();
-        ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 1 << 60, 1 << 61)
+        ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 0, 0)
             .unwrap();
         let mut learner = ArkheLearner::from_editable(
             ed,
@@ -1629,9 +1636,9 @@ fn r5b_sb_kt_match_test_pass_and_fail_voids_positive_flux_only_preserving_i4() {
         assert!(port_cone_register_depth(&circ, 0) >= 1);
 
         let mut ed = EditableCircuit::new(circ, econ).unwrap();
-        ed.register_comparator(sp_agree.sub_node, sp_agree.eqz_node, 0, 1 << 60, 1 << 61)
+        ed.register_comparator(sp_agree.sub_node, sp_agree.eqz_node, 0, 0, 0)
             .unwrap();
-        ed.register_comparator(sp_dis.sub_node, sp_dis.eqz_node, 0, 1 << 60, 1 << 62)
+        ed.register_comparator(sp_dis.sub_node, sp_dis.eqz_node, 0, 0, 0)
             .unwrap();
         // Fund nodes generously so no excision blurs the flux breakdown check.
         for ne in ed.economy_mut().nodes_mut() {
@@ -1956,42 +1963,38 @@ fn i4_epistemic_mdl_conservation_across_multi_segment_wake_sleep_runs() {
     //     run_sleep_segment (R5(a) primary excision + alt promotion), and post-sleep wake.
     {
         let width = Width::BITS_2;
-        let motif = [0u64, 1, 2, 0, 1, 3];
+        let warm_motif = [0u64, 1, 0, 3, 2, 3, 2, 1];
+        let motif = [0u64, 0, 0, 1, 2];
         let mut circ = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
         let d1 = circ.add_node(Primitive::Delay { init: 0 });
-        let d2 = circ.add_node(Primitive::Delay { init: 1 });
         circ.connect(
             SignalSource::BoundaryIn(0),
             SignalSink::NodeIn { node: d1, port: 0 },
         );
         circ.connect(
             SignalSource::NodeOut { node: d1, port: 0 },
-            SignalSink::NodeIn { node: d2, port: 0 },
-        );
-        circ.connect(
-            SignalSource::NodeOut { node: d2, port: 0 },
             SignalSink::BoundaryOut(0),
         );
-        let (_, _, ring_src) = build_autonomous_ring_source(&mut circ, 6, &motif);
+        let (_, _, ring_src) = build_autonomous_ring_source(&mut circ, 5, &motif);
         let sp = splice_comparator_onto_port(&mut circ, 0, ring_src).unwrap();
         let mut ed = EditableCircuit::new(circ, econ_uncapped_juv0).unwrap();
         ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 1, 0)
             .unwrap();
         for (idx, ne) in ed.economy_mut().nodes_mut().iter_mut().enumerate() {
-            if idx != d1.index() && idx != d2.index() {
+            if idx != d1.index() {
                 ne.energy = 200.0;
             }
         }
-        // Start d2 low BEFORE enabling epistemic audit so zero manual energy edits happen post-audit.
-        ed.economy_mut().node_mut(d2.index()).unwrap().energy = 0.01;
+        // Start d1 low BEFORE enabling epistemic audit so zero manual energy edits happen post-audit.
+        ed.economy_mut().node_mut(d1.index()).unwrap().energy = 0.2;
 
         let mut learner = ArkheLearner::from_editable(
             ed,
             GrowthConfig {
                 sleep_schedule: SleepSchedule::ConsistencyReplay,
-                // Keep W_diag > 72 pre-sleep wake ticks so wake Step-A/Step-B does not swap/prune
-                // before S-B R5(a) sleep adjudication runs.
-                diagnostic_window: 100,
+                // Keep W_diag = 200 > 190 pre-sleep wake ticks so wake Step-A/Step-B does not swap/prune
+                // before S-B R5(a) sleep adjudication runs (`FactBuffer` capacity = 200).
+                diagnostic_window: 200,
                 sprout_interval: 1_000_000,
                 redundancy_sprouting: false,
                 ..GrowthConfig::default()
@@ -1999,26 +2002,29 @@ fn i4_epistemic_mdl_conservation_across_multi_segment_wake_sleep_runs() {
             SeedBank::new(71),
         )
         .unwrap();
-        let mut regs = learner.editable().state().registers().to_vec();
-        regs[0] = motif[4];
-        regs[1] = motif[3];
-        learner.editable_mut().set_registers(&regs).unwrap();
-        learner.set_prev_observed_frame(&[motif[5]]);
+        learner.set_prev_observed_frame(&[1]);
 
         learner.enable_epistemic_audit();
         let start_ticks = learner.compute_ledger().total_substrate_ticks();
         let mut budget = TickBudget::new(10_000);
 
-        // Phase 1: Pre-sleep wake (72 ticks).
-        for t in 0..72usize {
-            let sym = motif[t % 6];
+        // Phase 1 (125 ticks = 25 * 5, aligned mod 5): ~50% match, +30 total wake bits, keeps channel 0 grounded.
+        for t in 0..125usize {
+            let sym = warm_motif[t % warm_motif.len()];
+            let _ = learner.predict(&mut budget);
+            let _ = learner.observe(&[sym], &mut budget);
+        }
+        // Phase 2 (68 ticks >= replay_ticks=64): FactBuffer captures pure `[0, 0, 0, 1, 2]`, where
+        // primary is fact-refuted (`buffer_net_bits <= 0`) while period-5 alt is fact-supported (`> 0`).
+        for t in 125..193usize {
+            let sym = motif[t % motif.len()];
             let _ = learner.predict(&mut budget);
             let _ = learner.observe(&[sym], &mut budget);
         }
         assert!(learner.channel_is_grounded(0));
 
-        // Phase 2: S-B sleep segment -> R5(a) fact adjudication excises primary and promotes alt.
-        let seg = learner.run_sleep_segment(160);
+        // Phase 2b: S-B sleep segment -> R5(a) fact adjudication excises primary and promotes alt.
+        let seg = learner.run_sleep_segment(128);
         assert!(
             seg.starvation_excisions >= 1
                 && learner.sleep_telemetry().sleep_starvation_excisions >= 1,
@@ -2026,11 +2032,11 @@ fn i4_epistemic_mdl_conservation_across_multi_segment_wake_sleep_runs() {
         );
         assert_eq!(learner.active_comparator_count(), 0);
 
-        // Phase 3: Post-sleep wake (24 ticks) -> promoted alt predicts with 0 errors.
+        // Phase 3: Post-sleep wake (20 ticks) -> promoted alt predicts with 0 errors.
         let mut post_errs = 0usize;
-        for t in 0..24usize {
+        for t in 0..20usize {
             let pred = learner.predict(&mut budget);
-            let expected = motif[t % 6];
+            let expected = motif[(193 + t) % 5];
             if pred[0] != expected {
                 post_errs += 1;
             }
@@ -2038,7 +2044,7 @@ fn i4_epistemic_mdl_conservation_across_multi_segment_wake_sleep_runs() {
         }
         assert_eq!(
             post_errs, 0,
-            "promoted alt must predict period-6 motif exactly"
+            "promoted alt must predict period-5 motif exactly"
         );
 
         let elapsed_ticks = learner
@@ -2081,4 +2087,842 @@ fn i4_epistemic_mdl_conservation_across_multi_segment_wake_sleep_runs() {
         assert!(cons.flux_mdl_err_bits_per_symbol <= 1e-11);
         assert!(cons.energy_flux_err_bits_per_symbol <= 1e-11);
     }
+}
+
+#[test]
+fn r3_noisy_sleep_entry_recovers_consistent_window_and_suspends_missing_epoch() {
+    let width = Width::BITS_1;
+    let econ = EconomyConfig {
+        juvenile_ticks: 0,
+        reserve_cap: ReserveCap::Uncapped,
+        ..EconomyConfig::default()
+    };
+
+    // Subcase A: Last wake frame before sleep has an observation noise flip on a grounded reactive channel
+    // (two oracle-identical period-2 Delay views). R3 rewinds to the latest d_cone=1 prediction-consistent
+    // snapshot in FactBuffer, avoids phase-slip disagreements/wrongful excisions, accounts warmup evals, and
+    // restores the exact t_sleep wake registers on exit (I3).
+    {
+        let mut circ = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
+        let d_pri = circ.add_node(Primitive::Delay { init: 1 });
+        circ.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn {
+                node: d_pri,
+                port: 0,
+            },
+        );
+        circ.connect(
+            SignalSource::NodeOut {
+                node: d_pri,
+                port: 0,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        let d_alt = circ.add_node(Primitive::Delay { init: 1 });
+        let in_alt = tap_source(&mut circ, SignalSource::BoundaryIn(0));
+        circ.connect(
+            in_alt,
+            SignalSink::NodeIn {
+                node: d_alt,
+                port: 0,
+            },
+        );
+        let sp = splice_comparator_onto_port(
+            &mut circ,
+            0,
+            SignalSource::NodeOut {
+                node: d_alt,
+                port: 0,
+            },
+        )
+        .unwrap();
+        let mut ed = EditableCircuit::new(circ, econ).unwrap();
+        ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 1, 1)
+            .unwrap();
+        let mut learner = ArkheLearner::from_editable(
+            ed,
+            GrowthConfig {
+                sleep_schedule: SleepSchedule::ConsistencyOnly,
+                sprout_interval: 1_000_000,
+                redundancy_sprouting: false,
+                ..GrowthConfig::default()
+            },
+            SeedBank::new(501),
+        )
+        .unwrap();
+        // Clean alternating parity sequence [0, 1, 0, 1, ...] predicted identically by lag-1 Delay(init=1)
+        // except final wake frame t=31 flips observation `1 -> 0`.
+        let mut b = TickBudget::new(2_000);
+        learner.set_prev_observed_frame(&[1]);
+        for t in 0..31usize {
+            let sym = (t % 2) as u64;
+            let _ = learner.predict(&mut b);
+            let _ = learner.observe(&[sym], &mut b);
+        }
+        let _ = learner.predict(&mut b);
+        let _ = learner.observe(&[0], &mut b); // Noisy corruption right before sleep!
+        let pre_sleep_regs = learner.editable().state().registers().to_vec();
+        let pre_sleep_live_evals = learner.compute_ledger().live_step_node_evals;
+
+        let seg = learner.run_sleep_segment(64);
+        assert_eq!(seg.sleep_excisions, 0);
+        assert_eq!(seg.comparator_disagreement_ticks, 0);
+        assert_eq!(seg.entry_registers, pre_sleep_regs);
+        assert_eq!(
+            learner.editable().state().registers(),
+            pre_sleep_regs.as_slice()
+        );
+        assert_eq!(learner.prev_observed_frame(), &[0]);
+        assert!(
+            learner.compute_ledger().live_step_node_evals
+                > pre_sleep_live_evals + 64 * (learner.editable().circuit().node_count() as u64),
+            "R3 d_cone consistent-window warmup steps must be honestly accounted in live_step_node_evals"
+        );
+    }
+
+    // Subcase B: No d_cone-step consistent window exists in current structure_epoch of FactBuffer ->
+    // R3 suspends the comparator for the segment (SleepComparatorSuspendedUngrounded, I7) with 0 excisions and 0 flux.
+    {
+        let width2 = Width::BITS_2;
+        let mut circ = Circuit::new(width2, 1, 1, WireDelayMode::Combinational);
+        let d_pri = circ.add_node(Primitive::Delay { init: 0 });
+        circ.connect(
+            SignalSource::BoundaryIn(0),
+            SignalSink::NodeIn {
+                node: d_pri,
+                port: 0,
+            },
+        );
+        circ.connect(
+            SignalSource::NodeOut {
+                node: d_pri,
+                port: 0,
+            },
+            SignalSink::BoundaryOut(0),
+        );
+        let d_alt = circ.add_node(Primitive::Delay { init: 0 });
+        let in_alt = tap_source(&mut circ, SignalSource::BoundaryIn(0));
+        circ.connect(
+            in_alt,
+            SignalSink::NodeIn {
+                node: d_alt,
+                port: 0,
+            },
+        );
+        let sp = splice_comparator_onto_port(
+            &mut circ,
+            0,
+            SignalSource::NodeOut {
+                node: d_alt,
+                port: 0,
+            },
+        )
+        .unwrap();
+        let mut ed2 = EditableCircuit::new(circ, econ).unwrap();
+        ed2.register_comparator(sp.sub_node, sp.eqz_node, 0, 1, 1)
+            .unwrap();
+        let mut learner2 = ArkheLearner::from_editable(
+            ed2,
+            GrowthConfig {
+                sleep_schedule: SleepSchedule::ConsistencyOnly,
+                diagnostic_window: 32, // FactBuffer capacity = 32
+                sprout_interval: 1_000_000,
+                redundancy_sprouting: false,
+                ..GrowthConfig::default()
+            },
+            SeedBank::new(503),
+        )
+        .unwrap();
+        let mut b2 = TickBudget::new(2_000);
+        // First 96 ticks lag-2 predictable (`[0,1,0,1]` / `[2,3,2,3]`): balanced null (~0.25) and q_hat > 0.70!
+        for t in 0..96usize {
+            let sym = if t < 48 {
+                (t % 2) as u64
+            } else {
+                2 + (t % 2) as u64
+            };
+            let _ = learner2.predict(&mut b2);
+            let _ = learner2.observe(&[sym], &mut b2);
+        }
+        // Next 32 ticks (= FactBuffer full capacity) follow `[1, 2, 3, 0]` mod 4: lag-2 misses 32/32 frames (`consistent_mask = 0`)!
+        learner2.set_prev_observed_frame(&[0]);
+        for t in 0..32usize {
+            let _ = learner2.predict(&mut b2);
+            let _ = learner2.observe(&[((t + 1) % 4) as u64], &mut b2);
+        }
+        assert!(learner2.channel_is_grounded(0));
+
+        let pre_flux = learner2.cumulative_comparator_flux();
+        let seg = learner2.run_sleep_segment(32);
+        assert_eq!(seg.suspended_comparator_ticks, 32);
+        assert!(
+            learner2
+                .sleep_telemetry()
+                .sleep_comparator_suspended_ungrounded
+                >= 32
+        );
+        assert_eq!(seg.sleep_excisions, 0);
+        assert_eq!(
+            learner2.cumulative_comparator_flux().to_bits(),
+            pre_flux.to_bits()
+        );
+    }
+}
+
+#[test]
+fn r5a_solvency_guard_never_excises_fact_supported_primary_on_4_of_6() {
+    // DR #50 R5(a) + Addendum #2 (3b-ii) Solvency Guard: when both primary and alt clear
+    // `buffer_net_bits > 0` on a noisy stream and `alt`'s marginal count edge is within KT
+    // noise (`two_sample_kt_match_test.passed`), S-B must NEVER excise the primary.
+    let width = Width::BITS_2;
+    let motif = [0u64, 1, 2, 0, 1, 3];
+    let econ = EconomyConfig {
+        juvenile_ticks: 0,
+        reserve_cap: ReserveCap::Uncapped,
+        ..EconomyConfig::default()
+    };
+    let mut circ = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
+    let d1 = circ.add_node(Primitive::Delay { init: 0 });
+    let d2 = circ.add_node(Primitive::Delay { init: 1 });
+    circ.connect(
+        SignalSource::BoundaryIn(0),
+        SignalSink::NodeIn { node: d1, port: 0 },
+    );
+    circ.connect(
+        SignalSource::NodeOut { node: d1, port: 0 },
+        SignalSink::NodeIn { node: d2, port: 0 },
+    );
+    circ.connect(
+        SignalSource::NodeOut { node: d2, port: 0 },
+        SignalSink::BoundaryOut(0),
+    );
+    let (_, _, ring_src) = build_autonomous_ring_source(&mut circ, 6, &motif);
+    let sp = splice_comparator_onto_port(&mut circ, 0, ring_src).unwrap();
+    let mut ed = EditableCircuit::new(circ, econ).unwrap();
+    ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 1, 0)
+        .unwrap();
+    for ne in ed.economy_mut().nodes_mut() {
+        ne.energy = 200.0;
+    }
+    let mut learner = ArkheLearner::from_editable(
+        ed,
+        GrowthConfig {
+            sleep_schedule: SleepSchedule::ConsistencyReplay,
+            diagnostic_window: 100,
+            sprout_interval: 1_000_000,
+            redundancy_sprouting: false,
+            ..GrowthConfig::default()
+        },
+        SeedBank::new(504),
+    )
+    .unwrap();
+    let mut regs = learner.editable().state().registers().to_vec();
+    regs[0] = motif[4];
+    regs[1] = motif[3];
+    learner.editable_mut().set_registers(&regs).unwrap();
+    learner.set_prev_observed_frame(&[motif[5]]);
+    let mut b = TickBudget::new(10_000);
+    // Inject deterministic exogenous noise so alt (~28/36) only barely leads lag-3 pri (~25/36)
+    // within `two_sample_kt_match_test` noise while keeping both strongly fact-supported (> 0.25).
+    for t in 0..72usize {
+        let mut sym = motif[t % 6];
+        if t % 6 == 5 && (t / 6) % 2 == 1 {
+            sym = 2; // matches lag-3 pri instead of alt on half the phase-5 ticks
+        } else if t % 6 == 4 && (t / 6) % 3 == 0 {
+            sym = 0; // exogenous flip hurting both on 1/3 of phase-4 ticks
+        }
+        let _ = learner.predict(&mut b);
+        let _ = learner.observe(&[sym], &mut b);
+    }
+    learner
+        .editable_mut()
+        .economy_mut()
+        .node_mut(d2.index())
+        .unwrap()
+        .energy = 0.01;
+    let pre_nodes = learner.editable().circuit().node_count();
+    assert_eq!(pre_nodes, 12);
+    let seg = learner.run_sleep_segment(72);
+    assert!(
+        seg.composed_old_to_new[d1.index()].is_some()
+            && seg.composed_old_to_new[d2.index()].is_some(),
+        "R5(a) solvency guard must never excise fact-supported primary on noisy count edge: {seg:?}, pre_nodes={pre_nodes}"
+    );
+}
+
+#[test]
+fn r5c_k2_five_sixths_spurious_ring_refuted_and_excised_in_sa_and_sb_with_i4() {
+    // DR #50 R5(c): On Width::BITS_2 (`p_null = 0.25`), a PL1:k2 period-3 ring matching `[0, 1, 2, 0, 1, 3]`
+    // on 5/6 ticks previously accumulated net positive DR #40 sleep flux. With per-comparator escrow &
+    // deterministic loopback refutation voiding (`segment_loopback_disagreements > 0`), both S-A and S-B
+    // void positive agreement flux, charge disagreement, starve, and excise the spurious ring cleanly under I4!
+    let width = Width::BITS_2;
+    let motif = [0u64, 1, 2, 0, 1, 3];
+    let short_motif = [0u64, 1, 2];
+    let econ = EconomyConfig {
+        juvenile_ticks: 0,
+        reserve_cap: ReserveCap::Uncapped,
+        ..EconomyConfig::default()
+    };
+
+    for schedule in [
+        SleepSchedule::ConsistencyOnly,
+        SleepSchedule::ConsistencyReplay,
+    ] {
+        let mut circ = Circuit::new(width, 1, 1, WireDelayMode::Combinational);
+        let (_, _, pri_src) = build_autonomous_ring_source(&mut circ, 6, &motif);
+        circ.connect(pri_src, SignalSink::BoundaryOut(0));
+        let (_, _, alt_src) = build_autonomous_ring_source(&mut circ, 3, &short_motif);
+        let sp = splice_comparator_onto_port(&mut circ, 0, alt_src).unwrap();
+
+        let mut ed = EditableCircuit::new(circ, econ).unwrap();
+        ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 0, 0)
+            .unwrap();
+        for ne in ed.economy_mut().nodes_mut() {
+            ne.energy = 200.0;
+        }
+        ed.economy_mut()
+            .node_mut(sp.sub_node.index())
+            .unwrap()
+            .energy = 0.2;
+        ed.economy_mut()
+            .node_mut(sp.eqz_node.index())
+            .unwrap()
+            .energy = 0.2;
+
+        let mut learner = ArkheLearner::from_editable(
+            ed,
+            GrowthConfig {
+                sleep_schedule: schedule,
+                diagnostic_window: 64,
+                sprout_interval: 1_000_000,
+                redundancy_sprouting: false,
+                ..GrowthConfig::default()
+            },
+            SeedBank::new(505),
+        )
+        .unwrap();
+        learner.enable_epistemic_audit();
+        let start_ticks = learner.compute_ledger().total_substrate_ticks();
+        let mut b = TickBudget::new(10_000);
+        for t in 0..64usize {
+            let _ = learner.predict(&mut b);
+            let _ = learner.observe(&[motif[t % 6]], &mut b);
+        }
+        assert!(learner.channel_is_grounded(0));
+
+        let seg = learner.run_sleep_segment(128);
+        assert!(
+            seg.sleep_excisions >= 1,
+            "{schedule:?}: R5(c) must excise k=2 5/6-matching spurious PL1 ring: {seg:?}"
+        );
+        assert_eq!(learner.active_comparator_count(), 0);
+        assert!(
+            seg.voided_agreement_flux_bits > 0.0,
+            "{schedule:?}: positive agreement flux on refuted PL1:k2 comparator must be voided: {seg:?}"
+        );
+
+        let mut post_errs = 0usize;
+        for t in 0..12usize {
+            let pred = learner.predict(&mut b);
+            let expected = motif[(64 + t) % 6];
+            if pred[0] != expected {
+                post_errs += 1;
+            }
+            let _ = learner.observe(&[expected], &mut b);
+        }
+        assert_eq!(post_errs, 0, "{schedule:?}: primary must remain intact");
+
+        let elapsed = learner
+            .compute_ledger()
+            .total_substrate_ticks()
+            .saturating_sub(start_ticks);
+        let audit = learner.take_epistemic_audit().unwrap();
+        let cons = verify_epistemic_mdl_conservation(&audit, &learner, elapsed);
+        assert!(
+            cons.flux_mdl_err_bits_per_symbol <= 1e-11,
+            "{schedule:?} I4 flux_mdl_err={}",
+            cons.flux_mdl_err_bits_per_symbol
+        );
+        assert!(
+            cons.energy_flux_err_bits_per_symbol <= 1e-11,
+            "{schedule:?} I4 energy_flux_err={}",
+            cons.energy_flux_err_bits_per_symbol
+        );
+    }
+}
+
+#[test]
+fn r2_wake_envelope_cap_bounds_sleep_episode_node_evals_under_i4() {
+    let tasks = m4a0_task_registry();
+    let task = tasks
+        .iter()
+        .find(|t| {
+            t.kind == M4aTaskKind::SpPeriod6LagRedundancy
+                && t.width == Width::BITS_2
+                && t.regime == M4aRegime::Noisy
+        })
+        .expect("SP:Period6_LagRedundancy:k2:noisy task exists");
+    let sb = SeedBank::new(506);
+
+    let mut env_wake = task.build_environment(sb).unwrap();
+    let channels = env_wake.generator().channels();
+    let mut learner_wake = ArkheLearner::new_with_config(
+        task.width,
+        channels,
+        task.wire_delay,
+        EconomyConfig::default(),
+        GrowthConfig {
+            sleep_schedule: SleepSchedule::None,
+            ..GrowthConfig::default()
+        },
+        sb,
+    )
+    .unwrap();
+    let rep_wake = learner_wake.run_wake_sleep_episode(&mut env_wake, 1_536, 64, 153_600);
+    let wake_evals = rep_wake.compute_ledger.total_node_evals();
+    assert!(wake_evals > 0);
+
+    for schedule in [
+        SleepSchedule::ConsistencyOnly,
+        SleepSchedule::ConsistencyReplay,
+    ] {
+        let mut env_sleep = task.build_environment(sb).unwrap();
+        let mut learner_sleep = ArkheLearner::new_with_config(
+            task.width,
+            channels,
+            task.wire_delay,
+            EconomyConfig::default(),
+            GrowthConfig {
+                sleep_schedule: schedule,
+                ..GrowthConfig::default()
+            },
+            sb,
+        )
+        .unwrap();
+        let rep_sleep = learner_sleep.run_wake_sleep_episode_with_cap(
+            &mut env_sleep,
+            1_536,
+            64,
+            153_600,
+            Some(wake_evals),
+        );
+        assert_eq!(
+            rep_sleep.compute_ledger.total_substrate_ticks(),
+            rep_wake.compute_ledger.total_substrate_ticks()
+        );
+        assert!(
+            rep_sleep.compute_ledger.total_node_evals() <= wake_evals,
+            "{schedule:?}: sleep_evals={} exceeded wake_evals={wake_evals}",
+            rep_sleep.compute_ledger.total_node_evals()
+        );
+    }
+}
+
+#[test]
+fn r5c_pl1_k2_sb_retroactive_debit_and_persistence_excise_within_envelope() {
+    let tasks = m4a0_task_registry();
+    let task = tasks
+        .iter()
+        .find(|t| {
+            t.kind == M4aTaskKind::Pl1ShortCycle
+                && t.width == Width::BITS_2
+                && t.regime == M4aRegime::Clean
+        })
+        .unwrap();
+    let oracle = task.make_oracle().unwrap();
+    let spec = task.to_clean_finite_state_spec().unwrap();
+    let PlantedSpec::Pl1 { short_motif } = task.planted.as_ref().unwrap() else {
+        unreachable!();
+    };
+
+    let build_settled_injected = |schedule: SleepSchedule| {
+        let mut env = task.build_environment(SeedBank::new(0)).unwrap();
+        let mut learner = ArkheLearner::new_with_config(
+            Width::BITS_2,
+            1,
+            WireDelayMode::Combinational,
+            EconomyConfig::default(),
+            GrowthConfig {
+                sleep_schedule: schedule,
+                ..GrowthConfig::default()
+            },
+            SeedBank::new(0),
+        )
+        .unwrap();
+        let mut budget = TickBudget::new(200_000);
+        let mut clean = vec![0u64; 1];
+        let mut obs = vec![0u64; 1];
+        let mut settled = false;
+        for _ in 0..2_000 {
+            let _ = learner.predict(&mut budget);
+            env.step_frame(&mut clean, &mut obs);
+            let _ = learner.observe(&obs, &mut budget);
+            if learner.active_comparator_count() == 0
+                && arkhe::verify_m4a::oracle::label_learner_oracle(&learner, &spec, &oracle)
+                    .oracle_correct_ports[0]
+            {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "PL1 k=2 primary failed to settle cleanly");
+        let phase_tick = learner.tick();
+        inject_pl1_short_cycle_alt(
+            &mut learner,
+            0,
+            short_motif,
+            phase_tick,
+            InjectionMode::Established,
+        )
+        .unwrap();
+        (learner, env)
+    };
+
+    let (mut learner_wake, mut env_wake) = build_settled_injected(SleepSchedule::None);
+    let wake_start_evals = learner_wake.compute_ledger().total_node_evals();
+    let _rep_wake =
+        run_wake_sleep_episode(&mut learner_wake, &mut env_wake, task.horizon, 64, 200_000);
+    let wake_episode_evals = learner_wake.compute_ledger().total_node_evals() - wake_start_evals;
+
+    let (mut learner_sb, mut env_sb) = build_settled_injected(SleepSchedule::ConsistencyReplay);
+    learner_sb.enable_epistemic_audit();
+    let start_ticks = learner_sb.compute_ledger().total_substrate_ticks();
+    let sb_start_evals = learner_sb.compute_ledger().total_node_evals();
+    let rep_sb = learner_sb.run_wake_sleep_episode_with_cap(
+        &mut env_sb,
+        task.horizon,
+        64,
+        200_000,
+        Some(wake_episode_evals),
+    );
+    let audit = learner_sb.take_epistemic_audit().unwrap();
+    let cons = verify_epistemic_mdl_conservation(&audit, &learner_sb, start_ticks);
+    assert!(
+        cons.flux_mdl_err_bits_per_symbol <= 1e-11,
+        "I4 err too high: {:?}",
+        cons
+    );
+    let sb_episode_evals = rep_sb.compute_ledger.total_node_evals() - sb_start_evals;
+    assert!(
+        sb_episode_evals <= wake_episode_evals,
+        "R2 overrun: sb_episode_evals={sb_episode_evals} > wake_episode_evals={wake_episode_evals}"
+    );
+    assert_eq!(
+        learner_sb.active_comparator_count(),
+        0,
+        "PL1 k=2 spurious comparator must be excised in S-B within wake envelope"
+    );
+}
+
+#[test]
+fn r4_cross_channel_homogeneity_and_closed_loop_delay_suspends_imperfect_driver() {
+    let p6_motif = [0u64, 1, 0, 1, 0, 0];
+    let bad_5_6 = [0u64, 1, 0, 1, 0, 1];
+    let run_case = |port1_sequence: &[u64; 6]| {
+        let mut c = Circuit::new(Width::BITS_1, 2, 2, WireDelayMode::Combinational);
+        let (_, _, pri0) = build_autonomous_ring_source(&mut c, 6, &p6_motif);
+        c.connect(pri0, SignalSink::BoundaryOut(0));
+        let (_, _, pri1) = build_autonomous_ring_source(&mut c, 6, port1_sequence);
+        c.connect(pri1, SignalSink::BoundaryOut(1));
+
+        // 5 explicit delays on BoundaryIn(1) plus 1-frame prev_observed_frame lag = phase shift 6 = 0 mod 6.
+        let mut prev_src = tap_source(&mut c, SignalSource::BoundaryIn(1));
+        for _ in 0..5 {
+            let d = c.add_node(Primitive::Delay { init: 0 });
+            c.connect(prev_src, SignalSink::NodeIn { node: d, port: 0 });
+            prev_src = SignalSource::NodeOut { node: d, port: 0 };
+        }
+        let sp = splice_comparator_onto_port(&mut c, 0, prev_src).expect("splice cross comparator");
+
+        let econ = EconomyConfig {
+            juvenile_ticks: 0,
+            reserve_cap: ReserveCap::Uncapped,
+            ..EconomyConfig::default()
+        };
+        let mut ed = EditableCircuit::new(c, econ).unwrap();
+        ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 0, 0b10)
+            .unwrap();
+        for ne in ed.economy_mut().nodes_mut() {
+            ne.energy = 100.0;
+        }
+        let growth = GrowthConfig {
+            sleep_schedule: SleepSchedule::ConsistencyOnly,
+            diagnostic_window: 32,
+            min_match_gain: 4,
+            sprout_interval: 1_000_000,
+            redundancy_sprouting: false,
+            ..GrowthConfig::default()
+        };
+        let mut learner = ArkheLearner::from_editable(ed, growth, SeedBank::new(71)).unwrap();
+        let mut budget = TickBudget::new(50_000);
+        // Run 59 wake ticks ending at phase 4 mod 6 (trailing 5 clean ticks, mismatch every 6th tick on port 1).
+        for t in 0..59usize {
+            let _ = learner.predict(&mut budget);
+            let y0 = p6_motif[t % 6];
+            let _ = learner.observe(&[y0, y0], &mut budget);
+        }
+        learner.run_sleep_segment(16)
+    };
+
+    let rep_bad = run_case(&bad_5_6);
+    assert_eq!(
+        rep_bad.suspended_comparator_ticks, 16,
+        "imperfect external 5/6 driver must suspend cross-channel comparator via DR #50 (2a)+(2b): {rep_bad:?}"
+    );
+    assert!((rep_bad.sleep_comparator_flux).abs() <= 1e-12);
+    assert_eq!(rep_bad.sleep_excisions, 0);
+
+    let rep_good = run_case(&p6_motif);
+    assert_eq!(
+        rep_good.suspended_comparator_ticks, 0,
+        "exact Period-6 external driver should run un-suspended in loopback: {rep_good:?}"
+    );
+}
+
+#[test]
+fn reference_primary_immunity_protects_primary_cone_when_wrong_alt_starves() {
+    let p4_pri = [0u64, 1, 2, 3];
+    let p4_wrong_alt = [0u64, 1, 2, 0];
+    for schedule in [
+        SleepSchedule::ConsistencyOnly,
+        SleepSchedule::ConsistencyReplay,
+    ] {
+        let mut c = Circuit::new(Width::BITS_2, 1, 1, WireDelayMode::Combinational);
+        let (pri_nodes, _, pri_src) = build_autonomous_ring_source(&mut c, 4, &p4_pri);
+        c.connect(pri_src, SignalSink::BoundaryOut(0));
+        let (_, _, alt_src) = build_autonomous_ring_source(&mut c, 4, &p4_wrong_alt);
+        let sp = splice_comparator_onto_port(&mut c, 0, alt_src).expect("splice 3/4 alt");
+
+        let econ = EconomyConfig {
+            juvenile_ticks: 0,
+            initial_energy: 1.5,
+            reserve_cap: ReserveCap::Fixed(1.5),
+            ..EconomyConfig::default()
+        };
+        let mut ed = EditableCircuit::new(c, econ).unwrap();
+        ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 0, 0)
+            .unwrap();
+        let growth = GrowthConfig {
+            sleep_schedule: schedule,
+            diagnostic_window: 32,
+            min_match_gain: 4,
+            sprout_interval: 1_000_000,
+            redundancy_sprouting: false,
+            ..GrowthConfig::default()
+        };
+        let mut learner = ArkheLearner::from_editable(ed, growth, SeedBank::new(88)).unwrap();
+        let mut budget = TickBudget::new(50_000);
+        // Primary matches 4/4 and alt matches 3/4 (> 0.25 null so q_hat > p -> negative flux on disagreement).
+        for t in 0..32usize {
+            let _ = learner.predict(&mut budget);
+            let _ = learner.observe(&[p4_pri[t % 4]], &mut budget);
+        }
+        let pre_pri_min = pri_nodes
+            .iter()
+            .map(|n| learner.editable().economy().nodes()[n.index()].energy)
+            .fold(f64::INFINITY, f64::min);
+        let rep = learner.run_sleep_segment(128);
+        if learner.active_comparator_count() == 1 {
+            let post_pri_min = pri_nodes
+                .iter()
+                .map(|n| learner.editable().economy().nodes()[n.index()].energy)
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                post_pri_min >= pre_pri_min - 1e-12,
+                "reference primary energy dropped during disagreement in {schedule:?}: pre={pre_pri_min}, post={post_pri_min}"
+            );
+        }
+        assert!(
+            rep.sleep_comparator_flux < -1e-6,
+            "alt disagreement with q_hat > p must emit negative comparator flux in {schedule:?}: {rep:?}"
+        );
+        assert_eq!(
+            learner.active_comparator_count(),
+            0,
+            "wrong 3/4 alt must be starved and excised cleanly while keeping exact primary in {schedule:?}: {rep:?}"
+        );
+        for pri_node in &pri_nodes {
+            assert!(
+                rep.composed_old_to_new[pri_node.index()].is_some(),
+                "primary cone node {pri_node:?} must remain completely unexcised in {schedule:?}"
+            );
+        }
+        // Verify preserved primary predicts exact `[0, 1, 2, 3]` cycle cleanly.
+        for t in 0..8usize {
+            let pred = learner.predict(&mut budget);
+            let exp = p4_pri[(32 + t) % 4];
+            assert_eq!(
+                pred,
+                vec![exp],
+                "primary prediction corrupted at offset {t}"
+            );
+            let _ = learner.observe(&[exp], &mut budget);
+        }
+    }
+}
+
+#[test]
+fn r5a_two_sample_kt_and_r3_lone_2_route_handle_k2_five_sixths_primary() {
+    let p6_motif = [0u64, 1, 2, 3, 1, 0];
+    let bad_5_6 = [0u64, 1, 2, 3, 1, 2];
+    let build_learner = |schedule: SleepSchedule, pri_energy: f64| {
+        let mut c = Circuit::new(Width::BITS_2, 2, 2, WireDelayMode::Combinational);
+        let (_, _, pri0) = build_autonomous_ring_source(&mut c, 6, &bad_5_6);
+        c.connect(pri0, SignalSink::BoundaryOut(0));
+        let (_, _, pri1) = build_autonomous_ring_source(&mut c, 6, &p6_motif);
+        c.connect(pri1, SignalSink::BoundaryOut(1));
+
+        // 5 explicit delays on BoundaryIn(1) + 1-frame prev_observed_frame lag = phase 6 = 0 mod 6.
+        let mut prev_src = tap_source(&mut c, SignalSource::BoundaryIn(1));
+        for _ in 0..5 {
+            let d = c.add_node(Primitive::Delay { init: 0 });
+            c.connect(prev_src, SignalSink::NodeIn { node: d, port: 0 });
+            prev_src = SignalSource::NodeOut { node: d, port: 0 };
+        }
+        let sp = splice_comparator_onto_port(&mut c, 0, prev_src).expect("splice cross comparator");
+        let econ = EconomyConfig {
+            juvenile_ticks: 0,
+            initial_energy: pri_energy,
+            reserve_cap: ReserveCap::Fixed(pri_energy),
+            ..EconomyConfig::default()
+        };
+        let mut ed = EditableCircuit::new(c, econ).unwrap();
+        ed.register_comparator(sp.sub_node, sp.eqz_node, 0, 0, 0b10)
+            .unwrap();
+        let growth = GrowthConfig {
+            sleep_schedule: schedule,
+            diagnostic_window: 32,
+            min_match_gain: 4,
+            sprout_interval: 1_000_000,
+            redundancy_sprouting: false,
+            ..GrowthConfig::default()
+        };
+        ArkheLearner::from_editable(ed, growth, SeedBank::new(91)).unwrap()
+    };
+
+    // S-A: lone 2-route external driver checks full closed_loop_delay_count + 1 = 7 ticks -> suspends bad 5/6 primary.
+    let mut learner_sa = build_learner(SleepSchedule::ConsistencyOnly, 100.0);
+    let mut budget_sa = TickBudget::new(50_000);
+    for t in 0..59usize {
+        let _ = learner_sa.predict(&mut budget_sa);
+        let y = p6_motif[t % 6];
+        let _ = learner_sa.observe(&[y, y], &mut budget_sa);
+    }
+    let rep_sa = learner_sa.run_sleep_segment(16);
+    assert_eq!(
+        rep_sa.suspended_comparator_ticks, 16,
+        "S-A lone 2-route R3 check must catch 5/6 ring over 7-tick closed-loop depth and suspend: {rep_sa:?}"
+    );
+    assert_eq!(rep_sa.sleep_excisions, 0);
+
+    // S-B: even with k=2 where 5/6 beats uniform 0.25 null (buffer_net_bits_primary > 0),
+    // R5(a) alt exoneration protects both oracle-correct alt and fact-supported primary via loopback suspension.
+    let mut learner_sb = build_learner(SleepSchedule::ConsistencyReplay, 1.5);
+    let mut budget_sb = TickBudget::new(200_000);
+    for t in 0..64usize {
+        let _ = learner_sb.predict(&mut budget_sb);
+        let y = p6_motif[t % 6];
+        let _ = learner_sb.observe(&[y, y], &mut budget_sb);
+    }
+    let rep_sb = learner_sb.run_sleep_segment(64);
+    assert_eq!(
+        rep_sb.suspended_comparator_ticks, rep_sb.loopback_ticks,
+        "S-B R5(a) alt exoneration must suspend loopback when 6/6 alt beats null-supported 5/6 primary: {rep_sb:?}"
+    );
+    assert_eq!(rep_sb.sleep_excisions, 0);
+    assert!((rep_sb.sleep_comparator_flux).abs() <= 1e-12);
+    assert_eq!(
+        learner_sb.active_comparator_count(),
+        1,
+        "S-B R5(a) must protect oracle-correct alt from wrongful excision: {rep_sb:?}"
+    );
+}
+
+#[test]
+fn r4_transitive_closed_loop_ungrounded_suspends_sa_and_sb_loopback() {
+    // CT2 topology: ch0 is ungrounded noise/LFSR, while BoundaryOut(1) = Delay(BoundaryIn(0)) grounds ch1.
+    // Even if a comparator on port 1 only lists ch1 in its mask, transitive closed-loop closure reaches
+    // ungrounded ch0 and must suspend loopback in both S-A and S-B.
+    let mut c = Circuit::new(Width::BITS_1, 2, 2, WireDelayMode::Combinational);
+    let d1 = c.add_node(Primitive::Delay { init: 0 });
+    c.connect(
+        SignalSource::BoundaryIn(0),
+        SignalSink::NodeIn { node: d1, port: 0 },
+    );
+    c.connect(
+        SignalSource::NodeOut { node: d1, port: 0 },
+        SignalSink::BoundaryOut(1),
+    );
+    let alt1 = c.add_node(Primitive::Delay { init: 0 });
+    c.connect(
+        SignalSource::BoundaryIn(1),
+        SignalSink::NodeIn {
+            node: alt1,
+            port: 0,
+        },
+    );
+    let sp = splice_comparator_onto_port(
+        &mut c,
+        1,
+        SignalSource::NodeOut {
+            node: alt1,
+            port: 0,
+        },
+    )
+    .expect("splice CT2 comparator on port 1");
+
+    let build_ct2 = |schedule: SleepSchedule| {
+        let econ = EconomyConfig {
+            juvenile_ticks: 0,
+            ..EconomyConfig::default()
+        };
+        let mut ed = EditableCircuit::new(c.clone(), econ).unwrap();
+        // Deliberately register port 1 comparator with shallow mask `0b10` (`ch1` only) to verify transitive closure catches `ch0` via BoundaryOut(1).
+        ed.register_comparator(sp.sub_node, sp.eqz_node, 1, 0b10, 0b10)
+            .unwrap();
+        let growth = GrowthConfig {
+            sleep_schedule: schedule,
+            diagnostic_window: 32,
+            min_match_gain: 4,
+            sprout_interval: 1_000_000,
+            redundancy_sprouting: false,
+            ..GrowthConfig::default()
+        };
+        let mut learner = ArkheLearner::from_editable(ed, growth, SeedBank::new(97)).unwrap();
+        let mut budget = TickBudget::new(50_000);
+        // Feed deterministic pseudo-random non-constant ch0 (port 0 ungrounded constant-0 primary misses),
+        // while ch1(t) = ch0(t-2) is predicted accurately by d1 on port 1 (ch1 grounds, ch0 does not).
+        let mut lfsr = 0b10111u64;
+        let mut prev1_x0 = 0u64;
+        let mut prev2_x0 = 0u64;
+        for _ in 0..48usize {
+            let _ = learner.predict(&mut budget);
+            let x0 = lfsr & 1;
+            let bit = (lfsr ^ (lfsr >> 2)) & 1;
+            lfsr = (lfsr >> 1) | (bit << 4);
+            let x1 = prev2_x0;
+            prev2_x0 = prev1_x0;
+            prev1_x0 = x0;
+            let _ = learner.observe(&[x0, x1], &mut budget);
+        }
+        assert!(!learner.channel_is_grounded(0));
+        assert!(learner.channel_is_grounded(1));
+        learner
+    };
+
+    let mut sa = build_ct2(SleepSchedule::ConsistencyOnly);
+    assert!(
+        !sa.has_scoreable_comparator_for_sleep(),
+        "S-A must treat transitive ungrounded CT2 closed-loop comparator as non-scoreable"
+    );
+    let rep_sa = sa.run_sleep_segment(16);
+    assert_eq!(rep_sa.suspended_comparator_ticks, 16);
+    assert_eq!(rep_sa.sleep_excisions, 0);
+
+    let mut sb = build_ct2(SleepSchedule::ConsistencyReplay);
+    let rep_sb = sb.run_sleep_segment(16);
+    assert_eq!(rep_sb.suspended_comparator_ticks, rep_sb.loopback_ticks);
+    assert_eq!(rep_sb.sleep_excisions, 0);
 }

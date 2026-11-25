@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use crate::baselines::{ObservationWindow, PredictorBaseline, TickBudget};
 use crate::config::ArkheM1Telemetry;
 use crate::env::{FiniteStateGenerator, NoisyEnvironment};
+use crate::metrics::PointForecastScorer;
 use crate::metrics::circuit_code_bits_with_tax;
 use crate::metrics::facts_code_bits;
 use crate::rng::SeedBank;
 use crate::structural::economy::{
     ComparatorSite, EconomyConfig, EconomyState, EconomyTick, ExecutionPhase,
+    score_with_reward_mode,
 };
 use crate::structural::graph_edit::{
     advance_tph_autonomous_ring_phase, comparator_exclusive_arm_nodes, excise_comparator_branch,
@@ -29,14 +31,17 @@ use crate::structural::growth::{
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
-    CausalAncestry, ComparatorCausalAncestry, ComparatorSensitivitySnapshot, SensitivitySnapshot,
-    assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
-    counterfactual_sensitivity_audited, counterfactual_sensitivity_with_comparators_audited,
+    CausalAncestry, ComparatorCausalAncestry, ComparatorSensitivitySnapshot, ComparatorTarget,
+    SensitivitySnapshot, SleepSensitivityMask, assemble_causal_ancestry,
+    assemble_causal_ancestry_sleep_masked, assemble_causal_ancestry_with_comparators,
+    counterfactual_sensitivity_audited, counterfactual_sensitivity_sleep_masked_audited,
+    counterfactual_sensitivity_with_comparators_audited, exact_wake_sensitivity_node_evals,
 };
 use crate::structural::sleep::{
     ComputeLedger, EpistemicAuditEvent, EpistemicTraceCollector, FactBuffer, SleepCompAudit,
     SleepSchedule, SleepSegmentReport, SleepTelemetry, WakeCompAudit, WakeSleepEpisodeReport,
     compose_old_to_new, run_wake_sleep_episode as sleep_run_wake_sleep_episode,
+    run_wake_sleep_episode_with_cap as sleep_run_wake_sleep_episode_with_cap,
     two_sample_kt_match_test,
 };
 use crate::structural::surgery::{
@@ -293,6 +298,10 @@ pub struct ArkheLearner {
     next_comp_audit_id: u64,
     comp_audit_ids: Vec<u64>,
     epistemic_audit: Option<EpistemicTraceCollector>,
+    max_episode_node_evals: Option<u64>,
+    episode_node_eval_envelope: Option<(u64, Option<u64>)>,
+    last_wake_sens_evals: u64,
+    sleep_port_consensus: Vec<(u64, u64, u64)>,
 }
 
 impl ArkheLearner {
@@ -396,6 +405,10 @@ impl ArkheLearner {
             next_comp_audit_id: 0,
             comp_audit_ids: Vec::new(),
             epistemic_audit: None,
+            max_episode_node_evals: None,
+            episode_node_eval_envelope: None,
+            last_wake_sens_evals: 0,
+            sleep_port_consensus: vec![(0, 0, 0); channels_usize],
         })
     }
 
@@ -499,6 +512,10 @@ impl ArkheLearner {
             next_comp_audit_id: 0,
             comp_audit_ids: Vec::new(),
             epistemic_audit: None,
+            max_episode_node_evals: None,
+            episode_node_eval_envelope: None,
+            last_wake_sens_evals: 0,
+            sleep_port_consensus: vec![(0, 0, 0); num_outputs],
         })
     }
 
@@ -683,14 +700,10 @@ impl ArkheLearner {
 
     /// Finishes and returns the opt-in epistemic MDL audit collector, if enabled (`I4`).
     pub fn take_epistemic_audit(&mut self) -> Option<EpistemicTraceCollector> {
-        self.comp_audit_ids.clear();
         self.epistemic_audit.take()
     }
 
     fn sync_comp_audit_ids(&mut self) {
-        if self.epistemic_audit.is_none() {
-            return;
-        }
         let comps = self.editable.economy().comparators();
         while self.comp_audit_ids.len() < comps.len() {
             let idx = self.comp_audit_ids.len();
@@ -707,9 +720,6 @@ impl ArkheLearner {
     }
 
     fn remap_comp_audit_ids(&mut self, pre_sub_nodes: &[NodeId], old_to_new: &[Option<NodeId>]) {
-        if self.epistemic_audit.is_none() {
-            return;
-        }
         let comps = self.editable.economy().comparators();
         let mut remapped = Vec::with_capacity(comps.len());
         for comp in comps {
@@ -774,6 +784,18 @@ impl ArkheLearner {
             .sleep_segment_skipped_no_scoreable_comparator += 1;
     }
 
+    pub(crate) fn add_skipped_sleep_segments(&mut self, count: u64) {
+        self.sleep_telemetry
+            .sleep_segment_skipped_no_scoreable_comparator = self
+            .sleep_telemetry
+            .sleep_segment_skipped_no_scoreable_comparator
+            .saturating_add(count);
+    }
+
+    pub(crate) fn set_sleep_schedule_for_fork(&mut self, schedule: SleepSchedule) {
+        self.growth_config.sleep_schedule = schedule;
+    }
+
     /// Returns `true` iff boundary channel `channel` is grounded at sleep entry (`R4`):
     /// its port is driven, its wake forecast scorer has evaluated at least one wake tick,
     /// and its calibrated forecast beats the port's null model ($\hat{q}_c > p_{\text{null},c}$).
@@ -828,9 +850,20 @@ impl ArkheLearner {
         match schedule {
             SleepSchedule::None => false,
             SleepSchedule::ConsistencyOnly => {
-                let leaf_mask = comp.primary_channel_mask | comp.alt_channel_mask;
+                let circuit = self.editable.circuit();
+                let tp_bit = if usize::from(comp.target_port) < 64 {
+                    1u64 << comp.target_port
+                } else {
+                    0
+                };
+                let leaf_mask = comp.primary_channel_mask | comp.alt_channel_mask | tp_bit;
+                let full_closure = closed_loop_channel_closure(
+                    circuit,
+                    leaf_mask,
+                    usize::from(circuit.num_outputs()),
+                );
                 (0..64u32).all(|bit| {
-                    (leaf_mask & (1u64 << bit)) == 0 || self.channel_is_grounded(bit as usize)
+                    (full_closure & (1u64 << bit)) == 0 || self.channel_is_grounded(bit as usize)
                 })
             }
             SleepSchedule::ConsistencyReplay => true,
@@ -851,6 +884,259 @@ impl ArkheLearner {
                 .any(|comp| self.comparator_is_scoreable_for_sleep(comp, schedule))
     }
 
+    /// Configured paired wake-envelope node evaluation cap for sleep arms (`R2`), if any.
+    #[must_use]
+    pub const fn max_episode_node_evals(&self) -> Option<u64> {
+        self.max_episode_node_evals
+    }
+
+    /// Sets the paired wake-envelope node evaluation cap for sleep arms (`R2`).
+    pub fn set_max_episode_node_evals(&mut self, max_evals: Option<u64>) {
+        self.max_episode_node_evals = max_evals;
+    }
+
+    /// Sets the active episode node-evaluation envelope `(cap, end_substrate_tick)` (`R2`).
+    pub(crate) fn set_episode_node_eval_envelope(
+        &mut self,
+        max_evals: Option<u64>,
+        episode_end_substrate_tick: Option<u64>,
+    ) {
+        self.max_episode_node_evals = max_evals;
+        self.episode_node_eval_envelope = max_evals.map(|cap| (cap, episode_end_substrate_tick));
+    }
+
+    fn max_remaining_r3_warmup_evals(
+        &self,
+        circuit: &Circuit,
+        compiled: &crate::substrate::CompiledCircuit,
+        rem_ticks: u64,
+    ) -> u64 {
+        if matches!(self.growth_config.sleep_schedule, SleepSchedule::None) || rem_ticks == 0 {
+            return 0;
+        }
+        let (w_wake, w_sleep) = crate::structural::sleep::derived_wake_sleep_windows(
+            &self.economy_config,
+            &self.growth_config,
+        );
+        let period = w_wake.saturating_add(w_sleep).max(1);
+        let max_segs = 1u64.saturating_add(rem_ticks / period);
+        let max_steps = (compiled.total_registers() as u64).saturating_add(1);
+        max_segs
+            .saturating_mul(max_steps)
+            .saturating_mul(circuit.node_count() as u64)
+    }
+
+    fn current_wake_sensitivity_evals(&self) -> u64 {
+        let targets = self.editable.comparator_targets();
+        exact_wake_sensitivity_node_evals(
+            self.editable.circuit(),
+            self.editable.compiled(),
+            self.sample_count,
+            &targets,
+        )
+    }
+
+    fn can_afford_extra_node_evals(&self, extra_evals: u64) -> bool {
+        let Some((cap, end_tick_opt)) = self.episode_node_eval_envelope else {
+            return true;
+        };
+        let curr_nodes = self.editable.circuit().node_count() as u64;
+        let sens_per_tick = self
+            .current_wake_sensitivity_evals()
+            .max(self.last_wake_sens_evals);
+        let rem_ticks = end_tick_opt.map_or(0, |end| {
+            end.saturating_sub(self.compute_ledger.total_substrate_ticks())
+        });
+        let reserved = rem_ticks.saturating_mul(curr_nodes.saturating_add(sens_per_tick));
+        self.compute_ledger
+            .total_node_evals()
+            .saturating_add(extra_evals)
+            .saturating_add(reserved)
+            <= cap
+    }
+
+    fn remaining_candidate_node_eval_budget(&self) -> Option<u64> {
+        let (cap, end_tick_opt) = self.episode_node_eval_envelope?;
+        let curr_nodes = self.editable.circuit().node_count() as u64;
+        let sens_per_tick = self
+            .current_wake_sensitivity_evals()
+            .max(self.last_wake_sens_evals);
+        let rem_ticks = end_tick_opt.map_or(0, |end| {
+            end.saturating_sub(self.compute_ledger.total_substrate_ticks())
+        });
+        let reserved_live_and_sens = rem_ticks
+            .saturating_mul(curr_nodes.saturating_add(sens_per_tick))
+            .saturating_add(self.max_remaining_r3_warmup_evals(
+                self.editable.circuit(),
+                self.editable.compiled(),
+                rem_ticks,
+            ));
+        let spent = self.compute_ledger.total_node_evals();
+        Some(cap.saturating_sub(spent.saturating_add(reserved_live_and_sens)))
+    }
+
+    fn can_afford_circuit_edit(
+        &self,
+        pending_evals: u64,
+        post_circuit: &Circuit,
+        post_targets: &[ComparatorTarget],
+        extra_edit_evals: u64,
+    ) -> bool {
+        let Some((cap, end_tick_opt)) = self.episode_node_eval_envelope else {
+            return true;
+        };
+        let Ok(post_compiled) = post_circuit.compile() else {
+            return false;
+        };
+        let post_nodes = post_circuit.node_count() as u64;
+        let post_sens = exact_wake_sensitivity_node_evals(
+            post_circuit,
+            &post_compiled,
+            self.sample_count,
+            post_targets,
+        );
+        let rem_ticks = end_tick_opt.map_or(0, |end| {
+            end.saturating_sub(self.compute_ledger.total_substrate_ticks())
+        });
+        let reserved = rem_ticks
+            .saturating_mul(post_nodes.saturating_add(post_sens))
+            .saturating_add(self.max_remaining_r3_warmup_evals(
+                post_circuit,
+                &post_compiled,
+                rem_ticks,
+            ));
+        let total = self
+            .compute_ledger
+            .total_node_evals()
+            .saturating_add(pending_evals)
+            .saturating_add(extra_edit_evals)
+            .saturating_add(reserved);
+        total <= cap
+    }
+
+    fn try_commit_handoff_within_envelope(&mut self, comp_idx: usize, pending_evals: u64) -> bool {
+        if self.episode_node_eval_envelope.is_some()
+            && let Some(comp) = self.editable.economy().comparators().get(comp_idx).cloned()
+        {
+            let target_port = comp.target_port;
+            let target_port_subs: Vec<NodeId> = self
+                .editable
+                .economy()
+                .comparators()
+                .iter()
+                .filter(|c| c.target_port == target_port)
+                .map(|c| c.sub_node)
+                .collect();
+            let mut swapped = self.editable.circuit().clone();
+            if !swap_comparator_driver(&mut swapped, target_port, comp.sub_node, &target_port_subs)
+            {
+                return false;
+            }
+            let targets = self.editable.comparator_targets();
+            if !self.can_afford_circuit_edit(pending_evals, &swapped, &targets, 0) {
+                self.sprout_budget_exhausted += 1;
+                return false;
+            }
+        }
+        self.perform_comparator_handoff(comp_idx)
+    }
+
+    fn try_commit_sprout_within_envelope(
+        &mut self,
+        port_idx: usize,
+        prop: ScoredSproutProposal,
+        pending_evals: u64,
+    ) -> bool {
+        let targets = self.editable.comparator_targets();
+        if !self.can_afford_circuit_edit(pending_evals, &prop.circuit, &targets, 0) {
+            self.sprout_budget_exhausted += 1;
+            return false;
+        }
+        self.commit_sprout(port_idx, prop.circuit, prop.effective_juvenile_ticks)
+    }
+
+    fn try_commit_ring_within_envelope(
+        &mut self,
+        ring_prop: AutonomousRingProposal,
+        pending_evals: u64,
+    ) -> bool {
+        let post_targets: Vec<ComparatorTarget> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .filter_map(|comp| {
+                let sub_node = ring_prop
+                    .old_to_new
+                    .get(comp.sub_node.index())
+                    .copied()
+                    .flatten()?;
+                let eqz_node = ring_prop
+                    .old_to_new
+                    .get(comp.eqz_node.index())
+                    .copied()
+                    .flatten()?;
+                Some(ComparatorTarget { sub_node, eqz_node })
+            })
+            .collect();
+        if !self.can_afford_circuit_edit(
+            pending_evals,
+            &ring_prop.candidate_circuit,
+            &post_targets,
+            0,
+        ) {
+            self.sprout_budget_exhausted += 1;
+            return false;
+        }
+        self.commit_ring_proposal(ring_prop)
+    }
+
+    fn try_commit_redundancy_within_envelope(
+        &mut self,
+        port_idx: usize,
+        proposal: RedundancySproutProposal,
+        pending_evals: u64,
+    ) -> bool {
+        let mut post_targets: Vec<ComparatorTarget> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .filter_map(|comp| {
+                let sub_node = proposal
+                    .old_to_new
+                    .get(comp.sub_node.index())
+                    .copied()
+                    .flatten()?;
+                let eqz_node = proposal
+                    .old_to_new
+                    .get(comp.eqz_node.index())
+                    .copied()
+                    .flatten()?;
+                Some(ComparatorTarget { sub_node, eqz_node })
+            })
+            .collect();
+        post_targets.push(ComparatorTarget {
+            sub_node: proposal.sub_node,
+            eqz_node: proposal.eqz_node,
+        });
+        let priming_steps = self
+            .obs_window
+            .len()
+            .min(2 * self.growth_config.diagnostic_window) as u64;
+        let est_priming_evals = priming_steps.saturating_mul(proposal.circuit.node_count() as u64);
+        if !self.can_afford_circuit_edit(
+            pending_evals,
+            &proposal.circuit,
+            &post_targets,
+            est_priming_evals,
+        ) {
+            self.sprout_budget_exhausted += 1;
+            return false;
+        }
+        self.commit_redundancy_sprout(port_idx, proposal)
+    }
+
     /// Runs a canonical scheduled wake–sleep episode of `total_substrate_ticks` substrate ticks (`R2`, `R7`, `I5`).
     pub fn run_wake_sleep_episode<G: FiniteStateGenerator>(
         &mut self,
@@ -865,6 +1151,25 @@ impl ArkheLearner {
             total_substrate_ticks,
             warmup_ticks,
             max_eval_ticks,
+        )
+    }
+
+    /// Runs a canonical scheduled wake–sleep episode bounded by `max_episode_node_evals` (`R2`).
+    pub fn run_wake_sleep_episode_with_cap<G: FiniteStateGenerator>(
+        &mut self,
+        env: &mut NoisyEnvironment<G>,
+        total_substrate_ticks: u64,
+        warmup_ticks: u64,
+        max_eval_ticks: u64,
+        max_episode_node_evals: Option<u64>,
+    ) -> WakeSleepEpisodeReport {
+        sleep_run_wake_sleep_episode_with_cap(
+            self,
+            env,
+            total_substrate_ticks,
+            warmup_ticks,
+            max_eval_ticks,
+            max_episode_node_evals,
         )
     }
 
@@ -1148,6 +1453,9 @@ impl ArkheLearner {
             .map_err(|_| GrowthError::InvalidConfig)?;
         self.sync_comp_audit_ids();
         self.sync_comparator_windows();
+        if let Some(slot) = self.sleep_port_consensus.get_mut(usize::from(target_port)) {
+            *slot = (0, 0, 0);
+        }
         Ok(comp_idx)
     }
 
@@ -1246,6 +1554,9 @@ impl ArkheLearner {
             })
             .collect();
         for q in changed_ports {
+            if let Some(slot) = self.sleep_port_consensus.get_mut(q) {
+                *slot = (0, 0, 0);
+            }
             if reset_scorer_counts {
                 self.editable
                     .economy_mut()
@@ -1904,6 +2215,9 @@ impl ArkheLearner {
         self.sync_comparator_windows();
         self.port_states[port_idx].diagnostic_buffer.clear();
         self.port_states[port_idx].ticks_since_last_check = 0;
+        if let Some(slot) = self.sleep_port_consensus.get_mut(port_idx) {
+            *slot = (0, 0, 0);
+        }
         // Keep Pass 1 active when an autonomous ring comparator is committed so
         // `evaluate_comparator_ring_promotion` can promote it; non-ring Stage-3
         // comparators leave Stage 2 exhausted (`#15.1`).
@@ -2052,6 +2366,9 @@ impl ArkheLearner {
             state.stage2_exhausted = false;
         }
         state.stage3_exhausted = false;
+        if let Some(slot) = self.sleep_port_consensus.get_mut(usize::from(target_port)) {
+            *slot = (0, 0, 0);
+        }
     }
 
     fn perform_comparator_handoff(&mut self, comp_idx: usize) -> bool {
@@ -2627,12 +2944,12 @@ impl ArkheLearner {
             .map(|c| self.channel_is_grounded(c))
             .collect();
 
-        let mut is_suspended: Vec<bool> = self
+        let mut is_replay_suspended: Vec<bool> = self
             .editable
             .economy()
             .comparators()
             .iter()
-            .map(|comp| comparator_is_suspended_for_sleep(comp, &grounded_channels, schedule))
+            .map(|comp| comparator_is_suspended_for_replay(comp, &grounded_channels, schedule))
             .collect();
 
         let (replay_ticks, loopback_ticks) = match schedule {
@@ -2655,15 +2972,49 @@ impl ArkheLearner {
             audit.push(EpistemicAuditEvent::SleepSegmentStart { schedule });
         }
 
-        // Step 1 — S-B teacher-forced fact-buffer replay (R5, R6, I5, I6).
+        // Step 1 — S-B teacher-forced fact-buffer replay (R5(a) solvency guard, I5, I6).
         // Never touches wake null models, wake scorers, or live wake registers (I3, I6).
         let init_comp_count = self.editable.economy().comparators().len();
-        let mut primary_fact_disagreements = vec![0u64; init_comp_count];
-        let mut alt_fact_disagreements = vec![0u64; init_comp_count];
+        let init_comp_audit_ids = self.comp_audit_ids.clone();
+        let mut buffer_net_bits_primary = vec![0.0f64; init_comp_count];
+        let mut buffer_net_bits_alt = vec![0.0f64; init_comp_count];
+        let mut pri_match_seq: Vec<Vec<u64>> =
+            vec![Vec::with_capacity(replay_ticks as usize); init_comp_count];
+        let mut alt_match_seq: Vec<Vec<u64>> =
+            vec![Vec::with_capacity(replay_ticks as usize); init_comp_count];
+        let mut replay_scored_frames = 0u64;
         let mut replayed_facts: Vec<Vec<u64>> =
             vec![Vec::with_capacity(replay_ticks as usize); k_channels];
+        let mut recorded_replay_frames: Vec<RecordedReplayFrame> =
+            if schedule == SleepSchedule::ConsistencyReplay {
+                Vec::with_capacity(replay_ticks as usize)
+            } else {
+                Vec::new()
+            };
 
         if replay_ticks > 0 {
+            let mut replay_scorers: Vec<_> = self
+                .editable
+                .economy()
+                .comparators()
+                .iter()
+                .enumerate()
+                .map(|(m, comp)| {
+                    if is_replay_suspended[m] {
+                        None
+                    } else {
+                        let tp = usize::from(comp.target_port);
+                        let frozen_null =
+                            self.editable.economy().scorers()[tp].null_model().clone();
+                        let mut pri_scorer = PointForecastScorer::new(width, frozen_null.kind());
+                        *pri_scorer.null_model_mut() = frozen_null.clone();
+                        let mut alt_scorer = PointForecastScorer::new(width, frozen_null.kind());
+                        *alt_scorer.null_model_mut() = frozen_null.clone();
+                        Some((frozen_null, pri_scorer, alt_scorer))
+                    }
+                })
+                .collect();
+
             let compiled = self.editable.compiled();
             let step_nodes = self.editable.circuit().node_count() as u64;
             let mut replay_state = ScalarState::new(compiled);
@@ -2678,6 +3029,7 @@ impl ArkheLearner {
             });
             let score_from = earliest_match.unwrap_or(replay_start);
             let mut input_buf = vec![0u64; num_in];
+            let reward_mode = self.economy_config.reward_mode;
 
             for frame_idx in replay_start..fb_len {
                 if Some(frame_idx) == earliest_match
@@ -2692,6 +3044,12 @@ impl ArkheLearner {
                 input_buf.fill(0);
                 let copy_len = num_in.min(raw_in.len());
                 input_buf[..copy_len].copy_from_slice(&raw_in[..copy_len]);
+                let pre_step_replay_regs =
+                    if frame_idx >= score_from && schedule == SleepSchedule::ConsistencyReplay {
+                        replay_state.registers().to_vec()
+                    } else {
+                        Vec::new()
+                    };
 
                 self.compute_ledger.sleep_replay_ticks =
                     self.compute_ledger.sleep_replay_ticks.saturating_add(1);
@@ -2711,31 +3069,406 @@ impl ArkheLearner {
                 }
 
                 if frame_idx >= score_from {
+                    replay_scored_frames += 1;
                     let wires = replay_state.wire_values();
                     let node_in_wires = compiled.node_input_wires();
+                    let mut rec_pri = Vec::with_capacity(init_comp_count);
+                    let mut rec_alt = Vec::with_capacity(init_comp_count);
+                    let mut rec_eqz = Vec::with_capacity(init_comp_count);
                     for (m, comp) in self.editable.economy().comparators().iter().enumerate() {
-                        if is_suspended[m] {
-                            continue;
-                        }
-                        let tp = usize::from(comp.target_port);
-                        let fact_v = width.normalize(truth.get(tp).copied().unwrap_or(0));
                         let sub_in = &node_in_wires[comp.sub_node.index()];
                         let pri_v = width.normalize(wires[sub_in[0]]);
                         let alt_v = width.normalize(wires[sub_in[1]]);
-                        if pri_v != fact_v {
-                            primary_fact_disagreements[m] += 1;
+                        let eqz_v = u64::from(pri_v == alt_v);
+                        rec_pri.push(pri_v);
+                        rec_alt.push(alt_v);
+                        rec_eqz.push(eqz_v);
+                        if is_replay_suspended[m] {
+                            continue;
                         }
-                        if alt_v != fact_v {
-                            alt_fact_disagreements[m] += 1;
+                        let Some((frozen_null, pri_scorer, alt_scorer)) =
+                            replay_scorers[m].as_mut()
+                        else {
+                            continue;
+                        };
+                        let tp = usize::from(comp.target_port);
+                        let fact_v = width.normalize(truth.get(tp).copied().unwrap_or(0));
+                        pri_match_seq[m].push(u64::from(pri_v == fact_v));
+                        alt_match_seq[m].push(u64::from(alt_v == fact_v));
+
+                        buffer_net_bits_primary[m] +=
+                            score_with_reward_mode(pri_scorer, reward_mode, width, pri_v, fact_v);
+                        *pri_scorer.null_model_mut() = frozen_null.clone();
+
+                        buffer_net_bits_alt[m] +=
+                            score_with_reward_mode(alt_scorer, reward_mode, width, alt_v, fact_v);
+                        *alt_scorer.null_model_mut() = frozen_null.clone();
+                    }
+                    if schedule == SleepSchedule::ConsistencyReplay {
+                        let facts: Vec<u64> = (0..num_out)
+                            .map(|q| width.normalize(truth.get(q).copied().unwrap_or(0)))
+                            .collect();
+                        recorded_replay_frames.push(RecordedReplayFrame {
+                            pre_regs: pre_step_replay_regs,
+                            input_buf: input_buf.clone(),
+                            facts,
+                            pri_vals: rec_pri,
+                            alt_vals: rec_alt,
+                            eqz_vals: rec_eqz,
+                        });
+                    }
+                }
+            }
+        }
+        let _ = &mut is_replay_suspended;
+
+        let mut r5a_primary_at_fault: Vec<bool> = (0..init_comp_count)
+            .map(|m| {
+                schedule == SleepSchedule::ConsistencyReplay
+                    && replay_scored_frames > 0
+                    && buffer_net_bits_primary[m] <= 0.0
+                    && buffer_net_bits_alt[m] > 0.0
+            })
+            .collect();
+        let r5a_alt_exonerated: Vec<bool> = (0..init_comp_count)
+            .map(|m| {
+                if schedule != SleepSchedule::ConsistencyReplay
+                    || replay_scored_frames == 0
+                    || buffer_net_bits_primary[m] <= 0.0
+                {
+                    return false;
+                }
+                let ones_pri: u64 = pri_match_seq[m].iter().sum();
+                let ones_alt: u64 = alt_match_seq[m].iter().sum();
+                ones_alt > ones_pri && buffer_net_bits_alt[m] > buffer_net_bits_primary[m]
+            })
+            .collect();
+
+        // Step 2 — Loopback (R3 prediction-consistent entry state, R4 loopback suspension, I3).
+        let mut is_suspended: Vec<bool> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .enumerate()
+            .map(|(m, comp)| {
+                comparator_is_suspended_for_sleep(
+                    self.editable.circuit(),
+                    comp,
+                    &grounded_channels,
+                    schedule,
+                ) || r5a_alt_exonerated[m]
+            })
+            .collect();
+
+        let grounded_mask: u64 = (0..k_channels.min(64)).fold(0u64, |acc, c| {
+            if grounded_channels[c] {
+                acc | (1u64 << c)
+            } else {
+                acc
+            }
+        });
+        let cur_epoch = self.editable.structure_epoch();
+        let mut curr_input = pre_sleep_prev_frame.clone();
+        curr_input.resize(num_in, 0);
+
+        let comp_req_masks: Vec<u64> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .enumerate()
+            .map(|(m, c)| {
+                let raw = if r5a_primary_at_fault[m] {
+                    c.alt_channel_mask & !(1u64 << c.target_port)
+                } else {
+                    let tp_bit = if schedule == SleepSchedule::ConsistencyOnly
+                        && usize::from(c.target_port) < 64
+                    {
+                        1u64 << c.target_port
+                    } else {
+                        0
+                    };
+                    c.primary_channel_mask | c.alt_channel_mask | tp_bit
+                };
+                closed_loop_channel_closure(self.editable.circuit(), raw, num_out) & grounded_mask
+            })
+            .collect();
+
+        // R4 (DR #50 Addendum 2b): Cross-Port Grounding Homogeneity Guard via two-sample KT test.
+        if loopback_ticks > 0 && !self.fact_buffer.is_empty() {
+            let cur_epoch_indices: Vec<usize> = (0..self.fact_buffer.len())
+                .filter(|&idx| {
+                    self.fact_buffer
+                        .state_snapshot_at(idx)
+                        .is_some_and(|(ep, _)| ep == cur_epoch)
+                })
+                .collect();
+            if !cur_epoch_indices.is_empty() {
+                for (m, comp) in self.editable.economy().comparators().iter().enumerate() {
+                    if is_suspended[m] {
+                        continue;
+                    }
+                    let tp = usize::from(comp.target_port);
+                    if tp >= 64 {
+                        continue;
+                    }
+                    let ext_mask = comp_req_masks[m] & !(1u64 << tp);
+                    if ext_mask == 0 {
+                        continue;
+                    }
+                    let seq_p: Vec<u64> = cur_epoch_indices
+                        .iter()
+                        .map(|&idx| {
+                            u64::from(
+                                self.fact_buffer
+                                    .consistent_mask_at(idx)
+                                    .is_some_and(|mask| (mask & (1u64 << tp)) != 0),
+                            )
+                        })
+                        .collect();
+                    let ones_p: u64 = seq_p.iter().sum();
+                    for c in 0..k_channels.min(64) {
+                        if (ext_mask & (1u64 << c)) == 0 {
+                            continue;
+                        }
+                        let seq_c: Vec<u64> = cur_epoch_indices
+                            .iter()
+                            .map(|&idx| {
+                                u64::from(
+                                    self.fact_buffer
+                                        .consistent_mask_at(idx)
+                                        .is_some_and(|mask| (mask & (1u64 << c)) != 0),
+                                )
+                            })
+                            .collect();
+                        let ones_c: u64 = seq_c.iter().sum();
+                        if !r5a_primary_at_fault[m]
+                            && ones_c != ones_p
+                            && !two_sample_kt_match_test(&seq_p, &seq_c, 0, Width::BITS_1).passed
+                        {
+                            is_suspended[m] = true;
+                            break;
                         }
                     }
                 }
             }
         }
 
-        // Step 2 — Loopback starting from live wake registers (I3).
-        let mut curr_input = pre_sleep_prev_frame.clone();
-        curr_input.resize(num_in, 0);
+        let d_cone: usize = {
+            let circuit = self.editable.circuit();
+            let comparators = self.editable.economy().comparators();
+            let active_subs: Vec<NodeId> = comparators
+                .iter()
+                .enumerate()
+                .filter_map(|(m, c)| (!is_suspended[m]).then_some(c.sub_node))
+                .collect();
+            grounded_reactive_register_depth(circuit, &grounded_channels, &active_subs).max(1)
+        };
+        let active_comps_on_port: Vec<usize> = {
+            let mut counts = vec![0usize; num_out];
+            for (j, comp) in self.editable.economy().comparators().iter().enumerate() {
+                let tp = usize::from(comp.target_port);
+                if !is_suspended[j] && tp < num_out {
+                    counts[tp] += 1;
+                }
+            }
+            counts
+        };
+        let consistent_len_for_comp: Vec<usize> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .enumerate()
+            .map(|(m, comp)| {
+                let tp = usize::from(comp.target_port);
+                let ext_mask = if tp < 64 {
+                    comp_req_masks[m] & !(1u64 << tp)
+                } else {
+                    comp_req_masks[m]
+                };
+                let comps_on_tp = active_comps_on_port.get(tp).copied().unwrap_or(0);
+                if !r5a_primary_at_fault[m] && (ext_mask != 0 || comps_on_tp == 1) {
+                    closed_loop_delay_count(
+                        self.editable.circuit(),
+                        comp.sub_node,
+                        comp_req_masks[m],
+                        num_out,
+                    )
+                    .max(1)
+                    .saturating_add(1)
+                } else {
+                    d_cone.saturating_add(1)
+                }
+            })
+            .collect();
+
+        let all_active_tail_ok = (0..init_comp_count)
+            .filter(|&m| !is_suspended[m] && comp_req_masks[m] != 0)
+            .all(|m| {
+                self.fact_buffer
+                    .has_consistent_tail(comp_req_masks[m], consistent_len_for_comp[m])
+            });
+
+        if loopback_ticks > 0 && !self.fact_buffer.is_empty() && !all_active_tail_ok {
+            let fb_len = self.fact_buffer.len();
+            let find_joint_window = |susp: &[bool]| -> Option<(usize, usize)> {
+                let max_len = (0..init_comp_count)
+                    .filter(|&m| !susp[m] && comp_req_masks[m] != 0)
+                    .map(|m| consistent_len_for_comp[m])
+                    .max()
+                    .unwrap_or(0);
+                if max_len == 0 || fb_len < max_len {
+                    return None;
+                }
+                for end_idx in (max_len..=fb_len).rev() {
+                    let start_idx = end_idx - max_len;
+                    if self
+                        .fact_buffer
+                        .state_snapshot_at(start_idx)
+                        .is_none_or(|(ep, _)| ep != cur_epoch)
+                    {
+                        continue;
+                    }
+                    let all_ok = (0..init_comp_count).all(|m| {
+                        if susp[m] || comp_req_masks[m] == 0 {
+                            return true;
+                        }
+                        let len_m = consistent_len_for_comp[m];
+                        let rm = comp_req_masks[m];
+                        ((end_idx - len_m)..end_idx).all(|idx| {
+                            self.fact_buffer
+                                .consistent_mask_at(idx)
+                                .is_some_and(|mask| (mask & rm) == rm)
+                        })
+                    });
+                    if all_ok {
+                        return Some((start_idx, max_len));
+                    }
+                }
+                None
+            };
+
+            let mut chosen_window = find_joint_window(&is_suspended);
+            if chosen_window.is_none() {
+                for (m, &req_mask) in comp_req_masks.iter().enumerate() {
+                    if !is_suspended[m]
+                        && req_mask != 0
+                        && self
+                            .fact_buffer
+                            .find_latest_consistent_window_start(
+                                cur_epoch,
+                                req_mask,
+                                consistent_len_for_comp[m],
+                            )
+                            .is_none()
+                    {
+                        is_suspended[m] = true;
+                    }
+                }
+                chosen_window = find_joint_window(&is_suspended);
+                if chosen_window.is_none()
+                    && let Some((best_end, _)) = (0..init_comp_count)
+                        .filter(|&m| !is_suspended[m] && comp_req_masks[m] != 0)
+                        .filter_map(|m| {
+                            self.fact_buffer
+                                .find_latest_consistent_window_start(
+                                    cur_epoch,
+                                    comp_req_masks[m],
+                                    consistent_len_for_comp[m],
+                                )
+                                .map(|s| (s + consistent_len_for_comp[m], m))
+                        })
+                        .max_by_key(|&(end_idx, _)| end_idx)
+                {
+                    for (m, &rm) in comp_req_masks.iter().enumerate() {
+                        if !is_suspended[m] && rm != 0 {
+                            let len_m = consistent_len_for_comp[m];
+                            let ok = best_end >= len_m
+                                && ((best_end - len_m)..best_end).all(|idx| {
+                                    self.fact_buffer
+                                        .consistent_mask_at(idx)
+                                        .is_some_and(|mask| (mask & rm) == rm)
+                                });
+                            if !ok {
+                                is_suspended[m] = true;
+                            }
+                        }
+                    }
+                    let rem_max_len = (0..init_comp_count)
+                        .filter(|&m| !is_suspended[m] && comp_req_masks[m] != 0)
+                        .map(|m| consistent_len_for_comp[m])
+                        .max()
+                        .unwrap_or(0);
+                    if rem_max_len > 0 && best_end >= rem_max_len {
+                        let start_idx = best_end - rem_max_len;
+                        if self
+                            .fact_buffer
+                            .state_snapshot_at(start_idx)
+                            .is_some_and(|(ep, _)| ep == cur_epoch)
+                        {
+                            chosen_window = Some((start_idx, rem_max_len));
+                        } else {
+                            for (m, &rm) in comp_req_masks.iter().enumerate() {
+                                if !is_suspended[m] && rm != 0 {
+                                    is_suspended[m] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let step_nodes = self.editable.circuit().node_count() as u64;
+            if let Some((start_idx, warmup_steps)) = chosen_window {
+                let warmup_evals = (warmup_steps as u64).saturating_mul(step_nodes);
+                if self.can_afford_extra_node_evals(warmup_evals)
+                    && let Some((snap_epoch, snap_regs)) =
+                        self.fact_buffer.state_snapshot_at(start_idx)
+                    && snap_epoch == cur_epoch
+                    && self
+                        .editable
+                        .restore_registers_preserving_epoch(snap_regs)
+                        .is_ok()
+                {
+                    let mut warmup_pred = vec![0u64; num_out];
+                    for offset in 0..warmup_steps {
+                        let frame_idx = start_idx + offset;
+                        let raw_in = self
+                            .fact_buffer
+                            .input_for_frame(frame_idx)
+                            .expect("R3 warmup frame index within FactBuffer bounds");
+                        curr_input.fill(0);
+                        let copy_len = num_in.min(raw_in.len());
+                        curr_input[..copy_len].copy_from_slice(&raw_in[..copy_len]);
+                        self.compute_ledger.live_step_node_evals = self
+                            .compute_ledger
+                            .live_step_node_evals
+                            .saturating_add(step_nodes);
+                        let _ = self.editable.step(&curr_input, &mut warmup_pred);
+                    }
+                    let last_frame = self
+                        .fact_buffer
+                        .frame_at(start_idx + warmup_steps - 1)
+                        .expect("R3 warmup end frame within FactBuffer bounds");
+                    curr_input.fill(0);
+                    let copy_len = num_in.min(last_frame.len());
+                    for (slot, &val) in curr_input[..copy_len]
+                        .iter_mut()
+                        .zip(&last_frame[..copy_len])
+                    {
+                        *slot = width.normalize(val);
+                    }
+                } else {
+                    for (m, &rm) in comp_req_masks.iter().enumerate() {
+                        if !is_suspended[m] && rm != 0 {
+                            is_suspended[m] = true;
+                        }
+                    }
+                }
+            }
+        }
 
         let mut max_circular_discrepancy = 0u64;
         let mut minority_routes_pruned = 0u64;
@@ -2743,16 +3476,21 @@ impl ArkheLearner {
         let mut suspended_comparator_ticks = 0u64;
         let mut first_loopback_predictions: Option<Vec<u64>> = None;
         let zeros_port_rewards = vec![0.0; num_out];
-        let mut per_port_consensus: Vec<(u64, u64, u64)> = vec![(0, 0, 0); num_out];
+        if self.sleep_port_consensus.len() != num_out {
+            self.sleep_port_consensus.resize(num_out, (0, 0, 0));
+        }
         let consensus_thr = self
             .growth_config
             .min_match_gain
-            .min(loopback_ticks.max(1) as usize) as u64;
+            .min(sleep_ticks.max(1) as usize) as u64;
 
         let mut free_run_preds: Vec<Vec<u64>> = vec![Vec::new(); num_out];
-        let mut escrowed_by_port: Vec<Vec<EscrowedSleepAgreement>> = vec![Vec::new(); num_out];
+        let mut escrowed_by_comp: Vec<Vec<EscrowedSleepAgreement>> =
+            vec![Vec::new(); init_comp_count];
+        let mut segment_loopback_disagreements = vec![0u64; init_comp_count];
         let mut next_escrow_id = 0u64;
         let mut dropped_escrow_ids: Vec<u64> = Vec::new();
+        let mut voided_agreement_flux_bits = 0.0f64;
 
         for lb_idx in 0..(loopback_ticks as usize) {
             if schedule == SleepSchedule::ConsistencyReplay {
@@ -2783,8 +3521,7 @@ impl ArkheLearner {
                     free_run_preds[p].push(width.normalize(pred));
                 }
             }
-            // In S-A, only grounded ports feed back predictions (R4).
-            // In S-B, grounded channels feed back predictions while ungrounded channels replay facts.
+            // Grounded channels feed back predictions; ungrounded channels replay facts in S-B (`R4`).
             for (c, (slot, &pred)) in curr_input.iter_mut().zip(&predictions).enumerate() {
                 if grounded_channels.get(c).copied().unwrap_or(false) {
                     *slot = width.normalize(pred);
@@ -2817,32 +3554,17 @@ impl ArkheLearner {
 
             let sens_tick_block = self.compute_ledger.total_substrate_ticks();
             let comp_count = self.editable.economy().comparators().len();
+            let any_active_comp = is_suspended.iter().any(|&s| !s);
             let econ_tick = if comp_count == 0 {
-                let mut sens_evals = 0u64;
-                let snapshot = counterfactual_sensitivity_audited(
-                    self.editable.circuit(),
-                    self.editable.compiled(),
-                    self.editable.state(),
-                    self.seed_bank,
-                    sens_tick_block,
-                    self.sample_count,
-                    &mut sens_evals,
-                )
-                .expect("valid sleep sensitivity snapshot");
-                self.compute_ledger.sensitivity_node_evals = self
-                    .compute_ledger
-                    .sensitivity_node_evals
-                    .saturating_add(sens_evals);
-                let ancestry = assemble_causal_ancestry(
-                    self.editable.circuit(),
-                    self.editable.compiled(),
-                    self.editable.state(),
-                    &snapshot,
-                    &self.editable.economy().activity(),
-                    self.editable.economy().register_eligibility(),
-                    self.economy_config.trace_discount,
-                )
-                .expect("valid sleep causal ancestry");
+                // R2 zero-flux sleep sensitivity skip: 0 sensitivity evals when no comparator exists.
+                let ancestry = CausalAncestry {
+                    port_shares: vec![vec![0.0; n]; num_out],
+                    next_register_eligibility: self
+                        .editable
+                        .economy()
+                        .register_eligibility()
+                        .to_vec(),
+                };
                 if let Some(audit) = self.epistemic_audit.as_mut() {
                     audit.push(EpistemicAuditEvent::SleepTick {
                         comp_evals: Vec::new(),
@@ -2860,37 +3582,83 @@ impl ArkheLearner {
                 self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
                 self.record_juvenile_shielded(&econ_tick);
                 econ_tick
+            } else if !any_active_comp {
+                // R2 zero-flux sleep sensitivity skip: 0 sensitivity evals when all comparators suspended (`I7`).
+                let mut pri_vals = Vec::with_capacity(comp_count);
+                let mut alt_vals = Vec::with_capacity(comp_count);
+                let mut eqz_vals = Vec::with_capacity(comp_count);
+                for comp in self.editable.economy().comparators() {
+                    let sub_in =
+                        &self.editable.compiled().node_input_wires()[comp.sub_node.index()];
+                    pri_vals.push(width.normalize(wires[sub_in[0]]));
+                    alt_vals.push(width.normalize(wires[sub_in[1]]));
+                    eqz_vals.push(width.normalize(node_outs[comp.eqz_node.index()]));
+                    self.sleep_telemetry.sleep_comparator_suspended_ungrounded += 1;
+                    suspended_comparator_ticks += 1;
+                }
+                let comp_obs = self
+                    .editable
+                    .economy_mut()
+                    .observe_comparators_with_suspension(
+                        &pri_vals,
+                        &alt_vals,
+                        &eqz_vals,
+                        None,
+                        Some(&is_suspended),
+                    )
+                    .expect("valid suspended sleep comparator observation");
+                if let Some(audit) = self.epistemic_audit.as_mut() {
+                    let comps_snapshot = self.editable.economy().comparators();
+                    let audit_evals: Vec<SleepCompAudit> = comps_snapshot
+                        .iter()
+                        .enumerate()
+                        .map(|(m, comp)| SleepCompAudit {
+                            comp_id: self.comp_audit_ids[m],
+                            target_port: comp.target_port,
+                            primary_channel_mask: comp.primary_channel_mask,
+                            alt_channel_mask: comp.alt_channel_mask,
+                            pri_val: pri_vals[m],
+                            alt_val: alt_vals[m],
+                            suspended: true,
+                            escrow_id: None,
+                        })
+                        .collect();
+                    audit.push(EpistemicAuditEvent::SleepTick {
+                        comp_evals: audit_evals,
+                    });
+                }
+                let zero_ancestry = ComparatorCausalAncestry {
+                    base: CausalAncestry {
+                        port_shares: vec![vec![0.0; n]; num_out],
+                        next_register_eligibility: self
+                            .editable
+                            .economy()
+                            .register_eligibility()
+                            .to_vec(),
+                    },
+                    comparator_shares: vec![vec![0.0; n]; comp_count],
+                };
+                let zero_comp_rewards = vec![0.0; comp_count];
+                let econ_tick = self
+                    .editable
+                    .economy_mut()
+                    .apply_causal_tick_with_comparators(
+                        &zeros_port_rewards,
+                        &zero_comp_rewards,
+                        comp_obs.agreements,
+                        comp_obs.disagreements,
+                        &zero_ancestry,
+                        &maintenance_costs,
+                    )
+                    .expect("valid suspended sleep causal tick");
+                self.cumulative_net_flux += econ_tick.net_flux;
+                self.cumulative_debt_paid += econ_tick.maintenance;
+                self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
+                self.reserve_clipped_bits += econ_tick.clipped_bits;
+                self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
+                self.record_juvenile_shielded(&econ_tick);
+                econ_tick
             } else {
-                let targets = self.editable.comparator_targets();
-                let mut sens_evals = 0u64;
-                let snapshot = counterfactual_sensitivity_with_comparators_audited(
-                    self.editable.circuit(),
-                    self.editable.compiled(),
-                    self.editable.state(),
-                    self.seed_bank,
-                    sens_tick_block,
-                    self.sample_count,
-                    &targets,
-                    &mut sens_evals,
-                )
-                .expect("valid sleep comparator sensitivity snapshot");
-                self.compute_ledger.sensitivity_node_evals = self
-                    .compute_ledger
-                    .sensitivity_node_evals
-                    .saturating_add(sens_evals);
-                let ancestry = assemble_causal_ancestry_with_comparators(
-                    self.editable.circuit(),
-                    self.editable.compiled(),
-                    self.editable.state(),
-                    &snapshot,
-                    &self.editable.economy().activity(),
-                    self.editable.economy().register_eligibility(),
-                    self.economy_config.trace_discount,
-                    &targets,
-                    true,
-                )
-                .expect("valid sleep comparator ancestry");
-
                 let mut pri_vals = Vec::with_capacity(comp_count);
                 let mut alt_vals = Vec::with_capacity(comp_count);
                 let mut eqz_vals = Vec::with_capacity(comp_count);
@@ -2905,11 +3673,94 @@ impl ArkheLearner {
                     } else {
                         max_circular_discrepancy =
                             max_circular_discrepancy.max(width.circular_distance(p_v, a_v));
+                        if p_v != a_v {
+                            segment_loopback_disagreements[m] += 1;
+                        }
                     }
                     pri_vals.push(p_v);
                     alt_vals.push(a_v);
                     eqz_vals.push(width.normalize(node_outs[comp.eqz_node.index()]));
                 }
+                let comps_snapshot = self.editable.economy().comparators().to_vec();
+                let mut include_outputs = vec![false; num_out];
+                if schedule == SleepSchedule::ConsistencyReplay {
+                    for (m, comp) in comps_snapshot.iter().enumerate() {
+                        if !is_suspended[m] && pri_vals[m] != alt_vals[m] && r5a_primary_at_fault[m]
+                        {
+                            let tp = usize::from(comp.target_port);
+                            if tp < num_out {
+                                include_outputs[tp] = true;
+                            }
+                        }
+                    }
+                }
+                let include_comparators: Vec<bool> = is_suspended.iter().map(|&s| !s).collect();
+                let include_latches = compute_sleep_include_latches(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    &comps_snapshot,
+                    &include_comparators,
+                    &include_outputs,
+                );
+                let sleep_mask = SleepSensitivityMask {
+                    include_outputs: &include_outputs,
+                    include_latches: &include_latches,
+                    include_comparators: &include_comparators,
+                };
+
+                let targets = self.editable.comparator_targets();
+                let mut sens_evals = 0u64;
+                let snapshot = counterfactual_sensitivity_sleep_masked_audited(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    self.seed_bank,
+                    sens_tick_block,
+                    self.sample_count,
+                    &targets,
+                    sleep_mask,
+                    &mut sens_evals,
+                )
+                .expect("valid sleep comparator sensitivity snapshot");
+                self.compute_ledger.sensitivity_node_evals = self
+                    .compute_ledger
+                    .sensitivity_node_evals
+                    .saturating_add(sens_evals);
+                let ancestry = assemble_causal_ancestry_sleep_masked(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    &snapshot,
+                    &self.editable.economy().activity(),
+                    self.editable.economy().register_eligibility(),
+                    self.economy_config.trace_discount,
+                    &targets,
+                    sleep_mask,
+                )
+                .expect("valid sleep comparator ancestry");
+
+                let mut tick_ancestry = ancestry.clone();
+                let mut step2_tick_suspended = is_suspended.clone();
+                for m in 0..comp_count {
+                    if is_suspended[m] {
+                        tick_ancestry.comparator_shares[m].fill(0.0);
+                    } else if pri_vals[m] != alt_vals[m] {
+                        let r5a_fault =
+                            schedule == SleepSchedule::ConsistencyReplay && r5a_primary_at_fault[m];
+                        let has_share = apply_sleep_disagreement_reference_immunity(
+                            self.editable.circuit(),
+                            &comps_snapshot,
+                            m,
+                            r5a_fault,
+                            &tick_ancestry.base.port_shares,
+                            &mut tick_ancestry.comparator_shares[m],
+                        );
+                        if !has_share {
+                            step2_tick_suspended[m] = true;
+                        }
+                    }
+                }
+
                 let comp_obs = self
                     .editable
                     .economy_mut()
@@ -2918,13 +3769,10 @@ impl ArkheLearner {
                         &alt_vals,
                         &eqz_vals,
                         None,
-                        Some(&is_suspended),
+                        Some(&step2_tick_suspended),
                     )
                     .expect("valid sleep comparator observation");
-
                 let mut tick_comp_rewards = comp_obs.rewards.clone();
-                let mut tick_ancestry = ancestry.clone();
-                let comps_snapshot = self.editable.economy().comparators().to_vec();
                 let has_audit = self.epistemic_audit.is_some();
                 let mut audit_evals = if has_audit {
                     Vec::with_capacity(comp_count)
@@ -2934,45 +3782,45 @@ impl ArkheLearner {
 
                 for (m, comp) in comps_snapshot.iter().enumerate() {
                     let mut escrow_id = None;
-                    if is_suspended[m] {
+                    if step2_tick_suspended[m] {
                         tick_comp_rewards[m] = 0.0;
                         tick_ancestry.comparator_shares[m].fill(0.0);
-                    } else if schedule == SleepSchedule::ConsistencyReplay {
-                        let tp = usize::from(comp.target_port);
-                        if tick_comp_rewards[m] > 0.0 {
-                            let share_sum: f64 = tick_ancestry.comparator_shares[m].iter().sum();
-                            if share_sum > 0.0 {
-                                let eid = next_escrow_id;
-                                next_escrow_id += 1;
-                                let inv = 1.0 / share_sum;
-                                let norm_shares: Vec<f64> = tick_ancestry.comparator_shares[m]
-                                    .iter()
-                                    .map(|&s| s * inv)
-                                    .collect();
-                                escrowed_by_port[tp].push(EscrowedSleepAgreement {
-                                    id: eid,
-                                    reward: tick_comp_rewards[m],
-                                    node_shares: norm_shares,
-                                });
-                                escrow_id = Some(eid);
-                            }
+                    } else if tick_comp_rewards[m] > 0.0
+                        && matches!(
+                            schedule,
+                            SleepSchedule::ConsistencyOnly | SleepSchedule::ConsistencyReplay
+                        )
+                    {
+                        // R5(c): escrow positive agreement flux per comparator in both S-A and S-B.
+                        let share_sum: f64 = tick_ancestry.comparator_shares[m].iter().sum();
+                        if share_sum > 0.0 {
+                            let eid = next_escrow_id;
+                            next_escrow_id += 1;
+                            let inv = 1.0 / share_sum;
+                            let norm_shares: Vec<f64> = tick_ancestry.comparator_shares[m]
+                                .iter()
+                                .map(|&s| s * inv)
+                                .collect();
+                            escrowed_by_comp[m].push(EscrowedSleepAgreement {
+                                id: eid,
+                                reward: tick_comp_rewards[m],
+                                node_shares: norm_shares,
+                            });
+                            escrow_id = Some(eid);
+                        }
+                        tick_comp_rewards[m] = 0.0;
+                    } else if tick_comp_rewards[m] < 0.0 {
+                        let r5a_fault =
+                            schedule == SleepSchedule::ConsistencyReplay && r5a_primary_at_fault[m];
+                        if !apply_sleep_disagreement_reference_immunity(
+                            self.editable.circuit(),
+                            &comps_snapshot,
+                            m,
+                            r5a_fault,
+                            &tick_ancestry.base.port_shares,
+                            &mut tick_ancestry.comparator_shares[m],
+                        ) {
                             tick_comp_rewards[m] = 0.0;
-                        } else if tick_comp_rewards[m] < 0.0
-                            && pri_vals[m] != alt_vals[m]
-                            && primary_fact_disagreements[m] > alt_fact_disagreements[m]
-                        {
-                            // R5(a): route disagreement charge to primary cone (excluding alt-only cone).
-                            if let Some(pri_share) = compute_r5a_primary_share(
-                                self.editable.circuit(),
-                                &comps_snapshot,
-                                m,
-                                &tick_ancestry.base.port_shares,
-                            ) {
-                                tick_ancestry.comparator_shares[m] = pri_share;
-                            } else if tick_ancestry.comparator_shares[m].iter().sum::<f64>() == 0.0
-                            {
-                                tick_comp_rewards[m] = 0.0;
-                            }
                         }
                     }
 
@@ -2984,7 +3832,7 @@ impl ArkheLearner {
                             alt_channel_mask: comp.alt_channel_mask,
                             pri_val: pri_vals[m],
                             alt_val: alt_vals[m],
-                            suspended: is_suspended[m],
+                            suspended: step2_tick_suspended[m],
                             escrow_id,
                         });
                     }
@@ -3014,341 +3862,397 @@ impl ArkheLearner {
                 self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
                 self.record_juvenile_shielded(&econ_tick);
 
+                let mut loop_state = SleepLoopState {
+                    grounded_channels: &grounded_channels,
+                    schedule,
+                    consensus_thr,
+                    composed_old_to_new: &mut composed_old_to_new,
+                    sleep_edited: &mut sleep_edited,
+                    minority_routes_pruned: &mut minority_routes_pruned,
+                    starvation_excisions: &mut starvation_excisions,
+                    is_suspended: &mut is_suspended,
+                    r5a_primary_at_fault: &mut r5a_primary_at_fault,
+                    segment_loopback_disagreements: &mut segment_loopback_disagreements,
+                    escrowed_by_comp: &mut escrowed_by_comp,
+                    dropped_escrow_ids: &mut dropped_escrow_ids,
+                    voided_agreement_flux_bits: &mut voided_agreement_flux_bits,
+                };
                 // 3-route majority pruning during sleep (excluding suspended comparators, I7).
-                for (p, counts) in per_port_consensus.iter_mut().enumerate() {
-                    let p_u16 = p as u16;
-                    let comps_on_p: Vec<usize> = self
-                        .editable
-                        .economy()
-                        .comparators()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, c)| {
-                            (c.target_port == p_u16 && !is_suspended[i]).then_some(i)
-                        })
-                        .collect();
-                    if comps_on_p.len() != 2 {
-                        *counts = (0, 0, 0);
-                        continue;
-                    }
-                    let idx_a = comps_on_p[0];
-                    let idx_b = comps_on_p[1];
-                    let comps = self.editable.economy().comparators();
-                    if !comparator_cone_is_mature(
-                        self.editable.circuit(),
-                        self.editable.economy(),
-                        &comps[idx_a],
-                    ) || !comparator_cone_is_mature(
-                        self.editable.circuit(),
-                        self.editable.economy(),
-                        &comps[idx_b],
-                    ) {
-                        continue;
-                    }
-                    let pri = pri_vals[idx_a];
-                    let alt_a = alt_vals[idx_a];
-                    let alt_b = alt_vals[idx_b];
-                    if pri != alt_a {
-                        counts.0 += 1;
-                    }
-                    if pri != alt_b {
-                        counts.1 += 1;
-                    }
-                    if alt_a != alt_b {
-                        counts.2 += 1;
-                    }
-                    let (d_pa, d_pb, d_ab) = *counts;
-                    let action = if d_pa == 0 && d_pb >= consensus_thr && d_ab >= consensus_thr {
-                        Some((idx_b, false))
-                    } else if d_pb == 0 && d_pa >= consensus_thr && d_ab >= consensus_thr {
-                        Some((idx_a, false))
-                    } else if d_ab == 0 && d_pa >= consensus_thr && d_pb >= consensus_thr {
-                        Some((idx_a, true))
-                    } else {
-                        None
-                    };
-                    if let Some((prune_idx, prune_primary)) = action {
-                        let pre_comps = self.editable.economy().comparators().to_vec();
-                        let promoted_pri_dis =
-                            prune_primary.then(|| (p_u16, alt_fact_disagreements[prune_idx]));
-                        if let Some(step_map) =
-                            self.excise_port_comparator_with_map(prune_idx, prune_primary)
-                        {
-                            compose_old_to_new(&mut composed_old_to_new, &step_map);
-                            sleep_edited = true;
-                            self.disagreement_prune_events += 1;
-                            minority_routes_pruned += 1;
-                            *counts = (0, 0, 0);
-                            remap_sleep_loop_state_after_edit(
-                                self.editable.economy().comparators(),
-                                self.editable.circuit().node_count(),
-                                &pre_comps,
-                                &step_map,
-                                &grounded_channels,
-                                schedule,
-                                promoted_pri_dis,
-                                &mut is_suspended,
-                                &mut primary_fact_disagreements,
-                                &mut alt_fact_disagreements,
-                                &mut escrowed_by_port,
-                                &mut dropped_escrow_ids,
-                            );
-                            break;
-                        }
-                    }
-                }
+                self.try_sleep_three_route_consensus_step(
+                    &pri_vals,
+                    &alt_vals,
+                    None,
+                    None,
+                    &mut loop_state,
+                );
                 econ_tick
             };
 
             // Depleted-node / starved comparator-branch excision during sleep (excluding suspended, I7).
             if !econ_tick.starved_nodes.is_empty() {
-                loop {
-                    let starved_set: BTreeSet<NodeId> = self
-                        .editable
-                        .economy()
-                        .nodes()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, econ)| {
-                            (econ.juvenile_ticks == 0 && econ.energy <= 0.0)
-                                .then_some(NodeId(idx as u32))
-                        })
-                        .collect();
-                    if starved_set.is_empty() {
-                        break;
+                let mut loop_state = SleepLoopState {
+                    grounded_channels: &grounded_channels,
+                    schedule,
+                    consensus_thr,
+                    composed_old_to_new: &mut composed_old_to_new,
+                    sleep_edited: &mut sleep_edited,
+                    minority_routes_pruned: &mut minority_routes_pruned,
+                    starvation_excisions: &mut starvation_excisions,
+                    is_suspended: &mut is_suspended,
+                    r5a_primary_at_fault: &mut r5a_primary_at_fault,
+                    segment_loopback_disagreements: &mut segment_loopback_disagreements,
+                    escrowed_by_comp: &mut escrowed_by_comp,
+                    dropped_escrow_ids: &mut dropped_escrow_ids,
+                    voided_agreement_flux_bits: &mut voided_agreement_flux_bits,
+                };
+                self.process_sleep_starvation_excisions(&mut loop_state);
+            }
+        }
+
+        // Step 3 — DR #50 Addendum (1c): Retroactive Replay Disagreement Debit on Loopback-Refuted Comparators.
+        let has_step3_candidates = schedule == SleepSchedule::ConsistencyReplay
+            && !recorded_replay_frames.is_empty()
+            && self
+                .editable
+                .economy()
+                .comparators()
+                .iter()
+                .enumerate()
+                .any(|(m, comp)| {
+                    (!is_suspended[m] && segment_loopback_disagreements[m] > 0)
+                        || (!comparator_is_suspended_for_sleep(
+                            self.editable.circuit(),
+                            comp,
+                            &grounded_channels,
+                            schedule,
+                        ) && r5a_primary_at_fault[m])
+                });
+        if has_step3_candidates {
+            let mut cached_reg_map_epoch: Option<u64> = None;
+            let mut cached_reg_map: Vec<Option<usize>> = Vec::new();
+            let mut step_in = vec![0u64; num_in];
+            let mut step_pred = vec![0u64; num_out];
+            let base_sens_tick_block = self.compute_ledger.total_substrate_ticks();
+
+            for (r_idx, r_frame) in recorded_replay_frames.iter().enumerate() {
+                let comps_snapshot = self.editable.economy().comparators().to_vec();
+                let comp_count = comps_snapshot.len();
+                if comp_count == 0 {
+                    break;
+                }
+                let orig_idx_for_curr: Vec<Option<usize>> = (0..comp_count)
+                    .map(|m| {
+                        let cid = self.comp_audit_ids.get(m).copied()?;
+                        init_comp_audit_ids.iter().position(|&id| id == cid)
+                    })
+                    .collect();
+
+                let mut candidate_active = vec![false; comp_count];
+                let mut any_eligible = false;
+                let mut port_active_in_step3 = vec![false; num_out];
+                for m in 0..comp_count {
+                    let eligible = (!is_suspended[m] && segment_loopback_disagreements[m] > 0)
+                        || (!comparator_is_suspended_for_sleep(
+                            self.editable.circuit(),
+                            &comps_snapshot[m],
+                            &grounded_channels,
+                            schedule,
+                        ) && r5a_primary_at_fault[m]);
+                    if !eligible {
+                        continue;
                     }
-                    let comps = self.editable.economy().comparators().to_vec();
-                    let mut excised_comp: Option<(usize, u16, bool)> = None;
-                    for (comp_idx, comp) in comps.iter().enumerate() {
-                        if is_suspended[comp_idx] {
-                            continue;
-                        }
-                        let target_port_subs: Vec<NodeId> = comps
-                            .iter()
-                            .filter(|c| c.target_port == comp.target_port)
-                            .map(|c| c.sub_node)
-                            .collect();
-                        let surviving_comp_nodes: Vec<(NodeId, NodeId)> = comps
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, c)| {
-                                (i != comp_idx).then_some((c.sub_node, c.eqz_node))
-                            })
-                            .collect();
-                        let circuit = self.editable.circuit();
-                        let pri_starved = comparator_exclusive_arm_nodes(
-                            circuit,
-                            comp.sub_node,
-                            comp.eqz_node,
-                            comp.target_port,
-                            true,
-                            &target_port_subs,
-                            &surviving_comp_nodes,
-                        )
-                        .is_some_and(|excl| excl.iter().any(|n| starved_set.contains(n)));
-                        let alt_starved = comparator_exclusive_arm_nodes(
-                            circuit,
-                            comp.sub_node,
-                            comp.eqz_node,
-                            comp.target_port,
-                            false,
-                            &target_port_subs,
-                            &surviving_comp_nodes,
-                        )
-                        .is_some_and(|excl| excl.iter().any(|n| starved_set.contains(n)));
-                        let comp_node_starved = starved_set.contains(&comp.sub_node)
-                            || starved_set.contains(&comp.eqz_node);
-                        if (comp_node_starved || alt_starved) && !pri_starved {
-                            excised_comp = Some((comp_idx, comp.target_port, false));
-                            break;
-                        }
-                        if schedule == SleepSchedule::ConsistencyReplay
-                            && pri_starved
-                            && !alt_starved
-                            && !comp_node_starved
-                            && alt_cone_is_mature(circuit, self.editable.economy(), comp)
-                        {
-                            excised_comp = Some((comp_idx, comp.target_port, true));
-                            break;
-                        }
-                    }
-                    if let Some((comp_idx, tp, prune_primary)) = excised_comp {
-                        let promoted_pri_dis =
-                            prune_primary.then(|| (tp, alt_fact_disagreements[comp_idx]));
-                        if let Some(step_map) =
-                            self.excise_port_comparator_with_map(comp_idx, prune_primary)
-                        {
-                            compose_old_to_new(&mut composed_old_to_new, &step_map);
-                            sleep_edited = true;
-                            self.disagreement_prune_events += 1;
-                            starvation_excisions += 1;
-                            if let Some(c) = per_port_consensus.get_mut(usize::from(tp)) {
-                                *c = (0, 0, 0);
-                            }
-                            remap_sleep_loop_state_after_edit(
-                                self.editable.economy().comparators(),
-                                self.editable.circuit().node_count(),
-                                &comps,
-                                &step_map,
-                                &grounded_channels,
-                                schedule,
-                                promoted_pri_dis,
-                                &mut is_suspended,
-                                &mut primary_fact_disagreements,
-                                &mut alt_fact_disagreements,
-                                &mut escrowed_by_port,
-                                &mut dropped_escrow_ids,
-                            );
-                            continue;
+                    any_eligible = true;
+                    let Some(orig_m) = orig_idx_for_curr[m] else {
+                        continue;
+                    };
+                    let tp = usize::from(comps_snapshot[m].target_port);
+                    let Some(&pri_v) = r_frame.pri_vals.get(orig_m) else {
+                        continue;
+                    };
+                    let Some(&alt_v) = r_frame.alt_vals.get(orig_m) else {
+                        continue;
+                    };
+                    let fact_v = r_frame.facts.get(tp).copied().unwrap_or(0);
+                    let fault_frame = if r5a_primary_at_fault[m] {
+                        alt_v == fact_v && pri_v != fact_v
+                    } else {
+                        pri_v == fact_v && alt_v != fact_v
+                    };
+                    if fault_frame {
+                        candidate_active[m] = true;
+                        if tp < num_out {
+                            port_active_in_step3[tp] = true;
                         }
                     }
+                }
+                if !any_eligible {
+                    break;
+                }
+                if !candidate_active.iter().any(|&a| a) {
+                    continue;
+                }
+
+                let step_nodes = self.editable.circuit().node_count() as u64;
+                let targets = self.editable.comparator_targets();
+                let est_sens = exact_wake_sensitivity_node_evals(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.sample_count,
+                    &targets,
+                );
+                if !self.can_afford_extra_node_evals(step_nodes.saturating_add(est_sens)) {
                     break;
                 }
 
-                let suspended_protected = collect_suspended_protected_nodes(
+                let regs_restored = if !sleep_edited {
+                    self.editable
+                        .restore_registers_preserving_epoch(&r_frame.pre_regs)
+                        .is_ok()
+                } else {
+                    let cur_ep = self.editable.structure_epoch();
+                    if cached_reg_map_epoch != Some(cur_ep) {
+                        cached_reg_map = register_mapping(
+                            &pre_sleep_circuit,
+                            self.editable.circuit(),
+                            &pre_sleep_compiled,
+                            self.editable.compiled(),
+                            &composed_old_to_new,
+                        );
+                        cached_reg_map_epoch = Some(cur_ep);
+                    }
+                    let mut mapped_regs = ScalarState::new(self.editable.compiled())
+                        .registers()
+                        .to_vec();
+                    for (old_r, mapped) in cached_reg_map.iter().enumerate() {
+                        if let Some(new_r) = mapped
+                            && old_r < r_frame.pre_regs.len()
+                            && *new_r < mapped_regs.len()
+                        {
+                            mapped_regs[*new_r] = r_frame.pre_regs[old_r];
+                        }
+                    }
+                    self.editable
+                        .restore_registers_preserving_epoch(&mapped_regs)
+                        .is_ok()
+                };
+                if !regs_restored {
+                    break;
+                }
+
+                step_in.fill(0);
+                let copy_len = num_in.min(r_frame.input_buf.len());
+                step_in[..copy_len].copy_from_slice(&r_frame.input_buf[..copy_len]);
+                self.compute_ledger.candidate_replay_node_evals = self
+                    .compute_ledger
+                    .candidate_replay_node_evals
+                    .saturating_add(step_nodes);
+                let _ = self.editable.step(&step_in, &mut step_pred);
+
+                let node_outs = node_output_values(self.editable.circuit(), self.editable.state());
+                let _ = self.editable.economy_mut().record_activity(&node_outs);
+
+                let n = self.editable.circuit().node_count();
+                let mut include_outputs = vec![false; num_out];
+                for (m, comp) in comps_snapshot.iter().enumerate() {
+                    if candidate_active[m] && r5a_primary_at_fault[m] {
+                        let tp = usize::from(comp.target_port);
+                        if tp < num_out {
+                            include_outputs[tp] = true;
+                        }
+                    }
+                }
+                let include_latches = compute_sleep_include_latches(
                     self.editable.circuit(),
-                    self.editable.economy().comparators(),
-                    &is_suspended,
-                    &grounded_channels,
+                    self.editable.compiled(),
+                    &comps_snapshot,
+                    &candidate_active,
+                    &include_outputs,
                 );
-                let remaining_starved: BTreeSet<NodeId> = self
+                let sleep_mask = SleepSensitivityMask {
+                    include_outputs: &include_outputs,
+                    include_latches: &include_latches,
+                    include_comparators: &candidate_active,
+                };
+                let mut sens_evals = 0u64;
+                let sens_tick_block = base_sens_tick_block.wrapping_add(r_idx as u64);
+                let snapshot = counterfactual_sensitivity_sleep_masked_audited(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    self.seed_bank,
+                    sens_tick_block,
+                    self.sample_count,
+                    &targets,
+                    sleep_mask,
+                    &mut sens_evals,
+                )
+                .expect("valid step-3 sleep comparator sensitivity snapshot");
+                self.compute_ledger.sensitivity_node_evals = self
+                    .compute_ledger
+                    .sensitivity_node_evals
+                    .saturating_add(sens_evals);
+                let mut tick_ancestry = assemble_causal_ancestry_sleep_masked(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    &snapshot,
+                    &self.editable.economy().activity(),
+                    self.editable.economy().register_eligibility(),
+                    self.economy_config.trace_discount,
+                    &targets,
+                    sleep_mask,
+                )
+                .expect("valid step-3 sleep comparator ancestry");
+
+                let mut step3_suspended = vec![true; comp_count];
+                let mut pri_vals = vec![0u64; comp_count];
+                let mut alt_vals = vec![0u64; comp_count];
+                let mut eqz_vals = vec![1u64; comp_count];
+                for m in 0..comp_count {
+                    if !candidate_active[m] {
+                        continue;
+                    }
+                    let Some(orig_m) = orig_idx_for_curr[m] else {
+                        continue;
+                    };
+                    let has_share = apply_sleep_disagreement_reference_immunity(
+                        self.editable.circuit(),
+                        &comps_snapshot,
+                        m,
+                        r5a_primary_at_fault[m],
+                        &tick_ancestry.base.port_shares,
+                        &mut tick_ancestry.comparator_shares[m],
+                    );
+                    if has_share {
+                        step3_suspended[m] = false;
+                        pri_vals[m] = r_frame.pri_vals[orig_m];
+                        alt_vals[m] = r_frame.alt_vals[orig_m];
+                        eqz_vals[m] = r_frame.eqz_vals[orig_m];
+                    } else {
+                        tick_ancestry.comparator_shares[m].fill(0.0);
+                    }
+                }
+
+                let comp_obs = self
                     .editable
-                    .economy()
-                    .nodes()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, econ)| {
-                        let id = NodeId(idx as u32);
-                        (econ.juvenile_ticks == 0
-                            && econ.energy <= 0.0
-                            && !suspended_protected.contains(&id))
-                        .then_some(id)
-                    })
-                    .collect();
-                if !remaining_starved.is_empty() {
-                    let pre_prune_circuit = self.editable.circuit().clone();
-                    let pre_comps = self.editable.economy().comparators().to_vec();
-                    let pre_energies: Vec<f64> = self
-                        .editable
-                        .economy()
-                        .nodes()
-                        .iter()
-                        .map(|n| n.energy)
-                        .collect();
-                    let pre_sub_nodes: Vec<NodeId> = pre_comps.iter().map(|c| c.sub_node).collect();
-                    let juvenile_set: BTreeSet<NodeId> = self
-                        .editable
-                        .economy()
-                        .nodes()
+                    .economy_mut()
+                    .observe_comparators_with_suspension(
+                        &pri_vals,
+                        &alt_vals,
+                        &eqz_vals,
+                        None,
+                        Some(&step3_suspended),
+                    )
+                    .expect("valid step-3 sleep comparator observation");
+                let mut tick_comp_rewards = comp_obs.rewards;
+                for (m, reward) in tick_comp_rewards.iter_mut().enumerate() {
+                    if step3_suspended[m] || *reward > 0.0 {
+                        *reward = 0.0;
+                    }
+                }
+                if let Some(audit) = self.epistemic_audit.as_mut() {
+                    let audit_evals: Vec<SleepCompAudit> = comps_snapshot
                         .iter()
                         .enumerate()
-                        .filter_map(|(idx, econ)| {
-                            (econ.juvenile_ticks > 0).then_some(NodeId(idx as u32))
+                        .map(|(m, comp)| SleepCompAudit {
+                            comp_id: self.comp_audit_ids[m],
+                            target_port: comp.target_port,
+                            primary_channel_mask: comp.primary_channel_mask,
+                            alt_channel_mask: comp.alt_channel_mask,
+                            pri_val: pri_vals[m],
+                            alt_val: alt_vals[m],
+                            suspended: step3_suspended[m],
+                            escrow_id: None,
                         })
                         .collect();
-                    let mut surgery_audit = SurgeryEvalAudit::default();
-                    let mut excised_starved_passthrough = false;
-                    let prune_res = if let Some((pruned, old_to_new)) =
-                        prune_starved_preserving_healthy_split_branches(
-                            self.editable.circuit(),
-                            &remaining_starved,
-                            &juvenile_set,
-                        ) {
-                        self.editable
-                            .recompile_preserving_state(pruned, &old_to_new)
-                            .map(|()| old_to_new)
-                    } else if self.growth_config.excision_mode
-                        == ExcisionMode::VerifiedLocalExcision
-                        && let Ok(Some(old_to_new)) = self
-                            .editable
-                            .excise_verified_passthrough_for_starved_cone_audited(
-                                &remaining_starved,
-                                self.economy_config.split_code_tax,
-                                &mut surgery_audit,
-                            )
-                    {
-                        excised_starved_passthrough = true;
-                        Ok(old_to_new)
-                    } else {
-                        self.editable.prune_starved_set_with_mode_audited(
-                            &remaining_starved,
-                            self.growth_config.excision_mode,
-                            self.growth_config.diagnostic_window,
-                            &mut surgery_audit,
-                        )
-                    };
-                    self.compute_ledger.candidate_replay_node_evals = self
-                        .compute_ledger
-                        .candidate_replay_node_evals
-                        .saturating_add(surgery_audit.replay_node_evals);
-                    self.compute_ledger.sensitivity_node_evals = self
-                        .compute_ledger
-                        .sensitivity_node_evals
-                        .saturating_add(surgery_audit.sensitivity_node_evals);
-                    if let Ok(old_to_new) = prune_res
-                        && old_to_new.iter().any(Option::is_none)
-                    {
-                        self.record_structure_energy_delta(&pre_energies, &old_to_new);
-                        self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
-                        self.ledger.on_prune(
-                            self.editable.circuit(),
-                            self.economy_config.split_code_tax,
-                            &old_to_new,
-                        );
-                        self.clear_changed_port_diagnostics_preserving_scorer(
-                            &pre_prune_circuit,
-                            &old_to_new,
-                        );
-                        self.apply_node_remap_to_windows(&old_to_new);
-                        compose_old_to_new(&mut composed_old_to_new, &old_to_new);
-                        sleep_edited = true;
-                        starvation_excisions += 1;
-                        if excised_starved_passthrough {
-                            self.idle_prune_events += 1;
-                            self.local_excision_events += 1;
-                        } else {
-                            self.starvation_prune_events += 1;
-                            self.record_scoped_starvation_prune(
-                                &pre_prune_circuit,
-                                &pre_comps,
-                                &remaining_starved,
-                            );
-                        }
-                        remap_sleep_loop_state_after_edit(
-                            self.editable.economy().comparators(),
-                            self.editable.circuit().node_count(),
-                            &pre_comps,
-                            &old_to_new,
-                            &grounded_channels,
-                            schedule,
-                            None,
-                            &mut is_suspended,
-                            &mut primary_fact_disagreements,
-                            &mut alt_fact_disagreements,
-                            &mut escrowed_by_port,
-                            &mut dropped_escrow_ids,
-                        );
-                    }
+                    audit.push(EpistemicAuditEvent::SleepTick {
+                        comp_evals: audit_evals,
+                    });
+                }
+
+                let zero_maint = vec![0.0; n];
+                let econ_tick = self
+                    .editable
+                    .economy_mut()
+                    .apply_causal_tick_with_comparators(
+                        &zeros_port_rewards,
+                        &tick_comp_rewards,
+                        comp_obs.agreements,
+                        comp_obs.disagreements,
+                        &tick_ancestry,
+                        &zero_maint,
+                    )
+                    .expect("valid step-3 sleep causal tick");
+                self.cumulative_net_flux += econ_tick.net_flux;
+                self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
+                self.reserve_clipped_bits += econ_tick.clipped_bits;
+                self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
+                self.record_juvenile_shielded(&econ_tick);
+
+                let mut loop_state = SleepLoopState {
+                    grounded_channels: &grounded_channels,
+                    schedule,
+                    consensus_thr,
+                    composed_old_to_new: &mut composed_old_to_new,
+                    sleep_edited: &mut sleep_edited,
+                    minority_routes_pruned: &mut minority_routes_pruned,
+                    starvation_excisions: &mut starvation_excisions,
+                    is_suspended: &mut is_suspended,
+                    r5a_primary_at_fault: &mut r5a_primary_at_fault,
+                    segment_loopback_disagreements: &mut segment_loopback_disagreements,
+                    escrowed_by_comp: &mut escrowed_by_comp,
+                    dropped_escrow_ids: &mut dropped_escrow_ids,
+                    voided_agreement_flux_bits: &mut voided_agreement_flux_bits,
+                };
+                self.try_sleep_three_route_consensus_step(
+                    &r_frame.pri_vals,
+                    &r_frame.alt_vals,
+                    Some(&port_active_in_step3),
+                    Some(&orig_idx_for_curr),
+                    &mut loop_state,
+                );
+                if !econ_tick.starved_nodes.is_empty() {
+                    self.process_sleep_starvation_excisions(&mut loop_state);
                 }
             }
         }
 
-        // End of S-B loopback: R5(b) two-sample KT match test & escrowed agreement release/voiding.
+        // End of sleep loopback: R5(b) KT match test (S-B grounded ports) & R5(c) per-comparator escrow release/voiding (S-A & S-B).
         let mut match_failures = 0u64;
-        let mut voided_agreement_flux_bits = 0.0f64;
         let mut voided_ports = vec![false; num_out];
         if schedule == SleepSchedule::ConsistencyReplay {
-            let mut total_payout_credits = vec![0.0; self.editable.circuit().node_count()];
             for p in 0..num_out {
                 if !grounded_channels.get(p).copied().unwrap_or(false) {
                     continue;
                 }
-                let d_cone = port_cone_register_depth(self.editable.circuit(), p as u16);
+                let d_cone_port = port_cone_register_depth(self.editable.circuit(), p as u16);
                 let s1 = &free_run_preds[p];
                 let s2 = replayed_facts.get(p).map_or(&[][..], Vec::as_slice);
-                let kt_res = two_sample_kt_match_test(s1, s2, d_cone, width);
-                if kt_res.passed {
-                    for entry in &escrowed_by_port[p] {
+                let kt_res = two_sample_kt_match_test(s1, s2, d_cone_port, width);
+                if !kt_res.passed {
+                    voided_ports[p] = true;
+                    match_failures += 1;
+                    self.sleep_telemetry.sleep_match_failures += 1;
+                }
+            }
+        }
+        if matches!(
+            schedule,
+            SleepSchedule::ConsistencyOnly | SleepSchedule::ConsistencyReplay
+        ) {
+            let mut total_payout_credits = vec![0.0; self.editable.circuit().node_count()];
+            let post_comps = self.editable.economy().comparators();
+            for (m, entries) in escrowed_by_comp.iter().enumerate() {
+                if entries.is_empty() {
+                    continue;
+                }
+                let tp = post_comps
+                    .get(m)
+                    .map_or(usize::MAX, |c| usize::from(c.target_port));
+                let port_voided = voided_ports.get(tp).copied().unwrap_or(false);
+                let comp_refuted = segment_loopback_disagreements[m] > 0;
+                if !port_voided && !comp_refuted {
+                    for entry in entries {
                         let sum: f64 = entry.node_shares.iter().sum();
                         if sum > 0.0 {
                             let inv = entry.reward / sum;
@@ -3362,11 +4266,9 @@ impl ArkheLearner {
                         }
                     }
                 } else {
-                    voided_ports[p] = true;
-                    match_failures += 1;
-                    self.sleep_telemetry.sleep_match_failures += 1;
-                    for entry in &escrowed_by_port[p] {
+                    for entry in entries {
                         voided_agreement_flux_bits += entry.reward;
+                        dropped_escrow_ids.push(entry.id);
                     }
                 }
             }
@@ -3375,7 +4277,7 @@ impl ArkheLearner {
                     .editable
                     .economy_mut()
                     .apply_escrowed_comparator_flux(&total_payout_credits)
-                    .expect("valid escrowed S-B payout");
+                    .expect("valid escrowed sleep payout");
                 self.cumulative_net_flux += payout_tick.net_flux;
                 self.reserve_clipped_count += payout_tick.clipped_nodes as u64;
                 self.reserve_clipped_bits += payout_tick.clipped_bits;
@@ -3459,6 +4361,441 @@ impl ArkheLearner {
             composed_old_to_new,
         }
     }
+
+    fn try_sleep_three_route_consensus_step(
+        &mut self,
+        pri_vals: &[u64],
+        alt_vals: &[u64],
+        port_mask_opt: Option<&[bool]>,
+        comp_index_map: Option<&[Option<usize>]>,
+        loop_state: &mut SleepLoopState<'_>,
+    ) {
+        let num_out = usize::from(self.editable.compiled().num_outputs());
+        if self.sleep_port_consensus.len() < num_out {
+            self.sleep_port_consensus.resize(num_out, (0, 0, 0));
+        }
+        for p in 0..num_out {
+            if port_mask_opt.is_some_and(|mask| !mask.get(p).copied().unwrap_or(false)) {
+                continue;
+            }
+            let p_u16 = p as u16;
+            let comps_on_p: Vec<usize> = self
+                .editable
+                .economy()
+                .comparators()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    (c.target_port == p_u16 && !loop_state.is_suspended[i]).then_some(i)
+                })
+                .collect();
+            if comps_on_p.len() != 2 {
+                // R5(c) / DR #50 (1b): preserve sleep_port_consensus across non-edit boundaries.
+                continue;
+            }
+            let idx_a = comps_on_p[0];
+            let idx_b = comps_on_p[1];
+            let Some(val_idx_a) =
+                comp_index_map.map_or(Some(idx_a), |m| m.get(idx_a).copied().flatten())
+            else {
+                continue;
+            };
+            let Some(val_idx_b) =
+                comp_index_map.map_or(Some(idx_b), |m| m.get(idx_b).copied().flatten())
+            else {
+                continue;
+            };
+            let comps = self.editable.economy().comparators();
+            if !comparator_cone_is_mature(
+                self.editable.circuit(),
+                self.editable.economy(),
+                &comps[idx_a],
+            ) || !comparator_cone_is_mature(
+                self.editable.circuit(),
+                self.editable.economy(),
+                &comps[idx_b],
+            ) {
+                continue;
+            }
+            let Some(&pri) = pri_vals.get(val_idx_a) else {
+                continue;
+            };
+            let Some(&alt_a) = alt_vals.get(val_idx_a) else {
+                continue;
+            };
+            let Some(&alt_b) = alt_vals.get(val_idx_b) else {
+                continue;
+            };
+            let counts = &mut self.sleep_port_consensus[p];
+            if pri != alt_a {
+                counts.0 += 1;
+            }
+            if pri != alt_b {
+                counts.1 += 1;
+            }
+            if alt_a != alt_b {
+                counts.2 += 1;
+            }
+            let (d_pa, d_pb, d_ab) = *counts;
+            let thr = loop_state.consensus_thr;
+            let action = if d_pa == 0 && d_pb >= thr && d_ab >= thr {
+                Some((idx_b, false))
+            } else if d_pb == 0 && d_pa >= thr && d_ab >= thr {
+                Some((idx_a, false))
+            } else if d_ab == 0 && d_pa >= thr && d_pb >= thr {
+                Some((idx_a, true))
+            } else {
+                None
+            };
+            if let Some((prune_idx, prune_primary)) = action {
+                let pre_comps = self.editable.economy().comparators().to_vec();
+                let promoted_port = prune_primary.then_some(p_u16);
+                if let Some(step_map) =
+                    self.excise_port_comparator_with_map(prune_idx, prune_primary)
+                {
+                    compose_old_to_new(loop_state.composed_old_to_new, &step_map);
+                    *loop_state.sleep_edited = true;
+                    self.disagreement_prune_events += 1;
+                    *loop_state.minority_routes_pruned += 1;
+                    if let Some(c) = self.sleep_port_consensus.get_mut(p) {
+                        *c = (0, 0, 0);
+                    }
+                    remap_sleep_loop_state_after_edit(
+                        self.editable.economy().comparators(),
+                        self.editable.circuit(),
+                        &pre_comps,
+                        &step_map,
+                        loop_state.grounded_channels,
+                        loop_state.schedule,
+                        promoted_port,
+                        loop_state.is_suspended,
+                        loop_state.r5a_primary_at_fault,
+                        loop_state.segment_loopback_disagreements,
+                        loop_state.escrowed_by_comp,
+                        loop_state.dropped_escrow_ids,
+                        loop_state.voided_agreement_flux_bits,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    fn process_sleep_starvation_excisions(&mut self, loop_state: &mut SleepLoopState<'_>) {
+        if !self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .enumerate()
+            .any(|(i, c)| {
+                sleep_comp_is_active(
+                    self.editable.circuit(),
+                    c,
+                    i,
+                    loop_state.is_suspended,
+                    loop_state.r5a_primary_at_fault,
+                    loop_state.grounded_channels,
+                    loop_state.schedule,
+                )
+            })
+        {
+            return;
+        }
+        loop {
+            let starved_set: BTreeSet<NodeId> = self
+                .editable
+                .economy()
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, econ)| {
+                    (econ.juvenile_ticks == 0 && econ.energy <= 0.0).then_some(NodeId(idx as u32))
+                })
+                .collect();
+            if starved_set.is_empty() {
+                break;
+            }
+            let comps = self.editable.economy().comparators().to_vec();
+            let mut excised_comp: Option<(usize, u16, bool)> = None;
+            for (comp_idx, comp) in comps.iter().enumerate() {
+                if !sleep_comp_is_active(
+                    self.editable.circuit(),
+                    comp,
+                    comp_idx,
+                    loop_state.is_suspended,
+                    loop_state.r5a_primary_at_fault,
+                    loop_state.grounded_channels,
+                    loop_state.schedule,
+                ) {
+                    continue;
+                }
+                let target_port_subs: Vec<NodeId> = comps
+                    .iter()
+                    .filter(|c| c.target_port == comp.target_port)
+                    .map(|c| c.sub_node)
+                    .collect();
+                let surviving_comp_nodes: Vec<(NodeId, NodeId)> = comps
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| (i != comp_idx).then_some((c.sub_node, c.eqz_node)))
+                    .collect();
+                let circuit = self.editable.circuit();
+                let pri_starved = comparator_exclusive_arm_nodes(
+                    circuit,
+                    comp.sub_node,
+                    comp.eqz_node,
+                    comp.target_port,
+                    true,
+                    &target_port_subs,
+                    &surviving_comp_nodes,
+                )
+                .is_some_and(|excl| excl.iter().any(|n| starved_set.contains(n)));
+                let alt_starved = comparator_exclusive_arm_nodes(
+                    circuit,
+                    comp.sub_node,
+                    comp.eqz_node,
+                    comp.target_port,
+                    false,
+                    &target_port_subs,
+                    &surviving_comp_nodes,
+                )
+                .is_some_and(|excl| excl.iter().any(|n| starved_set.contains(n)));
+                let comp_node_starved =
+                    starved_set.contains(&comp.sub_node) || starved_set.contains(&comp.eqz_node);
+                if (comp_node_starved || alt_starved)
+                    && (!loop_state.r5a_primary_at_fault[comp_idx] || !pri_starved)
+                {
+                    excised_comp = Some((comp_idx, comp.target_port, false));
+                    break;
+                }
+                if loop_state.schedule == SleepSchedule::ConsistencyReplay
+                    && pri_starved
+                    && !alt_starved
+                    && !comp_node_starved
+                    && loop_state.r5a_primary_at_fault[comp_idx]
+                    && alt_cone_is_mature(circuit, self.editable.economy(), comp)
+                {
+                    excised_comp = Some((comp_idx, comp.target_port, true));
+                    break;
+                }
+            }
+            if let Some((comp_idx, tp, prune_primary)) = excised_comp {
+                let promoted_port = prune_primary.then_some(tp);
+                if let Some(step_map) =
+                    self.excise_port_comparator_with_map(comp_idx, prune_primary)
+                {
+                    compose_old_to_new(loop_state.composed_old_to_new, &step_map);
+                    *loop_state.sleep_edited = true;
+                    self.disagreement_prune_events += 1;
+                    *loop_state.starvation_excisions += 1;
+                    if let Some(c) = self.sleep_port_consensus.get_mut(usize::from(tp)) {
+                        *c = (0, 0, 0);
+                    }
+                    remap_sleep_loop_state_after_edit(
+                        self.editable.economy().comparators(),
+                        self.editable.circuit(),
+                        &comps,
+                        &step_map,
+                        loop_state.grounded_channels,
+                        loop_state.schedule,
+                        promoted_port,
+                        loop_state.is_suspended,
+                        loop_state.r5a_primary_at_fault,
+                        loop_state.segment_loopback_disagreements,
+                        loop_state.escrowed_by_comp,
+                        loop_state.dropped_escrow_ids,
+                        loop_state.voided_agreement_flux_bits,
+                    );
+                    continue;
+                }
+            }
+            break;
+        }
+
+        let suspended_protected = collect_suspended_protected_nodes(
+            self.editable.circuit(),
+            self.editable.economy().comparators(),
+            loop_state.is_suspended,
+            loop_state.grounded_channels,
+        );
+        let comps = self.editable.economy().comparators();
+        let circuit = self.editable.circuit();
+        let mut protected_primary_nodes = BTreeSet::new();
+        for p in 0..circuit.num_outputs() {
+            let has_active_r5a_fault = comps.iter().enumerate().any(|(i, c)| {
+                c.target_port == p
+                    && !loop_state.is_suspended.get(i).copied().unwrap_or(true)
+                    && loop_state
+                        .r5a_primary_at_fault
+                        .get(i)
+                        .copied()
+                        .unwrap_or(false)
+            });
+            if !has_active_r5a_fault {
+                let (pri_cone, _) = port_upstream_cone_and_edges(circuit, p);
+                protected_primary_nodes.extend(pri_cone);
+            }
+        }
+        let remaining_starved: BTreeSet<NodeId> = self
+            .editable
+            .economy()
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, econ)| {
+                let id = NodeId(idx as u32);
+                (econ.juvenile_ticks == 0
+                    && econ.energy <= 0.0
+                    && !suspended_protected.contains(&id)
+                    && !protected_primary_nodes.contains(&id))
+                .then_some(id)
+            })
+            .collect();
+        if !remaining_starved.is_empty() {
+            let pre_prune_circuit = self.editable.circuit().clone();
+            let pre_comps = self.editable.economy().comparators().to_vec();
+            let pre_energies: Vec<f64> = self
+                .editable
+                .economy()
+                .nodes()
+                .iter()
+                .map(|n| n.energy)
+                .collect();
+            let pre_sub_nodes: Vec<NodeId> = pre_comps.iter().map(|c| c.sub_node).collect();
+            let juvenile_set: BTreeSet<NodeId> = self
+                .editable
+                .economy()
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, econ)| (econ.juvenile_ticks > 0).then_some(NodeId(idx as u32)))
+                .collect();
+            let sleep_surgery_cap = self.remaining_candidate_node_eval_budget();
+            let mut surgery_audit = SurgeryEvalAudit {
+                max_additional_node_evals: sleep_surgery_cap,
+                ..SurgeryEvalAudit::default()
+            };
+            let mut excised_starved_passthrough = false;
+            let worst_case_starv_evals = (self.editable.circuit().node_count() as u64)
+                .saturating_mul(2)
+                .saturating_add(self.current_wake_sensitivity_evals());
+            let can_verified_starved = self.growth_config.excision_mode
+                == ExcisionMode::VerifiedLocalExcision
+                && sleep_surgery_cap.is_none_or(|rem| rem >= worst_case_starv_evals)
+                && self.can_afford_extra_node_evals(worst_case_starv_evals);
+            let prune_res = if let Some((pruned, old_to_new)) =
+                prune_starved_preserving_healthy_split_branches(
+                    self.editable.circuit(),
+                    &remaining_starved,
+                    &juvenile_set,
+                ) {
+                self.editable
+                    .recompile_preserving_state(pruned, &old_to_new)
+                    .map(|()| old_to_new)
+            } else if can_verified_starved
+                && let Ok(Some(old_to_new)) = self
+                    .editable
+                    .excise_verified_passthrough_for_starved_cone_audited(
+                        &remaining_starved,
+                        self.economy_config.split_code_tax,
+                        &mut surgery_audit,
+                    )
+            {
+                excised_starved_passthrough = true;
+                Ok(old_to_new)
+            } else {
+                self.editable.prune_starved_set_with_mode_audited(
+                    &remaining_starved,
+                    self.growth_config.excision_mode,
+                    self.growth_config.diagnostic_window,
+                    &mut surgery_audit,
+                )
+            };
+            self.compute_ledger.candidate_replay_node_evals = self
+                .compute_ledger
+                .candidate_replay_node_evals
+                .saturating_add(surgery_audit.replay_node_evals);
+            self.compute_ledger.sensitivity_node_evals = self
+                .compute_ledger
+                .sensitivity_node_evals
+                .saturating_add(surgery_audit.sensitivity_node_evals);
+            if surgery_audit.budget_cap_hit {
+                self.sprout_budget_exhausted += 1;
+            }
+            if let Ok(old_to_new) = prune_res
+                && old_to_new.iter().any(Option::is_none)
+            {
+                self.record_structure_energy_delta(&pre_energies, &old_to_new);
+                self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
+                self.ledger.on_prune(
+                    self.editable.circuit(),
+                    self.economy_config.split_code_tax,
+                    &old_to_new,
+                );
+                self.clear_changed_port_diagnostics_preserving_scorer(
+                    &pre_prune_circuit,
+                    &old_to_new,
+                );
+                self.apply_node_remap_to_windows(&old_to_new);
+                compose_old_to_new(loop_state.composed_old_to_new, &old_to_new);
+                *loop_state.sleep_edited = true;
+                *loop_state.starvation_excisions += 1;
+                if excised_starved_passthrough {
+                    self.idle_prune_events += 1;
+                    self.local_excision_events += 1;
+                } else {
+                    self.starvation_prune_events += 1;
+                    self.record_scoped_starvation_prune(
+                        &pre_prune_circuit,
+                        &pre_comps,
+                        &remaining_starved,
+                    );
+                }
+                remap_sleep_loop_state_after_edit(
+                    self.editable.economy().comparators(),
+                    self.editable.circuit(),
+                    &pre_comps,
+                    &old_to_new,
+                    loop_state.grounded_channels,
+                    loop_state.schedule,
+                    None,
+                    loop_state.is_suspended,
+                    loop_state.r5a_primary_at_fault,
+                    loop_state.segment_loopback_disagreements,
+                    loop_state.escrowed_by_comp,
+                    loop_state.dropped_escrow_ids,
+                    loop_state.voided_agreement_flux_bits,
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RecordedReplayFrame {
+    pre_regs: Vec<u64>,
+    input_buf: Vec<u64>,
+    facts: Vec<u64>,
+    pri_vals: Vec<u64>,
+    alt_vals: Vec<u64>,
+    eqz_vals: Vec<u64>,
+}
+
+struct SleepLoopState<'a> {
+    grounded_channels: &'a [bool],
+    schedule: SleepSchedule,
+    consensus_thr: u64,
+    composed_old_to_new: &'a mut Vec<Option<NodeId>>,
+    sleep_edited: &'a mut bool,
+    minority_routes_pruned: &'a mut u64,
+    starvation_excisions: &'a mut u64,
+    is_suspended: &'a mut Vec<bool>,
+    r5a_primary_at_fault: &'a mut Vec<bool>,
+    segment_loopback_disagreements: &'a mut Vec<u64>,
+    escrowed_by_comp: &'a mut Vec<Vec<EscrowedSleepAgreement>>,
+    dropped_escrow_ids: &'a mut Vec<u64>,
+    voided_agreement_flux_bits: &'a mut f64,
 }
 
 #[derive(Clone, Debug)]
@@ -3466,6 +4803,72 @@ struct EscrowedSleepAgreement {
     id: u64,
     reward: f64,
     node_shares: Vec<f64>,
+}
+
+fn closed_loop_delay_count(
+    circuit: &Circuit,
+    sub_node: NodeId,
+    req_mask: u64,
+    num_out: usize,
+) -> usize {
+    let n = circuit.node_count();
+    let is_tph = circuit.wire_delay() == WireDelayMode::TicksPerHop;
+    let mut visited = vec![false; n];
+    let mut stack = Vec::new();
+    if sub_node.index() < n {
+        visited[sub_node.index()] = true;
+        stack.push(sub_node);
+    }
+    for c in 0..num_out.min(64) {
+        if (req_mask & (1u64 << c)) == 0 {
+            continue;
+        }
+        for edge in circuit.edges() {
+            if edge.dst == SignalSink::BoundaryOut(c as u16)
+                && let SignalSource::NodeOut { node, .. } = edge.src
+                && node.index() < n
+                && !visited[node.index()]
+            {
+                visited[node.index()] = true;
+                stack.push(node);
+            }
+        }
+    }
+    let mut delay_count = 0usize;
+    while let Some(dst_node) = stack.pop() {
+        if matches!(
+            circuit.nodes().get(dst_node.index()),
+            Some(Primitive::Delay { .. })
+        ) {
+            delay_count += 1;
+        }
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == dst_node
+                && let SignalSource::NodeOut { node: src, .. } = edge.src
+                && src.index() < n
+                && !visited[src.index()]
+            {
+                visited[src.index()] = true;
+                stack.push(src);
+            }
+        }
+    }
+    if is_tph {
+        for edge in circuit.edges() {
+            let dst_active = match edge.dst {
+                SignalSink::NodeIn { node, .. } => node.index() < n && visited[node.index()],
+                SignalSink::BoundaryOut(c) => {
+                    let idx = usize::from(c);
+                    idx < num_out.min(64) && (req_mask & (1u64 << idx)) != 0
+                }
+            };
+            if dst_active {
+                delay_count += usize::from(edge.hops);
+            }
+        }
+    }
+    delay_count
 }
 
 fn channel_mask_touches_ungrounded(mask: u64, grounded_channels: &[bool]) -> bool {
@@ -3478,7 +4881,7 @@ fn channel_mask_touches_ungrounded(mask: u64, grounded_channels: &[bool]) -> boo
     })
 }
 
-fn comparator_is_suspended_for_sleep(
+fn comparator_is_suspended_for_replay(
     comp: &ComparatorSite,
     grounded_channels: &[bool],
     schedule: SleepSchedule,
@@ -3490,14 +4893,243 @@ fn comparator_is_suspended_for_sleep(
     match schedule {
         SleepSchedule::None => true,
         SleepSchedule::ConsistencyOnly => {
-            if !target_grounded {
-                return true;
-            }
-            let leaf_mask = comp.primary_channel_mask | comp.alt_channel_mask;
-            channel_mask_touches_ungrounded(leaf_mask, grounded_channels)
+            !target_grounded
+                || channel_mask_touches_ungrounded(
+                    comp.primary_channel_mask | comp.alt_channel_mask,
+                    grounded_channels,
+                )
         }
         SleepSchedule::ConsistencyReplay => !target_grounded,
     }
+}
+
+fn closed_loop_channel_closure(circuit: &Circuit, init_mask: u64, num_out: usize) -> u64 {
+    let direct_out_deps: Vec<u64> = (0..num_out.min(64))
+        .map(|c| {
+            circuit
+                .edges()
+                .iter()
+                .find(|e| e.dst == SignalSink::BoundaryOut(c as u16))
+                .map_or(0, |e| {
+                    crate::structural::graph_edit::cone_channel_mask(circuit, e.src)
+                })
+        })
+        .collect();
+    let mut closure = init_mask;
+    loop {
+        let prev = closure;
+        for (c, &deps) in direct_out_deps.iter().enumerate() {
+            if (closure & (1u64 << c)) != 0 {
+                closure |= deps;
+            }
+        }
+        if closure == prev {
+            break;
+        }
+    }
+    closure
+}
+
+fn comparator_is_suspended_for_sleep(
+    circuit: &Circuit,
+    comp: &ComparatorSite,
+    grounded_channels: &[bool],
+    schedule: SleepSchedule,
+) -> bool {
+    let target_grounded = grounded_channels
+        .get(usize::from(comp.target_port))
+        .copied()
+        .unwrap_or(false);
+    match schedule {
+        SleepSchedule::None => true,
+        SleepSchedule::ConsistencyOnly | SleepSchedule::ConsistencyReplay => {
+            if !target_grounded {
+                return true;
+            }
+            let tp_bit = if usize::from(comp.target_port) < 64 {
+                1u64 << comp.target_port
+            } else {
+                0
+            };
+            let leaf_mask = comp.primary_channel_mask | comp.alt_channel_mask | tp_bit;
+            let full_closure =
+                closed_loop_channel_closure(circuit, leaf_mask, usize::from(circuit.num_outputs()));
+            channel_mask_touches_ungrounded(full_closure, grounded_channels)
+        }
+    }
+}
+
+fn grounded_reactive_register_depth(
+    circuit: &Circuit,
+    grounded_channels: &[bool],
+    active_sub_nodes: &[NodeId],
+) -> usize {
+    fn rec(
+        circuit: &Circuit,
+        node: NodeId,
+        grounded_channels: &[bool],
+        is_tph: bool,
+        on_path: &mut [bool],
+    ) -> Option<usize> {
+        if on_path[node.index()] {
+            return None;
+        }
+        on_path[node.index()] = true;
+        let self_reg = usize::from(matches!(
+            circuit.nodes().get(node.index()),
+            Some(Primitive::Delay { .. })
+        ));
+        let mut max_up: Option<usize> = None;
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, .. } = edge.dst
+                && dst == node
+            {
+                let hop_regs = if is_tph { usize::from(edge.hops) } else { 0 };
+                let candidate = match edge.src {
+                    SignalSource::BoundaryIn(c) => grounded_channels
+                        .get(usize::from(c))
+                        .copied()
+                        .unwrap_or(false)
+                        .then_some(hop_regs),
+                    SignalSource::NodeOut { node: src_node, .. } => {
+                        rec(circuit, src_node, grounded_channels, is_tph, on_path)
+                            .map(|d| hop_regs + d)
+                    }
+                };
+                if let Some(d) = candidate {
+                    max_up = Some(max_up.map_or(d, |prev| prev.max(d)));
+                }
+            }
+        }
+        on_path[node.index()] = false;
+        max_up.map(|d| self_reg + d)
+    }
+
+    let n = circuit.node_count();
+    let is_tph = circuit.wire_delay() == WireDelayMode::TicksPerHop;
+    let mut on_path = vec![false; n];
+    let mut max_depth = 0usize;
+    let consider_edge =
+        |edge: &crate::substrate::Edge, on_path: &mut [bool], max_depth: &mut usize| {
+            let hop_regs = if is_tph { usize::from(edge.hops) } else { 0 };
+            let depth = match edge.src {
+                SignalSource::BoundaryIn(c) => grounded_channels
+                    .get(usize::from(c))
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some(hop_regs),
+                SignalSource::NodeOut { node, .. } => {
+                    rec(circuit, node, grounded_channels, is_tph, on_path).map(|d| hop_regs + d)
+                }
+            };
+            if let Some(d) = depth {
+                *max_depth = (*max_depth).max(d);
+            }
+        };
+    for p in 0..usize::from(circuit.num_outputs()) {
+        if !grounded_channels.get(p).copied().unwrap_or(false) {
+            continue;
+        }
+        for edge in circuit.edges() {
+            if edge.dst == SignalSink::BoundaryOut(p as u16) {
+                consider_edge(edge, &mut on_path, &mut max_depth);
+            }
+        }
+    }
+    for &sub_node in active_sub_nodes {
+        for edge in circuit.edges() {
+            if matches!(edge.dst, SignalSink::NodeIn { node, .. } if node == sub_node) {
+                consider_edge(edge, &mut on_path, &mut max_depth);
+            }
+        }
+    }
+    max_depth
+}
+
+fn compute_sleep_include_latches(
+    circuit: &Circuit,
+    compiled: &crate::substrate::CompiledCircuit,
+    comparators: &[ComparatorSite],
+    include_comparators: &[bool],
+    include_outputs: &[bool],
+) -> Vec<bool> {
+    let node_count = circuit.node_count();
+    let total_regs = compiled.total_registers();
+    let mut include_latches = vec![false; total_regs];
+    if total_regs == 0 {
+        return include_latches;
+    }
+    let mut active_nodes = vec![false; node_count];
+    let mut stack: Vec<NodeId> = Vec::new();
+    for (m, comp) in comparators.iter().enumerate() {
+        if include_comparators.get(m).copied().unwrap_or(false)
+            && comp.eqz_node.index() < node_count
+            && !active_nodes[comp.eqz_node.index()]
+        {
+            active_nodes[comp.eqz_node.index()] = true;
+            stack.push(comp.eqz_node);
+        }
+    }
+    for edge in circuit.edges() {
+        if let SignalSink::BoundaryOut(p) = edge.dst
+            && include_outputs
+                .get(usize::from(p))
+                .copied()
+                .unwrap_or(false)
+            && let SignalSource::NodeOut { node, .. } = edge.src
+            && node.index() < node_count
+            && !active_nodes[node.index()]
+        {
+            active_nodes[node.index()] = true;
+            stack.push(node);
+        }
+    }
+    while let Some(dst_node) = stack.pop() {
+        for edge in circuit.edges() {
+            if matches!(edge.dst, SignalSink::NodeIn { node, .. } if node == dst_node)
+                && let SignalSource::NodeOut { node: src, .. } = edge.src
+                && src.index() < node_count
+                && !active_nodes[src.index()]
+            {
+                active_nodes[src.index()] = true;
+                stack.push(src);
+            }
+        }
+    }
+
+    let mut explicit_idx = 0usize;
+    for (idx, prim) in circuit.nodes().iter().enumerate() {
+        if prim.is_stateful() {
+            if explicit_idx < total_regs {
+                include_latches[explicit_idx] = active_nodes[idx];
+            }
+            explicit_idx += 1;
+        }
+    }
+    if circuit.wire_delay() == WireDelayMode::TicksPerHop {
+        let mut edge_reg_base = compiled.explicit_delay_count();
+        for edge in circuit.edges() {
+            let hops = usize::from(edge.hops);
+            let edge_active = match edge.dst {
+                SignalSink::NodeIn { node, .. } => {
+                    node.index() < node_count && active_nodes[node.index()]
+                }
+                SignalSink::BoundaryOut(p) => include_outputs
+                    .get(usize::from(p))
+                    .copied()
+                    .unwrap_or(false),
+            };
+            if edge_active {
+                for s in 0..hops {
+                    if edge_reg_base + s < total_regs {
+                        include_latches[edge_reg_base + s] = true;
+                    }
+                }
+            }
+            edge_reg_base += hops;
+        }
+    }
+    include_latches
 }
 
 fn alt_cone_is_mature(circuit: &Circuit, economy: &EconomyState, comp: &ComparatorSite) -> bool {
@@ -3639,52 +5271,120 @@ fn compute_r5a_primary_share(
     Some(pri_share)
 }
 
+fn apply_sleep_disagreement_reference_immunity(
+    circuit: &Circuit,
+    comps: &[ComparatorSite],
+    comp_idx: usize,
+    r5a_primary_at_fault: bool,
+    port_shares: &[Vec<f64>],
+    comp_share: &mut [f64],
+) -> bool {
+    let comp = &comps[comp_idx];
+    if r5a_primary_at_fault {
+        if let Some(pri_share) = compute_r5a_primary_share(circuit, comps, comp_idx, port_shares) {
+            let n = comp_share.len().min(pri_share.len());
+            comp_share[..n].copy_from_slice(&pri_share[..n]);
+            if comp_share.len() > n {
+                comp_share[n..].fill(0.0);
+            }
+            return true;
+        }
+        if comp.sub_node.index() < comp_share.len() {
+            comp_share[comp.sub_node.index()] = 0.0;
+        }
+        if comp.eqz_node.index() < comp_share.len() {
+            comp_share[comp.eqz_node.index()] = 0.0;
+        }
+        let target_port_subs: Vec<NodeId> = comps
+            .iter()
+            .filter(|c| c.target_port == comp.target_port)
+            .map(|c| c.sub_node)
+            .collect();
+        let surviving_comp_nodes: Vec<(NodeId, NodeId)> = comps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| (i != comp_idx).then_some((c.sub_node, c.eqz_node)))
+            .collect();
+        if let Some(alt_excl) = comparator_exclusive_arm_nodes(
+            circuit,
+            comp.sub_node,
+            comp.eqz_node,
+            comp.target_port,
+            false,
+            &target_port_subs,
+            &surviving_comp_nodes,
+        ) {
+            for node in alt_excl {
+                if node.index() < comp_share.len() {
+                    comp_share[node.index()] = 0.0;
+                }
+            }
+        }
+    } else {
+        let (pri_cone, _) = port_upstream_cone_and_edges(circuit, comp.target_port);
+        for node in pri_cone {
+            if node.index() < comp_share.len() {
+                comp_share[node.index()] = 0.0;
+            }
+        }
+    }
+    let sum: f64 = comp_share.iter().sum();
+    if sum <= 0.0 || !sum.is_finite() {
+        comp_share.fill(0.0);
+        return false;
+    }
+    let inv = 1.0 / sum;
+    for s in comp_share.iter_mut() {
+        *s *= inv;
+    }
+    true
+}
+
+fn sleep_comp_is_active(
+    circuit: &Circuit,
+    comp: &ComparatorSite,
+    comp_idx: usize,
+    is_suspended: &[bool],
+    r5a_primary_at_fault: &[bool],
+    grounded_channels: &[bool],
+    schedule: SleepSchedule,
+) -> bool {
+    !is_suspended.get(comp_idx).copied().unwrap_or(true)
+        || (!comparator_is_suspended_for_sleep(circuit, comp, grounded_channels, schedule)
+            && r5a_primary_at_fault.get(comp_idx).copied().unwrap_or(false))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn remap_sleep_loop_state_after_edit(
     post_comps: &[ComparatorSite],
-    post_node_count: usize,
+    post_circuit: &Circuit,
     pre_comps: &[ComparatorSite],
     step_map: &[Option<NodeId>],
     grounded_channels: &[bool],
     schedule: SleepSchedule,
-    promoted_pri_dis: Option<(u16, u64)>,
+    promoted_pri_port: Option<u16>,
     is_suspended: &mut Vec<bool>,
-    primary_fact_disagreements: &mut Vec<u64>,
-    alt_fact_disagreements: &mut Vec<u64>,
-    escrowed_by_port: &mut [Vec<EscrowedSleepAgreement>],
+    r5a_primary_at_fault: &mut Vec<bool>,
+    segment_loopback_disagreements: &mut Vec<u64>,
+    escrowed_by_comp: &mut Vec<Vec<EscrowedSleepAgreement>>,
     dropped_escrow_ids: &mut Vec<u64>,
+    voided_agreement_flux_bits: &mut f64,
 ) {
-    for entries in escrowed_by_port.iter_mut() {
-        let mut retained = Vec::with_capacity(entries.len());
-        for mut entry in entries.drain(..) {
-            let mut next_shares = vec![0.0; post_node_count];
-            for (old_idx, mapped) in step_map.iter().enumerate() {
-                if let Some(new_id) = mapped
-                    && old_idx < entry.node_shares.len()
-                    && new_id.index() < post_node_count
-                {
-                    next_shares[new_id.index()] += entry.node_shares[old_idx];
-                }
-            }
-            if next_shares.iter().sum::<f64>() > 0.0 {
-                entry.node_shares = next_shares;
-                retained.push(entry);
-            } else {
-                dropped_escrow_ids.push(entry.id);
-            }
-        }
-        *entries = retained;
-    }
+    let post_node_count = post_circuit.node_count();
+    let old_suspended = is_suspended.clone();
+    let old_r5a = r5a_primary_at_fault.clone();
+    let old_lb_dis = segment_loopback_disagreements.clone();
+    let old_escrow = std::mem::take(escrowed_by_comp);
 
     let mut next_susp = Vec::with_capacity(post_comps.len());
-    let mut next_pri = Vec::with_capacity(post_comps.len());
-    let mut next_alt = Vec::with_capacity(post_comps.len());
-    for comp in post_comps {
-        next_susp.push(comparator_is_suspended_for_sleep(
-            comp,
-            grounded_channels,
-            schedule,
-        ));
+    let mut next_r5a = Vec::with_capacity(post_comps.len());
+    let mut next_lb_dis = Vec::with_capacity(post_comps.len());
+    let mut next_escrow: Vec<Vec<EscrowedSleepAgreement>> = vec![Vec::new(); post_comps.len()];
+    let mut old_matched = vec![false; pre_comps.len()];
+
+    for (new_idx, comp) in post_comps.iter().enumerate() {
+        let base_susp =
+            comparator_is_suspended_for_sleep(post_circuit, comp, grounded_channels, schedule);
         if let Some(old_idx) = pre_comps.iter().position(|old_c| {
             step_map
                 .get(old_c.sub_node.index())
@@ -3692,20 +5392,52 @@ fn remap_sleep_loop_state_after_edit(
                 .flatten()
                 .is_some_and(|mapped| mapped == comp.sub_node)
         }) {
-            let pri_d = match promoted_pri_dis {
-                Some((tp, new_pri_d)) if comp.target_port == tp => new_pri_d,
-                _ => primary_fact_disagreements[old_idx],
+            old_matched[old_idx] = true;
+            next_susp.push(old_suspended[old_idx] || base_susp);
+            let r5a = match promoted_pri_port {
+                Some(tp) if comp.target_port == tp => false,
+                _ => old_r5a[old_idx],
             };
-            next_pri.push(pri_d);
-            next_alt.push(alt_fact_disagreements[old_idx]);
+            next_r5a.push(r5a);
+            next_lb_dis.push(old_lb_dis[old_idx]);
+            for mut entry in old_escrow[old_idx].iter().cloned() {
+                let mut next_shares = vec![0.0; post_node_count];
+                for (oi, mapped) in step_map.iter().enumerate() {
+                    if let Some(new_id) = mapped
+                        && oi < entry.node_shares.len()
+                        && new_id.index() < post_node_count
+                    {
+                        next_shares[new_id.index()] += entry.node_shares[oi];
+                    }
+                }
+                if next_shares.iter().sum::<f64>() > 0.0 {
+                    entry.node_shares = next_shares;
+                    next_escrow[new_idx].push(entry);
+                } else {
+                    *voided_agreement_flux_bits += entry.reward;
+                    dropped_escrow_ids.push(entry.id);
+                }
+            }
         } else {
-            next_pri.push(0);
-            next_alt.push(0);
+            next_susp.push(base_susp);
+            next_r5a.push(false);
+            next_lb_dis.push(0);
         }
     }
+
+    for (old_idx, matched) in old_matched.iter().enumerate() {
+        if !*matched {
+            for entry in &old_escrow[old_idx] {
+                *voided_agreement_flux_bits += entry.reward;
+                dropped_escrow_ids.push(entry.id);
+            }
+        }
+    }
+
     *is_suspended = next_susp;
-    *primary_fact_disagreements = next_pri;
-    *alt_fact_disagreements = next_alt;
+    *r5a_primary_at_fault = next_r5a;
+    *segment_loopback_disagreements = next_lb_dis;
+    *escrowed_by_comp = next_escrow;
 }
 
 fn comparator_cone_is_mature(
@@ -4037,6 +5769,7 @@ impl PredictorBaseline for ArkheLearner {
             .expect("valid comparator causal ancestry");
             PendingSnapshot::WithComparators { ancestry, snapshot }
         };
+        self.last_wake_sens_evals = sens_evals;
         self.compute_ledger.sensitivity_node_evals = self
             .compute_ledger
             .sensitivity_node_evals
@@ -4094,10 +5827,19 @@ impl PredictorBaseline for ArkheLearner {
         };
         self.obs_window
             .push_frame_with_state(truth, pre_epoch, &pre_registers);
-        if self
-            .fact_buffer
-            .push_frame_with_state(truth, pre_epoch, &pre_registers)
-        {
+        let width_norm = self.editable.circuit().width();
+        let mut consistent_channel_mask = 0u64;
+        for (c, (&p_val, &o_val)) in predictions.iter().zip(truth.iter()).enumerate() {
+            if c < 64 && width_norm.normalize(p_val) == width_norm.normalize(o_val) {
+                consistent_channel_mask |= 1u64 << c;
+            }
+        }
+        if self.fact_buffer.push_frame_with_state_and_consistency(
+            truth,
+            pre_epoch,
+            &pre_registers,
+            consistent_channel_mask,
+        ) {
             self.sleep_telemetry.fact_buffer_evictions =
                 self.sleep_telemetry.fact_buffer_evictions.saturating_add(1);
         }
@@ -4319,7 +6061,17 @@ impl PredictorBaseline for ArkheLearner {
                 .collect();
             let mut used_split_preserving = false;
             let mut excised_starved_passthrough = false;
-            let mut surgery_audit = SurgeryEvalAudit::default();
+            let wake_surgery_cap = self.remaining_candidate_node_eval_budget();
+            let mut surgery_audit = SurgeryEvalAudit {
+                max_additional_node_evals: wake_surgery_cap,
+                ..SurgeryEvalAudit::default()
+            };
+            let worst_case_starv_evals = (self.editable.circuit().node_count() as u64)
+                .saturating_mul(2)
+                .saturating_add(self.current_wake_sensitivity_evals());
+            let can_verified_starved = self.growth_config.excision_mode
+                == ExcisionMode::VerifiedLocalExcision
+                && wake_surgery_cap.is_none_or(|rem| rem >= worst_case_starv_evals);
             let prune_res = if let Some((pruned, old_to_new)) =
                 prune_starved_preserving_healthy_split_branches(
                     self.editable.circuit(),
@@ -4330,7 +6082,7 @@ impl PredictorBaseline for ArkheLearner {
                 self.editable
                     .recompile_preserving_state(pruned, &old_to_new)
                     .map(|()| old_to_new)
-            } else if self.growth_config.excision_mode == ExcisionMode::VerifiedLocalExcision
+            } else if can_verified_starved
                 && let Ok(Some(old_to_new)) = self
                     .editable
                     .excise_verified_passthrough_for_starved_cone_audited(
@@ -4356,7 +6108,12 @@ impl PredictorBaseline for ArkheLearner {
                 .compute_ledger
                 .sensitivity_node_evals
                 .saturating_add(surgery_audit.sensitivity_node_evals);
-            if let Ok(old_to_new) = prune_res {
+            if surgery_audit.budget_cap_hit {
+                self.sprout_budget_exhausted += 1;
+            }
+            if let Ok(old_to_new) = prune_res
+                && old_to_new.iter().any(Option::is_none)
+            {
                 self.record_structure_energy_delta(&pre_energies, &old_to_new);
                 self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
                 self.ledger.on_prune(
@@ -4566,7 +6323,14 @@ impl PredictorBaseline for ArkheLearner {
                         self.editable.economy(),
                     ),
             };
-            if !idle_nodes.is_empty() {
+            let worst_case_diag_evals = ((self.port_states[p].diagnostic_buffer.len() as u64) + 2)
+                .saturating_mul(self.editable.circuit().node_count() as u64)
+                .saturating_add(self.current_wake_sensitivity_evals());
+            if !idle_nodes.is_empty()
+                && self
+                    .remaining_candidate_node_eval_budget()
+                    .is_none_or(|rem| rem >= worst_case_diag_evals)
+            {
                 let pre_prune_circuit = self.editable.circuit().clone();
                 let pre_energies: Vec<f64> = self
                     .editable
@@ -4586,7 +6350,10 @@ impl PredictorBaseline for ArkheLearner {
                     &mut self.port_states[p].diagnostic_buffer,
                     DiagnosticBuffer::new(0),
                 );
-                let mut surgery_audit = SurgeryEvalAudit::default();
+                let mut surgery_audit = SurgeryEvalAudit {
+                    max_additional_node_evals: self.remaining_candidate_node_eval_budget(),
+                    ..SurgeryEvalAudit::default()
+                };
                 let prune_res = self
                     .editable
                     .prune_zero_sensitivity_mature_nodes_with_mode_audited(
@@ -4609,6 +6376,9 @@ impl PredictorBaseline for ArkheLearner {
                     .compute_ledger
                     .sensitivity_node_evals
                     .saturating_add(surgery_audit.sensitivity_node_evals);
+                if surgery_audit.budget_cap_hit {
+                    self.sprout_budget_exhausted += 1;
+                }
                 if let Ok(old_to_new) = prune_res {
                     let any_pruned = old_to_new.iter().any(Option::is_none);
                     if any_pruned {
@@ -4637,7 +6407,11 @@ impl PredictorBaseline for ArkheLearner {
                     }
                 }
             }
-            if self.growth_config.excision_mode == ExcisionMode::VerifiedLocalExcision {
+            if self.growth_config.excision_mode == ExcisionMode::VerifiedLocalExcision
+                && self
+                    .remaining_candidate_node_eval_budget()
+                    .is_none_or(|rem| rem >= worst_case_diag_evals)
+            {
                 let pre_prune_circuit = self.editable.circuit().clone();
                 let pre_energies: Vec<f64> = self
                     .editable
@@ -4657,7 +6431,10 @@ impl PredictorBaseline for ArkheLearner {
                     &mut self.port_states[p].diagnostic_buffer,
                     DiagnosticBuffer::new(0),
                 );
-                let mut surgery_audit = SurgeryEvalAudit::default();
+                let mut surgery_audit = SurgeryEvalAudit {
+                    max_additional_node_evals: self.remaining_candidate_node_eval_budget(),
+                    ..SurgeryEvalAudit::default()
+                };
                 let excise_res = self.editable.excise_verified_passthrough_subgraphs_audited(
                     port_u16,
                     &diag_buf.inputs,
@@ -4676,6 +6453,9 @@ impl PredictorBaseline for ArkheLearner {
                     .compute_ledger
                     .sensitivity_node_evals
                     .saturating_add(surgery_audit.sensitivity_node_evals);
+                if surgery_audit.budget_cap_hit {
+                    self.sprout_budget_exhausted += 1;
+                }
                 if let Ok(Some(old_to_new)) = excise_res {
                     self.record_structure_energy_delta(&pre_energies, &old_to_new);
                     self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
@@ -4729,7 +6509,15 @@ impl PredictorBaseline for ArkheLearner {
                     }
                 }
 
-                let mut growth_audit = GrowthEvalAudit::default();
+                let stage2_eval_cap = self.remaining_candidate_node_eval_budget();
+                if stage2_eval_cap == Some(0) {
+                    self.sprout_budget_exhausted += 1;
+                    continue;
+                }
+                let mut growth_audit = GrowthEvalAudit {
+                    max_additional_node_evals: stage2_eval_cap,
+                    ..GrowthEvalAudit::default()
+                };
                 let mut stage0_tel = SproutTelemetry::default();
                 let can_potentially_deepen = num_ports > 1
                     && !port_zero_error
@@ -4762,12 +6550,16 @@ impl PredictorBaseline for ArkheLearner {
                     && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
                     && stage0_tel.sprout_blocked_max_nodes == 0
                     && stage0_tel.sprout_budget_exhausted == 0
+                    && !growth_audit.budget_cap_hit
                     && port_budget.remaining() > 0;
 
                 let mut deferred_best: Option<DeferredProposal> = match stage0_res {
                     Ok(Some(prop)) if prop.e_cand == 0 || !can_deepen_eligible => {
-                        sprouted =
-                            self.commit_sprout(p, prop.circuit, prop.effective_juvenile_ticks);
+                        sprouted = self.try_commit_sprout_within_envelope(
+                            p,
+                            prop,
+                            growth_audit.total_evals(),
+                        );
                         None
                     }
                     Ok(Some(prop)) => Some(DeferredProposal::Sprout(prop)),
@@ -4776,7 +6568,7 @@ impl PredictorBaseline for ArkheLearner {
 
                 // 2b. Autonomous delay ring proposal under noise (checked BEFORE lag deepening per C2-a)
                 let mut ring_tel = SproutTelemetry::default();
-                if !sprouted {
+                if !sprouted && !growth_audit.budget_cap_hit {
                     if let Some((comp_idx, e_comp_diag, j_comp_diag)) =
                         evaluate_comparator_ring_promotion_audited(
                             &self.editable,
@@ -4790,7 +6582,10 @@ impl PredictorBaseline for ArkheLearner {
                         )
                     {
                         if deferred_best.is_none() || e_comp_diag == 0 {
-                            sprouted = self.perform_comparator_handoff(comp_idx);
+                            sprouted = self.try_commit_handoff_within_envelope(
+                                comp_idx,
+                                growth_audit.total_evals(),
+                            );
                         } else if deferred_best
                             .as_ref()
                             .is_none_or(|prev| j_comp_diag < prev.j_score())
@@ -4811,7 +6606,10 @@ impl PredictorBaseline for ArkheLearner {
                         )
                     {
                         if deferred_best.is_none() || e_ring_diag == 0 {
-                            sprouted = self.commit_ring_proposal(ring_prop);
+                            sprouted = self.try_commit_ring_within_envelope(
+                                ring_prop,
+                                growth_audit.total_evals(),
+                            );
                         } else if deferred_best
                             .as_ref()
                             .is_none_or(|prev| j_ring_diag < prev.j_score())
@@ -4825,7 +6623,7 @@ impl PredictorBaseline for ArkheLearner {
                 let mut last_band_tel: Option<SproutTelemetry> = None;
                 let mut band_blocked = 0u64;
                 let mut band_exhausted = 0u64;
-                if !sprouted && can_deepen_eligible {
+                if !sprouted && can_deepen_eligible && !growth_audit.budget_cap_hit {
                     let mut bands = Vec::new();
                     let mut prev_max = self.growth_config.max_reactive_lag;
                     for &cap in &[6u8, 12u8] {
@@ -4841,7 +6639,7 @@ impl PredictorBaseline for ArkheLearner {
 
                     let num_bands = bands.len();
                     for (band_idx, &(min_tau, max_tau)) in bands.iter().enumerate() {
-                        if port_budget.remaining() == 0 {
+                        if port_budget.remaining() == 0 || growth_audit.budget_cap_hit {
                             break;
                         }
                         self.lag_deepening_steps += 1;
@@ -4872,15 +6670,16 @@ impl PredictorBaseline for ArkheLearner {
                         band_blocked += band_tel.sprout_blocked_max_nodes;
                         band_exhausted += band_tel.sprout_budget_exhausted;
                         let band_stopped = band_tel.sprout_blocked_max_nodes > 0
-                            || band_tel.sprout_budget_exhausted > 0;
+                            || band_tel.sprout_budget_exhausted > 0
+                            || growth_audit.budget_cap_hit;
                         last_band_tel = Some(band_tel);
 
                         if let Ok(Some(band_prop)) = band_res {
                             if band_prop.e_cand == 0 {
-                                sprouted = self.commit_sprout(
+                                sprouted = self.try_commit_sprout_within_envelope(
                                     p,
-                                    band_prop.circuit,
-                                    band_prop.effective_juvenile_ticks,
+                                    band_prop,
+                                    growth_audit.total_evals(),
                                 );
                                 break;
                             }
@@ -4899,15 +6698,18 @@ impl PredictorBaseline for ArkheLearner {
 
                 if !sprouted && let Some(winner) = deferred_best {
                     sprouted = match winner {
-                        DeferredProposal::Sprout(prop) => {
-                            self.commit_sprout(p, prop.circuit, prop.effective_juvenile_ticks)
-                        }
-                        DeferredProposal::Ring(ring_prop, _) => {
-                            self.commit_ring_proposal(ring_prop)
-                        }
-                        DeferredProposal::ComparatorHandoff(comp_idx, _) => {
-                            self.perform_comparator_handoff(comp_idx)
-                        }
+                        DeferredProposal::Sprout(prop) => self.try_commit_sprout_within_envelope(
+                            p,
+                            prop,
+                            growth_audit.total_evals(),
+                        ),
+                        DeferredProposal::Ring(ring_prop, _) => self
+                            .try_commit_ring_within_envelope(ring_prop, growth_audit.total_evals()),
+                        DeferredProposal::ComparatorHandoff(comp_idx, _) => self
+                            .try_commit_handoff_within_envelope(
+                                comp_idx,
+                                growth_audit.total_evals(),
+                            ),
                     };
                 }
 
@@ -4924,6 +6726,7 @@ impl PredictorBaseline for ArkheLearner {
                     + if sprouted { 0 } else { band_blocked };
                 let stage2_budget_exhausted = stage0_tel.sprout_budget_exhausted
                     + ring_tel.sprout_budget_exhausted
+                    + u64::from(growth_audit.budget_cap_hit)
                     + if sprouted { 0 } else { band_exhausted };
                 self.sprout_budget_exhausted += stage2_budget_exhausted;
                 self.ring_period_bound += ring_tel.ring_period_bound;
@@ -4936,6 +6739,8 @@ impl PredictorBaseline for ArkheLearner {
                 if !sprouted {
                     let mut bound = bound_tel.lag_horizon_bound + ring_tel.lag_horizon_bound;
                     if let Some(tau_max) = deferred_lag_bound_tau
+                        && !growth_audit.budget_cap_hit
+                        && stage2_budget_exhausted == 0
                         && check_deeper_lag_for_port_audited(
                             &self.editable,
                             &self.obs_window,
@@ -5031,9 +6836,17 @@ impl PredictorBaseline for ArkheLearner {
                 {
                     self.port_states[p].ticks_since_last_check = prev_ticks_since_check;
                 } else if stage3_eligible {
+                    let stage3_eval_cap = self.remaining_candidate_node_eval_budget();
+                    if stage3_eval_cap == Some(0) {
+                        self.sprout_budget_exhausted += 1;
+                        continue;
+                    }
                     let any_sibling_needs_stage2 =
                         (0..num_ports).any(|q| q != p && self.port_needs_stage2(q));
-                    let mut growth_audit = GrowthEvalAudit::default();
+                    let mut growth_audit = GrowthEvalAudit {
+                        max_additional_node_evals: stage3_eval_cap,
+                        ..GrowthEvalAudit::default()
+                    };
                     let mut stage3_tel = SproutTelemetry::default();
                     let mut stage3_ok_none = false;
                     let mut sprouted = false;
@@ -5050,7 +6863,11 @@ impl PredictorBaseline for ArkheLearner {
                             &mut growth_audit,
                         ) {
                             Ok(Some(prop)) => {
-                                sprouted = self.commit_redundancy_sprout(p, prop);
+                                sprouted = self.try_commit_redundancy_within_envelope(
+                                    p,
+                                    prop,
+                                    growth_audit.total_evals(),
+                                );
                             }
                             Ok(None) => stage3_ok_none = true,
                             Err(_) => {}
@@ -5080,7 +6897,11 @@ impl PredictorBaseline for ArkheLearner {
                             &mut growth_audit,
                         ) {
                             Ok(Some(prop)) => {
-                                sprouted = self.commit_redundancy_sprout(p, prop);
+                                sprouted = self.try_commit_redundancy_within_envelope(
+                                    p,
+                                    prop,
+                                    growth_audit.total_evals(),
+                                );
                             }
                             Ok(None) => stage3_ok_none = true,
                             Err(_) => {}
