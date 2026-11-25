@@ -317,6 +317,7 @@ pub struct EconomyState {
     scorers: Vec<PointForecastScorer>,
     register_eligibility: Vec<Vec<f64>>,
     phase: ExecutionPhase,
+    pause_juvenile_countdown: bool,
     comparators: Vec<ComparatorSite>,
     comparator_agreement_ticks: u64,
     comparator_disagreement_ticks: u64,
@@ -355,6 +356,7 @@ impl EconomyState {
                 .collect(),
             register_eligibility: vec![vec![0.0; nodes]; registers],
             phase: ExecutionPhase::Wake,
+            pause_juvenile_countdown: false,
             comparators: Vec::new(),
             comparator_agreement_ticks: 0,
             comparator_disagreement_ticks: 0,
@@ -366,6 +368,17 @@ impl EconomyState {
     #[must_use]
     pub const fn phase(&self) -> ExecutionPhase {
         self.phase
+    }
+
+    /// Whether `juvenile_ticks` countdown is temporarily paused (e.g., during M4a sleep segments).
+    #[must_use]
+    pub const fn pause_juvenile_countdown(&self) -> bool {
+        self.pause_juvenile_countdown
+    }
+
+    /// Toggles pausing of `juvenile_ticks` countdown inside tick evaluation.
+    pub fn set_pause_juvenile_countdown(&mut self, paused: bool) {
+        self.pause_juvenile_countdown = paused;
     }
 
     /// Transitions execution phase, initializing or clearing per-segment Sleep scorers against
@@ -616,6 +629,7 @@ impl EconomyState {
         )?;
         remapped.scorers.clone_from(&self.scorers);
         remapped.phase = self.phase;
+        remapped.pause_juvenile_countdown = self.pause_juvenile_countdown;
         remapped.comparator_agreement_ticks = self.comparator_agreement_ticks;
         remapped.comparator_disagreement_ticks = self.comparator_disagreement_ticks;
         remapped.cumulative_comparator_flux = self.cumulative_comparator_flux;
@@ -1144,7 +1158,9 @@ impl EconomyState {
             node.energy = next_energy;
             node.smoothed_drain_rate = next_smoothed_drain;
             if node.juvenile_ticks > 0 {
-                node.juvenile_ticks -= 1;
+                if !self.pause_juvenile_countdown {
+                    node.juvenile_ticks -= 1;
+                }
             } else if node.energy <= 0.0 {
                 starved_nodes.push(index);
             }
@@ -1791,5 +1807,103 @@ mod tests {
         assert_eq!(remapped.comparators().len(), 1);
         assert_eq!(remapped.comparators()[0].sub_node, NodeId(0));
         assert_eq!(remapped.comparators()[0].eqz_node, NodeId(1));
+    }
+
+    #[test]
+    fn sleep_pauses_juvenile_ticks_while_mature_nodes_still_starve() {
+        let config = EconomyConfig {
+            juvenile_ticks: 4,
+            initial_energy: 2.0,
+            reserve_cap: ReserveCap::Uncapped,
+            ..EconomyConfig::default()
+        };
+        let mut economy =
+            EconomyState::new(config, Width::BITS_1, 3, 1, 0, test_obs_horizon(&config)).unwrap();
+        // Node 0 & 2 mature; Node 1 juvenile (4 ticks remaining).
+        economy.node_mut(0).unwrap().juvenile_ticks = 0;
+        economy.node_mut(2).unwrap().juvenile_ticks = 0;
+        assert_eq!(economy.nodes()[1].juvenile_ticks, 4);
+
+        // Warm up wake port null model, then enter Sleep.
+        economy
+            .register_comparator(NodeId(1), NodeId(2), 0, 0b01, 0b01)
+            .unwrap();
+        for t in 0..16u64 {
+            let s = t % 2;
+            let _ = economy.observe_predictions(&[s], &[s]).unwrap();
+        }
+
+        // Sleep phase with M4a countdown pause: juvenile_ticks on Node 1 must stay frozen, while
+        // mature Node 2 on negative reward can still starve and enter starved_nodes.
+        economy.set_phase(ExecutionPhase::Sleep);
+        economy.set_pause_juvenile_countdown(true);
+        assert!(economy.pause_juvenile_countdown());
+        for t in 0..16u64 {
+            let s = t % 2;
+            let obs = economy.observe_comparators(&[s], &[s], &[1], None).unwrap();
+            let _ = economy
+                .apply_tick_with_comparators(
+                    &[0.0],
+                    &[vec![1.0, 0.0, 0.0]],
+                    &obs.rewards,
+                    &[vec![0.0, 1.0, 0.0]],
+                    obs.agreements,
+                    obs.disagreements,
+                    &[0.0; 3],
+                )
+                .unwrap();
+            assert_eq!(economy.nodes()[1].juvenile_ticks, 4);
+        }
+        let mut mature_starved = false;
+        for _ in 0..8 {
+            let obs = economy.observe_comparators(&[0], &[1], &[0], None).unwrap();
+            let tick = economy
+                .apply_tick_with_comparators(
+                    &[0.0],
+                    &[vec![1.0, 0.0, 0.0]],
+                    &obs.rewards,
+                    &[vec![0.0, 0.0, 1.0]],
+                    obs.agreements,
+                    obs.disagreements,
+                    &[0.0; 3],
+                )
+                .unwrap();
+            if tick.starved_nodes.contains(&2) {
+                mature_starved = true;
+            }
+            assert_eq!(economy.nodes()[1].juvenile_ticks, 4);
+        }
+        assert!(mature_starved);
+        assert!(economy.nodes()[2].energy <= 0.0);
+
+        // Unpaused Sleep (legacy M2b run_offline_loopback) and Wake resume juvenile countdown.
+        economy.set_pause_juvenile_countdown(false);
+        assert!(!economy.pause_juvenile_countdown());
+        let _ = economy
+            .apply_tick_with_comparators(
+                &[0.0],
+                &[vec![1.0, 0.0, 0.0]],
+                &[0.0],
+                &[vec![0.0, 1.0, 0.0]],
+                0,
+                0,
+                &[0.0; 3],
+            )
+            .unwrap();
+        assert_eq!(economy.nodes()[1].juvenile_ticks, 3);
+
+        economy.set_phase(ExecutionPhase::Wake);
+        let _ = economy
+            .apply_tick_with_comparators(
+                &[0.0],
+                &[vec![1.0, 0.0, 0.0]],
+                &[0.0],
+                &[vec![0.0, 1.0, 0.0]],
+                0,
+                0,
+                &[0.0; 3],
+            )
+            .unwrap();
+        assert_eq!(economy.nodes()[1].juvenile_ticks, 2);
     }
 }

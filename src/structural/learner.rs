@@ -543,6 +543,12 @@ impl ArkheLearner {
         &self.editable
     }
 
+    /// Global 0-based wake tick counter.
+    #[must_use]
+    pub const fn tick(&self) -> u64 {
+        self.tick
+    }
+
     /// Mutable reference to current editable circuit.
     pub fn editable_mut(&mut self) -> &mut EditableCircuit {
         &mut self.editable
@@ -1073,6 +1079,76 @@ impl ArkheLearner {
             win.clear();
         }
         Ok(())
+    }
+
+    /// Applies an external structural edit (`M3-E3`) via [`Self::apply_external_edit`], optionally
+    /// installs explicit `post_registers`, and registers an injected comparator
+    /// `(sub_node, eqz_node)` targeting `target_port` along with its wake disagreement window and
+    /// epistemic audit registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrowthError::InvalidConfig`] if `sub_node`/`eqz_node`/`target_port` are invalid,
+    /// collide with surviving comparators, `post_registers` mismatches, or `apply_external_edit`
+    /// fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_external_comparator_edit(
+        &mut self,
+        edited: Circuit,
+        old_to_new: &[Option<NodeId>],
+        injected: &[NodeId],
+        mode: InjectionMode,
+        sub_node: NodeId,
+        eqz_node: NodeId,
+        target_port: u16,
+        primary_channel_mask: u64,
+        alt_channel_mask: u64,
+        post_registers: Option<&[u64]>,
+    ) -> Result<usize, GrowthError> {
+        if sub_node == eqz_node
+            || !matches!(edited.nodes().get(sub_node.index()), Some(Primitive::Sub))
+            || !matches!(edited.nodes().get(eqz_node.index()), Some(Primitive::Eqz))
+            || usize::from(target_port) >= self.editable.economy().scorers().len()
+        {
+            return Err(GrowthError::InvalidConfig);
+        }
+        for comp in self.editable.economy().comparators() {
+            let mapped_sub = old_to_new.get(comp.sub_node.index()).copied().flatten();
+            let mapped_eqz = old_to_new.get(comp.eqz_node.index()).copied().flatten();
+            if mapped_sub == Some(sub_node)
+                || mapped_eqz == Some(eqz_node)
+                || mapped_sub == Some(eqz_node)
+                || mapped_eqz == Some(sub_node)
+            {
+                return Err(GrowthError::InvalidConfig);
+            }
+        }
+        if let Some(regs) = post_registers {
+            let preview = edited.compile().map_err(|_| GrowthError::InvalidConfig)?;
+            if regs.len() != preview.total_registers() {
+                return Err(GrowthError::InvalidConfig);
+            }
+        }
+
+        self.apply_external_edit(edited, old_to_new, injected, mode)?;
+        if let Some(regs) = post_registers {
+            self.editable
+                .set_registers(regs)
+                .map_err(|_| GrowthError::InvalidConfig)?;
+        }
+        let comp_idx = self
+            .editable
+            .register_comparator(
+                sub_node,
+                eqz_node,
+                target_port,
+                primary_channel_mask,
+                alt_channel_mask,
+            )
+            .map_err(|_| GrowthError::InvalidConfig)?;
+        self.sync_comp_audit_ids();
+        self.sync_comparator_windows();
+        Ok(comp_idx)
     }
 
     /// Number of externally injected detour nodes still present in the live circuit.
@@ -2572,6 +2648,9 @@ impl ArkheLearner {
         let start_flux = self.editable.economy().cumulative_comparator_flux();
 
         self.editable.economy_mut().set_phase(ExecutionPhase::Sleep);
+        self.editable
+            .economy_mut()
+            .set_pause_juvenile_countdown(true);
         if let Some(audit) = self.epistemic_audit.as_mut() {
             audit.push(EpistemicAuditEvent::SleepSegmentStart { schedule });
         }
@@ -3310,6 +3389,9 @@ impl ArkheLearner {
         }
 
         // Sleep exit (R3, I3, I6): restore Wake phase, prev_observed_frame, and remapped wake registers.
+        self.editable
+            .economy_mut()
+            .set_pause_juvenile_countdown(false);
         self.editable.economy_mut().set_phase(ExecutionPhase::Wake);
         self.prev_observed_frame = pre_sleep_prev_frame;
         if !sleep_edited {
@@ -3374,6 +3456,7 @@ impl ArkheLearner {
             contradiction_detected: comparator_disagreement_ticks > 0,
             entry_registers: pre_sleep_regs,
             first_loopback_predictions,
+            composed_old_to_new,
         }
     }
 }
@@ -3383,6 +3466,16 @@ struct EscrowedSleepAgreement {
     id: u64,
     reward: f64,
     node_shares: Vec<f64>,
+}
+
+fn channel_mask_touches_ungrounded(mask: u64, grounded_channels: &[bool]) -> bool {
+    (0..64u32).any(|bit| {
+        (mask & (1u64 << bit)) != 0
+            && !grounded_channels
+                .get(bit as usize)
+                .copied()
+                .unwrap_or(false)
+    })
 }
 
 fn comparator_is_suspended_for_sleep(
@@ -3401,13 +3494,7 @@ fn comparator_is_suspended_for_sleep(
                 return true;
             }
             let leaf_mask = comp.primary_channel_mask | comp.alt_channel_mask;
-            (0..64u32).any(|bit| {
-                (leaf_mask & (1u64 << bit)) != 0
-                    && !grounded_channels
-                        .get(bit as usize)
-                        .copied()
-                        .unwrap_or(false)
-            })
+            channel_mask_touches_ungrounded(leaf_mask, grounded_channels)
         }
         SleepSchedule::ConsistencyReplay => !target_grounded,
     }
@@ -3478,10 +3565,13 @@ fn collect_suspended_protected_nodes(
         ) {
             protected.extend(alt_excl);
         }
-        if !grounded_channels
+        let target_ungrounded = !grounded_channels
             .get(usize::from(comp.target_port))
             .copied()
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let primary_touches_ungrounded =
+            channel_mask_touches_ungrounded(comp.primary_channel_mask, grounded_channels);
+        if (target_ungrounded || primary_touches_ungrounded)
             && let Some(pri_excl) = comparator_exclusive_arm_nodes(
                 circuit,
                 comp.sub_node,

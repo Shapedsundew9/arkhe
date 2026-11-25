@@ -339,14 +339,18 @@ fn rec_wire_final_sinks(
     }
 }
 
-fn certify_against_spec_outcome(
+fn certify_against_spec_outcome_for_port(
     compiled: &CompiledCircuit,
     spec: &FiniteStateSpec,
+    target_port: Option<u16>,
     max_joint_steps: usize,
 ) -> CertifyOutcome {
     let k_out = usize::from(compiled.num_outputs());
     let k_in = usize::from(compiled.num_inputs());
     if k_out != usize::from(spec.channels) || (k_in != 0 && k_in != usize::from(spec.channels)) {
+        return CertifyOutcome::Rejected;
+    }
+    if target_port.is_some_and(|port| usize::from(port) >= k_out) {
         return CertifyOutcome::Rejected;
     }
     if spec.num_states == 0 || spec.initial_state >= spec.num_states {
@@ -385,10 +389,14 @@ fn certify_against_spec_outcome(
         circuit_state
             .step(compiled, &prev_obs, &mut pred)
             .expect("matching port counts");
-        let mismatch = pred
-            .iter()
-            .zip(clean_frame)
-            .any(|(&p, &c)| compiled.width().normalize(p) != compiled.width().normalize(c));
+        let mismatch = if let Some(port) = target_port {
+            let p = usize::from(port);
+            compiled.width().normalize(pred[p]) != compiled.width().normalize(clean_frame[p])
+        } else {
+            pred.iter()
+                .zip(clean_frame)
+                .any(|(&p, &c)| compiled.width().normalize(p) != compiled.width().normalize(c))
+        };
         had_mismatch.push(mismatch);
 
         if k_in > 0 {
@@ -411,7 +419,26 @@ pub fn certify_circuit_against_spec(
     spec: &FiniteStateSpec,
     max_joint_steps: usize,
 ) -> Option<usize> {
-    match certify_against_spec_outcome(compiled, spec, max_joint_steps) {
+    match certify_against_spec_outcome_for_port(compiled, spec, None, max_joint_steps) {
+        CertifyOutcome::Certified { lock_tick } => Some(lock_tick),
+        CertifyOutcome::Rejected | CertifyOutcome::StepCapExceeded => None,
+    }
+}
+
+/// Certifies whether `compiled` achieves **zero** prediction errors on `target_port` for all
+/// $t \ge t^*$ around the closed joint `(generator, prev_obs, circuit)` state cycle of `spec`.
+///
+/// Shares exact joint-state cycle-closure semantics with [`certify_circuit_against_spec`] while
+/// scoping mismatch verification to `target_port`.
+#[must_use]
+pub fn certify_circuit_port_against_spec(
+    compiled: &CompiledCircuit,
+    spec: &FiniteStateSpec,
+    target_port: u16,
+    max_joint_steps: usize,
+) -> Option<usize> {
+    match certify_against_spec_outcome_for_port(compiled, spec, Some(target_port), max_joint_steps)
+    {
         CertifyOutcome::Certified { lock_tick } => Some(lock_tick),
         CertifyOutcome::Rejected | CertifyOutcome::StepCapExceeded => None,
     }
@@ -451,7 +478,7 @@ pub fn exact_synthesize_certified_circuit(
             let compiled = cand
                 .compile()
                 .expect("canonical enumerator emits §2.5-valid circuits");
-            match certify_against_spec_outcome(&compiled, spec, max_joint_steps) {
+            match certify_against_spec_outcome_for_port(&compiled, spec, None, max_joint_steps) {
                 CertifyOutcome::Certified { .. } => {
                     if !any_step_cap_exceeded {
                         return (

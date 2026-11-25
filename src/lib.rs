@@ -12,6 +12,7 @@
 //! - [`stats`]: Reusable multi-bank pooled Clopper–Pearson and Cochran $\chi^2$/permutation homogeneity statistics.
 //! - [`verify_m2a`], [`verify_m2b`]: Pre-registered Milestone 2a (`G2A.1`–`G2A.5`) and Milestone 2b (`G2B.1`–`G2B.5`) verification batteries.
 //! - [`verify_m3`]: Milestone 3 (`H4`) free-rider detour library and verified local excision harness.
+//! - [`verify_m4a`]: Milestone 4a (`H5`/`H6`) sleep oracle instrumentation, planted spurious injections, and task registry.
 
 pub mod baselines;
 pub mod config;
@@ -24,6 +25,7 @@ pub mod substrate;
 pub mod verify_m2a;
 pub mod verify_m2b;
 pub mod verify_m3;
+pub mod verify_m4a;
 
 use std::fs;
 use std::path::PathBuf;

@@ -385,6 +385,8 @@ pub struct SleepSegmentReport {
     pub entry_registers: Vec<u64>,
     /// Predictions emitted on the first loopback step, if `loopback_ticks > 0` (`I3` verification).
     pub first_loopback_predictions: Option<Vec<u64>>,
+    /// Composed pre-sleep to post-sleep node mapping (`None` for nodes excised during this segment, `R8`).
+    pub composed_old_to_new: Vec<Option<NodeId>>,
 }
 
 /// Summary report returned by [`run_wake_sleep_episode`] (`R2`, `R7`, `I5`).
