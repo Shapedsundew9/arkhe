@@ -17,8 +17,9 @@ use crate::structural::graph_edit::{
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
     ComparatorTarget, assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
-    counterfactual_sensitivity, counterfactual_sensitivity_with_comparators,
+    counterfactual_sensitivity_audited, counterfactual_sensitivity_with_comparators_audited,
 };
+use crate::structural::sleep::SleepSchedule;
 use crate::structural::surgery::{
     EditableCircuit, MarginalDebtLedger, explicit_delay_register_index, port_cone_changed,
     port_upstream_cone_and_edges, port_uses_boundary_in, register_mapping,
@@ -240,6 +241,12 @@ pub struct GrowthConfig {
     /// Wake structural excision policy (`M3-E1` + `M3-E2` vs. `BaselineD1b1` ablation).
     #[serde(default)]
     pub excision_mode: ExcisionMode,
+    /// Wake–sleep schedule (`SleepSchedule::None` by default for backward-identical `I1` runs).
+    #[serde(default)]
+    pub sleep_schedule: SleepSchedule,
+    /// Optional M4a-0 descriptive sensitivity override for $W_{\text{sleep}}$ (`None` uses $W_{\text{obs}}$).
+    #[serde(default)]
+    pub sleep_window_override: Option<u64>,
 }
 
 const fn default_redundancy_sprouting() -> bool {
@@ -262,6 +269,8 @@ impl Default for GrowthConfig {
             sensitivity_sample_count: 8,
             redundancy_sprouting: true,
             excision_mode: ExcisionMode::VerifiedLocalExcision,
+            sleep_schedule: SleepSchedule::None,
+            sleep_window_override: None,
         }
     }
 }
@@ -283,6 +292,7 @@ impl GrowthConfig {
             && self.min_ring_period >= 2
             && self.max_ring_period >= self.min_ring_period
             && self.sensitivity_sample_count >= 1
+            && self.sleep_window_override.is_none_or(|w| w > 0)
     }
 }
 
@@ -333,6 +343,13 @@ pub struct ResidualDiagnostics {
     pub candidate_list_truncated: bool,
     /// Whether a non-zero constant offset or feature clears the growth guards.
     pub growth_criterion_met: bool,
+}
+
+/// Audited node-evaluation counters recorded during candidate growth replay and survival checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GrowthEvalAudit {
+    pub candidate_replay_node_evals: u64,
+    pub sensitivity_node_evals: u64,
 }
 
 /// Telemetry counters for structural growth guardrails and search horizons.
@@ -2219,6 +2236,7 @@ fn replay_current_baseline(
     economy_config: &EconomyConfig,
     out_port: u16,
     is_epoch_1: bool,
+    audit: &mut GrowthEvalAudit,
 ) -> BaselineReplayMetrics {
     let w_diag = growth_config.diagnostic_window;
     let max_w_replay = obs_window.len().min(2 * w_diag);
@@ -2296,6 +2314,7 @@ fn replay_current_baseline(
 
     let mut e_curr = 0usize;
     let mut flux_curr = 0.0;
+    let curr_node_count = editable.circuit().node_count() as u64;
     for i in 0..w_replay {
         let idx = start_idx + i;
         let input = if idx == 0 {
@@ -2304,6 +2323,9 @@ fn replay_current_baseline(
             &obs_window.frames()[idx - 1]
         };
         let truth = &obs_window.frames()[idx];
+        audit.candidate_replay_node_evals = audit
+            .candidate_replay_node_evals
+            .saturating_add(curr_node_count);
         let _ = curr_state.step(editable.compiled(), input, &mut curr_pred);
         let p_curr = if is_epoch_1 {
             0
@@ -2699,6 +2721,7 @@ fn prime_non_surviving_registers_with_plan(
     obs_window: &ObservationWindow,
     start_idx: usize,
     regs: &mut [u64],
+    replay_node_evals: &mut u64,
     seed_shadow_at: impl FnOnce(usize, &mut ScalarState) -> bool,
 ) {
     let mut is_untouched_reg = vec![false; regs.len()];
@@ -2749,12 +2772,14 @@ fn prime_non_surviving_registers_with_plan(
         return;
     }
     let mut dummy_pred = vec![0u64; usize::from(staged_compiled.num_outputs())];
+    let staged_nodes = staged.node_count() as u64;
     for idx in plan.prime_start..start_idx {
         let input = if idx == 0 {
             obs_window.prior_frame()
         } else {
             &obs_window.frames()[idx - 1]
         };
+        *replay_node_evals = replay_node_evals.saturating_add(staged_nodes);
         if shadow
             .step(staged_compiled, input, &mut dummy_pred)
             .is_err()
@@ -2814,6 +2839,7 @@ fn prime_non_surviving_registers(
         obs_window,
         start_idx,
         regs,
+        &mut 0,
         |prime_idx, shadow| {
             if let Some((snap_epoch, snap_regs)) = obs_window.state_snapshot_at(prime_idx)
                 && snap_epoch == structure_epoch
@@ -2984,6 +3010,7 @@ impl FastCombKind {
 struct FastCombPlan {
     kind: FastCombKind,
     is_epoch_1: bool,
+    min_added_nodes: usize,
 }
 
 enum FastCombPrep {
@@ -3144,17 +3171,23 @@ impl FastCombPlan {
         if baseline.start_idx > 0 && kind.register_depth() > baseline.eval_offset {
             return FastCombPrep::Fallback;
         }
-        FastCombPrep::Plan(Self { kind, is_epoch_1 })
+        FastCombPrep::Plan(Self {
+            kind,
+            is_epoch_1,
+            min_added_nodes: min_added,
+        })
     }
 
-    fn exceeds_error_upper(
+    fn exceeds_error_upper_audited(
         &self,
         baseline: &BaselineReplayMetrics,
         width: Width,
         e_cand_upper: isize,
-    ) -> bool {
+    ) -> (bool, usize) {
         let mut e_cand = 0usize;
+        let mut steps_evaluated = 0usize;
         for i in baseline.eval_offset..baseline.w_replay {
+            steps_evaluated += 1;
             let p_cand = match self.kind {
                 FastCombKind::ConstLoop(c) => {
                     if self.is_epoch_1 {
@@ -3298,11 +3331,11 @@ impl FastCombPlan {
             if p_cand != baseline.out_truth_trace[i] {
                 e_cand += 1;
                 if (e_cand as isize) > e_cand_upper {
-                    return true;
+                    return (true, steps_evaluated);
                 }
             }
         }
-        (e_cand as isize) > e_cand_upper
+        ((e_cand as isize) > e_cand_upper, steps_evaluated)
     }
 }
 
@@ -3319,6 +3352,7 @@ fn evaluate_sprout_motif(
     baseline: &BaselineReplayMetrics,
     mut budget: Option<&mut TickBudget>,
     mut telemetry: Option<&mut SproutTelemetry>,
+    audit: &mut GrowthEvalAudit,
 ) -> SproutMotifOutcome {
     let w_diag = growth_config.diagnostic_window;
     let width = editable.circuit().width();
@@ -3361,7 +3395,12 @@ fn evaluate_sprout_motif(
                 return SproutMotifOutcome::OutOfBudget;
             }
             budget_consumed = true;
-            if plan.exceeds_error_upper(baseline, width, e_cand_upper) {
+            let (exceeded, steps_evaluated) =
+                plan.exceeds_error_upper_audited(baseline, width, e_cand_upper);
+            audit.candidate_replay_node_evals = audit.candidate_replay_node_evals.saturating_add(
+                (steps_evaluated as u64).saturating_mul(plan.min_added_nodes.max(1) as u64),
+            );
+            if exceeded {
                 return SproutMotifOutcome::Rejected;
             }
         }
@@ -3448,6 +3487,7 @@ fn evaluate_sprout_motif(
                 obs_window,
                 baseline.start_idx,
                 &mut staged_regs,
+                &mut audit.candidate_replay_node_evals,
                 |prime_idx, shadow| {
                     if let Some((prime_epoch, prime_snap_regs)) =
                         obs_window.state_snapshot_at(prime_idx)
@@ -3500,6 +3540,7 @@ fn evaluate_sprout_motif(
         vec![0usize; comparators.len()]
     };
 
+    let staged_nodes = staged.node_count() as u64;
     for (i, trace_slot) in p_cand_trace.iter_mut().enumerate() {
         let idx = baseline.start_idx + i;
         let input = if idx == 0 {
@@ -3508,6 +3549,9 @@ fn evaluate_sprout_motif(
             &obs_window.frames()[idx - 1]
         };
         let truth = &obs_window.frames()[idx];
+        audit.candidate_replay_node_evals = audit
+            .candidate_replay_node_evals
+            .saturating_add(staged_nodes);
         if state.step(&staged_compiled, input, pred).is_err() {
             return SproutMotifOutcome::Rejected;
         }
@@ -3649,6 +3693,7 @@ fn evaluate_sprout_motif(
             d_cone,
             eff_juv_base,
             telemetry,
+            audit,
         ) else {
             return SproutMotifOutcome::Rejected;
         };
@@ -3683,8 +3728,12 @@ fn replay_causal_tick(
     compute_ancestry: bool,
     comp_capture_idx: Option<usize>,
     sink_port: Option<usize>,
+    audit: &mut GrowthEvalAudit,
 ) -> Option<(Vec<f64>, Option<f64>, Option<f64>)> {
     let num_outputs = usize::from(sim.compiled().num_outputs());
+    audit.candidate_replay_node_evals = audit
+        .candidate_replay_node_evals
+        .saturating_add(sim.circuit().node_count() as u64);
     sim.step(input, predictions).ok()?;
     let node_outs = node_output_values(sim.circuit(), sim.state());
     sim.economy_mut().record_activity(&node_outs).ok()?;
@@ -3693,13 +3742,14 @@ fn replay_causal_tick(
     }
     let eff_samples = sample_count.min(RING_SIM_SENSITIVITY_SAMPLES);
     if targets.is_empty() {
-        let snapshot = counterfactual_sensitivity(
+        let snapshot = counterfactual_sensitivity_audited(
             sim.circuit(),
             sim.compiled(),
             sim.state(),
             seed_bank,
             step_seed,
             eff_samples,
+            &mut audit.sensitivity_node_evals,
         )
         .ok()?;
         let ancestry = assemble_causal_ancestry(
@@ -3744,7 +3794,7 @@ fn replay_causal_tick(
         } else {
             None
         };
-        let snapshot = counterfactual_sensitivity_with_comparators(
+        let snapshot = counterfactual_sensitivity_with_comparators_audited(
             sim.circuit(),
             sim.compiled(),
             sim.state(),
@@ -3752,6 +3802,7 @@ fn replay_causal_tick(
             step_seed,
             eff_samples,
             targets,
+            &mut audit.sensitivity_node_evals,
         )
         .ok()?;
         let ancestry = assemble_causal_ancestry_with_comparators(
@@ -3924,6 +3975,7 @@ fn verify_stage2_debt_amortization_and_survival(
     d_cone: usize,
     base_eff_juv: u32,
     telemetry: Option<&mut SproutTelemetry>,
+    audit: &mut GrowthEvalAudit,
 ) -> Option<u32> {
     let old_n = editable.circuit().node_count();
     let old_to_new: Vec<Option<NodeId>> = (0..old_n).map(|i| Some(NodeId(i as u32))).collect();
@@ -4030,6 +4082,7 @@ fn verify_stage2_debt_amortization_and_survival(
             compute_ancestry,
             None,
             Some(usize::from(out_port)),
+            audit,
         )?;
         if score_tick {
             for (v, &c) in node_credit.iter().enumerate() {
@@ -4076,6 +4129,7 @@ fn verify_stage2_debt_amortization_and_survival(
     let w_span = w_obs.saturating_sub(replay_start).max(1);
     let reactive_warmup = d_cone.min(w_span / 2);
     let settled_chunk = w_span.saturating_sub(reactive_warmup).max(1);
+    let sim_node_count = sim_circuit.node_count() as u64;
     for step_idx in 0..j_ticks {
         let frame_idx = if step_idx < w_span {
             replay_start + step_idx
@@ -4090,6 +4144,9 @@ fn verify_stage2_debt_amortization_and_survival(
                     } else {
                         &obs_window.frames()[w_idx - 1]
                     };
+                    audit.candidate_replay_node_evals = audit
+                        .candidate_replay_node_evals
+                        .saturating_add(sim_node_count);
                     grad_sim.step(w_in, &mut predictions).ok()?;
                 }
             }
@@ -4116,6 +4173,7 @@ fn verify_stage2_debt_amortization_and_survival(
             true,
             None,
             None,
+            audit,
         )?;
     }
 
@@ -4167,6 +4225,7 @@ fn has_admissible_deeper_lag(
     out_port: u16,
     is_epoch_1: bool,
     baseline: &BaselineReplayMetrics,
+    audit: &mut GrowthEvalAudit,
 ) -> bool {
     let probe_max = (growth_config.diagnostic_window / 2)
         .min(obs_window.len().saturating_sub(1))
@@ -4216,6 +4275,7 @@ fn has_admissible_deeper_lag(
                             baseline,
                             None,
                             None,
+                            audit,
                         ),
                         SproutMotifOutcome::Accepted { .. }
                     )
@@ -4384,6 +4444,37 @@ pub(crate) fn propose_sprout_band_scored_internal(
     telemetry: &mut SproutTelemetry,
     compute_lag_bound: bool,
 ) -> Result<(Option<ScoredSproutProposal>, bool), GrowthError> {
+    propose_sprout_band_scored_internal_audited(
+        editable,
+        obs_window,
+        diag,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        min_tau,
+        max_tau,
+        telemetry,
+        compute_lag_bound,
+        &mut GrowthEvalAudit::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn propose_sprout_band_scored_internal_audited(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    min_tau: u8,
+    max_tau: u8,
+    telemetry: &mut SproutTelemetry,
+    compute_lag_bound: bool,
+    audit: &mut GrowthEvalAudit,
+) -> Result<(Option<ScoredSproutProposal>, bool), GrowthError> {
     let len = diag.len();
     if len < growth_config.diagnostic_window {
         return Ok((None, false));
@@ -4431,6 +4522,7 @@ pub(crate) fn propose_sprout_band_scored_internal(
         economy_config,
         out_port,
         is_epoch_1,
+        audit,
     );
 
     if !diagnostics.growth_criterion_met {
@@ -4447,6 +4539,7 @@ pub(crate) fn propose_sprout_band_scored_internal(
             out_port,
             is_epoch_1,
             &baseline,
+            audit,
         ) {
             telemetry.lag_horizon_bound += 1;
         }
@@ -4546,6 +4639,7 @@ pub(crate) fn propose_sprout_band_scored_internal(
             &baseline,
             Some(budget),
             Some(telemetry),
+            audit,
         ) {
             SproutMotifOutcome::Accepted {
                 circuit: staged,
@@ -4677,6 +4771,7 @@ pub(crate) fn propose_sprout_band_scored_internal(
             out_port,
             is_epoch_1,
             &baseline,
+            audit,
         ) {
             telemetry.lag_horizon_bound += 1;
         }
@@ -4686,7 +4781,7 @@ pub(crate) fn propose_sprout_band_scored_internal(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn check_deeper_lag_for_port(
+pub(crate) fn check_deeper_lag_for_port_audited(
     editable: &EditableCircuit,
     obs_window: &ObservationWindow,
     diag: &DiagnosticBuffer,
@@ -4694,6 +4789,7 @@ pub(crate) fn check_deeper_lag_for_port(
     economy_config: &EconomyConfig,
     out_port: u16,
     max_tau: u8,
+    audit: &mut GrowthEvalAudit,
 ) -> bool {
     let residuals: Vec<u64> = diag
         .residuals
@@ -4712,6 +4808,7 @@ pub(crate) fn check_deeper_lag_for_port(
         economy_config,
         out_port,
         is_epoch_1,
+        audit,
     );
     has_admissible_deeper_lag(
         editable,
@@ -4723,6 +4820,7 @@ pub(crate) fn check_deeper_lag_for_port(
         out_port,
         is_epoch_1,
         &baseline,
+        audit,
     )
 }
 
@@ -4852,6 +4950,7 @@ fn simulate_ring_juvenile_survival(
     out_port: u16,
     l_curr: f64,
     economy_config: &EconomyConfig,
+    audit: &mut GrowthEvalAudit,
 ) -> bool {
     let j_ticks = economy_config.juvenile_ticks as usize;
     let mut sim = editable.clone();
@@ -4908,6 +5007,7 @@ fn simulate_ring_juvenile_survival(
     let zeros_maint = vec![0.0; sim.circuit().node_count()];
     let seed_bank = SeedBank::new(0);
 
+    let sim_node_count = sim.circuit().node_count() as u64;
     for step_idx in 0..j_ticks {
         let frame_idx = if start_offset + step_idx < w_replay {
             start_offset + step_idx
@@ -4920,6 +5020,9 @@ fn simulate_ring_juvenile_survival(
             &obs_window.frames()[frame_idx - 1]
         };
         let truth = &obs_window.frames()[frame_idx];
+        audit.candidate_replay_node_evals = audit
+            .candidate_replay_node_evals
+            .saturating_add(sim_node_count);
         if sim.step(input, &mut predictions).is_err() {
             return false;
         }
@@ -4927,13 +5030,14 @@ fn simulate_ring_juvenile_survival(
         if sim.economy_mut().record_activity(&node_outputs).is_err() {
             return false;
         }
-        let Ok(snapshot) = counterfactual_sensitivity(
+        let Ok(snapshot) = counterfactual_sensitivity_audited(
             sim.circuit(),
             sim.compiled(),
             sim.state(),
             seed_bank,
             step_idx as u64,
             RING_SIM_SENSITIVITY_SAMPLES,
+            &mut audit.sensitivity_node_evals,
         ) else {
             return false;
         };
@@ -5035,6 +5139,7 @@ fn evaluate_ring_period(
     j_curr: f64,
     budget: Option<&mut TickBudget>,
     telemetry: Option<&mut SproutTelemetry>,
+    audit: &mut GrowthEvalAudit,
 ) -> RingPeriodOutcome {
     let w_replay = obs_window.len();
     let out_idx = usize::from(out_port);
@@ -5237,12 +5342,16 @@ fn evaluate_ring_period(
         &mut trace_heap
     };
 
+    let staged_nodes = staged.node_count() as u64;
     for (i, frame) in obs_window.frames().iter().enumerate() {
         let input = if i == 0 {
             obs_window.prior_frame()
         } else {
             &obs_window.frames()[i - 1]
         };
+        audit.candidate_replay_node_evals = audit
+            .candidate_replay_node_evals
+            .saturating_add(staged_nodes);
         if state.step(&staged_compiled, input, pred).is_err() {
             return RingPeriodOutcome::Rejected;
         }
@@ -5293,6 +5402,7 @@ fn evaluate_ring_period(
         out_port,
         l_curr,
         economy_config,
+        audit,
     ) {
         return RingPeriodOutcome::Rejected;
     }
@@ -5348,6 +5458,29 @@ pub fn propose_autonomous_delay_ring_scored_with_telemetry(
     out_port: u16,
     telemetry: &mut SproutTelemetry,
 ) -> Option<(AutonomousRingProposal, usize, f64)> {
+    propose_autonomous_delay_ring_scored_audited(
+        editable,
+        obs_window,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        telemetry,
+        &mut GrowthEvalAudit::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn propose_autonomous_delay_ring_scored_audited(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    telemetry: &mut SproutTelemetry,
+    audit: &mut GrowthEvalAudit,
+) -> Option<(AutonomousRingProposal, usize, f64)> {
     if editable.circuit().wire_delay() != WireDelayMode::Combinational {
         return None;
     }
@@ -5380,12 +5513,15 @@ pub fn propose_autonomous_delay_ring_scored_with_telemetry(
     let mut e_curr = 0usize;
     let mut e_curr_diag = 0usize;
     let mut flux_curr = 0.0;
+    let curr_nodes = editable.circuit().node_count() as u64;
     for (i, frame) in obs_window.frames().iter().enumerate() {
         let input = if i == 0 {
             obs_window.prior_frame()
         } else {
             &obs_window.frames()[i - 1]
         };
+        audit.candidate_replay_node_evals =
+            audit.candidate_replay_node_evals.saturating_add(curr_nodes);
         if curr_state
             .step(editable.compiled(), input, &mut curr_pred)
             .is_err()
@@ -5456,6 +5592,7 @@ pub fn propose_autonomous_delay_ring_scored_with_telemetry(
             j_curr,
             Some(budget),
             Some(telemetry),
+            audit,
         ) {
             RingPeriodOutcome::Accepted {
                 proposal,
@@ -5494,6 +5631,7 @@ pub fn propose_autonomous_delay_ring_scored_with_telemetry(
                 j_curr,
                 None,
                 None,
+                audit,
             ) {
                 telemetry.ring_period_bound += 1;
                 break;
@@ -5799,6 +5937,7 @@ fn stage3_measure_z_alt_and_survive(
     primary_channel_mask: u64,
     pre: &EvaluatedStage3Pre,
     telemetry: &mut SproutTelemetry,
+    audit: &mut GrowthEvalAudit,
 ) -> Option<(usize, f64, u32)> {
     let staged = &pre.staged;
     let is_tph = staged.wire_delay() == WireDelayMode::TicksPerHop;
@@ -5934,6 +6073,7 @@ fn stage3_measure_z_alt_and_survive(
             compute_ancestry,
             Some(comp_idx),
             None,
+            audit,
         )?;
         if score_tick {
             if let Some(zt) = z_tick {
@@ -6000,6 +6140,7 @@ fn stage3_measure_z_alt_and_survive(
     let reactive_warmup = d_alt.min(w_replay / 2);
     let settled_chunk = w_replay.saturating_sub(reactive_warmup).max(1);
 
+    let sim_node_count = sim_circuit.node_count() as u64;
     for step_idx in 0..j_ticks {
         let frame_idx = if ring_period.is_some() {
             step_idx % cycle_len
@@ -6018,6 +6159,9 @@ fn stage3_measure_z_alt_and_survive(
                     } else {
                         &obs_window.frames()[w - 1]
                     };
+                    audit.candidate_replay_node_evals = audit
+                        .candidate_replay_node_evals
+                        .saturating_add(sim_node_count);
                     sim.step(w_in, &mut predictions).ok()?;
                 }
             }
@@ -6045,6 +6189,7 @@ fn stage3_measure_z_alt_and_survive(
             true,
             None,
             None,
+            audit,
         )?;
     }
 
@@ -6074,6 +6219,7 @@ fn evaluate_stage3_candidate_pre(
     autonomous_ring: Option<(usize, Vec<u64>, Vec<NodeId>)>,
     blocked_by_max_nodes: &mut usize,
     telemetry: &mut SproutTelemetry,
+    audit: &mut GrowthEvalAudit,
 ) -> Option<Result<EvaluatedStage3Pre, ()>> {
     let max_nodes = effective_max_nodes(staged.num_inputs(), growth_config);
     if staged.node_count() > max_nodes {
@@ -6228,6 +6374,7 @@ fn evaluate_stage3_candidate_pre(
                 obs_window,
                 baseline.start_idx,
                 &mut regs,
+                &mut audit.candidate_replay_node_evals,
                 |prime_idx, shadow| {
                     let mut shadow_regs = shadow.registers().to_vec();
                     if let Some((prime_epoch, prime_snap_regs)) =
@@ -6274,6 +6421,7 @@ fn evaluate_stage3_candidate_pre(
     );
     *alt_scorer.null_model_mut() = editable.economy().scorers()[out_idx].null_model().clone();
 
+    let staged_nodes = staged.node_count() as u64;
     for i in 0..baseline.w_replay {
         let idx = baseline.start_idx + i;
         let input = if idx == 0 {
@@ -6282,6 +6430,9 @@ fn evaluate_stage3_candidate_pre(
             &obs_window.frames()[idx - 1]
         };
         let truth = &obs_window.frames()[idx];
+        audit.candidate_replay_node_evals = audit
+            .candidate_replay_node_evals
+            .saturating_add(staged_nodes);
         if state.step(&staged_compiled, input, &mut pred).is_err() {
             return None;
         }
@@ -6415,7 +6566,7 @@ fn rank_stage3_candidates(candidates: &mut Vec<EvaluatedStage3Pre>) {
 /// current structure epoch's replay span, allowing Stage 2 to promote the ring via handoff without
 /// duplicating autonomous cycles or breaking existing comparators.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn evaluate_comparator_ring_promotion(
+pub(crate) fn evaluate_comparator_ring_promotion_audited(
     editable: &EditableCircuit,
     obs_window: &ObservationWindow,
     growth_config: &GrowthConfig,
@@ -6423,6 +6574,7 @@ pub(crate) fn evaluate_comparator_ring_promotion(
     budget: &mut TickBudget,
     out_port: u16,
     telemetry: &mut SproutTelemetry,
+    audit: &mut GrowthEvalAudit,
 ) -> Option<(usize, usize, f64)> {
     let circuit = editable.circuit();
     let has_port_driver = circuit
@@ -6506,12 +6658,15 @@ pub(crate) fn evaluate_comparator_ring_promotion(
     let mut curr_scorer = PointForecastScorer::new(width, economy_config.null_model);
     let mut flux_curr = 0.0;
 
+    let curr_nodes = circuit.node_count() as u64;
     for (i, frame) in obs_window.frames().iter().enumerate().skip(start_idx) {
         let input = if i == 0 {
             obs_window.prior_frame()
         } else {
             &obs_window.frames()[i - 1]
         };
+        audit.candidate_replay_node_evals =
+            audit.candidate_replay_node_evals.saturating_add(curr_nodes);
         if curr_state
             .step(editable.compiled(), input, &mut curr_pred)
             .is_err()
@@ -6615,12 +6770,16 @@ pub(crate) fn evaluate_comparator_ring_promotion(
         let mut flux_cand = 0.0;
         let mut ok = true;
 
+        let swapped_nodes = swapped.node_count() as u64;
         for (i, frame) in obs_window.frames().iter().enumerate().skip(start_idx) {
             let input = if i == 0 {
                 obs_window.prior_frame()
             } else {
                 &obs_window.frames()[i - 1]
             };
+            audit.candidate_replay_node_evals = audit
+                .candidate_replay_node_evals
+                .saturating_add(swapped_nodes);
             if cand_state
                 .step(&swapped_compiled, input, &mut cand_pred)
                 .is_err()
@@ -6715,6 +6874,31 @@ pub fn propose_redundancy_sprout(
     out_port: u16,
     telemetry: &mut SproutTelemetry,
 ) -> Result<Option<RedundancySproutProposal>, GrowthError> {
+    propose_redundancy_sprout_audited(
+        editable,
+        obs_window,
+        diag,
+        growth_config,
+        economy_config,
+        budget,
+        out_port,
+        telemetry,
+        &mut GrowthEvalAudit::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn propose_redundancy_sprout_audited(
+    editable: &EditableCircuit,
+    obs_window: &ObservationWindow,
+    diag: &DiagnosticBuffer,
+    growth_config: &GrowthConfig,
+    economy_config: &EconomyConfig,
+    budget: &mut TickBudget,
+    out_port: u16,
+    telemetry: &mut SproutTelemetry,
+    audit: &mut GrowthEvalAudit,
+) -> Result<Option<RedundancySproutProposal>, GrowthError> {
     if !growth_config.redundancy_sprouting || !growth_config.is_valid() {
         return Ok(None);
     }
@@ -6754,6 +6938,7 @@ pub fn propose_redundancy_sprout(
         economy_config,
         out_port,
         false,
+        audit,
     );
     let truth_slice: Vec<u64> = diag.truth.iter().map(|f| f[out_idx]).collect();
     let modal_counts = {
@@ -6821,6 +7006,7 @@ pub fn propose_redundancy_sprout(
                     Some((p, mu, delays)),
                     &mut blocked_by_max_nodes,
                     telemetry,
+                    audit,
                 ) {
                     Some(Ok(eval)) => candidates.push(eval),
                     Some(Err(())) => {
@@ -6947,6 +7133,7 @@ pub fn propose_redundancy_sprout(
                             None,
                             &mut blocked_by_max_nodes,
                             telemetry,
+                            audit,
                         ) {
                             Some(Ok(eval)) => candidates.push(eval),
                             Some(Err(())) => {
@@ -6987,6 +7174,7 @@ pub fn propose_redundancy_sprout(
             primary_channel_mask,
             &cand,
             telemetry,
+            audit,
         ) {
             let old_nodes = cand.old_to_new.len();
             let new_nodes = (old_nodes..cand.staged.node_count())
@@ -7791,7 +7979,15 @@ mod tests {
                 diag.push_frame(&prev, &cur, &pred, &res, &[], &[]);
             }
         }
-        let baseline = replay_current_baseline(&editable, &obs, &growth, &econ, 0, true);
+        let baseline = replay_current_baseline(
+            &editable,
+            &obs,
+            &growth,
+            &econ,
+            0,
+            true,
+            &mut GrowthEvalAudit::default(),
+        );
         assert_eq!(baseline.driven_ports, vec![false, true]);
         assert_eq!(baseline.e_curr_by_port[1], 0);
 
@@ -7808,6 +8004,7 @@ mod tests {
             &baseline,
             None,
             None,
+            &mut GrowthEvalAudit::default(),
         );
         assert!(matches!(outcome, SproutMotifOutcome::Rejected));
     }
@@ -8127,7 +8324,15 @@ mod tests {
         for t in 0..256usize {
             obs.push_frame(&[(t % 2) as u64]);
         }
-        let baseline = replay_current_baseline(&editable, &obs, &growth, &econ, 0, true);
+        let baseline = replay_current_baseline(
+            &editable,
+            &obs,
+            &growth,
+            &econ,
+            0,
+            true,
+            &mut GrowthEvalAudit::default(),
+        );
         let mut staged = Circuit::new(Width::BITS_1, 1, 1, WireDelayMode::Combinational);
         let split = staged.add_node(Primitive::Split);
         let useful = staged.add_node(Primitive::Eqz);
@@ -8180,6 +8385,7 @@ mod tests {
                 0,
                 effective_juvenile_ticks(0, &econ, &growth),
                 None,
+                &mut GrowthEvalAudit::default(),
             ),
             None
         );
@@ -8302,7 +8508,15 @@ mod tests {
             .recompile_preserving_state(old, &[Some(d0)])
             .unwrap();
         assert_eq!(editable.structure_epoch(), 1);
-        let baseline = replay_current_baseline(&editable, &obs_e2e, &growth, &econ, 0, false);
+        let baseline = replay_current_baseline(
+            &editable,
+            &obs_e2e,
+            &growth,
+            &econ,
+            0,
+            false,
+            &mut GrowthEvalAudit::default(),
+        );
         assert_eq!(baseline.start_idx, 3);
         assert_eq!(baseline.eval_start_idx, 3);
         assert_eq!(baseline.w_replay, 2);
@@ -8322,6 +8536,7 @@ mod tests {
             &baseline,
             Some(&mut budget),
             Some(&mut tel),
+            &mut GrowthEvalAudit::default(),
         );
         match outcome {
             SproutMotifOutcome::Accepted { e_cand, .. } => assert_eq!(e_cand, 0),
@@ -8543,6 +8758,7 @@ mod tests {
             None,
             &mut blocked,
             &mut tph_tel,
+            &mut GrowthEvalAudit::default(),
         );
         assert_eq!(
             tph_budget.consumed(),
@@ -8596,7 +8812,15 @@ mod tests {
                 .unwrap();
             obs1_p4.push_frame_with_state(&[p4[t % 4]], 0, &pre_regs);
         }
-        let baseline1 = replay_current_baseline(&editable1, &obs1_p4, &growth, &econ, 0, false);
+        let baseline1 = replay_current_baseline(
+            &editable1,
+            &obs1_p4,
+            &growth,
+            &econ,
+            0,
+            false,
+            &mut GrowthEvalAudit::default(),
+        );
         assert_eq!(baseline1.start_idx, 4);
         assert_eq!(baseline1.eval_start_idx, 6);
         assert_eq!(baseline1.w_replay, 4);
@@ -8616,6 +8840,7 @@ mod tests {
             &baseline1,
             Some(&mut budget_short),
             Some(&mut tel_short),
+            &mut GrowthEvalAudit::default(),
         );
         assert!(matches!(out_short, SproutMotifOutcome::OutOfBudget));
         assert_eq!(tel_short.sprout_budget_exhausted, 1);
@@ -8635,6 +8860,7 @@ mod tests {
             &baseline1,
             Some(&mut budget_exact),
             Some(&mut tel_exact),
+            &mut GrowthEvalAudit::default(),
         );
         assert!(!matches!(out_exact, SproutMotifOutcome::OutOfBudget));
         assert_eq!(tel_exact.sprout_budget_exhausted, 0);
@@ -8676,7 +8902,15 @@ mod tests {
             let ch1 = p4[(t + 1) % 4];
             obs3.push_frame_with_state(&[y_alt, ch1], 0, &pre_regs);
         }
-        let baseline3 = replay_current_baseline(&editable3, &obs3, &growth, &econ, 0, false);
+        let baseline3 = replay_current_baseline(
+            &editable3,
+            &obs3,
+            &growth,
+            &econ,
+            0,
+            false,
+            &mut GrowthEvalAudit::default(),
+        );
         assert_eq!(baseline3.start_idx, 4);
         assert_eq!(baseline3.eval_start_idx, 6);
         assert_eq!(baseline3.w_replay, 4);
@@ -8728,6 +8962,7 @@ mod tests {
             None,
             &mut blocked3,
             &mut t3_short,
+            &mut GrowthEvalAudit::default(),
         );
         assert!(matches!(res_short, Some(Err(()))));
         assert_eq!(t3_short.sprout_budget_exhausted, 1);
@@ -8752,6 +8987,7 @@ mod tests {
             None,
             &mut blocked3,
             &mut t3_exact,
+            &mut GrowthEvalAudit::default(),
         );
         assert!(!matches!(res_exact, Some(Err(()))));
         assert_eq!(t3_exact.sprout_budget_exhausted, 0);
@@ -8917,7 +9153,15 @@ mod tests {
         }
 
         for (label, obs) in [("missing", &obs_missing), ("mismatched", &obs_mismatch)] {
-            let baseline = replay_current_baseline(&editable, obs, &growth, &econ, 0, false);
+            let baseline = replay_current_baseline(
+                &editable,
+                obs,
+                &growth,
+                &econ,
+                0,
+                false,
+                &mut GrowthEvalAudit::default(),
+            );
             assert_eq!(baseline.start_idx, 3, "{label}: start_idx");
             assert_eq!(baseline.eval_start_idx, 3, "{label}: eval_start_idx");
             assert_eq!(baseline.w_replay, 2, "{label}: w_replay");
@@ -8937,6 +9181,7 @@ mod tests {
                 &baseline,
                 Some(&mut s2_budget),
                 Some(&mut s2_tel),
+                &mut GrowthEvalAudit::default(),
             );
             assert!(
                 matches!(s2_out, SproutMotifOutcome::Rejected),
@@ -8998,8 +9243,15 @@ mod tests {
                 "mismatched" => &comb_obs_mismatch,
                 _ => unreachable!(),
             };
-            let comb_baseline =
-                replay_current_baseline(&comb_editable, comb_obs, &growth, &econ, 0, false);
+            let comb_baseline = replay_current_baseline(
+                &comb_editable,
+                comb_obs,
+                &growth,
+                &econ,
+                0,
+                false,
+                &mut GrowthEvalAudit::default(),
+            );
             assert_eq!(comb_baseline.start_idx, 3, "{label}: comb start_idx");
             assert_eq!(
                 comb_baseline.eval_start_idx, 3,
@@ -9051,6 +9303,7 @@ mod tests {
                 None,
                 &mut blocked3_comb,
                 &mut s3_comb_tel,
+                &mut GrowthEvalAudit::default(),
             );
             assert!(
                 s3_comb_res.is_none(),
@@ -9150,8 +9403,15 @@ mod tests {
                 "mismatched" => &tph_obs_mismatch,
                 _ => unreachable!(),
             };
-            let tph_baseline =
-                replay_current_baseline(&tph_editable, tph_obs, &growth, &econ, 0, false);
+            let tph_baseline = replay_current_baseline(
+                &tph_editable,
+                tph_obs,
+                &growth,
+                &econ,
+                0,
+                false,
+                &mut GrowthEvalAudit::default(),
+            );
             assert_eq!(tph_baseline.start_idx, 3, "{label}: tph start_idx");
             assert_eq!(
                 tph_baseline.eval_start_idx, 3,
@@ -9197,6 +9457,7 @@ mod tests {
                 None,
                 &mut blocked3_tph,
                 &mut s3_tph_tel,
+                &mut GrowthEvalAudit::default(),
             );
             assert!(
                 s3_tph_res.is_none(),

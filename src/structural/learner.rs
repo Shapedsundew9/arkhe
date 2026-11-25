@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::baselines::{ObservationWindow, PredictorBaseline, TickBudget};
 use crate::config::ArkheM1Telemetry;
+use crate::env::{FiniteStateGenerator, NoisyEnvironment};
 use crate::metrics::circuit_code_bits_with_tax;
 use crate::metrics::facts_code_bits;
 use crate::rng::SeedBank;
@@ -17,24 +18,29 @@ use crate::structural::graph_edit::{
 };
 use crate::structural::growth::{
     AutonomousRingProposal, DiagnosticBuffer, ExcisionMode, GrowthConfig, GrowthError,
-    RedundancySproutProposal, ScoredSproutProposal, SproutTelemetry, assign_stage3_juvenile_ticks,
-    check_deeper_lag_for_port, diagnose_residual, effective_juvenile_ticks,
-    evaluate_comparator_ring_promotion, observation_horizon, port_primary_cone_is_mature,
-    propose_autonomous_delay_ring_scored_with_telemetry, propose_redundancy_sprout,
-    propose_sprout_band_scored_internal,
+    GrowthEvalAudit, RedundancySproutProposal, ScoredSproutProposal, SproutTelemetry,
+    assign_stage3_juvenile_ticks, check_deeper_lag_for_port_audited, diagnose_residual,
+    effective_juvenile_ticks, evaluate_comparator_ring_promotion_audited, observation_horizon,
+    port_primary_cone_is_mature, propose_autonomous_delay_ring_scored_audited,
+    propose_redundancy_sprout_audited, propose_sprout_band_scored_internal_audited,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
     CausalAncestry, ComparatorCausalAncestry, ComparatorSensitivitySnapshot, SensitivitySnapshot,
     assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
-    counterfactual_sensitivity, counterfactual_sensitivity_with_comparators,
+    counterfactual_sensitivity_audited, counterfactual_sensitivity_with_comparators_audited,
+};
+use crate::structural::sleep::{
+    ComputeLedger, SleepSchedule, SleepSegmentReport, SleepTelemetry, WakeSleepEpisodeReport,
+    compose_old_to_new, run_wake_sleep_episode as sleep_run_wake_sleep_episode,
 };
 use crate::structural::surgery::{
-    EditableCircuit, MarginalDebtLedger, explicit_delay_register_index, port_cone_changed,
-    port_is_cone_mature, port_is_primed, port_upstream_cone_and_edges,
+    EditableCircuit, MarginalDebtLedger, SurgeryEvalAudit, explicit_delay_register_index,
+    port_cone_changed, port_is_cone_mature, port_is_primed, port_upstream_cone_and_edges,
+    register_mapping,
 };
 use crate::substrate::{
-    Circuit, NodeId, Primitive, SignalSink, SignalSource, Width, WireDelayMode,
+    Circuit, NodeId, Primitive, ScalarState, SignalSink, SignalSource, Width, WireDelayMode,
 };
 
 /// Telemetry record capturing residual entropy and diagnostic mutual information across growth epochs.
@@ -272,6 +278,9 @@ pub struct ArkheLearner {
     sprout_budget_exhausted: u64,
     total_budget_seen: Option<u64>,
     injected_detour_nodes: BTreeSet<NodeId>,
+    last_wake_predictions: Option<Vec<u64>>,
+    sleep_telemetry: SleepTelemetry,
+    compute_ledger: ComputeLedger,
 }
 
 impl ArkheLearner {
@@ -363,6 +372,9 @@ impl ArkheLearner {
             sprout_budget_exhausted: 0,
             total_budget_seen: None,
             injected_detour_nodes: BTreeSet::new(),
+            last_wake_predictions: None,
+            sleep_telemetry: SleepTelemetry::default(),
+            compute_ledger: ComputeLedger::default(),
         })
     }
 
@@ -454,7 +466,16 @@ impl ArkheLearner {
             sprout_budget_exhausted: 0,
             total_budget_seen: None,
             injected_detour_nodes: BTreeSet::new(),
+            last_wake_predictions: None,
+            sleep_telemetry: SleepTelemetry::default(),
+            compute_ledger: ComputeLedger::default(),
         })
+    }
+
+    /// Normalized previous observed input frame for closed-loop stepping.
+    #[must_use]
+    pub fn prev_observed_frame(&self) -> &[u64] {
+        &self.prev_observed_frame
     }
 
     /// Sets the normalized previous observed input frame for closed-loop stepping.
@@ -527,6 +548,117 @@ impl ArkheLearner {
     #[must_use]
     pub const fn economy_config(&self) -> &EconomyConfig {
         &self.economy_config
+    }
+
+    /// Wake–sleep onset, segment, suspension, and excision telemetry.
+    #[must_use]
+    pub const fn sleep_telemetry(&self) -> SleepTelemetry {
+        self.sleep_telemetry
+    }
+
+    /// Equal-compute substrate tick ledger and one-sided node-evaluation audit ledger (`R2`).
+    #[must_use]
+    pub const fn compute_ledger(&self) -> ComputeLedger {
+        self.compute_ledger
+    }
+
+    pub(crate) fn record_skipped_sleep_segment(&mut self) {
+        self.sleep_telemetry
+            .sleep_segment_skipped_no_scoreable_comparator += 1;
+    }
+
+    /// Returns `true` iff boundary channel `channel` is grounded at sleep entry (`R4`):
+    /// its port is driven, its wake forecast scorer has evaluated at least one wake tick,
+    /// and its calibrated forecast beats the port's null model ($\hat{q}_c > p_{\text{null},c}$).
+    #[must_use]
+    pub fn channel_is_grounded(&self, channel: usize) -> bool {
+        let Ok(port_u16) = u16::try_from(channel) else {
+            return false;
+        };
+        if !self.is_port_driven(port_u16) {
+            return false;
+        }
+        let Some(scorer) = self.editable.economy().scorers().get(channel) else {
+            return false;
+        };
+        if scorer.ticks() == 0 {
+            return false;
+        }
+        let width = self.editable.circuit().width();
+        let (q_hat, p_null) = if let Some(raw_pred) = self
+            .last_wake_predictions
+            .as_ref()
+            .and_then(|preds| preds.get(channel).copied())
+        {
+            let pred = width.normalize(raw_pred);
+            (
+                scorer.q_hat_for(pred),
+                scorer.null_model().probability(pred),
+            )
+        } else {
+            let uniform = 1.0 / (2.0f64.powi(i32::from(width.bits())));
+            (scorer.q_hat(), uniform)
+        };
+        q_hat > p_null
+    }
+
+    /// Returns `true` iff comparator `comp` is mature, grounded, and scoreable under `schedule` (`R4`, `R7`).
+    #[must_use]
+    pub fn comparator_is_scoreable_for_sleep(
+        &self,
+        comp: &ComparatorSite,
+        schedule: SleepSchedule,
+    ) -> bool {
+        if schedule == SleepSchedule::None {
+            return false;
+        }
+        if !comparator_cone_is_mature(self.editable.circuit(), self.editable.economy(), comp) {
+            return false;
+        }
+        if !self.channel_is_grounded(usize::from(comp.target_port)) {
+            return false;
+        }
+        match schedule {
+            SleepSchedule::None => false,
+            SleepSchedule::ConsistencyOnly => {
+                let leaf_mask = comp.primary_channel_mask | comp.alt_channel_mask;
+                (0..64u32).all(|bit| {
+                    (leaf_mask & (1u64 << bit)) == 0 || self.channel_is_grounded(bit as usize)
+                })
+            }
+            SleepSchedule::ConsistencyReplay => true,
+        }
+    }
+
+    /// Returns `true` iff at least one mature, grounded, scoreable comparator exists for the
+    /// configured [`SleepSchedule`] (`R7`, `I2`).
+    #[must_use]
+    pub fn has_scoreable_comparator_for_sleep(&self) -> bool {
+        let schedule = self.growth_config.sleep_schedule;
+        schedule != SleepSchedule::None
+            && self
+                .editable
+                .economy()
+                .comparators()
+                .iter()
+                .any(|comp| self.comparator_is_scoreable_for_sleep(comp, schedule))
+    }
+
+    /// Runs a canonical scheduled wake–sleep episode of `total_substrate_ticks` substrate ticks (`R2`, `R7`, `I5`).
+    pub fn run_wake_sleep_episode<G: FiniteStateGenerator>(
+        &mut self,
+        env: &mut NoisyEnvironment<G>,
+        total_substrate_ticks: u64,
+        warmup_ticks: u64,
+        max_eval_ticks: u64,
+    ) -> WakeSleepEpisodeReport {
+        sleep_run_wake_sleep_episode(
+            self,
+            env,
+            total_substrate_ticks,
+            warmup_ticks,
+            max_eval_ticks,
+        )
     }
 
     /// Total sprout transactions committed.
@@ -698,7 +830,16 @@ impl ArkheLearner {
 
         // In TicksPerHop, pre-settle newly injected Delay-free constant subgraphs (e.g. ConstLoop(1/3)).
         if post_circuit.wire_delay() == WireDelayMode::TicksPerHop {
-            settle_injected_tph_constant_subgraphs(&mut self.editable, &is_surviving);
+            let mut probe_evals = 0u64;
+            settle_injected_tph_constant_subgraphs(
+                &mut self.editable,
+                &is_surviving,
+                &mut probe_evals,
+            );
+            self.compute_ledger.candidate_replay_node_evals = self
+                .compute_ledger
+                .candidate_replay_node_evals
+                .saturating_add(probe_evals);
         }
 
         for q in 0..self.port_states.len() {
@@ -1365,12 +1506,17 @@ impl ArkheLearner {
                     let _ = shadow.set_registers(compiled, &shadow_regs);
                 }
                 let mut dummy_pred = vec![0u64; usize::from(compiled.num_outputs())];
+                let replay_nodes = self.editable.circuit().node_count() as u64;
                 for idx in start_idx..self.obs_window.len() {
                     let input = if idx == 0 {
                         self.obs_window.prior_frame()
                     } else {
                         &self.obs_window.frames()[idx - 1]
                     };
+                    self.compute_ledger.candidate_replay_node_evals = self
+                        .compute_ledger
+                        .candidate_replay_node_evals
+                        .saturating_add(replay_nodes);
                     let _ = shadow.step(compiled, input, &mut dummy_pred);
                 }
                 let mut live_regs = self.editable.state().registers().to_vec();
@@ -1423,9 +1569,18 @@ impl ArkheLearner {
     }
 
     fn excise_port_comparator(&mut self, comp_idx: usize, prune_primary: bool) -> bool {
+        self.excise_port_comparator_with_map(comp_idx, prune_primary)
+            .is_some()
+    }
+
+    fn excise_port_comparator_with_map(
+        &mut self,
+        comp_idx: usize,
+        prune_primary: bool,
+    ) -> Option<Vec<Option<NodeId>>> {
         let comps = self.editable.economy().comparators();
         if comp_idx >= comps.len() {
-            return false;
+            return None;
         }
         let comp = comps[comp_idx].clone();
         let target_port = comp.target_port;
@@ -1446,7 +1601,7 @@ impl ArkheLearner {
             .filter_map(|(i, c)| (i != comp_idx).then_some((c.sub_node, c.eqz_node)))
             .collect();
 
-        let Some((pruned, old_to_new)) = excise_comparator_branch(
+        let (pruned, old_to_new) = excise_comparator_branch(
             self.editable.circuit(),
             comp.sub_node,
             comp.eqz_node,
@@ -1454,9 +1609,7 @@ impl ArkheLearner {
             prune_primary,
             &target_port_subs,
             &surviving_comp_nodes,
-        ) else {
-            return false;
-        };
+        )?;
 
         if prune_primary {
             self.swap_port_and_comparator_scorer(target_idx, comp_idx);
@@ -1478,7 +1631,7 @@ impl ArkheLearner {
             .recompile_preserving_state(pruned, &old_to_new)
             .is_err()
         {
-            return false;
+            return None;
         }
         self.ledger.on_prune(
             self.editable.circuit(),
@@ -1497,7 +1650,7 @@ impl ArkheLearner {
             }
         }
         self.refresh_stage_gates_after_comparator_transition(target_port, true);
-        true
+        Some(old_to_new)
     }
 
     /// Return whether `target_port` remains driven and its primary scorer still
@@ -1860,6 +2013,13 @@ impl ArkheLearner {
 
         for _ in 0..loopback_ticks {
             let mut predictions = vec![0u64; num_out];
+            let step_nodes = self.editable.circuit().node_count() as u64;
+            self.compute_ledger.sleep_loopback_ticks =
+                self.compute_ledger.sleep_loopback_ticks.saturating_add(1);
+            self.compute_ledger.live_step_node_evals = self
+                .compute_ledger
+                .live_step_node_evals
+                .saturating_add(step_nodes);
             let _ = self.editable.step(&curr_input, &mut predictions);
             for (slot, &pred) in curr_input.iter_mut().zip(&predictions) {
                 *slot = width.normalize(pred);
@@ -1891,15 +2051,21 @@ impl ArkheLearner {
 
             let comp_count = self.editable.economy().comparators().len();
             if comp_count == 0 {
-                let snapshot = counterfactual_sensitivity(
+                let mut sens_evals = 0u64;
+                let snapshot = counterfactual_sensitivity_audited(
                     self.editable.circuit(),
                     self.editable.compiled(),
                     self.editable.state(),
                     self.seed_bank,
                     self.tick,
                     self.sample_count,
+                    &mut sens_evals,
                 )
                 .expect("valid sensitivity snapshot");
+                self.compute_ledger.sensitivity_node_evals = self
+                    .compute_ledger
+                    .sensitivity_node_evals
+                    .saturating_add(sens_evals);
                 let ancestry = assemble_causal_ancestry(
                     self.editable.circuit(),
                     self.editable.compiled(),
@@ -1918,7 +2084,8 @@ impl ArkheLearner {
                 self.cumulative_debt_paid += econ_tick.maintenance;
             } else {
                 let targets = self.editable.comparator_targets();
-                let snapshot = counterfactual_sensitivity_with_comparators(
+                let mut sens_evals = 0u64;
+                let snapshot = counterfactual_sensitivity_with_comparators_audited(
                     self.editable.circuit(),
                     self.editable.compiled(),
                     self.editable.state(),
@@ -1926,8 +2093,13 @@ impl ArkheLearner {
                     self.tick,
                     self.sample_count,
                     &targets,
+                    &mut sens_evals,
                 )
                 .expect("valid comparator sensitivity snapshot");
+                self.compute_ledger.sensitivity_node_evals = self
+                    .compute_ledger
+                    .sensitivity_node_evals
+                    .saturating_add(sens_evals);
                 let ancestry = assemble_causal_ancestry_with_comparators(
                     self.editable.circuit(),
                     self.editable.compiled(),
@@ -2057,6 +2229,542 @@ impl ArkheLearner {
             max_circular_discrepancy,
             minority_routes_pruned,
             contradiction_detected: comparator_disagreement_ticks > 0,
+        }
+    }
+
+    /// Executes a single scheduled sleep segment starting from live `DELAY` state and restoring
+    /// remapped pre-sleep wake registers on exit (`R3`, `R7`, `I3`, `I5`, `I6`).
+    ///
+    /// Wake null models and wake forecast scorers remain frozen throughout. Economy state
+    /// (energies, deaths, excisions, comparators, flux/debt) persists on exit.
+    pub fn run_sleep_segment(&mut self, sleep_ticks: u64) -> SleepSegmentReport {
+        self.pending_prediction = None;
+        if sleep_ticks == 0 {
+            return SleepSegmentReport::default();
+        }
+
+        let pre_sleep_circuit = self.editable.circuit().clone();
+        let pre_sleep_compiled = self.editable.compiled().clone();
+        let pre_sleep_regs = self.editable.state().registers().to_vec();
+        let pre_sleep_prev_frame = self.prev_observed_frame.clone();
+        let mut composed_old_to_new: Vec<Option<NodeId>> = (0..pre_sleep_circuit.node_count())
+            .map(|i| Some(NodeId(i as u32)))
+            .collect();
+        let mut sleep_edited = false;
+
+        let (replay_ticks, loopback_ticks) = match self.growth_config.sleep_schedule {
+            SleepSchedule::ConsistencyReplay => {
+                let r = sleep_ticks / 2;
+                (r, sleep_ticks - r)
+            }
+            SleepSchedule::ConsistencyOnly | SleepSchedule::None => (0, sleep_ticks),
+        };
+
+        let start_agree = self.editable.economy().comparator_agreement_ticks();
+        let start_disagree = self.editable.economy().comparator_disagreement_ticks();
+        let start_flux = self.editable.economy().cumulative_comparator_flux();
+
+        self.editable.economy_mut().set_phase(ExecutionPhase::Sleep);
+
+        // S-B replay half (Phase 0.1 meters replay ticks and preserves wake state; Phase 0.2 adds
+        // bounded fact-buffer adjudication and statistics-match tests).
+        if replay_ticks > 0 {
+            let num_in = usize::from(self.editable.compiled().num_inputs());
+            let num_out = usize::from(self.editable.compiled().num_outputs());
+            let mut replay_pred = vec![0u64; num_out];
+            let obs_len = self.obs_window.len();
+            let replay_start = obs_len.saturating_sub(replay_ticks as usize);
+            let mut fallback_in = pre_sleep_prev_frame.clone();
+            fallback_in.resize(num_in, 0);
+            let step_nodes = self.editable.circuit().node_count() as u64;
+            for r_idx in 0..(replay_ticks as usize) {
+                let input: &[u64] = if obs_len > 0 && replay_start + r_idx < obs_len {
+                    let frame_idx = replay_start + r_idx;
+                    if frame_idx == 0 {
+                        self.obs_window.prior_frame()
+                    } else {
+                        &self.obs_window.frames()[frame_idx - 1]
+                    }
+                } else {
+                    &fallback_in
+                };
+                self.compute_ledger.sleep_replay_ticks =
+                    self.compute_ledger.sleep_replay_ticks.saturating_add(1);
+                self.compute_ledger.live_step_node_evals = self
+                    .compute_ledger
+                    .live_step_node_evals
+                    .saturating_add(step_nodes);
+                let _ = self.editable.step(input, &mut replay_pred);
+            }
+            // Restore pre-sleep live registers so loopback always starts from live wake DELAY state (I3).
+            let _ = self
+                .editable
+                .restore_registers_preserving_epoch(&pre_sleep_regs);
+        }
+
+        let width = self.editable.circuit().width();
+        let num_in = usize::from(self.editable.compiled().num_inputs());
+        let num_out = usize::from(self.editable.compiled().num_outputs());
+        let mut curr_input = pre_sleep_prev_frame.clone();
+        curr_input.resize(num_in, 0);
+
+        let mut max_circular_discrepancy = 0u64;
+        let mut minority_routes_pruned = 0u64;
+        let mut starvation_excisions = 0u64;
+        let mut first_loopback_predictions: Option<Vec<u64>> = None;
+        let zeros_port_rewards = vec![0.0; num_out];
+        let mut per_port_consensus: Vec<(u64, u64, u64)> = vec![(0, 0, 0); num_out];
+        let consensus_thr = self
+            .growth_config
+            .min_match_gain
+            .min(loopback_ticks.max(1) as usize) as u64;
+
+        for _ in 0..loopback_ticks {
+            let mut predictions = vec![0u64; num_out];
+            let step_nodes = self.editable.circuit().node_count() as u64;
+            self.compute_ledger.sleep_loopback_ticks =
+                self.compute_ledger.sleep_loopback_ticks.saturating_add(1);
+            self.compute_ledger.live_step_node_evals = self
+                .compute_ledger
+                .live_step_node_evals
+                .saturating_add(step_nodes);
+            let _ = self.editable.step(&curr_input, &mut predictions);
+            if first_loopback_predictions.is_none() {
+                first_loopback_predictions = Some(predictions.clone());
+            }
+            for (slot, &pred) in curr_input.iter_mut().zip(&predictions) {
+                *slot = width.normalize(pred);
+            }
+
+            let node_outs = node_output_values(self.editable.circuit(), self.editable.state());
+            let wires = self.editable.state().wire_values().to_vec();
+            let _ = self.editable.economy_mut().record_activity(&node_outs);
+
+            let n = self.editable.circuit().node_count();
+            if self.ledger.node_debts.len() != n {
+                self.ledger
+                    .ensure_capacity(self.editable.circuit(), self.economy_config.split_code_tax);
+                self.editable
+                    .economy_mut()
+                    .assign_sprout_debts(&self.ledger.node_debts);
+            }
+            let mut maintenance_costs = vec![0.0; n];
+            for (i, cost) in maintenance_costs.iter_mut().enumerate().take(n) {
+                let node = &self.editable.economy().nodes()[i];
+                if node.juvenile_ticks == 0 && !self.ledger.debt_paid[i] {
+                    *cost = self.ledger.node_debts[i];
+                    self.ledger.debt_paid[i] = true;
+                    if let Some(n_mut) = self.editable.economy_mut().node_mut(i) {
+                        n_mut.debt_paid = true;
+                    }
+                }
+            }
+
+            let sens_tick_block = self.compute_ledger.total_substrate_ticks();
+            let comp_count = self.editable.economy().comparators().len();
+            let econ_tick = if comp_count == 0 {
+                let mut sens_evals = 0u64;
+                let snapshot = counterfactual_sensitivity_audited(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    self.seed_bank,
+                    sens_tick_block,
+                    self.sample_count,
+                    &mut sens_evals,
+                )
+                .expect("valid sleep sensitivity snapshot");
+                self.compute_ledger.sensitivity_node_evals = self
+                    .compute_ledger
+                    .sensitivity_node_evals
+                    .saturating_add(sens_evals);
+                let ancestry = assemble_causal_ancestry(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    &snapshot,
+                    &self.editable.economy().activity(),
+                    self.editable.economy().register_eligibility(),
+                    self.economy_config.trace_discount,
+                )
+                .expect("valid sleep causal ancestry");
+                let econ_tick = self
+                    .editable
+                    .economy_mut()
+                    .apply_causal_tick(&zeros_port_rewards, &ancestry, &maintenance_costs)
+                    .expect("valid sleep tick");
+                self.cumulative_net_flux += econ_tick.net_flux;
+                self.cumulative_debt_paid += econ_tick.maintenance;
+                self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
+                self.reserve_clipped_bits += econ_tick.clipped_bits;
+                self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
+                econ_tick
+            } else {
+                let targets = self.editable.comparator_targets();
+                let mut sens_evals = 0u64;
+                let snapshot = counterfactual_sensitivity_with_comparators_audited(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    self.seed_bank,
+                    sens_tick_block,
+                    self.sample_count,
+                    &targets,
+                    &mut sens_evals,
+                )
+                .expect("valid sleep comparator sensitivity snapshot");
+                self.compute_ledger.sensitivity_node_evals = self
+                    .compute_ledger
+                    .sensitivity_node_evals
+                    .saturating_add(sens_evals);
+                let ancestry = assemble_causal_ancestry_with_comparators(
+                    self.editable.circuit(),
+                    self.editable.compiled(),
+                    self.editable.state(),
+                    &snapshot,
+                    &self.editable.economy().activity(),
+                    self.editable.economy().register_eligibility(),
+                    self.economy_config.trace_discount,
+                    &targets,
+                    true,
+                )
+                .expect("valid sleep comparator ancestry");
+
+                let mut pri_vals = Vec::with_capacity(comp_count);
+                let mut alt_vals = Vec::with_capacity(comp_count);
+                let mut eqz_vals = Vec::with_capacity(comp_count);
+                for comp in self.editable.economy().comparators() {
+                    let sub_in =
+                        &self.editable.compiled().node_input_wires()[comp.sub_node.index()];
+                    let p_v = width.normalize(wires[sub_in[0]]);
+                    let a_v = width.normalize(wires[sub_in[1]]);
+                    max_circular_discrepancy =
+                        max_circular_discrepancy.max(width.circular_distance(p_v, a_v));
+                    pri_vals.push(p_v);
+                    alt_vals.push(a_v);
+                    eqz_vals.push(width.normalize(node_outs[comp.eqz_node.index()]));
+                }
+                let comp_obs = self
+                    .editable
+                    .economy_mut()
+                    .observe_comparators(&pri_vals, &alt_vals, &eqz_vals, None)
+                    .expect("valid sleep comparator observation");
+                let econ_tick = self
+                    .editable
+                    .economy_mut()
+                    .apply_causal_tick_with_comparators(
+                        &zeros_port_rewards,
+                        &comp_obs.rewards,
+                        comp_obs.agreements,
+                        comp_obs.disagreements,
+                        &ancestry,
+                        &maintenance_costs,
+                    )
+                    .expect("valid sleep causal tick");
+                self.cumulative_net_flux += econ_tick.net_flux;
+                self.cumulative_debt_paid += econ_tick.maintenance;
+                self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
+                self.reserve_clipped_bits += econ_tick.clipped_bits;
+                self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
+
+                // 3-route majority pruning during sleep.
+                for (p, counts) in per_port_consensus.iter_mut().enumerate() {
+                    let p_u16 = p as u16;
+                    let comps_on_p: Vec<usize> = self
+                        .editable
+                        .economy()
+                        .comparators()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| (c.target_port == p_u16).then_some(i))
+                        .collect();
+                    if comps_on_p.len() != 2 {
+                        *counts = (0, 0, 0);
+                        continue;
+                    }
+                    let idx_a = comps_on_p[0];
+                    let idx_b = comps_on_p[1];
+                    let comps = self.editable.economy().comparators();
+                    if !comparator_cone_is_mature(
+                        self.editable.circuit(),
+                        self.editable.economy(),
+                        &comps[idx_a],
+                    ) || !comparator_cone_is_mature(
+                        self.editable.circuit(),
+                        self.editable.economy(),
+                        &comps[idx_b],
+                    ) {
+                        continue;
+                    }
+                    let pri = pri_vals[idx_a];
+                    let alt_a = alt_vals[idx_a];
+                    let alt_b = alt_vals[idx_b];
+                    if pri != alt_a {
+                        counts.0 += 1;
+                    }
+                    if pri != alt_b {
+                        counts.1 += 1;
+                    }
+                    if alt_a != alt_b {
+                        counts.2 += 1;
+                    }
+                    let (d_pa, d_pb, d_ab) = *counts;
+                    let action = if d_pa == 0 && d_pb >= consensus_thr && d_ab >= consensus_thr {
+                        Some((idx_b, false))
+                    } else if d_pb == 0 && d_pa >= consensus_thr && d_ab >= consensus_thr {
+                        Some((idx_a, false))
+                    } else if d_ab == 0 && d_pa >= consensus_thr && d_pb >= consensus_thr {
+                        Some((idx_a, true))
+                    } else {
+                        None
+                    };
+                    if let Some((prune_idx, prune_primary)) = action
+                        && let Some(step_map) =
+                            self.excise_port_comparator_with_map(prune_idx, prune_primary)
+                    {
+                        compose_old_to_new(&mut composed_old_to_new, &step_map);
+                        sleep_edited = true;
+                        self.disagreement_prune_events += 1;
+                        minority_routes_pruned += 1;
+                        *counts = (0, 0, 0);
+                        break;
+                    }
+                }
+                econ_tick
+            };
+
+            // Depleted-node / starved comparator-branch excision during sleep.
+            if !econ_tick.starved_nodes.is_empty() {
+                loop {
+                    let starved_set: BTreeSet<NodeId> = self
+                        .editable
+                        .economy()
+                        .nodes()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, econ)| {
+                            (econ.juvenile_ticks == 0 && econ.energy <= 0.0)
+                                .then_some(NodeId(idx as u32))
+                        })
+                        .collect();
+                    if starved_set.is_empty() {
+                        break;
+                    }
+                    let comps = self.editable.economy().comparators().to_vec();
+                    let mut excised_comp: Option<(usize, u16)> = None;
+                    for (comp_idx, comp) in comps.iter().enumerate() {
+                        let target_port_subs: Vec<NodeId> = comps
+                            .iter()
+                            .filter(|c| c.target_port == comp.target_port)
+                            .map(|c| c.sub_node)
+                            .collect();
+                        let surviving_comp_nodes: Vec<(NodeId, NodeId)> = comps
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, c)| {
+                                (i != comp_idx).then_some((c.sub_node, c.eqz_node))
+                            })
+                            .collect();
+                        let circuit = self.editable.circuit();
+                        let pri_starved = comparator_exclusive_arm_nodes(
+                            circuit,
+                            comp.sub_node,
+                            comp.eqz_node,
+                            comp.target_port,
+                            true,
+                            &target_port_subs,
+                            &surviving_comp_nodes,
+                        )
+                        .is_some_and(|excl| excl.iter().any(|n| starved_set.contains(n)));
+                        let alt_starved = comparator_exclusive_arm_nodes(
+                            circuit,
+                            comp.sub_node,
+                            comp.eqz_node,
+                            comp.target_port,
+                            false,
+                            &target_port_subs,
+                            &surviving_comp_nodes,
+                        )
+                        .is_some_and(|excl| excl.iter().any(|n| starved_set.contains(n)));
+                        let comp_node_starved = starved_set.contains(&comp.sub_node)
+                            || starved_set.contains(&comp.eqz_node);
+                        if (comp_node_starved || alt_starved) && !pri_starved {
+                            excised_comp = Some((comp_idx, comp.target_port));
+                            break;
+                        }
+                    }
+                    if let Some((comp_idx, tp)) = excised_comp
+                        && let Some(step_map) =
+                            self.excise_port_comparator_with_map(comp_idx, false)
+                    {
+                        compose_old_to_new(&mut composed_old_to_new, &step_map);
+                        sleep_edited = true;
+                        self.disagreement_prune_events += 1;
+                        starvation_excisions += 1;
+                        if let Some(c) = per_port_consensus.get_mut(usize::from(tp)) {
+                            *c = (0, 0, 0);
+                        }
+                        continue;
+                    }
+                    break;
+                }
+
+                let remaining_starved: BTreeSet<NodeId> = self
+                    .editable
+                    .economy()
+                    .nodes()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, econ)| {
+                        (econ.juvenile_ticks == 0 && econ.energy <= 0.0)
+                            .then_some(NodeId(idx as u32))
+                    })
+                    .collect();
+                if !remaining_starved.is_empty() {
+                    let pre_prune_circuit = self.editable.circuit().clone();
+                    let pre_comps = self.editable.economy().comparators().to_vec();
+                    let juvenile_set: BTreeSet<NodeId> = self
+                        .editable
+                        .economy()
+                        .nodes()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, econ)| {
+                            (econ.juvenile_ticks > 0).then_some(NodeId(idx as u32))
+                        })
+                        .collect();
+                    let mut surgery_audit = SurgeryEvalAudit::default();
+                    let mut excised_starved_passthrough = false;
+                    let prune_res = if let Some((pruned, old_to_new)) =
+                        prune_starved_preserving_healthy_split_branches(
+                            self.editable.circuit(),
+                            &remaining_starved,
+                            &juvenile_set,
+                        ) {
+                        self.editable
+                            .recompile_preserving_state(pruned, &old_to_new)
+                            .map(|()| old_to_new)
+                    } else if self.growth_config.excision_mode
+                        == ExcisionMode::VerifiedLocalExcision
+                        && let Ok(Some(old_to_new)) = self
+                            .editable
+                            .excise_verified_passthrough_for_starved_cone_audited(
+                                &remaining_starved,
+                                self.economy_config.split_code_tax,
+                                &mut surgery_audit,
+                            )
+                    {
+                        excised_starved_passthrough = true;
+                        Ok(old_to_new)
+                    } else {
+                        self.editable.prune_starved_nodes_with_mode_audited(
+                            self.growth_config.excision_mode,
+                            self.growth_config.diagnostic_window,
+                            &mut surgery_audit,
+                        )
+                    };
+                    self.compute_ledger.candidate_replay_node_evals = self
+                        .compute_ledger
+                        .candidate_replay_node_evals
+                        .saturating_add(surgery_audit.replay_node_evals);
+                    self.compute_ledger.sensitivity_node_evals = self
+                        .compute_ledger
+                        .sensitivity_node_evals
+                        .saturating_add(surgery_audit.sensitivity_node_evals);
+                    if let Ok(old_to_new) = prune_res
+                        && old_to_new.iter().any(Option::is_none)
+                    {
+                        self.ledger.on_prune(
+                            self.editable.circuit(),
+                            self.economy_config.split_code_tax,
+                            &old_to_new,
+                        );
+                        self.clear_changed_port_diagnostics_preserving_scorer(
+                            &pre_prune_circuit,
+                            &old_to_new,
+                        );
+                        self.apply_node_remap_to_windows(&old_to_new);
+                        compose_old_to_new(&mut composed_old_to_new, &old_to_new);
+                        sleep_edited = true;
+                        starvation_excisions += 1;
+                        if excised_starved_passthrough {
+                            self.idle_prune_events += 1;
+                            self.local_excision_events += 1;
+                        } else {
+                            self.starvation_prune_events += 1;
+                            self.record_scoped_starvation_prune(
+                                &pre_prune_circuit,
+                                &pre_comps,
+                                &remaining_starved,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sleep exit (R3, I3, I6): restore Wake phase, prev_observed_frame, and remapped wake registers.
+        self.editable.economy_mut().set_phase(ExecutionPhase::Wake);
+        self.prev_observed_frame = pre_sleep_prev_frame;
+        if !sleep_edited {
+            self.editable
+                .restore_registers_preserving_epoch(&pre_sleep_regs)
+                .expect("pre-sleep register snapshot matches unedited circuit");
+        } else {
+            let reg_map = register_mapping(
+                &pre_sleep_circuit,
+                self.editable.circuit(),
+                &pre_sleep_compiled,
+                self.editable.compiled(),
+                &composed_old_to_new,
+            );
+            let mut restored_regs = ScalarState::new(self.editable.compiled())
+                .registers()
+                .to_vec();
+            for (old_r, mapped) in reg_map.iter().enumerate() {
+                if let Some(new_r) = mapped
+                    && old_r < pre_sleep_regs.len()
+                    && *new_r < restored_regs.len()
+                {
+                    restored_regs[*new_r] = pre_sleep_regs[old_r];
+                }
+            }
+            self.editable
+                .restore_registers_preserving_epoch(&restored_regs)
+                .expect("remapped wake register snapshot matches post-sleep circuit");
+        }
+
+        let comparator_agreement_ticks =
+            self.editable.economy().comparator_agreement_ticks() - start_agree;
+        let comparator_disagreement_ticks =
+            self.editable.economy().comparator_disagreement_ticks() - start_disagree;
+        let sleep_comparator_flux =
+            self.editable.economy().cumulative_comparator_flux() - start_flux;
+        let sleep_excisions = minority_routes_pruned + starvation_excisions;
+
+        if self.sleep_telemetry.first_onset_wake_tick.is_none() {
+            self.sleep_telemetry.first_onset_wake_tick = Some(self.tick);
+        }
+        self.sleep_telemetry.sleep_segments_executed += 1;
+        self.sleep_telemetry.sleep_excisions += sleep_excisions;
+        self.sleep_telemetry.sleep_minority_routes_pruned += minority_routes_pruned;
+        self.sleep_telemetry.sleep_starvation_excisions += starvation_excisions;
+        self.sleep_telemetry.facts_forgone += sleep_ticks;
+
+        SleepSegmentReport {
+            ticks: sleep_ticks,
+            replay_ticks,
+            loopback_ticks,
+            comparator_agreement_ticks,
+            comparator_disagreement_ticks,
+            sleep_comparator_flux,
+            max_circular_discrepancy,
+            minority_routes_pruned,
+            starvation_excisions,
+            sleep_excisions,
+            contradiction_detected: comparator_disagreement_ticks > 0,
+            entry_registers: pre_sleep_regs,
+            first_loopback_predictions,
         }
     }
 }
@@ -2234,7 +2942,11 @@ fn injected_subgraph_register_depth(
     rec(circuit, is_surviving, start, &mut on_path)
 }
 
-fn settle_injected_tph_constant_subgraphs(editable: &mut EditableCircuit, is_surviving: &[bool]) {
+fn settle_injected_tph_constant_subgraphs(
+    editable: &mut EditableCircuit,
+    is_surviving: &[bool],
+    probe_evals: &mut u64,
+) {
     let circuit = editable.circuit().clone();
     let compiled = editable.compiled().clone();
     if circuit.wire_delay() != WireDelayMode::TicksPerHop {
@@ -2302,6 +3014,7 @@ fn settle_injected_tph_constant_subgraphs(editable: &mut EditableCircuit, is_sur
     let zeros_in = vec![0u64; usize::from(compiled.num_inputs())];
     let mut out = vec![0u64; usize::from(compiled.num_outputs())];
     for _ in 0..(node_count + 4) {
+        *probe_evals = probe_evals.saturating_add(node_count as u64);
         if probe.step(&compiled, &zeros_in, &mut out).is_err() {
             return;
         }
@@ -2326,19 +3039,25 @@ impl PredictorBaseline for ArkheLearner {
         let pre_registers = self.editable.state().registers().to_vec();
         let num_out = usize::from(self.editable.compiled().num_outputs());
         let mut predictions = vec![0u64; num_out];
+        self.compute_ledger.live_step_node_evals = self
+            .compute_ledger
+            .live_step_node_evals
+            .saturating_add(self.editable.circuit().node_count() as u64);
         let _ = self
             .editable
             .step(&self.prev_observed_frame, &mut predictions);
         let node_outputs = node_output_values(self.editable.circuit(), self.editable.state());
         let _ = self.editable.economy_mut().record_activity(&node_outputs);
+        let mut sens_evals = 0u64;
         let snap = if self.editable.economy().comparators().is_empty() {
-            let snapshot = counterfactual_sensitivity(
+            let snapshot = counterfactual_sensitivity_audited(
                 self.editable.circuit(),
                 self.editable.compiled(),
                 self.editable.state(),
                 self.seed_bank,
                 self.tick,
                 self.sample_count,
+                &mut sens_evals,
             )
             .expect("valid sensitivity snapshot");
             let ancestry = assemble_causal_ancestry(
@@ -2354,7 +3073,7 @@ impl PredictorBaseline for ArkheLearner {
             PendingSnapshot::Base { ancestry, snapshot }
         } else {
             let targets = self.editable.comparator_targets();
-            let snapshot = counterfactual_sensitivity_with_comparators(
+            let snapshot = counterfactual_sensitivity_with_comparators_audited(
                 self.editable.circuit(),
                 self.editable.compiled(),
                 self.editable.state(),
@@ -2362,6 +3081,7 @@ impl PredictorBaseline for ArkheLearner {
                 self.tick,
                 self.sample_count,
                 &targets,
+                &mut sens_evals,
             )
             .expect("valid comparator sensitivity snapshot");
             let ancestry = assemble_causal_ancestry_with_comparators(
@@ -2378,6 +3098,10 @@ impl PredictorBaseline for ArkheLearner {
             .expect("valid comparator causal ancestry");
             PendingSnapshot::WithComparators { ancestry, snapshot }
         };
+        self.compute_ledger.sensitivity_node_evals = self
+            .compute_ledger
+            .sensitivity_node_evals
+            .saturating_add(sens_evals);
 
         self.pending_prediction = Some((
             predictions.clone(),
@@ -2397,6 +3121,9 @@ impl PredictorBaseline for ArkheLearner {
             .pending_prediction
             .take()
             .expect("observe called with pending prediction");
+        self.compute_ledger.wake_substrate_ticks =
+            self.compute_ledger.wake_substrate_ticks.saturating_add(1);
+        self.last_wake_predictions = Some(predictions.clone());
         let (base_ancestry, comp_ancestry, output_by_node, latch_by_node, comp_eqz_by_node) =
             match &pending_snap {
                 PendingSnapshot::Base { ancestry, snapshot } => (
@@ -2607,6 +3334,7 @@ impl PredictorBaseline for ArkheLearner {
                 .collect();
             let mut used_split_preserving = false;
             let mut excised_starved_passthrough = false;
+            let mut surgery_audit = SurgeryEvalAudit::default();
             let prune_res = if let Some((pruned, old_to_new)) =
                 prune_starved_preserving_healthy_split_branches(
                     self.editable.circuit(),
@@ -2618,20 +3346,31 @@ impl PredictorBaseline for ArkheLearner {
                     .recompile_preserving_state(pruned, &old_to_new)
                     .map(|()| old_to_new)
             } else if self.growth_config.excision_mode == ExcisionMode::VerifiedLocalExcision
-                && let Ok(Some(old_to_new)) =
-                    self.editable.excise_verified_passthrough_for_starved_cone(
+                && let Ok(Some(old_to_new)) = self
+                    .editable
+                    .excise_verified_passthrough_for_starved_cone_audited(
                         &starved_set,
                         self.economy_config.split_code_tax,
+                        &mut surgery_audit,
                     )
             {
                 excised_starved_passthrough = true;
                 Ok(old_to_new)
             } else {
-                self.editable.prune_starved_nodes_with_mode(
+                self.editable.prune_starved_nodes_with_mode_audited(
                     self.growth_config.excision_mode,
                     self.growth_config.diagnostic_window,
+                    &mut surgery_audit,
                 )
             };
+            self.compute_ledger.candidate_replay_node_evals = self
+                .compute_ledger
+                .candidate_replay_node_evals
+                .saturating_add(surgery_audit.replay_node_evals);
+            self.compute_ledger.sensitivity_node_evals = self
+                .compute_ledger
+                .sensitivity_node_evals
+                .saturating_add(surgery_audit.sensitivity_node_evals);
             if let Ok(old_to_new) = prune_res {
                 self.ledger.on_prune(
                     self.editable.circuit(),
@@ -2846,17 +3585,29 @@ impl PredictorBaseline for ArkheLearner {
                     &mut self.port_states[p].diagnostic_buffer,
                     DiagnosticBuffer::new(0),
                 );
-                let prune_res = self.editable.prune_zero_sensitivity_mature_nodes_with_mode(
-                    &idle_nodes,
-                    &diag_buf.inputs,
-                    &diag_buf.predictions,
-                    self.economy_config.split_code_tax,
-                    self.growth_config.excision_mode,
-                    self.growth_config.diagnostic_window,
-                    Some(&diag_buf.node_outputs),
-                    replay_initial_regs.as_deref(),
-                );
+                let mut surgery_audit = SurgeryEvalAudit::default();
+                let prune_res = self
+                    .editable
+                    .prune_zero_sensitivity_mature_nodes_with_mode_audited(
+                        &idle_nodes,
+                        &diag_buf.inputs,
+                        &diag_buf.predictions,
+                        self.economy_config.split_code_tax,
+                        self.growth_config.excision_mode,
+                        self.growth_config.diagnostic_window,
+                        Some(&diag_buf.node_outputs),
+                        replay_initial_regs.as_deref(),
+                        &mut surgery_audit,
+                    );
                 self.port_states[p].diagnostic_buffer = diag_buf;
+                self.compute_ledger.candidate_replay_node_evals = self
+                    .compute_ledger
+                    .candidate_replay_node_evals
+                    .saturating_add(surgery_audit.replay_node_evals);
+                self.compute_ledger.sensitivity_node_evals = self
+                    .compute_ledger
+                    .sensitivity_node_evals
+                    .saturating_add(surgery_audit.sensitivity_node_evals);
                 if let Ok(old_to_new) = prune_res {
                     let any_pruned = old_to_new.iter().any(Option::is_none);
                     if any_pruned {
@@ -2889,15 +3640,25 @@ impl PredictorBaseline for ArkheLearner {
                     &mut self.port_states[p].diagnostic_buffer,
                     DiagnosticBuffer::new(0),
                 );
-                let excise_res = self.editable.excise_verified_passthrough_subgraphs(
+                let mut surgery_audit = SurgeryEvalAudit::default();
+                let excise_res = self.editable.excise_verified_passthrough_subgraphs_audited(
                     port_u16,
                     &diag_buf.inputs,
                     &diag_buf.predictions,
                     &diag_buf.node_outputs,
                     replay_initial_regs.as_deref(),
                     self.economy_config.split_code_tax,
+                    &mut surgery_audit,
                 );
                 self.port_states[p].diagnostic_buffer = diag_buf;
+                self.compute_ledger.candidate_replay_node_evals = self
+                    .compute_ledger
+                    .candidate_replay_node_evals
+                    .saturating_add(surgery_audit.replay_node_evals);
+                self.compute_ledger.sensitivity_node_evals = self
+                    .compute_ledger
+                    .sensitivity_node_evals
+                    .saturating_add(surgery_audit.sensitivity_node_evals);
                 if let Ok(Some(old_to_new)) = excise_res {
                     self.ledger.on_prune(
                         self.editable.circuit(),
@@ -2949,28 +3710,31 @@ impl PredictorBaseline for ArkheLearner {
                     }
                 }
 
+                let mut growth_audit = GrowthEvalAudit::default();
                 let mut stage0_tel = SproutTelemetry::default();
                 let can_potentially_deepen = num_ports > 1
                     && !port_zero_error
                     && self.growth_config.deepening_max_lag > self.growth_config.max_reactive_lag
                     && port_budget.remaining() > 0;
                 let mut deferred_lag_bound_tau: Option<u8> = None;
-                let (stage0_res, stage0_pending_bound) = match propose_sprout_band_scored_internal(
-                    &self.editable,
-                    &self.obs_window,
-                    &self.port_states[p].diagnostic_buffer,
-                    &self.growth_config,
-                    &self.economy_config,
-                    &mut port_budget,
-                    port_u16,
-                    1,
-                    self.growth_config.max_reactive_lag,
-                    &mut stage0_tel,
-                    !can_potentially_deepen,
-                ) {
-                    Ok((prop, pending)) => (Ok(prop), pending),
-                    Err(e) => (Err(e), false),
-                };
+                let (stage0_res, stage0_pending_bound) =
+                    match propose_sprout_band_scored_internal_audited(
+                        &self.editable,
+                        &self.obs_window,
+                        &self.port_states[p].diagnostic_buffer,
+                        &self.growth_config,
+                        &self.economy_config,
+                        &mut port_budget,
+                        port_u16,
+                        1,
+                        self.growth_config.max_reactive_lag,
+                        &mut stage0_tel,
+                        !can_potentially_deepen,
+                        &mut growth_audit,
+                    ) {
+                        Ok((prop, pending)) => (Ok(prop), pending),
+                        Err(e) => (Err(e), false),
+                    };
                 if stage0_pending_bound {
                     deferred_lag_bound_tau = Some(self.growth_config.max_reactive_lag);
                 }
@@ -2995,7 +3759,7 @@ impl PredictorBaseline for ArkheLearner {
                 let mut ring_tel = SproutTelemetry::default();
                 if !sprouted {
                     if let Some((comp_idx, e_comp_diag, j_comp_diag)) =
-                        evaluate_comparator_ring_promotion(
+                        evaluate_comparator_ring_promotion_audited(
                             &self.editable,
                             &self.obs_window,
                             &self.growth_config,
@@ -3003,6 +3767,7 @@ impl PredictorBaseline for ArkheLearner {
                             &mut port_budget,
                             port_u16,
                             &mut ring_tel,
+                            &mut growth_audit,
                         )
                     {
                         if deferred_best.is_none() || e_comp_diag == 0 {
@@ -3015,7 +3780,7 @@ impl PredictorBaseline for ArkheLearner {
                                 Some(DeferredProposal::ComparatorHandoff(comp_idx, j_comp_diag));
                         }
                     } else if let Some((ring_prop, e_ring_diag, j_ring_diag)) =
-                        propose_autonomous_delay_ring_scored_with_telemetry(
+                        propose_autonomous_delay_ring_scored_audited(
                             &self.editable,
                             &self.obs_window,
                             &self.growth_config,
@@ -3023,6 +3788,7 @@ impl PredictorBaseline for ArkheLearner {
                             &mut port_budget,
                             port_u16,
                             &mut ring_tel,
+                            &mut growth_audit,
                         )
                     {
                         if deferred_best.is_none() || e_ring_diag == 0 {
@@ -3064,7 +3830,7 @@ impl PredictorBaseline for ArkheLearner {
                         let mut band_tel = SproutTelemetry::default();
                         let is_last_band = band_idx + 1 == num_bands;
                         let (band_res, band_pending_bound) =
-                            match propose_sprout_band_scored_internal(
+                            match propose_sprout_band_scored_internal_audited(
                                 &self.editable,
                                 &self.obs_window,
                                 &self.port_states[p].diagnostic_buffer,
@@ -3076,6 +3842,7 @@ impl PredictorBaseline for ArkheLearner {
                                 max_tau,
                                 &mut band_tel,
                                 is_last_band,
+                                &mut growth_audit,
                             ) {
                                 Ok((prop, pending)) => (Ok(prop), pending),
                                 Err(e) => (Err(e), false),
@@ -3150,7 +3917,7 @@ impl PredictorBaseline for ArkheLearner {
                 if !sprouted {
                     let mut bound = bound_tel.lag_horizon_bound + ring_tel.lag_horizon_bound;
                     if let Some(tau_max) = deferred_lag_bound_tau
-                        && check_deeper_lag_for_port(
+                        && check_deeper_lag_for_port_audited(
                             &self.editable,
                             &self.obs_window,
                             &self.port_states[p].diagnostic_buffer,
@@ -3158,6 +3925,7 @@ impl PredictorBaseline for ArkheLearner {
                             &self.economy_config,
                             port_u16,
                             tau_max,
+                            &mut growth_audit,
                         )
                     {
                         bound += 1;
@@ -3173,6 +3941,14 @@ impl PredictorBaseline for ArkheLearner {
                         self.port_states[p].stage2_exhausted = true;
                     }
                 }
+                self.compute_ledger.candidate_replay_node_evals = self
+                    .compute_ledger
+                    .candidate_replay_node_evals
+                    .saturating_add(growth_audit.candidate_replay_node_evals);
+                self.compute_ledger.sensitivity_node_evals = self
+                    .compute_ledger
+                    .sensitivity_node_evals
+                    .saturating_add(growth_audit.sensitivity_node_evals);
             }
             self.port_states[p].stage2_checks_completed += 1;
 
@@ -3238,11 +4014,12 @@ impl PredictorBaseline for ArkheLearner {
                 } else if stage3_eligible {
                     let any_sibling_needs_stage2 =
                         (0..num_ports).any(|q| q != p && self.port_needs_stage2(q));
+                    let mut growth_audit = GrowthEvalAudit::default();
                     let mut stage3_tel = SproutTelemetry::default();
                     let mut stage3_ok_none = false;
                     let mut sprouted = false;
                     if num_ports == 1 {
-                        match propose_redundancy_sprout(
+                        match propose_redundancy_sprout_audited(
                             &self.editable,
                             &self.obs_window,
                             &self.port_states[p].diagnostic_buffer,
@@ -3251,6 +4028,7 @@ impl PredictorBaseline for ArkheLearner {
                             budget,
                             port_u16,
                             &mut stage3_tel,
+                            &mut growth_audit,
                         ) {
                             Ok(Some(prop)) => {
                                 sprouted = self.commit_redundancy_sprout(p, prop);
@@ -3271,7 +4049,7 @@ impl PredictorBaseline for ArkheLearner {
                             self.port_budget_allowance(p, budget)
                         };
                         let mut stage3_budget = TickBudget::new(cap);
-                        match propose_redundancy_sprout(
+                        match propose_redundancy_sprout_audited(
                             &self.editable,
                             &self.obs_window,
                             &self.port_states[p].diagnostic_buffer,
@@ -3280,6 +4058,7 @@ impl PredictorBaseline for ArkheLearner {
                             &mut stage3_budget,
                             port_u16,
                             &mut stage3_tel,
+                            &mut growth_audit,
                         ) {
                             Ok(Some(prop)) => {
                                 sprouted = self.commit_redundancy_sprout(p, prop);
@@ -3291,6 +4070,14 @@ impl PredictorBaseline for ArkheLearner {
                         let _ = budget.try_consume(spent);
                         self.port_states[p].replay_ticks_consumed += spent;
                     }
+                    self.compute_ledger.candidate_replay_node_evals = self
+                        .compute_ledger
+                        .candidate_replay_node_evals
+                        .saturating_add(growth_audit.candidate_replay_node_evals);
+                    self.compute_ledger.sensitivity_node_evals = self
+                        .compute_ledger
+                        .sensitivity_node_evals
+                        .saturating_add(growth_audit.sensitivity_node_evals);
                     if !sprouted {
                         self.sprout_blocked_max_nodes += stage3_tel.sprout_blocked_max_nodes;
                         self.sprout_budget_exhausted += stage3_tel.sprout_budget_exhausted;

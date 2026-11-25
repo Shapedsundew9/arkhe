@@ -131,7 +131,29 @@ pub fn counterfactual_sensitivity(
     tick_block: u64,
     sample_count: usize,
 ) -> Result<SensitivitySnapshot, SensitivityError> {
-    counterfactual_sensitivity_with_comparators(
+    counterfactual_sensitivity_audited(
+        circuit,
+        compiled,
+        state,
+        seed_bank,
+        tick_block,
+        sample_count,
+        &mut 0,
+    )
+}
+
+/// Computes whole-node counterfactual sensitivity while recording audited counterfactual node
+/// evaluations into `node_evals` without altering RNG consumption or outputs.
+pub fn counterfactual_sensitivity_audited(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    seed_bank: SeedBank,
+    tick_block: u64,
+    sample_count: usize,
+    node_evals: &mut u64,
+) -> Result<SensitivitySnapshot, SensitivityError> {
+    counterfactual_sensitivity_with_comparators_audited(
         circuit,
         compiled,
         state,
@@ -139,6 +161,7 @@ pub fn counterfactual_sensitivity(
         tick_block,
         sample_count,
         &[],
+        node_evals,
     )
     .map(|snapshot| snapshot.base)
 }
@@ -153,6 +176,31 @@ pub fn counterfactual_sensitivity_with_comparators(
     tick_block: u64,
     sample_count: usize,
     comparators: &[ComparatorTarget],
+) -> Result<ComparatorSensitivitySnapshot, SensitivityError> {
+    counterfactual_sensitivity_with_comparators_audited(
+        circuit,
+        compiled,
+        state,
+        seed_bank,
+        tick_block,
+        sample_count,
+        comparators,
+        &mut 0,
+    )
+}
+
+/// Computes node-by-target counterfactual sensitivity while recording audited counterfactual node
+/// evaluations into `node_evals` without altering RNG consumption or outputs.
+#[allow(clippy::too_many_arguments)]
+pub fn counterfactual_sensitivity_with_comparators_audited(
+    circuit: &Circuit,
+    compiled: &CompiledCircuit,
+    state: &ScalarState,
+    seed_bank: SeedBank,
+    tick_block: u64,
+    sample_count: usize,
+    comparators: &[ComparatorTarget],
+    node_evals: &mut u64,
 ) -> Result<ComparatorSensitivitySnapshot, SensitivityError> {
     let nodes = circuit.nodes();
     let wires = state.wire_values();
@@ -376,6 +424,10 @@ pub fn counterfactual_sensitivity_with_comparators(
         {
             continue;
         }
+
+        *node_evals = node_evals.saturating_add(
+            (candidates.len() as u64).saturating_mul((active_ops.len() as u64).saturating_add(1)),
+        );
 
         for &candidate in candidates {
             for port in 0..out_count {

@@ -6,6 +6,7 @@ pub mod growth;
 pub mod learner;
 pub mod live;
 pub mod sensitivity;
+pub mod sleep;
 pub mod surgery;
 
 pub use economy::{
@@ -40,7 +41,13 @@ pub use sensitivity::{
     CausalAncestry, ComparatorCausalAncestry, ComparatorSensitivitySnapshot, ComparatorTarget,
     EXACT_SENSITIVITY_MAX_BITS, NodeActivity, SensitivityError, SensitivitySnapshot,
     assemble_causal_ancestry, assemble_causal_ancestry_with_comparators,
-    counterfactual_sensitivity, counterfactual_sensitivity_with_comparators,
-    ring_identity_input_weights, source_node_for_wire,
+    counterfactual_sensitivity, counterfactual_sensitivity_audited,
+    counterfactual_sensitivity_with_comparators,
+    counterfactual_sensitivity_with_comparators_audited, ring_identity_input_weights,
+    source_node_for_wire,
+};
+pub use sleep::{
+    ComputeLedger, SleepSchedule, SleepSegmentReport, SleepTelemetry, WakeSleepEpisodeReport,
+    derived_wake_sleep_windows, run_wake_sleep_episode,
 };
 pub use surgery::{EditableCircuit, MarginalDebtLedger, SurgeryError};
