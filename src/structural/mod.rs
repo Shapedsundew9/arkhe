@@ -47,7 +47,9 @@ pub use sensitivity::{
     source_node_for_wire,
 };
 pub use sleep::{
-    ComputeLedger, SleepSchedule, SleepSegmentReport, SleepTelemetry, WakeSleepEpisodeReport,
-    derived_wake_sleep_windows, run_wake_sleep_episode,
+    ComputeLedger, EpistemicConservationReport, EpistemicTraceCollector, FactBuffer, SleepSchedule,
+    SleepSegmentReport, SleepTelemetry, TwoSampleKtResult, WakeSleepEpisodeReport,
+    derived_wake_sleep_windows, run_wake_sleep_episode, run_wake_sleep_episode_audited,
+    two_sample_kt_match_test, verify_epistemic_mdl_conservation,
 };
 pub use surgery::{EditableCircuit, MarginalDebtLedger, SurgeryError};

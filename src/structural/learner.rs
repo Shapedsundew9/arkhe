@@ -10,7 +10,9 @@ use crate::env::{FiniteStateGenerator, NoisyEnvironment};
 use crate::metrics::circuit_code_bits_with_tax;
 use crate::metrics::facts_code_bits;
 use crate::rng::SeedBank;
-use crate::structural::economy::{ComparatorSite, EconomyConfig, EconomyState, ExecutionPhase};
+use crate::structural::economy::{
+    ComparatorSite, EconomyConfig, EconomyState, EconomyTick, ExecutionPhase,
+};
 use crate::structural::graph_edit::{
     advance_tph_autonomous_ring_phase, comparator_exclusive_arm_nodes, excise_comparator_branch,
     is_pure_boundary_split, prune_starved_preserving_healthy_split_branches,
@@ -21,8 +23,9 @@ use crate::structural::growth::{
     GrowthEvalAudit, RedundancySproutProposal, ScoredSproutProposal, SproutTelemetry,
     assign_stage3_juvenile_ticks, check_deeper_lag_for_port_audited, diagnose_residual,
     effective_juvenile_ticks, evaluate_comparator_ring_promotion_audited, observation_horizon,
-    port_primary_cone_is_mature, propose_autonomous_delay_ring_scored_audited,
-    propose_redundancy_sprout_audited, propose_sprout_band_scored_internal_audited,
+    port_cone_register_depth, port_primary_cone_is_mature,
+    propose_autonomous_delay_ring_scored_audited, propose_redundancy_sprout_audited,
+    propose_sprout_band_scored_internal_audited,
 };
 use crate::structural::live::node_output_values;
 use crate::structural::sensitivity::{
@@ -31,8 +34,10 @@ use crate::structural::sensitivity::{
     counterfactual_sensitivity_audited, counterfactual_sensitivity_with_comparators_audited,
 };
 use crate::structural::sleep::{
-    ComputeLedger, SleepSchedule, SleepSegmentReport, SleepTelemetry, WakeSleepEpisodeReport,
+    ComputeLedger, EpistemicAuditEvent, EpistemicTraceCollector, FactBuffer, SleepCompAudit,
+    SleepSchedule, SleepSegmentReport, SleepTelemetry, WakeCompAudit, WakeSleepEpisodeReport,
     compose_old_to_new, run_wake_sleep_episode as sleep_run_wake_sleep_episode,
+    two_sample_kt_match_test,
 };
 use crate::structural::surgery::{
     EditableCircuit, MarginalDebtLedger, SurgeryEvalAudit, explicit_delay_register_index,
@@ -279,8 +284,15 @@ pub struct ArkheLearner {
     total_budget_seen: Option<u64>,
     injected_detour_nodes: BTreeSet<NodeId>,
     last_wake_predictions: Option<Vec<u64>>,
+    fact_buffer: FactBuffer,
     sleep_telemetry: SleepTelemetry,
     compute_ledger: ComputeLedger,
+    cumulative_energy_endowed: f64,
+    cumulative_energy_pruned: f64,
+    cumulative_juvenile_shielded: f64,
+    next_comp_audit_id: u64,
+    comp_audit_ids: Vec<u64>,
+    epistemic_audit: Option<EpistemicTraceCollector>,
 }
 
 impl ArkheLearner {
@@ -333,6 +345,8 @@ impl ArkheLearner {
         let port_states = (0..channels_usize)
             .map(|_| PortDevelopmentalState::new(growth_config.diagnostic_window))
             .collect();
+        let initial_energy_sum: f64 = editable.economy().nodes().iter().map(|n| n.energy).sum();
+        let fact_capacity = (obs_capacity / 2).max(1);
 
         Ok(Self {
             editable,
@@ -373,8 +387,15 @@ impl ArkheLearner {
             total_budget_seen: None,
             injected_detour_nodes: BTreeSet::new(),
             last_wake_predictions: None,
+            fact_buffer: FactBuffer::new(channels, fact_capacity),
             sleep_telemetry: SleepTelemetry::default(),
             compute_ledger: ComputeLedger::default(),
+            cumulative_energy_endowed: initial_energy_sum,
+            cumulative_energy_pruned: 0.0,
+            cumulative_juvenile_shielded: 0.0,
+            next_comp_audit_id: 0,
+            comp_audit_ids: Vec::new(),
+            epistemic_audit: None,
         })
     }
 
@@ -428,6 +449,8 @@ impl ArkheLearner {
             .iter()
             .map(|c| ComparatorWakeWindow::new(c.sub_node, comp_cap))
             .collect();
+        let initial_energy_sum: f64 = editable.economy().nodes().iter().map(|n| n.energy).sum();
+        let fact_capacity = (obs_capacity / 2).max(1);
         Ok(Self {
             editable,
             ledger,
@@ -467,8 +490,15 @@ impl ArkheLearner {
             total_budget_seen: None,
             injected_detour_nodes: BTreeSet::new(),
             last_wake_predictions: None,
+            fact_buffer: FactBuffer::new(num_inputs, fact_capacity),
             sleep_telemetry: SleepTelemetry::default(),
             compute_ledger: ComputeLedger::default(),
+            cumulative_energy_endowed: initial_energy_sum,
+            cumulative_energy_pruned: 0.0,
+            cumulative_juvenile_shielded: 0.0,
+            next_comp_audit_id: 0,
+            comp_audit_ids: Vec::new(),
+            epistemic_audit: None,
         })
     }
 
@@ -550,7 +580,13 @@ impl ArkheLearner {
         &self.economy_config
     }
 
-    /// Wake–sleep onset, segment, suspension, and excision telemetry.
+    /// Bounded trailing wake fact buffer (`W_obs / 2` capacity, `R6`).
+    #[must_use]
+    pub const fn fact_buffer(&self) -> &FactBuffer {
+        &self.fact_buffer
+    }
+
+    /// Wake–sleep onset, segment, suspension, match-failure, and excision telemetry.
     #[must_use]
     pub const fn sleep_telemetry(&self) -> SleepTelemetry {
         self.sleep_telemetry
@@ -560,6 +596,171 @@ impl ArkheLearner {
     #[must_use]
     pub const fn compute_ledger(&self) -> ComputeLedger {
         self.compute_ledger
+    }
+
+    /// Cumulative net flux (in bits) credited across wake and sleep.
+    #[must_use]
+    pub const fn cumulative_net_flux(&self) -> f64 {
+        self.cumulative_net_flux
+    }
+
+    /// Cumulative maturity debt paid (in bits).
+    #[must_use]
+    pub const fn cumulative_debt_paid(&self) -> f64 {
+        self.cumulative_debt_paid
+    }
+
+    /// Cumulative reserve energy bits clipped by `ReserveCap`.
+    #[must_use]
+    pub const fn reserve_clipped_bits(&self) -> f64 {
+        self.reserve_clipped_bits
+    }
+
+    /// Cumulative initial energy endowed to initial, sprouted, and injected nodes (`I4`).
+    #[must_use]
+    pub const fn cumulative_energy_endowed(&self) -> f64 {
+        self.cumulative_energy_endowed
+    }
+
+    /// Cumulative reserve energy carried out of the circuit by excised nodes (`I4`).
+    #[must_use]
+    pub const fn cumulative_energy_pruned(&self) -> f64 {
+        self.cumulative_energy_pruned
+    }
+
+    /// Cumulative negative flux shielded from juvenile nodes (`I4`).
+    #[must_use]
+    pub const fn cumulative_juvenile_shielded(&self) -> f64 {
+        self.cumulative_juvenile_shielded
+    }
+
+    /// Enables opt-in epistemic MDL audit trace collection from the current learner state (`I4`).
+    pub fn enable_epistemic_audit(&mut self) {
+        let comps = self.editable.economy().comparators();
+        self.comp_audit_ids.clear();
+        let mut initial_comparators = Vec::with_capacity(comps.len());
+        for comp in comps {
+            let id = self.next_comp_audit_id;
+            self.next_comp_audit_id += 1;
+            self.comp_audit_ids.push(id);
+            initial_comparators.push((id, comp.target_port, comp.scorer.clone()));
+        }
+        let initial_total_energy: f64 = self
+            .editable
+            .economy()
+            .nodes()
+            .iter()
+            .map(|n| n.energy)
+            .sum();
+        let initial_code_bits = circuit_code_bits_with_tax(
+            self.editable.circuit(),
+            0,
+            self.economy_config.split_code_tax,
+        );
+        self.epistemic_audit = Some(EpistemicTraceCollector::new_from_snapshot(
+            self.editable.circuit().width(),
+            self.economy_config.reward_mode,
+            self.economy_config.split_code_tax,
+            self.editable.economy().scorers().to_vec(),
+            initial_comparators,
+            initial_total_energy,
+            initial_code_bits,
+            self.cumulative_net_flux,
+            self.exogenous_injection_bits,
+            self.cumulative_debt_paid,
+            self.reserve_clipped_bits,
+            self.cumulative_energy_endowed,
+            self.cumulative_energy_pruned,
+            self.cumulative_juvenile_shielded,
+        ));
+    }
+
+    /// Finishes and returns the opt-in epistemic MDL audit collector, if enabled (`I4`).
+    pub fn take_epistemic_audit(&mut self) -> Option<EpistemicTraceCollector> {
+        self.comp_audit_ids.clear();
+        self.epistemic_audit.take()
+    }
+
+    fn sync_comp_audit_ids(&mut self) {
+        if self.epistemic_audit.is_none() {
+            return;
+        }
+        let comps = self.editable.economy().comparators();
+        while self.comp_audit_ids.len() < comps.len() {
+            let idx = self.comp_audit_ids.len();
+            let id = self.next_comp_audit_id;
+            self.next_comp_audit_id += 1;
+            self.comp_audit_ids.push(id);
+            if let Some(audit) = self.epistemic_audit.as_mut() {
+                audit.push(EpistemicAuditEvent::RegisterComparator {
+                    comp_id: id,
+                    target_port: comps[idx].target_port,
+                });
+            }
+        }
+    }
+
+    fn remap_comp_audit_ids(&mut self, pre_sub_nodes: &[NodeId], old_to_new: &[Option<NodeId>]) {
+        if self.epistemic_audit.is_none() {
+            return;
+        }
+        let comps = self.editable.economy().comparators();
+        let mut remapped = Vec::with_capacity(comps.len());
+        for comp in comps {
+            if let Some(old_pos) = pre_sub_nodes.iter().position(|old_sub| {
+                old_to_new
+                    .get(old_sub.index())
+                    .copied()
+                    .flatten()
+                    .is_some_and(|mapped| mapped == comp.sub_node)
+            }) && let Some(&id) = self.comp_audit_ids.get(old_pos)
+            {
+                remapped.push(id);
+            } else {
+                let id = self.next_comp_audit_id;
+                self.next_comp_audit_id += 1;
+                if let Some(audit) = self.epistemic_audit.as_mut() {
+                    audit.push(EpistemicAuditEvent::RegisterComparator {
+                        comp_id: id,
+                        target_port: comp.target_port,
+                    });
+                }
+                remapped.push(id);
+            }
+        }
+        self.comp_audit_ids = remapped;
+    }
+
+    fn record_structure_energy_delta(
+        &mut self,
+        pre_energies: &[f64],
+        old_to_new: &[Option<NodeId>],
+    ) {
+        let post_nodes = self.editable.economy().nodes();
+        let mut surviving = vec![false; post_nodes.len()];
+        for (old_idx, mapped) in old_to_new.iter().enumerate() {
+            if let Some(new_id) = mapped {
+                if let Some(slot) = surviving.get_mut(new_id.index()) {
+                    *slot = true;
+                }
+            } else if let Some(&old_e) = pre_energies.get(old_idx) {
+                self.cumulative_energy_pruned += old_e;
+            }
+        }
+        for (new_idx, node) in post_nodes.iter().enumerate() {
+            if !surviving[new_idx] {
+                self.cumulative_energy_endowed += node.energy;
+            }
+        }
+    }
+
+    fn record_juvenile_shielded(&mut self, econ_tick: &EconomyTick) {
+        let actual: f64 = econ_tick.node_delta.iter().sum();
+        let expected = econ_tick.net_flux - econ_tick.maintenance - econ_tick.clipped_bits;
+        let diff = actual - expected;
+        if diff.abs() > 1e-12 {
+            self.cumulative_juvenile_shielded += diff;
+        }
     }
 
     pub(crate) fn record_skipped_sleep_segment(&mut self) {
@@ -737,6 +938,20 @@ impl ArkheLearner {
 
         let split_tax = self.economy_config.split_code_tax;
         let pre_circuit = self.editable.circuit().clone();
+        let pre_energies: Vec<f64> = self
+            .editable
+            .economy()
+            .nodes()
+            .iter()
+            .map(|n| n.energy)
+            .collect();
+        let pre_sub_nodes: Vec<NodeId> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .map(|c| c.sub_node)
+            .collect();
         let l_pre = circuit_code_bits_with_tax(&pre_circuit, 0, split_tax);
         let prev_debts = self.ledger.node_debts.clone();
         let prev_paid = self.ledger.debt_paid.clone();
@@ -827,6 +1042,8 @@ impl ArkheLearner {
                 }
             }
         }
+        self.record_structure_energy_delta(&pre_energies, old_to_new);
+        self.remap_comp_audit_ids(&pre_sub_nodes, old_to_new);
 
         // In TicksPerHop, pre-settle newly injected Delay-free constant subgraphs (e.g. ConstLoop(1/3)).
         if post_circuit.wire_delay() == WireDelayMode::TicksPerHop {
@@ -958,6 +1175,9 @@ impl ArkheLearner {
                     .economy_mut()
                     .port_scorer_mut(q)
                     .reset_predictor_counts();
+                if let Some(audit) = self.epistemic_audit.as_mut() {
+                    audit.push(EpistemicAuditEvent::ResetPortPredictor { port: q });
+                }
             }
             let preserve_settlement_flags = !reset_scorer_counts && self.is_port_driven(q as u16);
             self.port_states[q].diagnostic_buffer.clear();
@@ -1102,6 +1322,13 @@ impl ArkheLearner {
             self.record_epoch_snapshot(port_idx, port_sprouts as usize, true);
         }
         let pre_sprout_circuit = self.editable.circuit().clone();
+        let pre_energies: Vec<f64> = self
+            .editable
+            .economy()
+            .nodes()
+            .iter()
+            .map(|n| n.energy)
+            .collect();
         let old_to_new: Vec<Option<NodeId>> = (0..self.editable.circuit().node_count())
             .map(|i| Some(NodeId(i as u32)))
             .collect();
@@ -1127,6 +1354,7 @@ impl ArkheLearner {
                     node.juvenile_ticks = effective_juvenile_ticks;
                 }
             }
+            self.record_structure_energy_delta(&pre_energies, &old_to_new);
             self.ledger.on_sprout(
                 self.editable.circuit(),
                 self.economy_config.split_code_tax,
@@ -1151,6 +1379,20 @@ impl ArkheLearner {
 
     fn commit_ring_proposal(&mut self, ring_prop: AutonomousRingProposal) -> bool {
         let pre_ring_circuit = self.editable.circuit().clone();
+        let pre_energies: Vec<f64> = self
+            .editable
+            .economy()
+            .nodes()
+            .iter()
+            .map(|n| n.energy)
+            .collect();
+        let pre_sub_nodes: Vec<NodeId> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .map(|c| c.sub_node)
+            .collect();
         let old_to_new = ring_prop.old_to_new;
         let ring_delay_nodes = ring_prop.ring_delay_nodes;
         let period = ring_prop.period;
@@ -1160,6 +1402,8 @@ impl ArkheLearner {
             .recompile_preserving_state(ring_prop.candidate_circuit, &old_to_new)
             .is_ok()
         {
+            self.record_structure_energy_delta(&pre_energies, &old_to_new);
+            self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
             self.ledger.on_sprout(
                 self.editable.circuit(),
                 self.economy_config.split_code_tax,
@@ -1394,6 +1638,14 @@ impl ArkheLearner {
         let comp_scorer =
             std::mem::replace(&mut econ.comparators_mut()[comp_idx].scorer, port_scorer);
         *econ.port_scorer_mut(port_idx) = comp_scorer;
+        if let Some(&comp_id) = self.comp_audit_ids.get(comp_idx)
+            && let Some(audit) = self.epistemic_audit.as_mut()
+        {
+            audit.push(EpistemicAuditEvent::SwapPortAndComparator {
+                port: port_idx,
+                comp_id,
+            });
+        }
     }
 
     fn commit_redundancy_sprout(
@@ -1403,6 +1655,20 @@ impl ArkheLearner {
     ) -> bool {
         let pre_epoch = self.editable.structure_epoch();
         let pre_circuit = self.editable.circuit().clone();
+        let pre_energies: Vec<f64> = self
+            .editable
+            .economy()
+            .nodes()
+            .iter()
+            .map(|n| n.energy)
+            .collect();
+        let pre_sub_nodes: Vec<NodeId> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .map(|c| c.sub_node)
+            .collect();
         let Ok(pre_compiled) = pre_circuit.compile() else {
             return false;
         };
@@ -1423,6 +1689,8 @@ impl ArkheLearner {
         {
             return false;
         }
+        self.record_structure_energy_delta(&pre_energies, &old_to_new);
+        self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
         self.ledger.on_sprout(
             self.editable.circuit(),
             self.economy_config.split_code_tax,
@@ -1556,6 +1824,7 @@ impl ArkheLearner {
         {
             return false;
         }
+        self.sync_comp_audit_ids();
         self.sync_comparator_windows();
         self.port_states[port_idx].diagnostic_buffer.clear();
         self.port_states[port_idx].ticks_since_last_check = 0;
@@ -1601,6 +1870,14 @@ impl ArkheLearner {
             .filter_map(|(i, c)| (i != comp_idx).then_some((c.sub_node, c.eqz_node)))
             .collect();
 
+        let pre_energies: Vec<f64> = self
+            .editable
+            .economy()
+            .nodes()
+            .iter()
+            .map(|n| n.energy)
+            .collect();
+        let pre_sub_nodes: Vec<NodeId> = comps.iter().map(|c| c.sub_node).collect();
         let (pruned, old_to_new) = excise_comparator_branch(
             self.editable.circuit(),
             comp.sub_node,
@@ -1633,6 +1910,8 @@ impl ArkheLearner {
         {
             return None;
         }
+        self.record_structure_energy_delta(&pre_energies, &old_to_new);
+        self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
         self.ledger.on_prune(
             self.editable.circuit(),
             self.economy_config.split_code_tax,
@@ -1719,6 +1998,13 @@ impl ArkheLearner {
             return false;
         }
         let pre_n = self.editable.circuit().node_count();
+        let pre_energies: Vec<f64> = self
+            .editable
+            .economy()
+            .nodes()
+            .iter()
+            .map(|n| n.energy)
+            .collect();
         let old_to_new: Vec<Option<NodeId>> = (0..pre_n).map(|i| Some(NodeId(i as u32))).collect();
         if self
             .editable
@@ -1739,6 +2025,7 @@ impl ArkheLearner {
                 }
             }
         }
+        self.record_structure_energy_delta(&pre_energies, &old_to_new);
         self.ledger.last_committed_code_bits =
             circuit_code_bits_with_tax(self.editable.circuit(), 0, split_tax);
         self.swap_port_and_comparator_scorer(target_idx, comp_idx);
@@ -2082,6 +2369,7 @@ impl ArkheLearner {
                     .apply_causal_tick(&zeros_port_rewards, &ancestry, &maintenance_costs)
                     .expect("valid sleep tick");
                 self.cumulative_debt_paid += econ_tick.maintenance;
+                self.record_juvenile_shielded(&econ_tick);
             } else {
                 let targets = self.editable.comparator_targets();
                 let mut sens_evals = 0u64;
@@ -2146,6 +2434,7 @@ impl ArkheLearner {
                     .expect("valid sleep causal tick");
                 self.cumulative_net_flux += econ_tick.net_flux;
                 self.cumulative_debt_paid += econ_tick.maintenance;
+                self.record_juvenile_shielded(&econ_tick);
 
                 // 3-route majority pruning: when a port has 2 mature comparators (3 routes) and 2
                 // routes consistently agree while 1 minority route disagrees, prune only the minority.
@@ -2233,7 +2522,7 @@ impl ArkheLearner {
     }
 
     /// Executes a single scheduled sleep segment starting from live `DELAY` state and restoring
-    /// remapped pre-sleep wake registers on exit (`R3`, `R7`, `I3`, `I5`, `I6`).
+    /// remapped pre-sleep wake registers on exit (`R3`, `R4`, `R5`, `R6`, `R7`, `I3`, `I4`, `I5`, `I6`, `I7`).
     ///
     /// Wake null models and wake forecast scorers remain frozen throughout. Economy state
     /// (energies, deaths, excisions, comparators, flux/debt) persists on exit.
@@ -2242,7 +2531,9 @@ impl ArkheLearner {
         if sleep_ticks == 0 {
             return SleepSegmentReport::default();
         }
+        self.sync_comp_audit_ids();
 
+        let schedule = self.growth_config.sleep_schedule;
         let pre_sleep_circuit = self.editable.circuit().clone();
         let pre_sleep_compiled = self.editable.compiled().clone();
         let pre_sleep_regs = self.editable.state().registers().to_vec();
@@ -2252,9 +2543,25 @@ impl ArkheLearner {
             .collect();
         let mut sleep_edited = false;
 
-        let (replay_ticks, loopback_ticks) = match self.growth_config.sleep_schedule {
+        let width = self.editable.circuit().width();
+        let num_in = usize::from(self.editable.compiled().num_inputs());
+        let num_out = usize::from(self.editable.compiled().num_outputs());
+        let k_channels = num_in.max(num_out);
+        let grounded_channels: Vec<bool> = (0..k_channels)
+            .map(|c| self.channel_is_grounded(c))
+            .collect();
+
+        let mut is_suspended: Vec<bool> = self
+            .editable
+            .economy()
+            .comparators()
+            .iter()
+            .map(|comp| comparator_is_suspended_for_sleep(comp, &grounded_channels, schedule))
+            .collect();
+
+        let (replay_ticks, loopback_ticks) = match schedule {
             SleepSchedule::ConsistencyReplay => {
-                let r = sleep_ticks / 2;
+                let r = (sleep_ticks / 2).min(self.fact_buffer.len() as u64);
                 (r, sleep_ticks - r)
             }
             SleepSchedule::ConsistencyOnly | SleepSchedule::None => (0, sleep_ticks),
@@ -2265,52 +2572,96 @@ impl ArkheLearner {
         let start_flux = self.editable.economy().cumulative_comparator_flux();
 
         self.editable.economy_mut().set_phase(ExecutionPhase::Sleep);
+        if let Some(audit) = self.epistemic_audit.as_mut() {
+            audit.push(EpistemicAuditEvent::SleepSegmentStart { schedule });
+        }
 
-        // S-B replay half (Phase 0.1 meters replay ticks and preserves wake state; Phase 0.2 adds
-        // bounded fact-buffer adjudication and statistics-match tests).
+        // Step 1 — S-B teacher-forced fact-buffer replay (R5, R6, I5, I6).
+        // Never touches wake null models, wake scorers, or live wake registers (I3, I6).
+        let init_comp_count = self.editable.economy().comparators().len();
+        let mut primary_fact_disagreements = vec![0u64; init_comp_count];
+        let mut alt_fact_disagreements = vec![0u64; init_comp_count];
+        let mut replayed_facts: Vec<Vec<u64>> =
+            vec![Vec::with_capacity(replay_ticks as usize); k_channels];
+
         if replay_ticks > 0 {
-            let num_in = usize::from(self.editable.compiled().num_inputs());
-            let num_out = usize::from(self.editable.compiled().num_outputs());
-            let mut replay_pred = vec![0u64; num_out];
-            let obs_len = self.obs_window.len();
-            let replay_start = obs_len.saturating_sub(replay_ticks as usize);
-            let mut fallback_in = pre_sleep_prev_frame.clone();
-            fallback_in.resize(num_in, 0);
+            let compiled = self.editable.compiled();
             let step_nodes = self.editable.circuit().node_count() as u64;
-            for r_idx in 0..(replay_ticks as usize) {
-                let input: &[u64] = if obs_len > 0 && replay_start + r_idx < obs_len {
-                    let frame_idx = replay_start + r_idx;
-                    if frame_idx == 0 {
-                        self.obs_window.prior_frame()
-                    } else {
-                        &self.obs_window.frames()[frame_idx - 1]
-                    }
-                } else {
-                    &fallback_in
-                };
+            let mut replay_state = ScalarState::new(compiled);
+            let mut replay_pred = vec![0u64; num_out];
+            let fb_len = self.fact_buffer.len();
+            let replay_start = fb_len - (replay_ticks as usize);
+            let cur_epoch = self.editable.structure_epoch();
+            let earliest_match = (replay_start..fb_len).find(|&idx| {
+                self.fact_buffer
+                    .state_snapshot_at(idx)
+                    .is_some_and(|(snap_epoch, _)| snap_epoch == cur_epoch)
+            });
+            let score_from = earliest_match.unwrap_or(replay_start);
+            let mut input_buf = vec![0u64; num_in];
+
+            for frame_idx in replay_start..fb_len {
+                if Some(frame_idx) == earliest_match
+                    && let Some((_, snap_regs)) = self.fact_buffer.state_snapshot_at(frame_idx)
+                {
+                    let _ = replay_state.set_registers(compiled, snap_regs);
+                }
+                let raw_in = self
+                    .fact_buffer
+                    .input_for_frame(frame_idx)
+                    .expect("replay frame index within FactBuffer bounds");
+                input_buf.fill(0);
+                let copy_len = num_in.min(raw_in.len());
+                input_buf[..copy_len].copy_from_slice(&raw_in[..copy_len]);
+
                 self.compute_ledger.sleep_replay_ticks =
                     self.compute_ledger.sleep_replay_ticks.saturating_add(1);
                 self.compute_ledger.live_step_node_evals = self
                     .compute_ledger
                     .live_step_node_evals
                     .saturating_add(step_nodes);
-                let _ = self.editable.step(input, &mut replay_pred);
+                let _ = replay_state.step(compiled, &input_buf, &mut replay_pred);
+
+                let truth = self
+                    .fact_buffer
+                    .frame_at(frame_idx)
+                    .expect("replay truth frame within FactBuffer bounds");
+                for (c, slot) in replayed_facts.iter_mut().enumerate() {
+                    let sym = truth.get(c).copied().unwrap_or(0);
+                    slot.push(width.normalize(sym));
+                }
+
+                if frame_idx >= score_from {
+                    let wires = replay_state.wire_values();
+                    let node_in_wires = compiled.node_input_wires();
+                    for (m, comp) in self.editable.economy().comparators().iter().enumerate() {
+                        if is_suspended[m] {
+                            continue;
+                        }
+                        let tp = usize::from(comp.target_port);
+                        let fact_v = width.normalize(truth.get(tp).copied().unwrap_or(0));
+                        let sub_in = &node_in_wires[comp.sub_node.index()];
+                        let pri_v = width.normalize(wires[sub_in[0]]);
+                        let alt_v = width.normalize(wires[sub_in[1]]);
+                        if pri_v != fact_v {
+                            primary_fact_disagreements[m] += 1;
+                        }
+                        if alt_v != fact_v {
+                            alt_fact_disagreements[m] += 1;
+                        }
+                    }
+                }
             }
-            // Restore pre-sleep live registers so loopback always starts from live wake DELAY state (I3).
-            let _ = self
-                .editable
-                .restore_registers_preserving_epoch(&pre_sleep_regs);
         }
 
-        let width = self.editable.circuit().width();
-        let num_in = usize::from(self.editable.compiled().num_inputs());
-        let num_out = usize::from(self.editable.compiled().num_outputs());
+        // Step 2 — Loopback starting from live wake registers (I3).
         let mut curr_input = pre_sleep_prev_frame.clone();
         curr_input.resize(num_in, 0);
 
         let mut max_circular_discrepancy = 0u64;
         let mut minority_routes_pruned = 0u64;
         let mut starvation_excisions = 0u64;
+        let mut suspended_comparator_ticks = 0u64;
         let mut first_loopback_predictions: Option<Vec<u64>> = None;
         let zeros_port_rewards = vec![0.0; num_out];
         let mut per_port_consensus: Vec<(u64, u64, u64)> = vec![(0, 0, 0); num_out];
@@ -2319,7 +2670,23 @@ impl ArkheLearner {
             .min_match_gain
             .min(loopback_ticks.max(1) as usize) as u64;
 
-        for _ in 0..loopback_ticks {
+        let mut free_run_preds: Vec<Vec<u64>> = vec![Vec::new(); num_out];
+        let mut escrowed_by_port: Vec<Vec<EscrowedSleepAgreement>> = vec![Vec::new(); num_out];
+        let mut next_escrow_id = 0u64;
+        let mut dropped_escrow_ids: Vec<u64> = Vec::new();
+
+        for lb_idx in 0..(loopback_ticks as usize) {
+            if schedule == SleepSchedule::ConsistencyReplay {
+                for (c, slot) in curr_input.iter_mut().enumerate().take(num_in) {
+                    if !grounded_channels.get(c).copied().unwrap_or(false)
+                        && let Some(facts_c) = replayed_facts.get(c)
+                        && !facts_c.is_empty()
+                    {
+                        *slot = facts_c[lb_idx % facts_c.len()];
+                    }
+                }
+            }
+
             let mut predictions = vec![0u64; num_out];
             let step_nodes = self.editable.circuit().node_count() as u64;
             self.compute_ledger.sleep_loopback_ticks =
@@ -2332,8 +2699,17 @@ impl ArkheLearner {
             if first_loopback_predictions.is_none() {
                 first_loopback_predictions = Some(predictions.clone());
             }
-            for (slot, &pred) in curr_input.iter_mut().zip(&predictions) {
-                *slot = width.normalize(pred);
+            for (p, &pred) in predictions.iter().enumerate().take(num_out) {
+                if grounded_channels.get(p).copied().unwrap_or(false) {
+                    free_run_preds[p].push(width.normalize(pred));
+                }
+            }
+            // In S-A, only grounded ports feed back predictions (R4).
+            // In S-B, grounded channels feed back predictions while ungrounded channels replay facts.
+            for (c, (slot, &pred)) in curr_input.iter_mut().zip(&predictions).enumerate() {
+                if grounded_channels.get(c).copied().unwrap_or(false) {
+                    *slot = width.normalize(pred);
+                }
             }
 
             let node_outs = node_output_values(self.editable.circuit(), self.editable.state());
@@ -2388,6 +2764,11 @@ impl ArkheLearner {
                     self.economy_config.trace_discount,
                 )
                 .expect("valid sleep causal ancestry");
+                if let Some(audit) = self.epistemic_audit.as_mut() {
+                    audit.push(EpistemicAuditEvent::SleepTick {
+                        comp_evals: Vec::new(),
+                    });
+                }
                 let econ_tick = self
                     .editable
                     .economy_mut()
@@ -2398,6 +2779,7 @@ impl ArkheLearner {
                 self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
                 self.reserve_clipped_bits += econ_tick.clipped_bits;
                 self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
+                self.record_juvenile_shielded(&econ_tick);
                 econ_tick
             } else {
                 let targets = self.editable.comparator_targets();
@@ -2433,13 +2815,18 @@ impl ArkheLearner {
                 let mut pri_vals = Vec::with_capacity(comp_count);
                 let mut alt_vals = Vec::with_capacity(comp_count);
                 let mut eqz_vals = Vec::with_capacity(comp_count);
-                for comp in self.editable.economy().comparators() {
+                for (m, comp) in self.editable.economy().comparators().iter().enumerate() {
                     let sub_in =
                         &self.editable.compiled().node_input_wires()[comp.sub_node.index()];
                     let p_v = width.normalize(wires[sub_in[0]]);
                     let a_v = width.normalize(wires[sub_in[1]]);
-                    max_circular_discrepancy =
-                        max_circular_discrepancy.max(width.circular_distance(p_v, a_v));
+                    if is_suspended[m] {
+                        self.sleep_telemetry.sleep_comparator_suspended_ungrounded += 1;
+                        suspended_comparator_ticks += 1;
+                    } else {
+                        max_circular_discrepancy =
+                            max_circular_discrepancy.max(width.circular_distance(p_v, a_v));
+                    }
                     pri_vals.push(p_v);
                     alt_vals.push(a_v);
                     eqz_vals.push(width.normalize(node_outs[comp.eqz_node.index()]));
@@ -2447,17 +2834,97 @@ impl ArkheLearner {
                 let comp_obs = self
                     .editable
                     .economy_mut()
-                    .observe_comparators(&pri_vals, &alt_vals, &eqz_vals, None)
+                    .observe_comparators_with_suspension(
+                        &pri_vals,
+                        &alt_vals,
+                        &eqz_vals,
+                        None,
+                        Some(&is_suspended),
+                    )
                     .expect("valid sleep comparator observation");
+
+                let mut tick_comp_rewards = comp_obs.rewards.clone();
+                let mut tick_ancestry = ancestry.clone();
+                let comps_snapshot = self.editable.economy().comparators().to_vec();
+                let has_audit = self.epistemic_audit.is_some();
+                let mut audit_evals = if has_audit {
+                    Vec::with_capacity(comp_count)
+                } else {
+                    Vec::new()
+                };
+
+                for (m, comp) in comps_snapshot.iter().enumerate() {
+                    let mut escrow_id = None;
+                    if is_suspended[m] {
+                        tick_comp_rewards[m] = 0.0;
+                        tick_ancestry.comparator_shares[m].fill(0.0);
+                    } else if schedule == SleepSchedule::ConsistencyReplay {
+                        let tp = usize::from(comp.target_port);
+                        if tick_comp_rewards[m] > 0.0 {
+                            let share_sum: f64 = tick_ancestry.comparator_shares[m].iter().sum();
+                            if share_sum > 0.0 {
+                                let eid = next_escrow_id;
+                                next_escrow_id += 1;
+                                let inv = 1.0 / share_sum;
+                                let norm_shares: Vec<f64> = tick_ancestry.comparator_shares[m]
+                                    .iter()
+                                    .map(|&s| s * inv)
+                                    .collect();
+                                escrowed_by_port[tp].push(EscrowedSleepAgreement {
+                                    id: eid,
+                                    reward: tick_comp_rewards[m],
+                                    node_shares: norm_shares,
+                                });
+                                escrow_id = Some(eid);
+                            }
+                            tick_comp_rewards[m] = 0.0;
+                        } else if tick_comp_rewards[m] < 0.0
+                            && pri_vals[m] != alt_vals[m]
+                            && primary_fact_disagreements[m] > alt_fact_disagreements[m]
+                        {
+                            // R5(a): route disagreement charge to primary cone (excluding alt-only cone).
+                            if let Some(pri_share) = compute_r5a_primary_share(
+                                self.editable.circuit(),
+                                &comps_snapshot,
+                                m,
+                                &tick_ancestry.base.port_shares,
+                            ) {
+                                tick_ancestry.comparator_shares[m] = pri_share;
+                            } else if tick_ancestry.comparator_shares[m].iter().sum::<f64>() == 0.0
+                            {
+                                tick_comp_rewards[m] = 0.0;
+                            }
+                        }
+                    }
+
+                    if has_audit {
+                        audit_evals.push(SleepCompAudit {
+                            comp_id: self.comp_audit_ids[m],
+                            target_port: comp.target_port,
+                            primary_channel_mask: comp.primary_channel_mask,
+                            alt_channel_mask: comp.alt_channel_mask,
+                            pri_val: pri_vals[m],
+                            alt_val: alt_vals[m],
+                            suspended: is_suspended[m],
+                            escrow_id,
+                        });
+                    }
+                }
+                if let Some(audit) = self.epistemic_audit.as_mut() {
+                    audit.push(EpistemicAuditEvent::SleepTick {
+                        comp_evals: audit_evals,
+                    });
+                }
+
                 let econ_tick = self
                     .editable
                     .economy_mut()
                     .apply_causal_tick_with_comparators(
                         &zeros_port_rewards,
-                        &comp_obs.rewards,
+                        &tick_comp_rewards,
                         comp_obs.agreements,
                         comp_obs.disagreements,
-                        &ancestry,
+                        &tick_ancestry,
                         &maintenance_costs,
                     )
                     .expect("valid sleep causal tick");
@@ -2466,8 +2933,9 @@ impl ArkheLearner {
                 self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
                 self.reserve_clipped_bits += econ_tick.clipped_bits;
                 self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
+                self.record_juvenile_shielded(&econ_tick);
 
-                // 3-route majority pruning during sleep.
+                // 3-route majority pruning during sleep (excluding suspended comparators, I7).
                 for (p, counts) in per_port_consensus.iter_mut().enumerate() {
                     let p_u16 = p as u16;
                     let comps_on_p: Vec<usize> = self
@@ -2476,7 +2944,9 @@ impl ArkheLearner {
                         .comparators()
                         .iter()
                         .enumerate()
-                        .filter_map(|(i, c)| (c.target_port == p_u16).then_some(i))
+                        .filter_map(|(i, c)| {
+                            (c.target_port == p_u16 && !is_suspended[i]).then_some(i)
+                        })
                         .collect();
                     if comps_on_p.len() != 2 {
                         *counts = (0, 0, 0);
@@ -2518,22 +2988,40 @@ impl ArkheLearner {
                     } else {
                         None
                     };
-                    if let Some((prune_idx, prune_primary)) = action
-                        && let Some(step_map) =
+                    if let Some((prune_idx, prune_primary)) = action {
+                        let pre_comps = self.editable.economy().comparators().to_vec();
+                        let promoted_pri_dis =
+                            prune_primary.then(|| (p_u16, alt_fact_disagreements[prune_idx]));
+                        if let Some(step_map) =
                             self.excise_port_comparator_with_map(prune_idx, prune_primary)
-                    {
-                        compose_old_to_new(&mut composed_old_to_new, &step_map);
-                        sleep_edited = true;
-                        self.disagreement_prune_events += 1;
-                        minority_routes_pruned += 1;
-                        *counts = (0, 0, 0);
-                        break;
+                        {
+                            compose_old_to_new(&mut composed_old_to_new, &step_map);
+                            sleep_edited = true;
+                            self.disagreement_prune_events += 1;
+                            minority_routes_pruned += 1;
+                            *counts = (0, 0, 0);
+                            remap_sleep_loop_state_after_edit(
+                                self.editable.economy().comparators(),
+                                self.editable.circuit().node_count(),
+                                &pre_comps,
+                                &step_map,
+                                &grounded_channels,
+                                schedule,
+                                promoted_pri_dis,
+                                &mut is_suspended,
+                                &mut primary_fact_disagreements,
+                                &mut alt_fact_disagreements,
+                                &mut escrowed_by_port,
+                                &mut dropped_escrow_ids,
+                            );
+                            break;
+                        }
                     }
                 }
                 econ_tick
             };
 
-            // Depleted-node / starved comparator-branch excision during sleep.
+            // Depleted-node / starved comparator-branch excision during sleep (excluding suspended, I7).
             if !econ_tick.starved_nodes.is_empty() {
                 loop {
                     let starved_set: BTreeSet<NodeId> = self
@@ -2551,8 +3039,11 @@ impl ArkheLearner {
                         break;
                     }
                     let comps = self.editable.economy().comparators().to_vec();
-                    let mut excised_comp: Option<(usize, u16)> = None;
+                    let mut excised_comp: Option<(usize, u16, bool)> = None;
                     for (comp_idx, comp) in comps.iter().enumerate() {
+                        if is_suspended[comp_idx] {
+                            continue;
+                        }
                         let target_port_subs: Vec<NodeId> = comps
                             .iter()
                             .filter(|c| c.target_port == comp.target_port)
@@ -2589,26 +3080,58 @@ impl ArkheLearner {
                         let comp_node_starved = starved_set.contains(&comp.sub_node)
                             || starved_set.contains(&comp.eqz_node);
                         if (comp_node_starved || alt_starved) && !pri_starved {
-                            excised_comp = Some((comp_idx, comp.target_port));
+                            excised_comp = Some((comp_idx, comp.target_port, false));
+                            break;
+                        }
+                        if schedule == SleepSchedule::ConsistencyReplay
+                            && pri_starved
+                            && !alt_starved
+                            && !comp_node_starved
+                            && alt_cone_is_mature(circuit, self.editable.economy(), comp)
+                        {
+                            excised_comp = Some((comp_idx, comp.target_port, true));
                             break;
                         }
                     }
-                    if let Some((comp_idx, tp)) = excised_comp
-                        && let Some(step_map) =
-                            self.excise_port_comparator_with_map(comp_idx, false)
-                    {
-                        compose_old_to_new(&mut composed_old_to_new, &step_map);
-                        sleep_edited = true;
-                        self.disagreement_prune_events += 1;
-                        starvation_excisions += 1;
-                        if let Some(c) = per_port_consensus.get_mut(usize::from(tp)) {
-                            *c = (0, 0, 0);
+                    if let Some((comp_idx, tp, prune_primary)) = excised_comp {
+                        let promoted_pri_dis =
+                            prune_primary.then(|| (tp, alt_fact_disagreements[comp_idx]));
+                        if let Some(step_map) =
+                            self.excise_port_comparator_with_map(comp_idx, prune_primary)
+                        {
+                            compose_old_to_new(&mut composed_old_to_new, &step_map);
+                            sleep_edited = true;
+                            self.disagreement_prune_events += 1;
+                            starvation_excisions += 1;
+                            if let Some(c) = per_port_consensus.get_mut(usize::from(tp)) {
+                                *c = (0, 0, 0);
+                            }
+                            remap_sleep_loop_state_after_edit(
+                                self.editable.economy().comparators(),
+                                self.editable.circuit().node_count(),
+                                &comps,
+                                &step_map,
+                                &grounded_channels,
+                                schedule,
+                                promoted_pri_dis,
+                                &mut is_suspended,
+                                &mut primary_fact_disagreements,
+                                &mut alt_fact_disagreements,
+                                &mut escrowed_by_port,
+                                &mut dropped_escrow_ids,
+                            );
+                            continue;
                         }
-                        continue;
                     }
                     break;
                 }
 
+                let suspended_protected = collect_suspended_protected_nodes(
+                    self.editable.circuit(),
+                    self.editable.economy().comparators(),
+                    &is_suspended,
+                    &grounded_channels,
+                );
                 let remaining_starved: BTreeSet<NodeId> = self
                     .editable
                     .economy()
@@ -2616,13 +3139,24 @@ impl ArkheLearner {
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, econ)| {
-                        (econ.juvenile_ticks == 0 && econ.energy <= 0.0)
-                            .then_some(NodeId(idx as u32))
+                        let id = NodeId(idx as u32);
+                        (econ.juvenile_ticks == 0
+                            && econ.energy <= 0.0
+                            && !suspended_protected.contains(&id))
+                        .then_some(id)
                     })
                     .collect();
                 if !remaining_starved.is_empty() {
                     let pre_prune_circuit = self.editable.circuit().clone();
                     let pre_comps = self.editable.economy().comparators().to_vec();
+                    let pre_energies: Vec<f64> = self
+                        .editable
+                        .economy()
+                        .nodes()
+                        .iter()
+                        .map(|n| n.energy)
+                        .collect();
+                    let pre_sub_nodes: Vec<NodeId> = pre_comps.iter().map(|c| c.sub_node).collect();
                     let juvenile_set: BTreeSet<NodeId> = self
                         .editable
                         .economy()
@@ -2657,7 +3191,8 @@ impl ArkheLearner {
                         excised_starved_passthrough = true;
                         Ok(old_to_new)
                     } else {
-                        self.editable.prune_starved_nodes_with_mode_audited(
+                        self.editable.prune_starved_set_with_mode_audited(
+                            &remaining_starved,
                             self.growth_config.excision_mode,
                             self.growth_config.diagnostic_window,
                             &mut surgery_audit,
@@ -2674,6 +3209,8 @@ impl ArkheLearner {
                     if let Ok(old_to_new) = prune_res
                         && old_to_new.iter().any(Option::is_none)
                     {
+                        self.record_structure_energy_delta(&pre_energies, &old_to_new);
+                        self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
                         self.ledger.on_prune(
                             self.editable.circuit(),
                             self.economy_config.split_code_tax,
@@ -2698,9 +3235,78 @@ impl ArkheLearner {
                                 &remaining_starved,
                             );
                         }
+                        remap_sleep_loop_state_after_edit(
+                            self.editable.economy().comparators(),
+                            self.editable.circuit().node_count(),
+                            &pre_comps,
+                            &old_to_new,
+                            &grounded_channels,
+                            schedule,
+                            None,
+                            &mut is_suspended,
+                            &mut primary_fact_disagreements,
+                            &mut alt_fact_disagreements,
+                            &mut escrowed_by_port,
+                            &mut dropped_escrow_ids,
+                        );
                     }
                 }
             }
+        }
+
+        // End of S-B loopback: R5(b) two-sample KT match test & escrowed agreement release/voiding.
+        let mut match_failures = 0u64;
+        let mut voided_agreement_flux_bits = 0.0f64;
+        let mut voided_ports = vec![false; num_out];
+        if schedule == SleepSchedule::ConsistencyReplay {
+            let mut total_payout_credits = vec![0.0; self.editable.circuit().node_count()];
+            for p in 0..num_out {
+                if !grounded_channels.get(p).copied().unwrap_or(false) {
+                    continue;
+                }
+                let d_cone = port_cone_register_depth(self.editable.circuit(), p as u16);
+                let s1 = &free_run_preds[p];
+                let s2 = replayed_facts.get(p).map_or(&[][..], Vec::as_slice);
+                let kt_res = two_sample_kt_match_test(s1, s2, d_cone, width);
+                if kt_res.passed {
+                    for entry in &escrowed_by_port[p] {
+                        let sum: f64 = entry.node_shares.iter().sum();
+                        if sum > 0.0 {
+                            let inv = entry.reward / sum;
+                            for (dst, &share) in
+                                total_payout_credits.iter_mut().zip(&entry.node_shares)
+                            {
+                                *dst += share * inv;
+                            }
+                        } else {
+                            dropped_escrow_ids.push(entry.id);
+                        }
+                    }
+                } else {
+                    voided_ports[p] = true;
+                    match_failures += 1;
+                    self.sleep_telemetry.sleep_match_failures += 1;
+                    for entry in &escrowed_by_port[p] {
+                        voided_agreement_flux_bits += entry.reward;
+                    }
+                }
+            }
+            if total_payout_credits.iter().any(|&c| c > 0.0) {
+                let payout_tick = self
+                    .editable
+                    .economy_mut()
+                    .apply_escrowed_comparator_flux(&total_payout_credits)
+                    .expect("valid escrowed S-B payout");
+                self.cumulative_net_flux += payout_tick.net_flux;
+                self.reserve_clipped_count += payout_tick.clipped_nodes as u64;
+                self.reserve_clipped_bits += payout_tick.clipped_bits;
+            }
+        }
+        if let Some(audit) = self.epistemic_audit.as_mut() {
+            audit.push(EpistemicAuditEvent::SleepSegmentEnd {
+                voided_ports,
+                dropped_escrow_ids,
+            });
         }
 
         // Sleep exit (R3, I3, I6): restore Wake phase, prev_observed_frame, and remapped wake registers.
@@ -2762,11 +3368,254 @@ impl ArkheLearner {
             minority_routes_pruned,
             starvation_excisions,
             sleep_excisions,
+            suspended_comparator_ticks,
+            match_failures,
+            voided_agreement_flux_bits,
             contradiction_detected: comparator_disagreement_ticks > 0,
             entry_registers: pre_sleep_regs,
             first_loopback_predictions,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct EscrowedSleepAgreement {
+    id: u64,
+    reward: f64,
+    node_shares: Vec<f64>,
+}
+
+fn comparator_is_suspended_for_sleep(
+    comp: &ComparatorSite,
+    grounded_channels: &[bool],
+    schedule: SleepSchedule,
+) -> bool {
+    let target_grounded = grounded_channels
+        .get(usize::from(comp.target_port))
+        .copied()
+        .unwrap_or(false);
+    match schedule {
+        SleepSchedule::None => true,
+        SleepSchedule::ConsistencyOnly => {
+            if !target_grounded {
+                return true;
+            }
+            let leaf_mask = comp.primary_channel_mask | comp.alt_channel_mask;
+            (0..64u32).any(|bit| {
+                (leaf_mask & (1u64 << bit)) != 0
+                    && !grounded_channels
+                        .get(bit as usize)
+                        .copied()
+                        .unwrap_or(false)
+            })
+        }
+        SleepSchedule::ConsistencyReplay => !target_grounded,
+    }
+}
+
+fn alt_cone_is_mature(circuit: &Circuit, economy: &EconomyState, comp: &ComparatorSite) -> bool {
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![comp.sub_node, comp.eqz_node];
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        let Some(econ) = economy.nodes().get(node.index()) else {
+            return false;
+        };
+        let is_comb_split = circuit.wire_delay() == WireDelayMode::Combinational
+            && matches!(circuit.nodes().get(node.index()), Some(Primitive::Split));
+        if !is_pure_boundary_split(circuit, node) && !is_comb_split && econ.juvenile_ticks > 0 {
+            return false;
+        }
+        for edge in circuit.edges() {
+            if let SignalSink::NodeIn { node: dst, port } = edge.dst
+                && dst == node
+            {
+                if node == comp.sub_node && port == 0 {
+                    continue;
+                }
+                if let SignalSource::NodeOut { node: src, .. } = edge.src {
+                    stack.push(src);
+                }
+            }
+        }
+    }
+    true
+}
+
+fn collect_suspended_protected_nodes(
+    circuit: &Circuit,
+    comps: &[ComparatorSite],
+    is_suspended: &[bool],
+    grounded_channels: &[bool],
+) -> BTreeSet<NodeId> {
+    let mut protected = BTreeSet::new();
+    for (comp_idx, comp) in comps.iter().enumerate() {
+        if !is_suspended.get(comp_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        protected.insert(comp.sub_node);
+        protected.insert(comp.eqz_node);
+        let target_port_subs: Vec<NodeId> = comps
+            .iter()
+            .filter(|c| c.target_port == comp.target_port)
+            .map(|c| c.sub_node)
+            .collect();
+        let surviving_comp_nodes: Vec<(NodeId, NodeId)> = comps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| (i != comp_idx).then_some((c.sub_node, c.eqz_node)))
+            .collect();
+        if let Some(alt_excl) = comparator_exclusive_arm_nodes(
+            circuit,
+            comp.sub_node,
+            comp.eqz_node,
+            comp.target_port,
+            false,
+            &target_port_subs,
+            &surviving_comp_nodes,
+        ) {
+            protected.extend(alt_excl);
+        }
+        if !grounded_channels
+            .get(usize::from(comp.target_port))
+            .copied()
+            .unwrap_or(false)
+            && let Some(pri_excl) = comparator_exclusive_arm_nodes(
+                circuit,
+                comp.sub_node,
+                comp.eqz_node,
+                comp.target_port,
+                true,
+                &target_port_subs,
+                &surviving_comp_nodes,
+            )
+        {
+            protected.extend(pri_excl);
+        }
+    }
+    protected
+}
+
+fn compute_r5a_primary_share(
+    circuit: &Circuit,
+    comps: &[ComparatorSite],
+    comp_idx: usize,
+    port_shares: &[Vec<f64>],
+) -> Option<Vec<f64>> {
+    let comp = &comps[comp_idx];
+    let tp = usize::from(comp.target_port);
+    let mut pri_share = port_shares.get(tp)?.clone();
+    if comp.sub_node.index() < pri_share.len() {
+        pri_share[comp.sub_node.index()] = 0.0;
+    }
+    if comp.eqz_node.index() < pri_share.len() {
+        pri_share[comp.eqz_node.index()] = 0.0;
+    }
+    let target_port_subs: Vec<NodeId> = comps
+        .iter()
+        .filter(|c| c.target_port == comp.target_port)
+        .map(|c| c.sub_node)
+        .collect();
+    let surviving_comp_nodes: Vec<(NodeId, NodeId)> = comps
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| (i != comp_idx).then_some((c.sub_node, c.eqz_node)))
+        .collect();
+    if let Some(alt_excl) = comparator_exclusive_arm_nodes(
+        circuit,
+        comp.sub_node,
+        comp.eqz_node,
+        comp.target_port,
+        false,
+        &target_port_subs,
+        &surviving_comp_nodes,
+    ) {
+        for node in alt_excl {
+            if node.index() < pri_share.len() {
+                pri_share[node.index()] = 0.0;
+            }
+        }
+    }
+    let sum: f64 = pri_share.iter().sum();
+    if sum <= 0.0 || !sum.is_finite() {
+        return None;
+    }
+    let inv = 1.0 / sum;
+    for s in &mut pri_share {
+        *s *= inv;
+    }
+    Some(pri_share)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remap_sleep_loop_state_after_edit(
+    post_comps: &[ComparatorSite],
+    post_node_count: usize,
+    pre_comps: &[ComparatorSite],
+    step_map: &[Option<NodeId>],
+    grounded_channels: &[bool],
+    schedule: SleepSchedule,
+    promoted_pri_dis: Option<(u16, u64)>,
+    is_suspended: &mut Vec<bool>,
+    primary_fact_disagreements: &mut Vec<u64>,
+    alt_fact_disagreements: &mut Vec<u64>,
+    escrowed_by_port: &mut [Vec<EscrowedSleepAgreement>],
+    dropped_escrow_ids: &mut Vec<u64>,
+) {
+    for entries in escrowed_by_port.iter_mut() {
+        let mut retained = Vec::with_capacity(entries.len());
+        for mut entry in entries.drain(..) {
+            let mut next_shares = vec![0.0; post_node_count];
+            for (old_idx, mapped) in step_map.iter().enumerate() {
+                if let Some(new_id) = mapped
+                    && old_idx < entry.node_shares.len()
+                    && new_id.index() < post_node_count
+                {
+                    next_shares[new_id.index()] += entry.node_shares[old_idx];
+                }
+            }
+            if next_shares.iter().sum::<f64>() > 0.0 {
+                entry.node_shares = next_shares;
+                retained.push(entry);
+            } else {
+                dropped_escrow_ids.push(entry.id);
+            }
+        }
+        *entries = retained;
+    }
+
+    let mut next_susp = Vec::with_capacity(post_comps.len());
+    let mut next_pri = Vec::with_capacity(post_comps.len());
+    let mut next_alt = Vec::with_capacity(post_comps.len());
+    for comp in post_comps {
+        next_susp.push(comparator_is_suspended_for_sleep(
+            comp,
+            grounded_channels,
+            schedule,
+        ));
+        if let Some(old_idx) = pre_comps.iter().position(|old_c| {
+            step_map
+                .get(old_c.sub_node.index())
+                .copied()
+                .flatten()
+                .is_some_and(|mapped| mapped == comp.sub_node)
+        }) {
+            let pri_d = match promoted_pri_dis {
+                Some((tp, new_pri_d)) if comp.target_port == tp => new_pri_d,
+                _ => primary_fact_disagreements[old_idx],
+            };
+            next_pri.push(pri_d);
+            next_alt.push(alt_fact_disagreements[old_idx]);
+        } else {
+            next_pri.push(0);
+            next_alt.push(0);
+        }
+    }
+    *is_suspended = next_susp;
+    *primary_fact_disagreements = next_pri;
+    *alt_fact_disagreements = next_alt;
 }
 
 fn comparator_cone_is_mature(
@@ -3114,6 +3963,7 @@ impl PredictorBaseline for ArkheLearner {
     }
 
     fn observe(&mut self, truth: &[u64], budget: &mut TickBudget) -> Option<f64> {
+        self.sync_comp_audit_ids();
         if self.total_budget_seen.is_none() {
             self.total_budget_seen = Some(budget.remaining().saturating_add(budget.consumed()));
         }
@@ -3154,6 +4004,13 @@ impl PredictorBaseline for ArkheLearner {
         };
         self.obs_window
             .push_frame_with_state(truth, pre_epoch, &pre_registers);
+        if self
+            .fact_buffer
+            .push_frame_with_state(truth, pre_epoch, &pre_registers)
+        {
+            self.sleep_telemetry.fact_buffer_evictions =
+                self.sleep_telemetry.fact_buffer_evictions.saturating_add(1);
+        }
         for (slot, &val) in self.prev_observed_frame.iter_mut().zip(truth) {
             *slot = self.editable.circuit().width().normalize(val);
         }
@@ -3278,6 +4135,36 @@ impl PredictorBaseline for ArkheLearner {
         self.reserve_clipped_count += econ_tick.clipped_nodes as u64;
         self.reserve_clipped_bits += econ_tick.clipped_bits;
         self.reserve_mismatch_floored += econ_tick.mismatch_floored_nodes as u64;
+        self.record_juvenile_shielded(&econ_tick);
+
+        if let Some(audit) = self.epistemic_audit.as_mut() {
+            let port_scored = self
+                .port_states
+                .iter()
+                .map(|ps| ps.scored_last_observe)
+                .collect();
+            let comp_evals = if comp_alt_vals.is_empty() {
+                Vec::new()
+            } else {
+                self.editable
+                    .economy()
+                    .comparators()
+                    .iter()
+                    .enumerate()
+                    .map(|(m, comp)| WakeCompAudit {
+                        comp_id: self.comp_audit_ids[m],
+                        target_port: comp.target_port,
+                        alt_val: comp_alt_vals[m],
+                    })
+                    .collect()
+            };
+            audit.push(EpistemicAuditEvent::WakeTick {
+                preds: predictions.clone(),
+                facts: truth[..num_ports].to_vec(),
+                port_scored,
+                comp_evals,
+            });
+        }
 
         // Update mature comparator rolling diagnostic windows and check Wake handoff / refutation.
         if !comp_rewards.is_empty() {
@@ -3324,6 +4211,14 @@ impl PredictorBaseline for ArkheLearner {
             }
             let pre_prune_circuit = self.editable.circuit().clone();
             let pre_comps = self.editable.economy().comparators().to_vec();
+            let pre_energies: Vec<f64> = self
+                .editable
+                .economy()
+                .nodes()
+                .iter()
+                .map(|n| n.energy)
+                .collect();
+            let pre_sub_nodes: Vec<NodeId> = pre_comps.iter().map(|c| c.sub_node).collect();
             let juvenile_set: BTreeSet<NodeId> = self
                 .editable
                 .economy()
@@ -3372,6 +4267,8 @@ impl PredictorBaseline for ArkheLearner {
                 .sensitivity_node_evals
                 .saturating_add(surgery_audit.sensitivity_node_evals);
             if let Ok(old_to_new) = prune_res {
+                self.record_structure_energy_delta(&pre_energies, &old_to_new);
+                self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
                 self.ledger.on_prune(
                     self.editable.circuit(),
                     self.economy_config.split_code_tax,
@@ -3581,6 +4478,20 @@ impl PredictorBaseline for ArkheLearner {
             };
             if !idle_nodes.is_empty() {
                 let pre_prune_circuit = self.editable.circuit().clone();
+                let pre_energies: Vec<f64> = self
+                    .editable
+                    .economy()
+                    .nodes()
+                    .iter()
+                    .map(|n| n.energy)
+                    .collect();
+                let pre_sub_nodes: Vec<NodeId> = self
+                    .editable
+                    .economy()
+                    .comparators()
+                    .iter()
+                    .map(|c| c.sub_node)
+                    .collect();
                 let diag_buf = std::mem::replace(
                     &mut self.port_states[p].diagnostic_buffer,
                     DiagnosticBuffer::new(0),
@@ -3611,6 +4522,8 @@ impl PredictorBaseline for ArkheLearner {
                 if let Ok(old_to_new) = prune_res {
                     let any_pruned = old_to_new.iter().any(Option::is_none);
                     if any_pruned {
+                        self.record_structure_energy_delta(&pre_energies, &old_to_new);
+                        self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
                         self.ledger.on_prune(
                             self.editable.circuit(),
                             self.economy_config.split_code_tax,
@@ -3636,6 +4549,20 @@ impl PredictorBaseline for ArkheLearner {
             }
             if self.growth_config.excision_mode == ExcisionMode::VerifiedLocalExcision {
                 let pre_prune_circuit = self.editable.circuit().clone();
+                let pre_energies: Vec<f64> = self
+                    .editable
+                    .economy()
+                    .nodes()
+                    .iter()
+                    .map(|n| n.energy)
+                    .collect();
+                let pre_sub_nodes: Vec<NodeId> = self
+                    .editable
+                    .economy()
+                    .comparators()
+                    .iter()
+                    .map(|c| c.sub_node)
+                    .collect();
                 let diag_buf = std::mem::replace(
                     &mut self.port_states[p].diagnostic_buffer,
                     DiagnosticBuffer::new(0),
@@ -3660,6 +4587,8 @@ impl PredictorBaseline for ArkheLearner {
                     .sensitivity_node_evals
                     .saturating_add(surgery_audit.sensitivity_node_evals);
                 if let Ok(Some(old_to_new)) = excise_res {
+                    self.record_structure_energy_delta(&pre_energies, &old_to_new);
+                    self.remap_comp_audit_ids(&pre_sub_nodes, &old_to_new);
                     self.ledger.on_prune(
                         self.editable.circuit(),
                         self.economy_config.split_code_tax,

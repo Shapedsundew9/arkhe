@@ -335,6 +335,17 @@ impl EditableCircuit {
             .filter(|(_, node)| node.juvenile_ticks == 0 && node.energy <= 0.0)
             .map(|(index, _)| NodeId(u32::try_from(index).expect("node count fits in u32")))
             .collect();
+        self.prune_starved_set_with_mode_audited(&removed, excision_mode, diagnostic_window, audit)
+    }
+
+    /// Excises an explicit set of starved mature nodes using the selected [`ExcisionMode`].
+    pub(crate) fn prune_starved_set_with_mode_audited(
+        &mut self,
+        removed: &BTreeSet<NodeId>,
+        excision_mode: ExcisionMode,
+        diagnostic_window: usize,
+        audit: &mut SurgeryEvalAudit,
+    ) -> Result<Vec<Option<NodeId>>, SurgeryError> {
         if removed.is_empty() {
             return Ok((0..self.circuit.node_count())
                 .map(|index| {
@@ -348,7 +359,7 @@ impl EditableCircuit {
         let pre_compiled = self.compiled.clone();
         let pre_regs = self.state.registers().to_vec();
         let (staged, old_to_new) =
-            self.build_pruned_circuit_with_mode(&removed, excision_mode, diagnostic_window, None)?;
+            self.build_pruned_circuit_with_mode(removed, excision_mode, diagnostic_window, None)?;
         let staged_compiled = staged.compile()?;
         let shifted_live = (excision_mode == ExcisionMode::VerifiedLocalExcision
             && pre_circuit.wire_delay() == WireDelayMode::TicksPerHop)

@@ -733,8 +733,33 @@ impl EconomyState {
         eqz_values: &[u64],
         facts: Option<&[u64]>,
     ) -> Result<ComparatorObservation, EconomyError> {
+        self.observe_comparators_with_suspension(
+            primary_values,
+            alt_values,
+            eqz_values,
+            facts,
+            None,
+        )
+    }
+
+    /// Scores all non-suspended registered comparators for one tick (`R4`, `I7`).
+    ///
+    /// Comparators marked `true` in `suspended` emit exact `0.0` reward, record `0` agreements
+    /// and `0` disagreements, and leave their sleep scorers untouched.
+    pub fn observe_comparators_with_suspension(
+        &mut self,
+        primary_values: &[u64],
+        alt_values: &[u64],
+        eqz_values: &[u64],
+        facts: Option<&[u64]>,
+        suspended: Option<&[bool]>,
+    ) -> Result<ComparatorObservation, EconomyError> {
         let count = self.comparators.len();
-        if primary_values.len() != count || alt_values.len() != count || eqz_values.len() != count {
+        if primary_values.len() != count
+            || alt_values.len() != count
+            || eqz_values.len() != count
+            || suspended.is_some_and(|s| s.len() != count)
+        {
             return Err(EconomyError::DimensionMismatch);
         }
         if self.phase == ExecutionPhase::Wake {
@@ -753,6 +778,10 @@ impl EconomyState {
         let width = self.width;
 
         for m in 0..count {
+            if suspended.is_some_and(|s| s[m]) {
+                rewards.push(0.0);
+                continue;
+            }
             let eqz_active = width.normalize(eqz_values[m]) != 0;
             if eqz_active {
                 agreements += 1;
@@ -803,6 +832,89 @@ impl EconomyState {
             rewards,
             agreements,
             disagreements,
+        })
+    }
+
+    /// Releases escrowed non-negative `S-B` comparator agreement payouts through the conserved
+    /// reserve ceiling path without double-advancing `juvenile_ticks` or `smoothed_drain_rate` (`R5(b)`, `I4`).
+    pub fn apply_escrowed_comparator_flux(
+        &mut self,
+        node_credits: &[f64],
+    ) -> Result<EconomyTick, EconomyError> {
+        if node_credits.len() != self.nodes.len() {
+            return Err(EconomyError::DimensionMismatch);
+        }
+        if node_credits.iter().any(|v| !v.is_finite() || *v < 0.0)
+            || !node_credits.iter().sum::<f64>().is_finite()
+        {
+            return Err(EconomyError::InvalidTickData);
+        }
+
+        let total_flux: f64 = node_credits.iter().sum();
+        if total_flux == 0.0 {
+            return Ok(EconomyTick {
+                net_flux: 0.0,
+                comparator_flux: 0.0,
+                comparator_agreements: 0,
+                comparator_disagreements: 0,
+                maintenance: 0.0,
+                node_credit: vec![0.0; self.nodes.len()],
+                node_delta: vec![0.0; self.nodes.len()],
+                starved_nodes: Vec::new(),
+                clipped_nodes: 0,
+                clipped_bits: 0.0,
+                mismatch_floored_nodes: 0,
+            });
+        }
+
+        let w_obs = self.observation_horizon as f64;
+        let mut node_delta = Vec::with_capacity(self.nodes.len());
+        let mut clipped_nodes = 0usize;
+        let mut clipped_bits = 0.0f64;
+
+        for (node, &credit) in self.nodes.iter_mut().zip(node_credits) {
+            let previous_energy = node.energy;
+            let unclipped = previous_energy + credit;
+            if !unclipped.is_finite() {
+                return Err(EconomyError::InvalidTickData);
+            }
+            let maybe_cap = if node.juvenile_ticks > 0 {
+                None
+            } else {
+                match self.config.reserve_cap {
+                    ReserveCap::Uncapped => None,
+                    ReserveCap::Fixed(cap) => Some(cap),
+                    ReserveCap::HorizonDerived => {
+                        Some((w_obs * node.smoothed_drain_rate).max(self.config.initial_energy))
+                    }
+                }
+            };
+            let (next_energy, clipped) = match maybe_cap {
+                Some(cap) if unclipped > cap => (cap, unclipped - cap),
+                _ => (unclipped, 0.0),
+            };
+            if clipped > 0.0 {
+                clipped_nodes += 1;
+                clipped_bits += clipped;
+            }
+            node.energy = next_energy;
+            node_delta.push(next_energy - previous_energy);
+        }
+
+        self.cumulative_comparator_flux += total_flux;
+
+        Ok(EconomyTick {
+            net_flux: total_flux,
+            comparator_flux: total_flux,
+            comparator_agreements: 0,
+            comparator_disagreements: 0,
+            maintenance: 0.0,
+            node_credit: node_credits.to_vec(),
+            node_delta,
+            starved_nodes: Vec::new(),
+            clipped_nodes,
+            clipped_bits,
+            mismatch_floored_nodes: 0,
         })
     }
 
