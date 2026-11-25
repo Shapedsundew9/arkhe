@@ -4,10 +4,18 @@
 //! Strictly enforces Principle 5 / `R8`: oracle labels in [`oracle`] are external instrumentation
 //! only and are never imported or read by `crate::structural`.
 
+pub mod explore;
 pub mod oracle;
 pub mod planted;
 pub mod tasks;
 
+pub use explore::{
+    ArmDistributionSummary, ExploreM4aReport, GuardrailAggregateSummary, H6PairedContrast,
+    InvariantAggregateSummary, K2OpportunitySummary, PairedDeltaStats, PerturbedDreamLaneSummary,
+    RuntimeExtrapolation, ScalarStats, SleepArmSummary, SleepTelemetryTotals,
+    SleepWindowSensitivityRow, SpOpportunityRow, check_explore_m4a_seed_range_holdout,
+    compute_recoverable_comparator_bits, run_explore_m4a,
+};
 pub use oracle::{
     CircuitOracleLabels, ComparatorOracleLabel, DEFAULT_MAX_LOOPBACK_ATTRACTOR_STEPS,
     LoopbackAttractorReport, PortLanguageOracle, SleepOracleAudit, audit_sleep_segment_oracle,

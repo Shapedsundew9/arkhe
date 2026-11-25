@@ -48,7 +48,11 @@ fn all_holdout_guards_share_closed_boundaries_and_status() {
         }
         assert!(arkhe::verify_m3::check_explore_m3_seed_range_holdout(start.into(), 1).is_err());
         assert!(arkhe::verify_m3::check_explore_m3_seed_range_holdout(end.into(), 1).is_err());
+        assert!(arkhe::verify_m4a::check_explore_m4a_seed_range_holdout(start.into(), 1).is_err());
+        assert!(arkhe::verify_m4a::check_explore_m4a_seed_range_holdout(end.into(), 1).is_err());
     }
+    assert!(arkhe::verify_m4a::check_explore_m4a_seed_range_holdout(20_200, 1).is_err());
+    assert!(arkhe::verify_m4a::check_explore_m4a_seed_range_holdout(20_299, 1).is_err());
 
     for check in checks {
         let error = check(50_100, 1, true).unwrap_err();
@@ -293,4 +297,62 @@ fn cli_verify_m3_refuses_holdout_ranges() {
         String::from_utf8_lossy(&bank_m4a.stderr)
             .contains("unconditionally forbidden under verify-m3")
     );
+}
+
+#[test]
+fn cli_explore_m4a_refuses_confirmation_and_holdout_ranges() {
+    for seed_offset in [
+        "10000", "20200", "20250", "20299", "30000", "40000", "50000", "50100", "60000", "60050",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+            .args(["explore-m4a", "--seed-offset", seed_offset, "--seeds", "20"])
+            .output()
+            .expect("spawn arkhe explore-m4a on blocked range");
+        assert!(
+            !output.status.success(),
+            "explore-m4a must unconditionally refuse seed_offset={seed_offset}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unconditionally forbidden under explore-m4a"),
+            "stderr for explore-m4a seed_offset={seed_offset} must cite unconditional refusal, got: {stderr}"
+        );
+    }
+
+    // Boundary overlaps from below and --seeds 0 on blocked ranges must fail.
+    for (seed_offset, seeds) in [
+        ("20195", "10"),
+        ("59990", "20"),
+        ("20200", "0"),
+        ("60000", "0"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+            .args([
+                "explore-m4a",
+                "--seed-offset",
+                seed_offset,
+                "--seeds",
+                seeds,
+            ])
+            .output()
+            .expect("spawn arkhe explore-m4a on boundary overlap");
+        assert!(
+            !output.status.success(),
+            "explore-m4a must reject boundary overlap {seed_offset}..+{seeds}"
+        );
+    }
+
+    // explore-m4a must not expose any --holdout override flag.
+    let holdout_flag = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+        .args([
+            "explore-m4a",
+            "--seed-offset",
+            "60000",
+            "--seeds",
+            "1",
+            "--holdout",
+        ])
+        .output()
+        .expect("spawn arkhe explore-m4a with --holdout");
+    assert!(!holdout_flag.status.success());
 }

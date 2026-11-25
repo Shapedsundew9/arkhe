@@ -109,6 +109,24 @@ pub enum Commands {
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
     },
+    /// Run Milestone 4a-0 exploratory wake-sleep characterisation sweep on non-holdout seeds.
+    ExploreM4a {
+        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
+        #[arg(long, default_value_t = 0)]
+        seed_offset: u64,
+        /// Number of master seeds evaluated.
+        #[arg(long, default_value_t = 20)]
+        seeds: usize,
+        /// Optional path to write the JSON `ExploreM4aReport` (prints to stdout when omitted).
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Include descriptive `W_sleep in {64, 128, 256}` and perturbed dream-lane sensitivity checks.
+        #[arg(long, default_value_t = false)]
+        include_sensitivity: bool,
+        /// Optional worker thread count (defaults to `std::thread::available_parallelism()`).
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// Run Milestone 3 exploratory and paired-ablation sweep on non-holdout development seeds.
     ExploreM3 {
         /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
@@ -279,6 +297,23 @@ where
                     Err("Milestone 2b verification failed one or more acceptance gates".into())
                 }
             }
+        }
+        Some(Commands::ExploreM4a {
+            seed_offset,
+            seeds,
+            output,
+            include_sensitivity,
+            threads,
+        }) => {
+            let report =
+                verify_m4a::run_explore_m4a(seed_offset, seeds, include_sensitivity, threads)?;
+            let json = serde_json::to_string_pretty(&report)?;
+            if let Some(out_path) = output {
+                fs::write(out_path, json)?;
+            } else {
+                println!("{json}");
+            }
+            Ok(())
         }
         Some(Commands::ExploreM3 {
             seed_offset,
