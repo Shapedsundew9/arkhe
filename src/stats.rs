@@ -775,7 +775,7 @@ pub const HOLDOUT_BANKS: &[HoldoutRangeSpec] = &[
         start: 60_000,
         end_inclusive: 60_099,
         allow_with_flag: false,
-        status_note: "reserved for M4a; blocked in existing commands",
+        status_note: "consumed once at 0f62e2f under S3 #65 and permanently closed",
     },
 ];
 

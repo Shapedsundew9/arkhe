@@ -1,13 +1,12 @@
 # Milestone M4a: Sleep as Internal Falsification — Plan (Chief Scientist Revision)
 
-**Date:** 2026-11-24 (Phase 0.5 Pre-Registration revision: 2026-11-25)  
-**Status:** `M4a-0 complete (089ed72); Phase 0.5 Pre-Registration signed off (DR #50); Phases 1–2 authorized (S3/S4 pending).`  
+**Date:** 2026-11-24 (Phase 0.5 Pre-Registration: 2026-11-25; Phase 3 Closeout: 2026-11-25)  
+**Status:** `Phase 1–2 & S3 Single-Shot Holdout PASSED (0f62e2f, source_tree_fnv1a128 = 349fe16d144f4fcd2c2184fe944d6c51); Phase 3 Closeout complete (60000..=60099 permanently closed allow_with_flag: false; S4 sign-off pending on closeout commit).`  
 **Charter Links:** [Foundational Research Charter v3](foundational_research_charter_v3.md) (§4.2, §6 `H5`/`H6`, §7, §8, §2.8, [DR #49–#50](foundational_research_charter_v3.md#appendix-a-decision-record)), [Parameter Inventory](parameter_inventory.md), [Research Record](research_record.md)
 
 This plan follows the [milestone plan template](templates/milestone_plan_template.md). It supersedes the
-junior draft of the same date. Phase 0.5 Pre-Registration is signed off under [DR #50](foundational_research_charter_v3.md#appendix-a-decision-record),
-authorizing Phase 1 (`verify-m4a`) and Phase 2 (development `520..720` and confirmation `20200..=20299` sweeps).
-`S3`, single-shot access to the holdout (`60000..=60099`) bank, and `S4` remain **pending**.
+junior draft of the same date. Phase 0.5 Pre-Registration was signed off under [DR #50](foundational_research_charter_v3.md#appendix-a-decision-record),
+Phase 1 (`verify-m4a` at `0f62e2f`), Phase 2 (`520..720` disjoint dev, `20200..=20299` confirmation, and clean `check_retained_baselines.py --require-clean`, `#64`), `S3` authorization (`#65`), and the single-shot 100-seed holdout (`60000..=60099`, `#67`) all passed with `overall_passed = true`, `excluded_cases = 0`, and `G4A.7` (`H6`) ruling `SaSuperiorDropReplay` (`delta_6 = +14.61` bits -> drop `S-B` replay in `M4b`). Holdout `60000..=60099` is permanently closed (`allow_with_flag: false`) and evidence is archived under [`docs/evidence/m4a/`](evidence/m4a/); **`S4` milestone sign-off** is pending `@chief-scientist` approval on the Phase 3 closeout commit.
 
 ## 0. Chief Scientist Review of the Draft
 
@@ -231,22 +230,20 @@ Every `TaskBankInput` in `verify-m4a` populates finite Option D `tail_metrics` (
 - **M4a-0 characterisation (completed & frozen):** `20..220` (`10 × 20 = 200` seeds, `550.98s = 9.18 min`). Pre-registered thresholds in §3 were derived solely from this range.
 - **M4a confirmatory development sweep:** `520..720` (`10 × 20 = 200` seeds, strictly disjoint from characterisation `20..220`, $2\times$ the 100-seed confirmation/holdout size, `~9.2 min <= 15 min` watchdog limit).
 - **Confirmation (`S3` precondition):** `20200..=20299` (`5 × 20 = 100` seeds, `~4.6 min`). Untouched during `M4a-0`; `explore-m4a` rejects it.
-- **Single-shot holdout (`S3`-gated, `S4` precondition):** `60000..=60099` (`5 × 20 = 100` seeds, `~4.6 min`), reserved and unconditionally blocked in `verify-m2a`, `verify-m2b`, `verify-m3`, and `explore-m3`.
-  - `explore-m4a` rejects it unconditionally.
-  - `verify-m4a` blocks `60000..=60099` unless `--holdout` is passed after `S3` authorization.
-  - The `S4` closeout commit sets `allow_with_flag: false` in every command.
+- **Single-shot holdout (`S3`-gated, `S4` precondition):** `60000..=60099` (`5 × 20 = 100` seeds, `272.63s`), executed once at `0f62e2f` under `S3` `#65` (`overall_passed = true`, `excluded_cases = 0`).
+  - Permanently closed unconditionally (`allow_with_flag: false`) in every command (`HOLDOUT_BANKS`, `VERIFY_M4A_HOLDOUT_BANKS`, `explore-m4a`) in the Phase 3 closeout commit, rejected even when `--holdout` / `--allow-holdout` is passed.
 - **Statistics:** [Charter §2.8](foundational_research_charter_v3.md#28-statistical-policy-holdout-governance-and-retained-baseline-regression-gate)
   Options A, B and D, applied to paired trajectory units, with `excluded_cases == 0`.
 
 | Check | Command | Required outcome |
 | :--- | :--- | :--- |
-| Retained baselines (before `S3` and before `S4`) | `python3 scripts/check_retained_baselines.py --require-clean` | `passed: true`, `git_dirty: false`, `golden_traces` `1/1` |
+| Retained baselines (before `S3` and after Phase 3 closeout commit) | `python3 scripts/check_retained_baselines.py --require-clean` | `passed: true`, `git_dirty: false`, `golden_traces` `1/1` |
 | Exploration (`M4a-0`, completed) | `cargo run --locked --release -- explore-m4a --seed-offset 20 --seeds 200` | Report only; no gates (`550.98s`, §2) |
-| Confirmatory Dev Sweep (Phase 2) | `cargo run --locked --release -- verify-m4a --banks 10 --seed-offset 520 --seeds 20` | All gates pass in both strata, `excluded_cases == 0`, tails inspected |
-| Confirmation (`S3` precondition, Phase 2) | `cargo run --locked --release -- verify-m4a --banks 5 --seed-offset 20200 --seeds 20` | All gates pass in both strata, `excluded_cases == 0`, tails inspected |
-| Holdout (`S4` precondition, Phase 3) | `cargo run --locked --release -- verify-m4a --banks 5 --seed-offset 60000 --seeds 20 --holdout` after `S3` | Same as confirmation, single shot |
+| Confirmatory Dev Sweep (Phase 2, passed `#64`) | `cargo run --locked --release -- verify-m4a --banks 10 --seed-offset 520 --seeds 20` | All gates pass in both strata, `excluded_cases == 0`, tails inspected |
+| Confirmation (`S3` precondition, Phase 2, passed `#64`) | `cargo run --locked --release -- verify-m4a --banks 5 --seed-offset 20200 --seeds 20` | All gates pass in both strata, `excluded_cases == 0`, tails inspected |
+| Holdout (`S4` precondition, Phase 3, passed `#67`) | `./target/release/arkhe verify-m4a --banks 5 --seed-offset 60000 --seeds 20 --holdout` at `0f62e2f` | Same as confirmation, single shot (now permanently closed `allow_with_flag: false`) |
 
-`docs/retained_baselines.json` gains an `m4a` entry only at `S4`.
+`docs/retained_baselines.json` gains an `m4a` entry (`verify-m4a` `G4A.1`–`G4A.7`) in the Phase 3 closeout commit alongside `scripts/check_retained_baselines.py` validation support.
 
 ## 5. Kill & Revisit Criteria
 
@@ -286,15 +283,28 @@ Each phase is one commit. `golden_traces` must stay bit-identical in every M4a-0
 | `0.3` | Oracle instrumentation: forbidden words, attractor detection, oracle-correct labels, wrongful-excision counter (`R8`); `PL` injections; `CT` controls | **Completed (`abeb8fe`).** 36-task registry & `tests/m4a_oracle.rs` |
 | `0.4` / `0.4b` | `explore-m4a` harness (rejecting `20200..=20299` & `60000..=60099`); `DR #50` sleep containment, Popperian loopback refutation, & compute parity; `0..20` smoke & `20..220` characterisation | **Completed (`2bb81c0`, `089ed72`, `#51`).** Report in §2 (`cargo test --locked` `242/242`) |
 | `0.5` | **Chief Scientist review.** Decide `K2`; finalise `R2` currency; write §3 thresholds with Rule-9 arguments; update inventory & Charter `DR #50` | **Signed off (`#54`, DR #50).** This revision |
-| `1` | `verify-m4a` with `StratifiedGateAudit`, paired units, Option D `tail_metrics`, `S3`-gated holdout guard (`60000..=60099` blocked without `--holdout`) | **Authorized (`#54`).** Smoke `0..20`, CLI guard & unit tests, `@verifier` audit |
-| `2` | Dev sweep `520..720`; confirmation `20200..=20299`; clean-commit `check_retained_baselines.py --require-clean` | **Authorized (`#54`).** `S3` request packet |
-| `3` | `S3`, then single-shot holdout `60000..=60099`, attainment record, closeout (`allow_with_flag: false`), `S4` | **Pending `S3`/`S4`.** |
+| `1` | `verify-m4a` with `StratifiedGateAudit`, paired units, Option D `tail_metrics`, `S3`-gated holdout guard (`60000..=60099` blocked without `--holdout`) | **Completed (`0f62e2f`).** Smoke `0..20` ([`verify_m4a_dev20.json`](evidence/m4a/verify_m4a_dev20.json)), CLI guard & unit tests |
+| `2` | Dev sweep `520..720`; confirmation `20200..=20299`; clean-commit `check_retained_baselines.py --require-clean` | **Completed (`#64`, `0f62e2f`).** `S3` authorized (`#65`); evidence [`verify_m4a_dev200.json`](evidence/m4a/verify_m4a_dev200.json), [`verify_m4a_conf100.json`](evidence/m4a/verify_m4a_conf100.json), [`retained_baselines_pre_s3.json`](evidence/m4a/retained_baselines_pre_s3.json) |
+| `3` | `S3`, then single-shot holdout `60000..=60099`, attainment record, closeout (`allow_with_flag: false`), `S4` | **Holdout PASSED (`#67`, `0f62e2f`, [`verify_m4a_holdout_60000.json`](evidence/m4a/verify_m4a_holdout_60000.json)); `60000..=60099` sealed `allow_with_flag: false` & `m4a` added to `retained_baselines.json`; `S4` pending `@chief-scientist` sign-off on closeout commit.** |
 
 ## 8. Sign-Off & Attainment Record
 
 - **M4a-0 authorization:** Chief Scientist, 2026-11-24 ([DR #49](foundational_research_charter_v3.md#appendix-a-decision-record)).
 - **M4a-0 completion:** Commits `d053aea`, `7687172`, `abeb8fe`, `2bb81c0`, `089ed72` (`@verifier`-approved `#51`; `cargo test --locked` `242/242`, `golden_traces` `1/1`).
 - **Pre-registration (`M4a` Phase 0.5):** Signed off by Chief Scientist, 2026-11-25 ([DR #50](foundational_research_charter_v3.md#appendix-a-decision-record), `#54` at commit `089ed72`); Phases 1–2 (`verify-m4a`, `520..720` dev, `20200..=20299` confirmation) authorized.
-- **Retained baselines, development and confirmation:** pending Phase 2.
-- **`S3`, holdout and `S4`:** pending. This plan implies no `S3`/`S4` authorization.
-- **Source digest and independent review:** pending (`S3`/`S4` closeout).
+- **Phase 1 & Phase 2 (`0f62e2fbc4cdf9babb1e538d867ebc3e59f7c277`, `git_dirty = false`, `source_tree_fnv1a128 = 349fe16d144f4fcd2c2184fe944d6c51`, `cargo_lock_fnv1a128 = 8d29cd24b1fbdbb743cf5c0b3933b22d`):**
+  - Pre-S3 retained baselines ([`retained_baselines_pre_s3.json`](evidence/m4a/retained_baselines_pre_s3.json)): `passed = true`, `git_dirty = false`, `golden_traces` `1/1`, `m2a` (`5/5` gates, `excluded_cases = 0`, `sprout_blocked_max_nodes = 0`, worst `G2A.5:CrossSum(d=1,2,k=2)` `0.9800` / `G2A.4b:AllNoise:CrossAdd(d=1,2,k=1)` `0.9900`), `m2b` (`5/5` gates, `excluded_cases = 0`, `sprout_blocked_max_nodes = 0`, `G2B.2` `1.0000`, worst `G2B.4:MV_AllChNoise_k2` `0.8900`).
+  - Smoke `0..20` ([`verify_m4a_dev20.json`](evidence/m4a/verify_m4a_dev20.json), pre-commit `4370540` `git_dirty = true` with identical `source_tree_fnv1a128 = 349fe16d144f4fcd2c2184fe944d6c51`, `55.02s`): `overall_passed = true`, `excluded_cases = 0`, `G4A.7` `SaSuperiorDropReplay` `delta_6 = +19.23` bits (`S-A` passed all gates).
+  - Disjoint 200-seed Dev `520..720` ([`verify_m4a_dev200.json`](evidence/m4a/verify_m4a_dev200.json), `10 × 20`, `546.92s`, clean `0f62e2f`): `overall_passed = true`, `excluded_cases = 0`, `sprout_blocked_max_nodes = 0`, `sprout_budget_exhausted = 178360`. `G4A.1` `7200/7200` (`Clean conj=200/200`, `max_mdl = 1.310e-13`, `max_diff = 0.0`, `max_ratio = 1.000000`), `G4A.2` `7200/7200` (`Clean conj=200/200`, `max_i2/i6/i7 = 0.0`), `G4A.3` `S-A 526/600` (`cp99 = 0.842083`, `hom_p = 0.557584`, worst `MV_Periodic:k2:noisy` `158/200 = 0.7900`; `S-B 525/600`), `G4A.4` `S-A 5599/5600` (`Clean 2800/2800 conj=200/200`, `Noisy 2799/2800`, `max_mean_reg = 0.0018`, `max_p95_reg = 0.1907`, `max_reg = 0.4049`), `G4A.5` `S-A 1580/1600` (`Clean 800/800 conj=200/200`, `Noisy 780/800`, worst `PL2:k2:noisy` `180/200 = 0.9000`, `med_surv = 0.0`; `S-B` failed `Noisy PL2:k2` `111/200 = 0.5550`), `G4A.6` `S-A 7195/7200` (`Clean 3600/3600 conj=200/200`, `Noisy 3595/3600`, `max_port_locks_lost = 0.0`, `max_we = 2.0`), `G4A.7` (`H6`) `SaSuperiorDropReplay` `delta_6 = +27.65` bits (`2200` obs).
+  - 100-seed Confirmation `20200..=20299` ([`verify_m4a_conf100.json`](evidence/m4a/verify_m4a_conf100.json), `5 × 20`, `273.93s`, clean `0f62e2f`): `overall_passed = true`, `excluded_cases = 0`, `sprout_blocked_max_nodes = 0`, `sprout_budget_exhausted = 88320`. `G4A.1` `3600/3600` (`Clean conj=100/100`), `G4A.2` `3600/3600`, `G4A.3` `S-A 258/300` (`cp99 = 0.806941`, worst `MV_Periodic:k2:noisy` `77/100 = 0.7700`; `S-B 258/300`), `G4A.4` `S-A 2799/2800` (`Clean 1400/1400 conj=100/100`, `Noisy 1399/1400`, `max_mean_reg = 0.0179`, `max_p95_reg = 0.2354`), `G4A.5` `S-A 786/800` (`Clean 400/400 conj=100/100`, `Noisy 386/400`, worst `PL2:k2:noisy` `86/100 = 0.8600`; `S-B` failed `Noisy PL2:k2` `60/100 = 0.6000`), `G4A.6` `S-A 3598/3600` (`Clean 1800/1800 conj=100/100`, `Noisy 1798/1800`, `max_port_locks_lost = 0.0`), `G4A.7` (`H6`) `SaSuperiorDropReplay` `delta_6 = +21.03` bits (`1100` obs).
+- **`S3` Single-Shot Holdout (`60000..=60099`, `5 × 20 = 100` seeds, `272.63s`, clean `0f62e2f`, [`verify_m4a_holdout_60000.json`](evidence/m4a/verify_m4a_holdout_60000.json)):**
+  - Authorized by `@chief-scientist` (`S3` `#65`) and passed cleanly (`#67`): `overall_passed = true`, `excluded_cases = 0`, `sprout_blocked_max_nodes = 0`, `sprout_budget_exhausted = 83072`.
+  - **`G4A.1`:** `3600/3600` (`Clean 1800/1800 conj=100/100 max_mdl = 1.310e-13`, `Noisy 1800/1800 max_mdl = 1.173e-13`, `max_compute_ledger_diff = 0.0`, `max_node_eval_ratio = 1.000000`).
+  - **`G4A.2`:** `3600/3600` (`Clean 1800/1800 conj=100/100`, `Noisy 1800/1800`, `max_i2/i6/i7 = 0.0`).
+  - **`G4A.3` (`H5`):** `S-A` `264/300 = 0.8800` (`cp99 = 0.829570`, `hom_p = 0.337192`, `min_binom_p = 1.000000`, `min_task_hom_p = 0.190650`, worst `SP:MV_Periodic:k2:noisy` `79/100 = 0.7900`; per-task mean/med `MV_Periodic:k1` `+117.32 / +130.47`, `MV_Periodic:k2` `+104.14 / +93.38`, `Period6_LagRedundancy:k2` `+60.65 / +58.58` bits); `S-B` `265/300 = 0.8833`.
+  - **`G4A.4`:** `S-A` `2799/2800` (`Clean 1400/1400 conj=100/100 max_reg = 0.0000`, `Noisy 1399/1400 cp99 = 0.995268`, worst `MV_Periodic:k2:noisy` `99/100 = 0.9900`, `max_mean_reg = 0.0150`, `max_p95_reg = 0.2031`, `max_reg = 0.4048`); `S-B` `2796/2800` (`max_reg = 1.4249`).
+  - **`G4A.5` (`PL`):** `S-A` `785/800` (`Clean 400/400 conj=100/100 max_surv = 0.0`, `Noisy 385/400 cp99 = 0.934123`, `hom_p = 0.807280`, `min_binom_p = 0.994579`, `min_task_hom_p = 0.770330`, `PL1:k1/k2` `1.00/1.00`, `PL2:k1` `1.00`, `PL2:k2` `85/100 = 0.8500` `med_surv = 0.0`, `max_surv = 4.0`); `S-B` `766/800` (`PL2:k2:noisy` `66/100 = 0.6600`, `med_surv = 2.0`).
+  - **`G4A.6`:** `S-A` `3599/3600` (`Clean 1800/1800 conj=100/100`, `Noisy 1799/1800 cp99 = 0.996318`, worst `MV_Periodic:k1:noisy` `99/100 = 0.9900`, `max_port_locks_lost = 0.0`, `max_we = 1.0`); `S-B` `3599/3600`.
+  - **`G4A.7` (`H6`):** `SaSuperiorDropReplay`, `delta_6 = +14.61` bits (`11` tasks, `1100` obs, `canonical_arm = Sa`, `canonical_arm_passed_all_gates = true`) -> **`S-A` selected as canonical sleep arm for `M4b` and `S-B` replay dropped in `M4b`**.
+- **Phase 3 Closeout & `S4` Status:** Holdout `60000..=60099` permanently closed (`allow_with_flag: false` in `src/stats.rs`, `src/verify_m4a/verify.rs`, and `src/lib.rs`, enforced by `tests/cli.rs` even with `--holdout` / `--allow-holdout`); `m4a` added to `docs/retained_baselines.json` and `scripts/check_retained_baselines.py`; evidence archived in [`docs/evidence/m4a/`](evidence/m4a/). **`S4` sign-off is pending `@chief-scientist` review of the closeout commit and clean-commit `check_retained_baselines.py --require-clean` output.**
+- **Source digest and independent review:** `0f62e2f` (`source_tree_fnv1a128 = 349fe16d144f4fcd2c2184fe944d6c51`, audited by `@verifier` `#64`, `#67`); Phase 3 closeout modifies only holdout-seal flag/status note (`src/stats.rs`, `src/verify_m4a/verify.rs`, `src/lib.rs`, `tests/cli.rs`), retained-baseline suite validation (`docs/retained_baselines.json`, `scripts/check_retained_baselines.py`), archived JSON evidence, and closeout docs with zero algorithmic, substrate, metric, or gate changes.

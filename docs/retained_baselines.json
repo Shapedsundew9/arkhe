@@ -73,6 +73,43 @@
           "artifact_name": "m2b_dev20.json"
         }
       }
+    },
+    "m4a": {
+      "subcommand": "verify-m4a",
+      "expected_gates": [
+        "G4A.1",
+        "G4A.2",
+        "G4A.3",
+        "G4A.4",
+        "G4A.5",
+        "G4A.6"
+      ],
+      "require_overall_passed": true,
+      "require_h6_decision": true,
+      "tiers": {
+        "standard": {
+          "args": [
+            "--banks",
+            "5",
+            "--seed-offset",
+            "20",
+            "--seeds",
+            "20"
+          ],
+          "artifact_name": "m4a_dev100.json"
+        },
+        "fast": {
+          "args": [
+            "--banks",
+            "1",
+            "--seed-offset",
+            "0",
+            "--seeds",
+            "20"
+          ],
+          "artifact_name": "m4a_dev20.json"
+        }
+      }
     }
   },
   "requirements": {
@@ -124,6 +161,60 @@
       },
       "G2B.5": {
         "default": ["min_post_fault_kt_advantage"]
+      }
+    },
+    "m4a": {
+      "G4A.1": {
+        "default": [
+          "sprout_blocked_max_nodes",
+          "max_epistemic_mdl_err",
+          "max_compute_ledger_diff",
+          "max_node_eval_ratio_sleep_over_wake"
+        ]
+      },
+      "G4A.2": {
+        "default": [
+          "sprout_blocked_max_nodes",
+          "max_i2_violations",
+          "max_i6_violations",
+          "max_i7_violations"
+        ]
+      },
+      "G4A.3": {
+        "default": [
+          "sprout_blocked_max_nodes",
+          "mean_l_epi_advantage",
+          "median_l_epi_advantage",
+          "min_l_epi_advantage",
+          "p05_l_epi_advantage",
+          "max_wrongful_excisions",
+          "max_port_locks_lost"
+        ]
+      },
+      "G4A.4": {
+        "default": [
+          "sprout_blocked_max_nodes",
+          "max_eval_kt_regret",
+          "mean_eval_kt_regret",
+          "p95_eval_kt_regret"
+        ]
+      },
+      "G4A.5": {
+        "default": [
+          "sprout_blocked_max_nodes",
+          "max_spurious_survival_segments",
+          "median_spurious_survival_segments",
+          "max_wrongful_excisions",
+          "pl_excision_rate",
+          "pl_spurious_extinction_rate"
+        ]
+      },
+      "G4A.6": {
+        "default": [
+          "sprout_blocked_max_nodes",
+          "max_wrongful_excisions",
+          "max_port_locks_lost"
+        ]
       }
     }
   }

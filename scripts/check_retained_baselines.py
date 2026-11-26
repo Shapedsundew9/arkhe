@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mechanical gate for Arkhe retained baselines (golden_traces, verify-m2a, verify-m2b)."""
+"""Mechanical gate for Arkhe retained baselines (golden_traces, verify-m2a, verify-m2b, verify-m4a)."""
 
 from __future__ import annotations
 
@@ -880,6 +880,171 @@ def _validate_provenance(
                 )
 
 
+def _validate_h6_decision(
+    h6: Any,
+    errors: list[str],
+) -> tuple[str | None, dict[str, Any] | None]:
+    ctx = "m4a.h6_decision"
+    if not isinstance(h6, dict):
+        errors.append(f"{ctx}: must be a dict, got {type(h6).__name__}")
+        return None, None
+
+    if h6.get("gate") != "G4A.7":
+        errors.append(f"{ctx}: gate must be 'G4A.7', got {h6.get('gate')!r}")
+
+    active_cnt = h6.get("active_task_count")
+    if not _is_real_int(active_cnt) or active_cnt <= 0:
+        errors.append(f"{ctx}: active_task_count must be int > 0, got {active_cnt!r}")
+        active_cnt = None
+
+    obs_cnt = h6.get("total_paired_observations")
+    if not _is_real_int(obs_cnt) or obs_cnt <= 0:
+        errors.append(f"{ctx}: total_paired_observations must be int > 0, got {obs_cnt!r}")
+
+    margin_raw = h6.get("equivalence_margin_bits")
+    if not _is_finite_number(margin_raw) or float(margin_raw) <= 0.0:
+        errors.append(f"{ctx}: equivalence_margin_bits must be finite > 0, got {margin_raw!r}")
+        margin = None
+    else:
+        margin = float(margin_raw)
+
+    delta_raw = h6.get("delta_6_sb_minus_sa_l_epi_bits")
+    if not _is_finite_number(delta_raw):
+        errors.append(f"{ctx}: delta_6_sb_minus_sa_l_epi_bits must be finite, got {delta_raw!r}")
+        delta_6 = None
+    else:
+        delta_6 = float(delta_raw)
+
+    decision = h6.get("decision")
+    canon_arm = h6.get("canonical_arm")
+    if decision not in ("SaSuperiorDropReplay", "SaEquivalentDropReplay", "SbSuperiorRetainReplay"):
+        errors.append(f"{ctx}: invalid H6 decision {decision!r}")
+    if canon_arm not in ("Sa", "Sb"):
+        errors.append(f"{ctx}: canonical_arm must be 'Sa' or 'Sb', got {canon_arm!r}")
+        canon_arm = None
+
+    if margin is not None and delta_6 is not None and canon_arm is not None:
+        if delta_6 > margin:
+            exp_dec, exp_arm = "SaSuperiorDropReplay", "Sa"
+        elif delta_6 < -margin:
+            exp_dec, exp_arm = "SbSuperiorRetainReplay", "Sb"
+        else:
+            exp_dec, exp_arm = "SaEquivalentDropReplay", "Sa"
+        if decision != exp_dec or canon_arm != exp_arm:
+            errors.append(
+                f"{ctx}: (decision={decision!r}, canonical_arm={canon_arm!r}) inconsistent with "
+                f"delta_6={delta_6} and margin={margin} (expected {exp_dec!r}, {exp_arm!r})"
+            )
+
+    if h6.get("canonical_arm_passed_all_gates") is not True:
+        errors.append(
+            f"{ctx}: canonical_arm_passed_all_gates must be True, got "
+            f"{h6.get('canonical_arm_passed_all_gates')!r}"
+        )
+
+    per_task = h6.get("per_task")
+    if not isinstance(per_task, list) or len(per_task) == 0:
+        errors.append(f"{ctx}: per_task must be a non-empty list")
+    else:
+        if active_cnt is not None and len(per_task) != active_cnt:
+            errors.append(
+                f"{ctx}: len(per_task) ({len(per_task)}) != active_task_count ({active_cnt})"
+            )
+        for idx, row in enumerate(per_task):
+            rctx = f"{ctx}.per_task[{idx}]"
+            if not isinstance(row, dict):
+                errors.append(f"{rctx}: must be a dict")
+                continue
+            if not isinstance(row.get("task_id"), str) or not row["task_id"]:
+                errors.append(f"{rctx}: task_id must be a non-empty str")
+            cnt = row.get("count")
+            if not _is_real_int(cnt) or cnt <= 0:
+                errors.append(f"{rctx}: count must be int > 0, got {cnt!r}")
+            for num_key in (
+                "mean_delta_6_sb_minus_sa_l_epi_bits",
+                "median_delta_6_bits",
+                "min_delta_6_bits",
+                "max_delta_6_bits",
+                "sa_mean_l_epi_advantage_bits",
+                "sb_mean_l_epi_advantage_bits",
+            ):
+                if not _is_finite_number(row.get(num_key)):
+                    errors.append(f"{rctx}: {num_key} must be finite, got {row.get(num_key)!r}")
+
+    return canon_arm, {
+        "gate": h6.get("gate"),
+        "decision": decision,
+        "canonical_arm": canon_arm,
+        "delta_6_sb_minus_sa_l_epi_bits": delta_6,
+        "active_task_count": active_cnt,
+        "total_paired_observations": obs_cnt,
+        "canonical_arm_passed_all_gates": h6.get("canonical_arm_passed_all_gates"),
+    }
+
+
+def _validate_arm_audit(
+    audit: Any,
+    audit_key: str,
+    suite_name: str,
+    gate_name: str,
+    is_canonical: bool,
+    max_excluded: int,
+    reqs: dict[str, Any],
+    enforce_pooled_cp: bool,
+    required_tail_metrics: dict[str, Any] | None,
+    errors: list[str],
+) -> None:
+    ctx = f"{suite_name}.{gate_name}.{audit_key}"
+    if not isinstance(audit, dict):
+        errors.append(f"{ctx}: must be a dict")
+        return
+
+    expected_arm = "Sa" if audit_key == "sa_audit" else "Sb"
+    if audit.get("arm") != expected_arm:
+        errors.append(f"{ctx}: arm must be {expected_arm!r}, got {audit.get('arm')!r}")
+
+    arm_excluded = audit.get("excluded_cases")
+    if not _is_real_int(arm_excluded) or arm_excluded < 0 or arm_excluded > max_excluded:
+        errors.append(
+            f"{ctx}: excluded_cases must be int in [0, {max_excluded}], got {arm_excluded!r}"
+        )
+
+    if is_canonical:
+        for flag in ("passed", "stratified_passed", "bonferroni_half_passed", "tail_checks_passed"):
+            if audit.get(flag) is not True:
+                errors.append(f"{ctx}: canonical arm {flag} must be True, got {audit.get(flag)!r}")
+
+    stratified = audit.get("stratified")
+    if not isinstance(stratified, dict):
+        errors.append(f"{ctx}: stratified must be a dict")
+        return
+
+    present_strata = [
+        key for key in ("clean", "noisy") if key in stratified and stratified[key] is not None
+    ]
+    if not present_strata:
+        errors.append(f"{ctx}: stratified must have at least one non-null stratum")
+        return
+
+    min_tails = int(reqs.get("min_tail_metrics_per_task", 1))
+    req_strat = bool(reqs["require_stratified_passed"]) and is_canonical
+    req_task = bool(reqs["require_per_task_passed"]) and is_canonical
+    for stratum_name in present_strata:
+        _validate_stratum(
+            stratum=stratified[stratum_name],
+            stratum_name=stratum_name,
+            suite_name=suite_name,
+            gate_name=gate_name,
+            enforce_pooled_cp=enforce_pooled_cp,
+            require_stratified_passed=req_strat,
+            require_per_task_passed=req_task,
+            require_finite_tail_metrics=reqs["require_finite_tail_metrics"],
+            min_tail_metrics_per_task=min_tails,
+            required_tail_metrics=required_tail_metrics if is_canonical else None,
+            errors=errors,
+        )
+
+
 def validate_suite_report(
     suite_name: str,
     report: Any,
@@ -889,8 +1054,10 @@ def validate_suite_report(
     enforce_pooled_cp: bool = True,
     expected_provenance: dict[str, Any] | None = None,
     required_tail_metrics: dict[str, Any] | None = None,
+    require_overall_passed: bool = False,
+    require_h6_decision: bool = False,
 ) -> dict[str, Any]:
-    """Validate a verify-m2a or verify-m2b JSON report against strict gate invariants."""
+    """Validate a verify-m2a, verify-m2b, or verify-m4a JSON report against strict gate invariants."""
     reqs: dict[str, Any] = {
         "require_all_passed": True,
         "max_excluded_cases": 0,
@@ -910,6 +1077,11 @@ def validate_suite_report(
     if reqs["require_all_passed"] and report.get("all_passed") is not True:
         errors.append(
             f"{suite_name}: top-level all_passed must be True, got {report.get('all_passed')!r}"
+        )
+
+    if require_overall_passed and report.get("overall_passed") is not True:
+        errors.append(
+            f"{suite_name}: top-level overall_passed must be True, got {report.get('overall_passed')!r}"
         )
 
     excluded_cases = report.get("excluded_cases")
@@ -967,6 +1139,11 @@ def validate_suite_report(
         if missing_gates:
             errors.append(f"{suite_name}: missing expected gates: {missing_gates}")
 
+    canonical_arm: str | None = None
+    h6_summary: dict[str, Any] | None = None
+    if require_h6_decision:
+        canonical_arm, h6_summary = _validate_h6_decision(report.get("h6_decision"), errors)
+
     min_tails = int(reqs.get("min_tail_metrics_per_task", 1))
     gate_summaries: list[dict[str, Any]] = []
     for gate_name, gate_entry in gates_by_name.items():
@@ -1019,6 +1196,27 @@ def validate_suite_report(
                         errors=errors,
                     )
 
+        if require_h6_decision and gate_name not in ("G4A.1", "G4A.2"):
+            canon_audit_key = "sa_audit" if canonical_arm == "Sa" else "sb_audit"
+            if canonical_arm is not None and canon_audit_key not in gate_entry:
+                errors.append(
+                    f"{suite_name}.{gate_name}: missing canonical arm audit {canon_audit_key!r}"
+                )
+            for audit_key, arm_label in (("sa_audit", "Sa"), ("sb_audit", "Sb")):
+                if audit_key in gate_entry and gate_entry[audit_key] is not None:
+                    _validate_arm_audit(
+                        audit=gate_entry[audit_key],
+                        audit_key=audit_key,
+                        suite_name=suite_name,
+                        gate_name=gate_name,
+                        is_canonical=(canonical_arm == arm_label),
+                        max_excluded=max_excluded,
+                        reqs=reqs,
+                        enforce_pooled_cp=enforce_pooled_cp,
+                        required_tail_metrics=required_tail_metrics,
+                        errors=errors,
+                    )
+
         gate_summaries.append(
             {
                 "gate": gate_name,
@@ -1045,7 +1243,7 @@ def validate_suite_report(
             if key in provenance:
                 prov_summary[key] = provenance[key]
 
-    return {
+    result = {
         "suite": suite_name,
         "passed": True,
         "excluded_cases": excluded_cases,
@@ -1053,6 +1251,9 @@ def validate_suite_report(
         "provenance": prov_summary,
         "gates": gate_summaries,
     }
+    if h6_summary is not None:
+        result["h6_decision"] = h6_summary
+    return result
 
 
 def load_manifest(manifest_path: Path) -> dict[str, Any]:
@@ -1097,7 +1298,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--suite",
-        choices=("all", "m2a", "m2b"),
+        choices=("all", "m2a", "m2b", "m4a"),
         default="all",
         help="Suite(s) to run and validate (default: all)",
     )
@@ -1490,10 +1691,159 @@ def _make_valid_m2b_report(git_dirty: bool = False) -> dict[str, Any]:
     }
 
 
+def _make_valid_m4a_report(
+    git_dirty: bool = False,
+    sb_fails_g4a5: bool = True,
+) -> dict[str, Any]:
+    g1_tails = {
+        "sprout_blocked_max_nodes": 0.0,
+        "max_epistemic_mdl_err": 1e-13,
+        "max_compute_ledger_diff": 0.0,
+        "max_node_eval_ratio_sleep_over_wake": 1.0,
+    }
+    g2_tails = {
+        "sprout_blocked_max_nodes": 0.0,
+        "max_i2_violations": 0.0,
+        "max_i6_violations": 0.0,
+        "max_i7_violations": 0.0,
+    }
+    g3_tails = {
+        "sprout_blocked_max_nodes": 0.0,
+        "mean_l_epi_advantage": 95.0,
+        "median_l_epi_advantage": 88.0,
+        "min_l_epi_advantage": -20.0,
+        "p05_l_epi_advantage": 5.0,
+        "max_wrongful_excisions": 0.0,
+        "max_port_locks_lost": 0.0,
+    }
+    g4_tails = {
+        "sprout_blocked_max_nodes": 0.0,
+        "max_eval_kt_regret": 0.0,
+        "mean_eval_kt_regret": 0.0,
+        "p95_eval_kt_regret": 0.0,
+    }
+    g5_tails = {
+        "sprout_blocked_max_nodes": 0.0,
+        "max_spurious_survival_segments": 0.0,
+        "median_spurious_survival_segments": 0.0,
+        "max_wrongful_excisions": 0.0,
+        "pl_excision_rate": 1.0,
+        "pl_spurious_extinction_rate": 1.0,
+    }
+    g6_tails = {
+        "sprout_blocked_max_nodes": 0.0,
+        "max_wrongful_excisions": 0.0,
+        "max_port_locks_lost": 0.0,
+    }
+
+    def arm_audit(arm: str, gate: str, clean_strat: dict[str, Any] | None, noisy_strat: dict[str, Any] | None, ok: bool = True) -> dict[str, Any]:
+        strat: dict[str, Any] = {"passed": ok}
+        if clean_strat is not None:
+            strat["clean"] = clean_strat
+        if noisy_strat is not None:
+            strat["noisy"] = noisy_strat
+        return {
+            "arm": arm,
+            "passed": ok,
+            "stratified_passed": ok,
+            "bonferroni_half_alpha": 0.00125 if gate in ("G4A.3", "G4A.5") else None,
+            "bonferroni_half_passed": ok,
+            "tail_checks_passed": ok,
+            "excluded_cases": 0,
+            "stratified": strat,
+        }
+
+    gates = []
+    for gn, tails in (("G4A.1", g1_tails), ("G4A.2", g2_tails)):
+        ct = [_make_task(f"{gn}:CT:clean", regime="clean", target_rate=1.0, task_count=1, tail_metrics=dict(tails))]
+        nt = [_make_task(f"{gn}:CT:noisy", regime="noisy", target_rate=1.0, task_count=1, tail_metrics=dict(tails))]
+        gates.append({
+            "gate": gn,
+            "passed": True,
+            "excluded_cases": 0,
+            "stratified": {
+                "passed": True,
+                "clean": _make_stratum(ct, regime="clean", passed=True, target_rate=1.0),
+                "noisy": _make_stratum(nt, regime="noisy", passed=True, target_rate=1.0),
+            },
+        })
+
+    g3_nt = [_make_task("SP:MV_Periodic:k1:noisy", regime="noisy", successes=90, trials=100, target_rate=0.55, task_count=1, tail_metrics=dict(g3_tails))]
+    g3_noisy = _make_stratum(g3_nt, regime="noisy", passed=True, target_rate=0.55)
+    gates.append({
+        "gate": "G4A.3",
+        "passed": True,
+        "excluded_cases": 0,
+        "stratified": {"passed": True, "noisy": copy.deepcopy(g3_noisy)},
+        "sa_audit": arm_audit("Sa", "G4A.3", None, copy.deepcopy(g3_noisy), ok=True),
+        "sb_audit": arm_audit("Sb", "G4A.3", None, copy.deepcopy(g3_noisy), ok=True),
+    })
+
+    for gn, n_target, tails in (("G4A.4", 0.85, g4_tails), ("G4A.5", 0.75, g5_tails), ("G4A.6", 0.90, g6_tails)):
+        ct = [_make_task(f"{gn}:Clean", regime="clean", successes=100, trials=100, target_rate=1.0, task_count=1, tail_metrics=dict(tails))]
+        nt = [_make_task(f"{gn}:Noisy", regime="noisy", successes=98, trials=100, target_rate=n_target, task_count=1, tail_metrics=dict(tails))]
+        cs = _make_stratum(ct, regime="clean", passed=True, target_rate=1.0)
+        ns = _make_stratum(nt, regime="noisy", passed=True, target_rate=n_target)
+        if gn == "G4A.5" and sb_fails_g4a5:
+            sb_nt = [_make_task("PL:PL2:k2:noisy", regime="noisy", successes=50, trials=100, target_rate=0.75, task_count=1, tail_metrics=dict(tails))]
+            sb_ns = _make_stratum(sb_nt, regime="noisy", passed=False, target_rate=0.75, pooled_mb=_make_multi_bank(50, 100, target_rate=0.75))
+            sb_aud = arm_audit("Sb", gn, copy.deepcopy(cs), sb_ns, ok=False)
+        else:
+            sb_aud = arm_audit("Sb", gn, copy.deepcopy(cs), copy.deepcopy(ns), ok=True)
+        gates.append({
+            "gate": gn,
+            "passed": True,
+            "excluded_cases": 0,
+            "stratified": {"passed": True, "clean": copy.deepcopy(cs), "noisy": copy.deepcopy(ns)},
+            "sa_audit": arm_audit("Sa", gn, copy.deepcopy(cs), copy.deepcopy(ns), ok=True),
+            "sb_audit": sb_aud,
+        })
+
+    return {
+        "provenance": {
+            "git_commit_sha": _SELF_TEST_PROV_A["git_commit_sha"],
+            "git_dirty": git_dirty,
+            "source_tree_fnv1a128": _SELF_TEST_PROV_A["source_tree_fnv1a128"],
+            "cargo_lock_fnv1a128": _SELF_TEST_PROV_A["cargo_lock_fnv1a128"],
+            "package_version": "0.1.0",
+            "rustc_version": "rustc 1.99.1",
+            "target_triple": "x86_64-unknown-linux-gnu",
+        },
+        "all_passed": True,
+        "overall_passed": True,
+        "excluded_cases": 0,
+        "cliff_counters": {"sprout_blocked_max_nodes": 0},
+        "gates": gates,
+        "h6_decision": {
+            "gate": "G4A.7",
+            "active_task_count": 1,
+            "total_paired_observations": 100,
+            "equivalence_margin_bits": 10.0,
+            "delta_6_sb_minus_sa_l_epi_bits": 14.61,
+            "decision": "SaSuperiorDropReplay",
+            "canonical_arm": "Sa",
+            "canonical_arm_passed_all_gates": True,
+            "per_task": [
+                {
+                    "task_id": "PL:PL2_RareContext:k2:noisy",
+                    "count": 100,
+                    "mean_delta_6_sb_minus_sa_l_epi_bits": 14.61,
+                    "median_delta_6_bits": 12.0,
+                    "min_delta_6_bits": -5.0,
+                    "max_delta_6_bits": 200.0,
+                    "sa_mean_l_epi_advantage_bits": 640.0,
+                    "sb_mean_l_epi_advantage_bits": 495.0,
+                }
+            ],
+        },
+    }
+
+
 def run_self_test() -> int:
     """Execute built-in adversarial validation and CLI guard tests."""
     m2a_gates = ["G2A.1", "G2A.2", "G2A.3", "G2A.4", "G2A.5"]
     m2b_gates = ["G2B.1", "G2B.2", "G2B.3", "G2B.4", "G2B.5"]
+    m4a_gates = ["G4A.1", "G4A.2", "G4A.3", "G4A.4", "G4A.5", "G4A.6"]
     checks: list[tuple[str, bool, str]] = []
 
     manifest_req_tails = (
@@ -2025,6 +2375,73 @@ def run_self_test() -> int:
 
     expect_pass("9b. main() rejects --require-clean --fast with exit != 0", test_main_cli_guard)
 
+    # 10. M4a schema, G4A.7 (H6), canonical arm audit, and tail checks
+    expect_pass(
+        "10a. valid m4a (S-B fails G4A.5 while canonical S-A passes, require_clean=True)",
+        lambda: validate_suite_report(
+            "m4a",
+            _make_valid_m4a_report(git_dirty=False, sb_fails_g4a5=True),
+            m4a_gates,
+            True,
+            expected_provenance=_SELF_TEST_PROV_A,
+            required_tail_metrics=manifest_req_tails,
+            require_overall_passed=True,
+            require_h6_decision=True,
+        ),
+    )
+
+    def m4a_overall_false() -> dict[str, Any]:
+        rep = _make_valid_m4a_report()
+        rep["overall_passed"] = False
+        return rep
+
+    def m4a_bad_h6() -> dict[str, Any]:
+        rep = _make_valid_m4a_report()
+        rep["h6_decision"]["canonical_arm_passed_all_gates"] = False
+        return rep
+
+    def m4a_canonical_sa_failed() -> dict[str, Any]:
+        rep = _make_valid_m4a_report()
+        rep["gates"][4]["sa_audit"]["passed"] = False
+        return rep
+
+    def m4a_missing_tail() -> dict[str, Any]:
+        rep = _make_valid_m4a_report()
+        del rep["gates"][2]["stratified"]["noisy"]["tasks"][0]["tail_metrics"]["mean_l_epi_advantage"]
+        return rep
+
+    expect_reject(
+        "10b. m4a overall_passed=False rejected",
+        lambda: validate_suite_report(
+            "m4a", m4a_overall_false(), m4a_gates, False, require_overall_passed=True, require_h6_decision=True
+        ),
+    )
+    expect_reject(
+        "10c. m4a canonical_arm_passed_all_gates=False rejected",
+        lambda: validate_suite_report(
+            "m4a", m4a_bad_h6(), m4a_gates, False, require_overall_passed=True, require_h6_decision=True
+        ),
+    )
+    expect_reject(
+        "10d. m4a canonical S-A audit passed=False rejected",
+        lambda: validate_suite_report(
+            "m4a", m4a_canonical_sa_failed(), m4a_gates, False, require_overall_passed=True, require_h6_decision=True
+        ),
+    )
+    if manifest_req_tails is not None:
+        expect_reject(
+            "10e. m4a missing G4A.3 required tail metric rejected",
+            lambda: validate_suite_report(
+                "m4a",
+                m4a_missing_tail(),
+                m4a_gates,
+                False,
+                required_tail_metrics=manifest_req_tails,
+                require_overall_passed=True,
+                require_h6_decision=True,
+            ),
+        )
+
     passed_count = sum(1 for _, ok, _ in checks if ok)
     total_count = len(checks)
     for name, ok, detail in checks:
@@ -2131,7 +2548,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {msg}", file=sys.stderr)
         return 1
 
-    selected_suites = ["m2a", "m2b"] if args.suite == "all" else [args.suite]
+    selected_suites = list(manifest["suites"].keys()) if args.suite == "all" else [args.suite]
     requirements = manifest.get("requirements", {})
     required_tail_metrics = manifest.get("required_tail_metrics")
     all_suites_ok = True
@@ -2175,6 +2592,8 @@ def main(argv: list[str] | None = None) -> int:
                 enforce_pooled_cp=enforce_pooled_cp,
                 expected_provenance=live_prov,
                 required_tail_metrics=required_tail_metrics,
+                require_overall_passed=bool(suite_cfg.get("require_overall_passed", False)),
+                require_h6_decision=bool(suite_cfg.get("require_h6_decision", False)),
             )
             verdict["suites"][suite_name] = suite_summary
             print(f"[PASS] {suite_name} ({len(suite_summary['gates'])} gates validated)")

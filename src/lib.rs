@@ -120,7 +120,7 @@ pub enum Commands {
         /// Number of consecutive seed banks to score.
         #[arg(long, default_value_t = 1)]
         banks: usize,
-        /// Single-shot M4a holdout override (`60000..=60099`; requires S3 authorization; prior holdouts stay blocked).
+        /// Pre-registered M4a holdout range (`60000..=60099` consumed once at 0f62e2f under S3 #65 and permanently closed alongside prior holdouts).
         #[arg(long, alias = "allow-holdout", default_value_t = false)]
         holdout: bool,
         /// Optional worker thread count (defaults to `std::thread::available_parallelism()`).

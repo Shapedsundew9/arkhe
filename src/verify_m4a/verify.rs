@@ -6,9 +6,9 @@
 //! `tail_metrics`, and emits the `G4A.7` (`H6`) pre-registered arm-selection decision.
 //!
 //! Prior holdout banks (`10000..=10019`, `30000..=30019`, `40000..=40019`, `50000..=50019`,
-//! `50100..=50199`) remain unconditionally closed (`allow_with_flag: false`), while the M4a
-//! single-shot holdout bank (`60000..=60099`) is blocked unless `--holdout` (`allow_with_flag:
-//! true`) is explicitly passed after `S3` authorization.
+//! `50100..=50199`) and the consumed M4a single-shot holdout bank (`60000..=60099`, consumed once
+//! at `0f62e2f` under S3 `#65`) remain permanently and unconditionally closed
+//! (`allow_with_flag: false`), rejected even when `--holdout` is passed.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -87,61 +87,18 @@ pub const G4A6_NOISY_TARGET_RATE: f64 = 0.90;
 /// Pre-registered `H6` equivalence margin (`G4A.7`, bits).
 pub const G4A7_EQUIVALENCE_MARGIN_BITS: f64 = 10.0;
 
-/// Holdout isolation table specific to `arkhe verify-m4a`.
+/// Holdout isolation table shared with `arkhe verify-m4a`.
 ///
-/// Consumed prior holdouts stay permanently closed (`allow_with_flag: false`), while the M4a
-/// single-shot holdout (`60000..=60099`) requires `--holdout` (`allow_with_flag: true`).
-pub const VERIFY_M4A_HOLDOUT_BANKS: &[HoldoutRangeSpec] = &[
-    HoldoutRangeSpec {
-        label: "M1",
-        start: 10_000,
-        end_inclusive: 10_019,
-        allow_with_flag: false,
-        status_note: "permanently closed",
-    },
-    HoldoutRangeSpec {
-        label: "M2a",
-        start: 30_000,
-        end_inclusive: 30_019,
-        allow_with_flag: false,
-        status_note: "consumed at aa6fb6d; permanently closed",
-    },
-    HoldoutRangeSpec {
-        label: "M2b",
-        start: 40_000,
-        end_inclusive: 40_019,
-        allow_with_flag: false,
-        status_note: "consumed at b211afa; permanently closed",
-    },
-    HoldoutRangeSpec {
-        label: "M3",
-        start: 50_000,
-        end_inclusive: 50_019,
-        allow_with_flag: false,
-        status_note: "consumed at dd13839; permanently closed",
-    },
-    HoldoutRangeSpec {
-        label: "M3_v2",
-        start: 50_100,
-        end_inclusive: 50_199,
-        allow_with_flag: false,
-        status_note: "consumed at 2b62140; permanently closed",
-    },
-    HoldoutRangeSpec {
-        label: "M4a",
-        start: 60_000,
-        end_inclusive: 60_099,
-        allow_with_flag: true,
-        status_note: "pre-registered single-shot M4a holdout; gated behind S3 --holdout",
-    },
-];
+/// All consumed holdouts—including M4a (`60000..=60099`, consumed once at `0f62e2f` under
+/// `S3` `#65`)—are permanently and unconditionally closed (`allow_with_flag: false`).
+pub const VERIFY_M4A_HOLDOUT_BANKS: &[HoldoutRangeSpec] = crate::stats::HOLDOUT_BANKS;
 
-/// Guards `verify-m4a` runs against consumed prior holdout banks and ungated M4a holdout access.
+/// Guards `verify-m4a` runs against all permanently closed milestone holdout banks (`M1`–`M4a`).
 ///
 /// # Errors
 ///
 /// Returns a descriptive refusal string when `[seed_offset, seed_offset + total_seeds)` overlaps
-/// any unconditionally closed bank or overlaps `60000..=60099` without `allow_holdout == true`.
+/// any unconditionally closed bank (including `60000..=60099`), even when `allow_holdout == true`.
 pub fn check_m4a_seed_range_holdout(
     seed_offset: u64,
     total_seeds: u64,
@@ -1568,8 +1525,8 @@ fn evaluate_all_gates_from_results(
 ///
 /// # Errors
 ///
-/// Returns an error if `banks == 0`, `banks * seeds` overflows, or the seed range overlaps a
-/// closed prior holdout bank or the M4a single-shot holdout (`60000..=60099`) without `--holdout`.
+/// Returns an error if `banks == 0`, `banks * seeds` overflows, or the seed range overlaps any
+/// permanently closed holdout bank (including M4a `60000..=60099`, even with `--holdout`).
 pub fn run_m4a_verification(
     seed_offset: u64,
     seeds: usize,
@@ -1789,26 +1746,33 @@ mod tests {
     }
 
     #[test]
-    fn verify_m4a_holdout_guard_enforces_s3_only_on_m4a_and_closes_prior_ranges() {
-        for prior in [10_000u64, 30_000, 40_000, 50_000, 50_100] {
+    fn verify_m4a_holdout_guard_unconditionally_closes_m4a_and_prior_ranges() {
+        for closed in [10_000u64, 30_000, 40_000, 50_000, 50_100, 60_000] {
             for allow in [false, true] {
-                assert!(check_m4a_seed_range_holdout(prior, 20, allow).is_err());
-                assert!(check_m4a_seed_range_holdout(prior + 10, 1, allow).is_err());
-                assert!(check_m4a_seed_range_holdout(prior - 5, 10, allow).is_err());
-                assert!(check_m4a_seed_range_holdout(prior, 0, allow).is_err());
+                assert!(check_m4a_seed_range_holdout(closed, 20, allow).is_err());
+                assert!(check_m4a_seed_range_holdout(closed + 10, 1, allow).is_err());
+                assert!(check_m4a_seed_range_holdout(closed - 5, 10, allow).is_err());
+                assert!(check_m4a_seed_range_holdout(closed, 0, allow).is_err());
             }
         }
 
+        // Consumed M4a holdout 60_000..=60_099 is unconditionally rejected even when allow_holdout=true.
         for interior in [60_000u64, 60_050, 60_099] {
-            assert!(check_m4a_seed_range_holdout(interior, 1, false).is_err());
-            assert!(check_m4a_seed_range_holdout(interior, 1, true).is_ok());
+            for allow in [false, true] {
+                let err = check_m4a_seed_range_holdout(interior, 1, allow).unwrap_err();
+                assert!(err.contains("60000..=60099"));
+                assert!(
+                    err.contains("consumed once at 0f62e2f under S3 #65 and permanently closed")
+                );
+                assert!(err.contains("unconditionally forbidden under verify-m4a"));
+            }
         }
         assert!(check_m4a_seed_range_holdout(59_920, 100, false).is_err());
-        assert!(check_m4a_seed_range_holdout(59_920, 100, true).is_ok());
-        assert!(check_m4a_seed_range_holdout(60_000, 0, false).is_err());
+        assert!(check_m4a_seed_range_holdout(59_920, 100, true).is_err());
 
         for safe in [(0u64, 20), (520, 200), (20_200, 100)] {
             assert!(check_m4a_seed_range_holdout(safe.0, safe.1, false).is_ok());
+            assert!(check_m4a_seed_range_holdout(safe.0, safe.1, true).is_ok());
         }
     }
 

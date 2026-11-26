@@ -46,6 +46,23 @@ fn all_holdout_guards_share_closed_boundaries_and_status() {
                 assert!(check(end, 1, allow).is_err());
             }
         }
+        for allow in [false, true] {
+            assert!(
+                arkhe::verify_m4a::check_m4a_seed_range_holdout(u64::from(start - 1), 1, allow)
+                    .is_ok()
+            );
+            assert!(
+                arkhe::verify_m4a::check_m4a_seed_range_holdout(u64::from(end + 1), 1, allow)
+                    .is_ok()
+            );
+            assert!(
+                arkhe::verify_m4a::check_m4a_seed_range_holdout(u64::from(start - 1), 2, allow)
+                    .is_err()
+            );
+            assert!(
+                arkhe::verify_m4a::check_m4a_seed_range_holdout(u64::from(end), 1, allow).is_err()
+            );
+        }
         assert!(arkhe::verify_m3::check_explore_m3_seed_range_holdout(start.into(), 1).is_err());
         assert!(arkhe::verify_m3::check_explore_m3_seed_range_holdout(end.into(), 1).is_err());
         assert!(arkhe::verify_m4a::check_explore_m4a_seed_range_holdout(start.into(), 1).is_err());
@@ -58,8 +75,12 @@ fn all_holdout_guards_share_closed_boundaries_and_status() {
         let error = check(50_100, 1, true).unwrap_err();
         assert!(error.contains("consumed at 2b62140; permanently closed"));
         let error = check(60_099, 1, true).unwrap_err();
-        assert!(error.contains("reserved for M4a"));
+        assert!(error.contains("consumed once at 0f62e2f under S3 #65 and permanently closed"));
     }
+    let m4a_err_m3 = arkhe::verify_m4a::check_m4a_seed_range_holdout(50_100, 1, true).unwrap_err();
+    assert!(m4a_err_m3.contains("consumed at 2b62140; permanently closed"));
+    let m4a_err_m4a = arkhe::verify_m4a::check_m4a_seed_range_holdout(60_099, 1, true).unwrap_err();
+    assert!(m4a_err_m4a.contains("consumed once at 0f62e2f under S3 #65 and permanently closed"));
 }
 
 #[test]
@@ -359,8 +380,8 @@ fn cli_explore_m4a_refuses_confirmation_and_holdout_ranges() {
 
 #[test]
 fn cli_verify_m4a_refuses_holdout_ranges() {
-    // 1. All 5 prior consumed holdouts (10000, 30000, 40000, 50000, 50100) AND reserved M4a
-    //    (60000..=60099) are refused without --holdout.
+    // 1. All 5 prior consumed holdouts (10000, 30000, 40000, 50000, 50100) AND consumed M4a
+    //    (60000..=60099) are unconditionally refused without --holdout.
     for seed_offset in [
         "10000", "30000", "40000", "50000", "50100", "50150", "60000", "60050", "60099",
     ] {
@@ -374,14 +395,16 @@ fn cli_verify_m4a_refuses_holdout_ranges() {
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("overlaps pre-registered") && stderr.contains("holdout range"),
-            "stderr for verify-m4a seed_offset={seed_offset} must cite holdout refusal, got: {stderr}"
+            stderr.contains("overlaps pre-registered")
+                && stderr.contains("holdout range")
+                && stderr.contains("unconditionally forbidden under verify-m4a"),
+            "stderr for verify-m4a seed_offset={seed_offset} must cite unconditional holdout refusal, got: {stderr}"
         );
     }
 
-    // 2. All 5 prior consumed holdout ranges MUST be refused EVEN WITH --holdout!
+    // 2. All 6 consumed holdout ranges (including M4a 60000..=60099) MUST be refused EVEN WITH --holdout!
     for seed_offset in [
-        "10000", "30000", "40000", "50000", "50100", "50150", "50199",
+        "10000", "30000", "40000", "50000", "50100", "50150", "50199", "60000", "60050", "60099",
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_arkhe"))
             .args([
@@ -393,22 +416,28 @@ fn cli_verify_m4a_refuses_holdout_ranges() {
                 "--holdout",
             ])
             .output()
-            .expect("spawn arkhe verify-m4a --holdout on prior closed holdout range");
+            .expect("spawn arkhe verify-m4a --holdout on permanently closed holdout range");
         assert!(
             !output.status.success(),
-            "verify-m4a --holdout must unconditionally refuse prior holdout seed_offset={seed_offset}"
+            "verify-m4a --holdout must unconditionally refuse closed holdout seed_offset={seed_offset}"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("unconditionally forbidden under verify-m4a"),
             "stderr for verify-m4a {seed_offset} --holdout must mention unconditional refusal, got: {stderr}"
         );
+        if seed_offset.starts_with("600") {
+            assert!(
+                stderr.contains("consumed once at 0f62e2f under S3 #65 and permanently closed"),
+                "stderr for verify-m4a {seed_offset} --holdout must cite M4a permanent closure, got: {stderr}"
+            );
+        }
     }
 
-    // 3. Multi-bank & boundary overlaps into 60000..=60099 without --holdout and into prior holdouts
-    //    even with --holdout must be refused.
-    let bank_m4a_no_flag = Command::new(env!("CARGO_BIN_EXE_arkhe"))
-        .args([
+    // 3. Multi-bank & boundary overlaps into permanently closed 60000..=60099 and 50100..=50199
+    //    must be unconditionally refused both without and with --holdout.
+    for extra_flag in [None, Some("--holdout"), Some("--allow-holdout")] {
+        let mut args = vec![
             "verify-m4a",
             "--banks",
             "5",
@@ -416,15 +445,22 @@ fn cli_verify_m4a_refuses_holdout_ranges() {
             "59920",
             "--seeds",
             "20",
-        ])
-        .output()
-        .expect("spawn arkhe verify-m4a overlapping M4a holdout without --holdout");
-    assert!(!bank_m4a_no_flag.status.success());
-    assert!(
-        String::from_utf8_lossy(&bank_m4a_no_flag.stderr).contains(
-            "overlaps pre-registered holdout range (M4a 60000..=60099) without --holdout"
-        )
-    );
+        ];
+        if let Some(flag) = extra_flag {
+            args.push(flag);
+        }
+        let bank_m4a = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+            .args(&args)
+            .output()
+            .expect("spawn arkhe verify-m4a overlapping closed M4a holdout");
+        assert!(!bank_m4a.status.success());
+        let stderr = String::from_utf8_lossy(&bank_m4a.stderr);
+        assert!(
+            stderr.contains("overlaps pre-registered holdout range (M4a 60000..=60099")
+                && stderr.contains("unconditionally forbidden under verify-m4a"),
+            "unexpected stderr for {args:?}: {stderr}"
+        );
+    }
 
     let bank_m3_with_flag = Command::new(env!("CARGO_BIN_EXE_arkhe"))
         .args([
@@ -445,31 +481,39 @@ fn cli_verify_m4a_refuses_holdout_ranges() {
             .contains("unconditionally forbidden under verify-m4a")
     );
 
-    // Zero-seed & alias --allow-holdout refusal check on M4a and prior closed ranges.
-    let zero_seeds_m4a = Command::new(env!("CARGO_BIN_EXE_arkhe"))
-        .args(["verify-m4a", "--seed-offset", "60000", "--seeds", "0"])
-        .output()
-        .expect("spawn arkhe verify-m4a --seeds 0 on M4a holdout");
-    assert!(!zero_seeds_m4a.status.success());
-    assert!(
-        String::from_utf8_lossy(&zero_seeds_m4a.stderr)
-            .contains("overlaps pre-registered holdout range")
-    );
+    // Zero-seed & alias --allow-holdout refusal check on permanently closed M4a and M3 v2 ranges.
+    for extra_flag in [None, Some("--holdout"), Some("--allow-holdout")] {
+        let mut args = vec!["verify-m4a", "--seed-offset", "60000", "--seeds", "0"];
+        if let Some(flag) = extra_flag {
+            args.push(flag);
+        }
+        let zero_seeds_m4a = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+            .args(&args)
+            .output()
+            .expect("spawn arkhe verify-m4a --seeds 0 on closed M4a holdout");
+        assert!(!zero_seeds_m4a.status.success());
+        assert!(
+            String::from_utf8_lossy(&zero_seeds_m4a.stderr)
+                .contains("unconditionally forbidden under verify-m4a")
+        );
+    }
 
-    let allow_holdout_m3 = Command::new(env!("CARGO_BIN_EXE_arkhe"))
-        .args([
-            "verify-m4a",
-            "--seed-offset",
-            "50100",
-            "--seeds",
-            "20",
-            "--allow-holdout",
-        ])
-        .output()
-        .expect("spawn arkhe verify-m4a --allow-holdout on M3 v2");
-    assert!(!allow_holdout_m3.status.success());
-    assert!(
-        String::from_utf8_lossy(&allow_holdout_m3.stderr)
-            .contains("unconditionally forbidden under verify-m4a")
-    );
+    for seed_offset in ["50100", "60000"] {
+        let allow_holdout = Command::new(env!("CARGO_BIN_EXE_arkhe"))
+            .args([
+                "verify-m4a",
+                "--seed-offset",
+                seed_offset,
+                "--seeds",
+                "20",
+                "--allow-holdout",
+            ])
+            .output()
+            .expect("spawn arkhe verify-m4a --allow-holdout on closed holdout");
+        assert!(!allow_holdout.status.success());
+        assert!(
+            String::from_utf8_lossy(&allow_holdout.stderr)
+                .contains("unconditionally forbidden under verify-m4a")
+        );
+    }
 }
