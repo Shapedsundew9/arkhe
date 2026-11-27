@@ -117,25 +117,36 @@ Read `.shared/ai/core/common-instructions.md`.
         tune thresholds. Consumed ranges (`10000..=10019`, `30000..=30019`, `40000..=40019`,
         `50000..=50019`) remain permanently and unconditionally closed (`allow_with_flag: false`)
         in CLI code (`HoldoutRangeSpec`).
-   - **Implementation Workers (`gemini-4-hydrogen-high` / `gemini-4-hydrogen-xhigh`, phase authors & `@verifier`):**
+   - **Implementation Workers (`gemini-4-hydrogen-high` default; `gemini-4-hydrogen-xhigh` reserved for mathematically complex core-engine phases; phase authors & per-phase `@verifier`):**
      Always spawned fresh (**never** `fork: "coordinator"`). Strictly bound to the parameters,
      formulas, file scope, and test specifications in their brief. Maximum **2 fix attempts** on any
      failing test; **never** weaken test assertions, alter generator parameters (`add_b`, `lag`,
      `Width`), mask or suppress guardrail counters (`SproutBlockedMaxNodes`,
-     `SproutBudgetExhausted`), or edit out-of-scope files to make a test pass. When escalating
-     (`@coordinator [escalation]` + `swarm_wait{mentions_only: true}`), the worker **must** present:
-     (i) the root cause or exact failing observation (file, line, metric), (ii) **2–3 concrete
-     options with trade-offs** aimed at an optimal or near-optimal solution, and (iii) whether any
-     guardrail/limit bound is due to substantively suboptimal learner/harness behavior vs. genuine
-     problem-class scale expansion.
+     `SproutBudgetExhausted`), or edit out-of-scope files to make a test pass. Use **CodeGraph-first**
+     navigation (`codegraph_explore` / `codegraph explore`) before reading large core files
+     (`learner.rs`, `growth.rs`, `surgery.rs`, `explore.rs`). Obey **line-1-only `@mention` hygiene**
+     (never write `@<member>` in message prose or backticks unless intentionally waking that agent
+     now) and keep board posts **`<= 3 KB`** (offloading long specs/tables to scratch or `docs/`
+     files). When receiving a `[quota]` warning with **`<= 12%` remaining** or a `[quota-pause]`
+     post, immediately finish the current atomic call, post `@coordinator [quota-checkpoint]`, and
+     sleep (`swarm_wait{mentions_only: true}`). When escalating (`@coordinator [escalation]` +
+     `swarm_wait{mentions_only: true}`), the worker **must** present: (i) the root cause or exact
+     failing observation (file, line, metric), (ii) **2–3 concrete options with trade-offs** aimed at
+     an optimal or near-optimal solution, and (iii) whether any guardrail/limit bound is due to
+     substantively suboptimal learner/harness behavior vs. genuine problem-class scale expansion.
    - **Operational Watchdog (`@monitor`, `gemini-4-hydrogen-high` with
      [`.agents/skills/arkhe-watchdog/SKILL.md`](../../.agents/skills/arkhe-watchdog/SKILL.md)):**
-     Parallel operational sidecar (not an escalation decision level). Wakes on a 10-minute timer
-     (`schedule`), uses a compact stateless delta check without dumping code or transcripts into its
-     context, verifies workers run on `gemini-4-hydrogen-*`, and halts any worker that exceeds 2
-     retries on a failure, weakens a test, masks a guardrail counter, edits out-of-scope files, or
-     runs an un-extrapolated multi-hour sweep (`W1`–`W6`), alerting Level 1 (`@coordinator`).
-   - **Level 1 Escalation — Senior Scientist Orchestrator (`Argon` `@coordinator` with
+     Parallel operational sidecar (not an escalation decision level). Delegates all polling to the
+     zero-token 90-second background watcher [`scripts/swarm_watchdog.py`](../../scripts/swarm_watchdog.py)
+     (`--watch`), never calling `read_board{since}` into its context or running a 10-minute LLM cron,
+     keeping its footprint `< 25K` tokens. Enforces **`W1`–`W9`**: catches non-Hydrogen worker model
+     leaks and mid-body `@mention` wakes (`W1`), halts workers hitting 2 edit+test failures on a
+     test (`W2`), catches unauthorized test/golden/holdout edits (`W3`) and guardrail masking (`W4`),
+     detects deadlocks (`W5`), flags runaway sweeps (`W6`), enforces machine-checked retained-baseline
+     evidence before `S3`/`S4` (`W7`), triggers **pre-emptive quota pause (`W8`) at `<= 15%`
+     remaining** (pausing its watcher during cooldown), and flags worker/verifier context bloat
+     (`W9`: compaction `#1` or `>= 300K` / verifier `>= 150K`).
+   - **Level 1 Escalation — Senior Scientist Orchestrator (`Carbon` / session orchestrator `@coordinator` with
      [`.agents/skills/arkhe-orchestrator/SKILL.md`](../../.agents/skills/arkhe-orchestrator/SKILL.md)):**
      The Orchestrator is the **Senior Scientist** for **intra-phase and intra-milestone execution**.
      It resolves **~80% of worker escalations directly in 1 turn** without waking the Chief
@@ -144,27 +155,34 @@ Read `.shared/ai/core/common-instructions.md`.
        *within* the active phase or milestone to make the problem tractable and achieve an optimal
        or near-optimal implementation, resolving implementation/harness bugs, granting cross-file
        edit permissions, and resetting the 2-strike counter.
+     - **Quota pause & lifecycle governance:** Freezes new spawns at **`<= 18%` quota**, coordinates
+       pre-emptive pause at **`<= 15%` quota** by arming `schedule{DurationSeconds: reset - now + 180, TimerCondition: "never"}` for unattended auto-resume, enforces clean-tree pre-flight before
+       Phase 1, uses fresh per-phase verifiers (or respawns at `>= 150K` context), lands sub-phase
+       checkpoints + fresh worker respawns on `W9` context bloat, delegates multi-step JSON analysis
+       to Hydrogen workers, enforces line-1-only `@mention` hygiene, and kills `@monitor` (and
+       `@chief-scientist`) immediately upon `[done]`.
      - **Anti-duplication rule:** When a worker has already identified the root cause and presented
        valid options within the active milestone's gates and parameters, `@coordinator` inspects at
        most the 1–2 cited code ranges, **makes the decision directly**, and sends the worker back.
-       Never re-run the worker's analysis or outsource phase-level decisions to `@chief-scientist`.
+       Never re-run the worker's analysis or outsource phase-level decisions to Chief Scientist.
      - **Limit & guardrail triage:** Bounds like `max_nodes` exist to flag pathology, not to be
        ground against or silenced. When a limit binds due to **substantively suboptimal worker or
        learner behavior** (e.g., sprouting on unpredictable exogenous driver channels, or running
        deep candidate searches on an already-locked port), `@coordinator` directs a correction to
        eliminate the suboptimal behavior while **maintaining the limit**.
-     - **When to escalate to Level 2 (`@chief-scientist`):** Escalate to `@chief-scientist` **only**
+     - **When to escalate to Level 2 (`@chief-scientist`):** Escalate to Chief Scientist **only**
        when: (a) every option has material disadvantages or cross-milestone fallout (`M3`–`M6`),
        (b) a limit/scaffolding constant is binding because the **class of problem genuinely expands
        the scale boundary**, (c) achieving Charter §§0–1 goals requires amending Charter §§2–3,
        recalibrating a pre-registered gate threshold, or splitting/re-ordering a milestone, or (d)
        dev and confirmation sweeps are complete and ready for single-shot holdout authorization
        (`S3`) or milestone closeout (`S4`).
-   - **Level 2 Escalation — Chief Scientist (`gemini-4-argon-high` with
+   - **Level 2 Escalation — Chief Scientist (`gemini-4-carbon-high` with
      [`.agents/skills/arkhe-chief-scientist/SKILL.md`](../../.agents/skills/arkhe-chief-scientist/SKILL.md)):**
      Always spawned fresh (**never** `fork: "coordinator"`), and **always** sleeps with
-     `swarm_wait{mentions_only: true}`. Acts as the **Foundational Stand-In for the User** across
-     the milestone roadmap (`M3`–`M6`):
+     `swarm_wait{mentions_only: true}`. Uses CodeGraph-first lookups, line-1-only `@mention` hygiene,
+     and `<= 3 KB` board summaries (offloading full Decision Record specs to files). Acts as the
+     **Foundational Stand-In for the User** across the milestone roadmap (`M3`–`M6`):
      - **Full authority over Charter §§2–3 amendments, parameters, derived laws, gates, holdouts,
        and milestone structure:** So long as the **Charter-Core Invariants (Charter §§0–1 & holdout
        isolation)** are preserved and no arbitrary magic-number tuning occurs, the Chief Scientist
