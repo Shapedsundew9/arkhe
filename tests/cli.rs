@@ -63,8 +63,6 @@ fn all_holdout_guards_share_closed_boundaries_and_status() {
                 arkhe::verify_m4a::check_m4a_seed_range_holdout(u64::from(end), 1, allow).is_err()
             );
         }
-        assert!(arkhe::verify_m3::check_explore_m3_seed_range_holdout(start.into(), 1).is_err());
-        assert!(arkhe::verify_m3::check_explore_m3_seed_range_holdout(end.into(), 1).is_err());
         assert!(arkhe::verify_m4a::check_explore_m4a_seed_range_holdout(start.into(), 1).is_err());
         assert!(arkhe::verify_m4a::check_explore_m4a_seed_range_holdout(end.into(), 1).is_err());
     }

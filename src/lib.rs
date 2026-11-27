@@ -6,7 +6,7 @@
 //! - [`substrate`]: Exact $\mathbb{Z}_{2^k}$ arithmetic, Level-0 primitives, §2.5 invariants, and evaluators.
 //! - [`structural`]: Coordinate-free graph morphogenesis, metabolic economy, sensitivity credit, and online learner.
 //! - [`env`]: Finite-state benchmark tiers (`T1`, `T2`, `T3b`, `T3c`), noise, exact $\varepsilon$-machines, and Reeds–Sloane synthesis.
-//! - [`metrics`]: Surprisal null models, Minimum Description Length ($L$), limit-cycle/basin inspection, and scorecards.
+//! - [`metrics`]: Surprisal null models, Minimum Description Length ($L$), and scorecards.
 //! - [`baselines`]: Compute-matched prequential baseline harness (`RandomSearch`, `CGP`, `CTW`, `CrossChannelCtw`, `Rnn`, `ReedsSloane`, `Exhaustive`).
 //! - [`config`]: Serializable TOML/JSON `ExperimentConfig` and `RunReport` execution.
 //! - [`stats`]: Reusable multi-bank pooled Clopper–Pearson and Cochran $\chi^2$/permutation homogeneity statistics.
@@ -147,18 +147,6 @@ pub enum Commands {
         /// Optional worker thread count (defaults to `std::thread::available_parallelism()`).
         #[arg(long)]
         threads: Option<usize>,
-    },
-    /// Run Milestone 3 exploratory and paired-ablation sweep on non-holdout development seeds.
-    ExploreM3 {
-        /// Starting master seed offset (`seed_offset .. seed_offset + seeds`).
-        #[arg(long, default_value_t = 0)]
-        seed_offset: u64,
-        /// Number of master seeds evaluated.
-        #[arg(long, default_value_t = 20)]
-        seeds: usize,
-        /// Optional path to write the JSON `ExploreM3Report` (prints to stdout when omitted).
-        #[arg(long)]
-        output: Option<PathBuf>,
     },
     /// Run Milestone 3 free-rider resistance and verified local excision verification gates (`G3.1`–`G3.5`).
     VerifyM3 {
@@ -350,20 +338,6 @@ where
         }) => {
             let report =
                 verify_m4a::run_explore_m4a(seed_offset, seeds, include_sensitivity, threads)?;
-            let json = serde_json::to_string_pretty(&report)?;
-            if let Some(out_path) = output {
-                fs::write(out_path, json)?;
-            } else {
-                println!("{json}");
-            }
-            Ok(())
-        }
-        Some(Commands::ExploreM3 {
-            seed_offset,
-            seeds,
-            output,
-        }) => {
-            let report = verify_m3::run_explore_m3(seed_offset, seeds)?;
             let json = serde_json::to_string_pretty(&report)?;
             if let Some(out_path) = output {
                 fs::write(out_path, json)?;

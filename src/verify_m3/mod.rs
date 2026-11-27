@@ -2,12 +2,10 @@
 //!
 //! - [`detours`]: synthetic free-rider library (`D0`–`D7b`) across widths $k \in \{1, 2\}$ and
 //!   [`crate::substrate::WireDelayMode`] (`Combinational` & `TicksPerHop`).
-//! - [`explore`]: exploratory and paired-ablation harness (`arkhe explore-m3`).
 //! - Top-level confirmatory verification suite (`arkhe verify-m3`, gates `G3.1`–`G3.5`) with
 //!   multi-bank Clopper–Pearson + homogeneity statistics and pre-registered holdout guards.
 
 pub mod detours;
-pub mod explore;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 pub use detours::{DetourClass, DetourEdit, build_detour_edit};
-pub use explore::{ExploreM3Report, check_explore_m3_seed_range_holdout, run_explore_m3};
 
 use crate::baselines::{
     DEFAULT_MAX_CERTIFY_JOINT_STEPS, PredictorBaseline, SynthesisCertStatus, TickBudget,

@@ -109,6 +109,7 @@ One commit per phase, with the named evidence linked here when produced. Keep co
 | Phase | Deliverable | Decision / expected commit unit |
 | :--- | :--- | :--- |
 | 0. M4a reconciliation | Archive closeout evidence, compare R2 ledgers on development, record explicit S4 disposition. | Evidence/decision commit; no new holdout. Planning and read-only census do not confer progression. |
+| 0b. M4a asset retirement | Only after the Phase 0 S4 disposition is recorded: fold the durable content of [`milestone_4a_plan.md`](milestone_4a_plan.md) (DR #49 rulings and invariants §§0.2–0.3, DR #50 characterisation and `G4A.1`–`G4A.7` gate definitions §§2–3, verification protocol §4, attainment ledger §8, S4 disposition) into [research record §13](research_record.md#13-milestone-4a-h5--h6-implementation--verification-record-2026-11-25) and the [inventory](parameter_inventory.md), and fold the [review](milestone_4a_independent_review.md) findings with their Phase 0 dispositions into §13; then delete both files. Repoint every link (Charter §7 M4a row and DR #49/#50, inventory, README tree, this plan's header, §2 and §8) to §13 anchors; add research record §1.1/§1.2 provenance rows. Keep [`docs/evidence/m4a/`](evidence/m4a/) and all `verify_m4a` code (`explore-m4a` backs `verify-m4a`). | Docs-only commit before Phase 1 (does not change `source_tree_fnv1a128`). Done when `python3 scripts/check_doc_links.py` and markdownlint pass and `milestone_4a_plan` / `milestone_4a_independent_review` survive only in research record provenance text. |
 | 1. Opportunity | Instrument read-only snapshots, classify opportunities and missed onsets, cost positive/minimal controls at both widths. | Census code, tests and report. Stop if no viable spontaneous search class. |
 | 2. Proof and deployment pilot | Small deterministic explorer, independent checker, priced palette entry and one reversible-to-primitives wake call. Exercise false, late, shared-state, zero-saving and budget-exhausted proposals. | Development pilot and certificate replay test. Require a working end-to-end replacement **and** plausible spontaneous opportunity before building the full verifier. |
 | 3. Experiment lock | Exercise A/B/C, synchronised scoring and work metering on exploratory seeds. Publish measurements, proposed numeric gates and their feasibility, inventory, bank guards and decision record. | Pre-registration commit and explicit approval. Without both, stop; no confirmation. |
@@ -120,6 +121,7 @@ One commit per phase, with the named evidence linked here when produced. Keep co
 | Record | Status |
 | :--- | :--- |
 | M4a S4 and R2 qualification | Pending; sealed M4a holdout remains closed. |
+| M4a asset retirement (Phase 0b) | Pending Phase 0. |
 | M4b census, proof certificate and independent replay | Not run. |
 | M4b pre-registration approval / commit | Pending development evidence and Rule-9 thresholds. |
 | Clean retained-baseline and direct M3 JSON; locked dev and 100-seed confirmation; Option D tails | Not run. |

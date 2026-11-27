@@ -37,5 +37,6 @@ State the recommended option with rationale.
 ## 7. Escalation Target & Authority Boundary
 
 State whether this report is:
+
 - **Level-2 Chief Scientist Adjudication (`@chief-scientist`):** For amending Charter §§2–3 to achieve Charter §§0–1 goals, evolving a Milestone-Scoped Scaffolding constant or bound into a reasoned Derived Scaling Law (no magic numbers), recalibrating an impractical pre-registered gate threshold (with a Rule-9 feasibility bound), re-blessing golden fixtures under Rule 4, splitting a milestone (`Ma/Mb/Mc`), or re-ordering milestones/phases; or
 - **Principal Investigator (User) Charter-Risk Escalation:** Required **only** when the overarching goal of the Charter (Charter §§0–1) or Holdout Seed Isolation is genuinely at risk and the Chief Scientist cannot identify a scientifically sound path forward with a realistic chance of success.

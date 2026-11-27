@@ -27,7 +27,7 @@ Read `.shared/ai/core/common-instructions.md`.
 - Integration tests belong in `tests/` and should import the package as `arkhe`.
 - Put one-off developer utilities or scripts in `scripts/`.
 - Keep build artifacts such as `target/` out of commits unless the repository explicitly tracks them.
-- Be explicitly aware that GEMINI.md is a symbolic link to .github/copilot-instructions.md
+- `GEMINI.md` and `.github/copilot-instructions.md` are separate agent entry files that point here; keep their shared text in sync.
 
 ## Rust Development
 

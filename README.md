@@ -1,6 +1,8 @@
 # Arkhe
 
-Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing **Milestone 0 (`M0 — Simulator and yardstick`)**, **Milestone 1 (`M1 — Metabolic economy and residual neurogenesis`)**, **Milestone 2a (`M2a — Cross-channel predictive coupling`)**, **Milestone 2b (`M2b — Redundant derivations and counterfactual comparators`)**, **Milestone 3 (`M3 — Free-rider resistance and structural compression`; Completed & verified — `M3 v2` passed `50100..=50199` holdout under Charter §2.8)**, and **Milestone 4a (`M4a — Sleep as internal falsification`; `60000..=60099` holdout passed at `0f62e2f` & permanently closed, `G4A.7` `H6` selected `S-A` for `M4b`, pending `S4` sign-off on closeout commit)** from the [Foundational Research Charter v3](docs/foundational_research_charter_v3.md). Canonical parameter, bound, and guardrail classifications live in [docs/parameter_inventory.md](docs/parameter_inventory.md), Milestone 0–4a sign-off records, review findings, and derivations live in [docs/research_record.md](docs/research_record.md) (with the Milestone 4a plan and attainment ledger in [docs/milestone_4a_plan.md](docs/milestone_4a_plan.md)), and two-level swarm escalation skills live in [.agents/skills/arkhe-orchestrator/SKILL.md](.agents/skills/arkhe-orchestrator/SKILL.md), [.agents/skills/arkhe-chief-scientist/SKILL.md](.agents/skills/arkhe-chief-scientist/SKILL.md), and [.agents/skills/arkhe-watchdog/SKILL.md](.agents/skills/arkhe-watchdog/SKILL.md).
+Deterministic variable-width modular circuit simulator, ground-truth yardstick, compute-matched baseline harness, and online neurogenesis learner implementing the [Foundational Research Charter v3](docs/foundational_research_charter_v3.md).
+
+**Status:** Milestones `M0`–`M3` are complete; `M4a` passed its single-shot holdout (`S4` disposition is recorded in [Milestone 4b](docs/milestone_4b_plan.md) Phase 0). The milestone roadmap is in [Charter §7](docs/foundational_research_charter_v3.md#7-milestones), canonical parameters, bounds, and guardrails are in [docs/parameter_inventory.md](docs/parameter_inventory.md), sign-off records and derivations are in [docs/research_record.md](docs/research_record.md), and the two-level swarm escalation skills are in [.agents/skills/arkhe-orchestrator/SKILL.md](.agents/skills/arkhe-orchestrator/SKILL.md), [.agents/skills/arkhe-chief-scientist/SKILL.md](.agents/skills/arkhe-chief-scientist/SKILL.md), and [.agents/skills/arkhe-watchdog/SKILL.md](.agents/skills/arkhe-watchdog/SKILL.md).
 
 ## Overview
 
@@ -9,9 +11,9 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 - **`substrate`**: Exact $\mathbb{Z}_{2^k}$ ring arithmetic, Level-0 primitives (`ADD`, `SUB`, `MUL`, `EQZ`, `SPLIT`, `DELAY`), Charter §2.5 structural invariant checks, scalar evaluator (`ScalarState`), and 64-lane bit-parallel evaluator (`BitParallel64State` at $k = 1$).
 - **`structural`**: Coordinate-free graph editing over `substrate::Circuit`, metabolic reserves and retrograde sensitivity, state-preserving live surgery, causal-disjoint redundancy sprouting, wake/sleep counterfactual comparators, finite-ring residual diagnostics with progressive lag deepening, and verified local pass-through & ring-identity wake excision (`M3-E1` + `M3-E2`).
 - **`env`**: Finite-state benchmark generators (`T1`, `T2`, `T2_MultiViewCoupled`, `T3b`, `T3c`), declared channel substitution & scheduled channel-fault noise (`NoiseModel`), an exact $\varepsilon$-machine solver ($C_\mu$, $h_\mu$, $L_{\text{sync}}$, scope & bounded MSP status), and **Reeds–Sloane** shift-register synthesis over $\mathbb{Z}_{2^k}$.
-- **`metrics`**: Epistemic & boundary-null surprisal models ($\Delta E \equiv -\Delta L_{\text{null}}^{\text{epistemic}}$), Minimum Description Length ($L$) accounting, autonomous limit-cycle & attractor-basin inspection, and standardised `Scorecard` manifests (with per-channel breakdowns) separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
+- **`metrics`**: Epistemic & boundary-null surprisal models ($\Delta E \equiv -\Delta L_{\text{null}}^{\text{epistemic}}$), Minimum Description Length ($L$) accounting, and standardised `Scorecard` manifests (with per-channel breakdowns) separating distributional log-loss, KT point-prediction residual loss, paired noise-oracle regret, and internal vs. boundary-lag state registers.
 - **`baselines`**: Compute-matched prequential baseline harness (`RandomSearch`, `(1+λ) CGP`, `CTW`, `CrossChannelCtw`, BPTT `Rnn`, `ReedsSloane`, and certified small-circuit `Exhaustive` synthesis) over phase-exact sliding observation windows.
-- **`rng`, `config`, `stats`, `verify_m2a`, `verify_m2b`, `verify_m3`, & `verify_m4a`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, regime-stratified per-task FWER (`StratifiedGateAudit`) + finite Option D `tail_metrics` + pooled Clopper–Pearson + $\chi^2$/permutation homogeneity bank statistics (`stats`), and M2a/M2b/M3/M4a verification & exploratory batteries (`G2A.1`–`G2A.5`, `G2B.1`–`G2B.5`, `G3.1`–`G3.5b`, `G4A.1`–`G4A.7`, `explore-m3`, `explore-m4a`), gated by `scripts/check_retained_baselines.py` against `docs/retained_baselines.json`.
+- **`rng`, `config`, `stats`, `verify_m2a`, `verify_m2b`, `verify_m3`, & `verify_m4a`**: Domain-separated portable `ChaCha8Rng` streams (`SeedBank`), TOML/JSON `ExperimentConfig` & `RunReport` manifests with embedded `BuildProvenance`, regime-stratified per-task FWER (`StratifiedGateAudit`) + finite Option D `tail_metrics` + pooled Clopper–Pearson + $\chi^2$/permutation homogeneity bank statistics (`stats`), and M2a/M2b/M3/M4a verification & exploratory batteries (`G2A.1`–`G2A.5`, `G2B.1`–`G2B.5`, `G3.1`–`G3.5b`, `G4A.1`–`G4A.7`, `explore-m4a`), gated by `scripts/check_retained_baselines.py` against `docs/retained_baselines.json`.
 
 ## Project Structure
 
@@ -30,7 +32,9 @@ Arkhe provides a pure, reproducible Rust research platform over $\mathbb{Z}_{2^k
 │   │   ├── blocker_report.md
 │   │   └── milestone_plan_template.md
 │   ├── foundational_research_charter_v3.md
+│   ├── milestone_4a_independent_review.md
 │   ├── milestone_4a_plan.md
+│   ├── milestone_4b_plan.md
 │   ├── parameter_inventory.md
 │   ├── research_record.md
 │   └── retained_baselines.json
@@ -96,10 +100,9 @@ cargo run --locked --release -- verify-m2b --banks 50 --seed-offset 20 --seeds 2
 cargo run --locked --release -- verify-m2b --seed-offset 20040 --seeds 20
 ```
 
-1. Run the Milestone 3 free-rider resistance and verified local excision exploratory and verification suites (`G3.1`–`G3.5b`):
+1. Run the Milestone 3 free-rider resistance and verified local excision verification suite (`G3.1`–`G3.5b`):
 
 ```bash
-cargo run --locked --release -- explore-m3 --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m3 --seed-offset 0 --seeds 20
 cargo run --locked --release -- verify-m3 --banks 50 --seed-offset 20 --seeds 20
 cargo run --locked --release -- verify-m3 --banks 5 --seed-offset 20100 --seeds 20

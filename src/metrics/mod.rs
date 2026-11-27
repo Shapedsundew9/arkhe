@@ -1,12 +1,10 @@
-//! Charter §2.6, §3.1.4, §3.4 & §8 Yardsticks: surprisal null models, MDL $L$, dynamics, and scorecards.
+//! Charter §3.1.4, §3.4 & §8 Yardsticks: surprisal null models, MDL $L$, and scorecards.
 
-pub mod dynamics;
 pub mod mdl;
 pub mod null_model;
 pub mod point_forecast;
 pub mod scorecard;
 
-pub use dynamics::{BasinReport, CycleReport, detect_autonomous_cycle, estimate_attractor_basin};
 pub use mdl::{
     CircuitDescriptionAllocation, MdlBreakdown, NullCalibratedMdlError,
     allocate_circuit_description_bits, circuit_code_bits, circuit_code_bits_with_tax,
