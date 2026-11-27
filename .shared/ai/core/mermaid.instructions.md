@@ -26,12 +26,14 @@ Invoke via Command Palette or the VS Code command API (GitHub Copilot in VS Code
 Do not invent command IDs. Prefer writing/editing `.mmd` files when a command is not needed.
 
 ### Diagram editing & preview
+
 - **Preview** (`mermaidChart.preview`) — preview the active Mermaid editor (`.mmd` / `.mermaid` must be open).
 - **Create Diagram** (`mermaidChart.createMermaidFile`) — creates a demo flowchart and opens preview side by side.
 - **Repair Diagram** (`mermaidChart.repairDiagram`) — Mermaid AI repair for the active diagram; uses Mermaid AI credits — tell the user before running.
 - **Improve Diagram** (`mermaidChart.improveDiagram`) — uses Copilot / LM API; suggests layout + styling variants for the active diagram.
 
 ### Generate diagrams (GitHub Copilot required)
+
 - **Generate Diagram from Code** (`mermaidChart.generateDiagramFromCode`)
 - **Generate Cloud Diagram** (`mermaidChart.generateCloudDiagram`)
 - **Generate ER Diagram** (`mermaidChart.generateERDiagram`)
@@ -39,9 +41,11 @@ Do not invent command IDs. Prefer writing/editing `.mmd` files when a command is
 - **Open AI Chat** (`mermaidChart.openCopilotChat`)
 
 ### Mermaid cloud
+
 - **Login** (`mermaidChart.login`) / **Logout** (`mermaidChart.logout`)
 - **Connect Diagram** (`mermaidChart.connectDiagramToMermaidChart`) — link a local diagram to Mermaid.
 - **Sync Diagram** (`mermaidChart.syncDiagramWithMermaid`) — only for diagrams already connected (frontmatter has `id:`). Example:
+
   ```yaml
   ---
   id: cbd9e9ba-a2cb-47c5-a98e-8c28a753428d
@@ -49,12 +53,15 @@ Do not invent command IDs. Prefer writing/editing `.mmd` files when a command is
   ```
 
 ### Review Mermaid Sync
+
 For diagrams updated by the Mermaid GitHub Sync app (or pre-commit regenerate):
+
 - **Review Mermaid Sync** (`mermaidChart.reviewAppCommits`) — start / open the review flow.
 - **Regenerate with Mermaid AI** (`mermaidChart.regenerateDiagramWithMermaidAI`) — regenerate from source references.
 Do not manually rewrite diagrams managed by this workflow. Accept/reject/diff UI actions stay in the extension UI.
 
 ### Install / update this pack
+
 - **Mermaid: Install AI Skills…** (`mermaidChart.installAiSkills`)
 
 ## @mermaid-chart slash commands
@@ -82,4 +89,4 @@ Do not manually rewrite diagrams managed by this workflow. Accept/reject/diff UI
 
 ## Docs
 
-More commands and features: https://marketplace.visualstudio.com/items?itemName=MermaidChart.vscode-mermaid-chart
+More commands and features: <https://marketplace.visualstudio.com/items?itemName=MermaidChart.vscode-mermaid-chart>
